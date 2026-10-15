@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 270" role="img" aria-labelledby="eo-t eo-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="eo-t">Evaluator–optimizer structure</title>
+  <desc id="eo-d">A generator model writes a draft. A separate evaluator model scores it against a rubric. If it passes, the draft is returned. If not, the evaluator's feedback goes back to the generator. A budget or stall check in code ends the loop and escalates.</desc>
+  <defs>
+    <marker id="eo-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="270" fill="#FBF5EA"/>
+
+  <rect x="16" y="70" width="80" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="56" y="101" text-anchor="middle" font-size="13" fill="#3B2F2A">Task</text>
+  <line x1="96" y1="96" x2="126" y2="96" stroke="#5A4636" stroke-width="1.5" marker-end="url(#eo-ah)"/>
+
+  <rect x="128" y="70" width="140" height="52" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="198" y="92" text-anchor="middle" font-size="14" font-weight="600" fill="#3B2F2A">generator</text>
+  <text x="198" y="110" text-anchor="middle" font-size="11" fill="#7A6A5E">draft / revise</text>
+  <line x1="268" y1="96" x2="318" y2="96" stroke="#5A4636" stroke-width="1.5" marker-end="url(#eo-ah)"/>
+  <text x="293" y="88" text-anchor="middle" font-size="10" fill="#7A6A5E">draft</text>
+
+  <rect x="320" y="70" width="150" height="52" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="395" y="92" text-anchor="middle" font-size="14" font-weight="600" fill="#3B2F2A">evaluator</text>
+  <text x="395" y="110" text-anchor="middle" font-size="11" fill="#7A6A5E">separate role + rubric</text>
+  <line x1="470" y1="96" x2="508" y2="96" stroke="#5A4636" stroke-width="1.5" marker-end="url(#eo-ah)"/>
+
+  <polygon points="536,70 562,96 536,122 510,96" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="536" y="100" text-anchor="middle" font-size="10" fill="#3B2F2A">pass?</text>
+  <line x1="562" y1="96" x2="626" y2="96" stroke="#5A4636" stroke-width="1.5" marker-end="url(#eo-ah)"/>
+  <text x="594" y="88" text-anchor="middle" font-size="10" fill="#6B7F5E">yes</text>
+  <rect x="628" y="70" width="116" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="686" y="101" text-anchor="middle" font-size="13" fill="#3B2F2A">Final draft</text>
+
+  <!-- feedback loop -->
+  <path d="M536,122 V 168 H 198 V 126" fill="none" stroke="#B5562E" stroke-width="1.5" marker-end="url(#eo-ah)"/>
+  <text x="367" y="162" text-anchor="middle" font-size="11" fill="#B5562E">no → itemised feedback (one fix per failed criterion)</text>
+
+  <!-- stop conditions -->
+  <rect x="380" y="196" width="312" height="48" rx="8" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="536" y="216" text-anchor="middle" font-size="12" fill="#3B2F2A">stop: round budget hit or same feedback twice</text>
+  <text x="536" y="233" text-anchor="middle" font-size="11" fill="#7A6A5E">→ return best effort, flagged, escalate</text>
+  <line x1="536" y1="168" x2="536" y2="194" stroke="#6B7F5E" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#eo-ah)"/>
+
+  <text x="16" y="262" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = deterministic code · Dashed = data</text>
+</svg>

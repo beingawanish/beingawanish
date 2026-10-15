@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 312" role="img" aria-labelledby="rt-t rt-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="rt-t">Routing structure</title>
+  <desc id="rt-d">A ticket first meets a free keyword pre-filter. Unique matches skip the model. Otherwise an LLM classifier returns a route and confidence, which code validates; valid routes go to one of three specialists, and unknown or low-confidence answers go to the general fallback.</desc>
+  <defs>
+    <marker id="rt-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="312" fill="#FBF5EA"/>
+
+  <!-- input -->
+  <rect x="16" y="130" width="84" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="58" y="161" text-anchor="middle" font-size="13" fill="#3B2F2A">Ticket</text>
+  <line x1="100" y1="156" x2="122" y2="156" stroke="#5A4636" stroke-width="1.5" marker-end="url(#rt-ah)"/>
+
+  <!-- keyword prefilter -->
+  <rect x="124" y="130" width="124" height="52" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="186" y="153" text-anchor="middle" font-size="13" font-weight="600" fill="#3B2F2A">keyword</text>
+  <text x="186" y="170" text-anchor="middle" font-size="13" font-weight="600" fill="#3B2F2A">pre-filter</text>
+  <line x1="248" y1="156" x2="272" y2="156" stroke="#5A4636" stroke-width="1.5" marker-end="url(#rt-ah)"/>
+  <text x="186" y="200" text-anchor="middle" font-size="10" fill="#7A6A5E">0 or 2+ hits → ask the model</text>
+
+  <!-- llm classifier -->
+  <rect x="274" y="130" width="124" height="52" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="336" y="153" text-anchor="middle" font-size="13" font-weight="600" fill="#3B2F2A">LLM classifier</text>
+  <text x="336" y="170" text-anchor="middle" font-size="11" fill="#7A6A5E">{route, confidence}</text>
+  <line x1="398" y1="156" x2="420" y2="156" stroke="#5A4636" stroke-width="1.5" marker-end="url(#rt-ah)"/>
+
+  <!-- unique keyword bypass -->
+  <path d="M186,130 V 92 H 446 V 128" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#rt-ah)"/>
+  <text x="316" y="86" text-anchor="middle" font-size="11" fill="#6B7F5E">unique keyword hit — no model call</text>
+
+  <!-- validate -->
+  <polygon points="446,130 472,156 446,182 420,156" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="446" y="160" text-anchor="middle" font-size="10" fill="#3B2F2A">valid?</text>
+  <text x="438" y="204" text-anchor="end" font-size="10" fill="#7A6A5E">known route</text>
+  <text x="438" y="217" text-anchor="end" font-size="10" fill="#7A6A5E">and conf ≥ τ</text>
+
+  <!-- handlers -->
+  <g font-size="13" fill="#3B2F2A">
+    <rect x="560" y="24" width="180" height="46" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+    <text x="650" y="52" text-anchor="middle" font-weight="600">billing specialist</text>
+    <rect x="560" y="88" width="180" height="46" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+    <text x="650" y="116" text-anchor="middle" font-weight="600">technical specialist</text>
+    <rect x="560" y="152" width="180" height="46" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+    <text x="650" y="180" text-anchor="middle" font-weight="600">account specialist</text>
+    <rect x="560" y="236" width="180" height="46" rx="10" fill="#FFFDF8" stroke="#B5562E" stroke-width="1.5"/>
+    <text x="650" y="257" text-anchor="middle" font-weight="600">general / fallback</text>
+    <text x="650" y="273" text-anchor="middle" font-size="10" fill="#7A6A5E">safe, human-friendly</text>
+  </g>
+  <line x1="472" y1="156" x2="510" y2="156" stroke="#5A4636" stroke-width="1.5"/>
+  <path d="M510,156 V 47 H 556" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#rt-ah)"/>
+  <path d="M510,111 H 556" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#rt-ah)"/>
+  <path d="M510,156 V 175 H 556" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#rt-ah)"/>
+  <text x="650" y="16" text-anchor="middle" font-size="10" fill="#6B7F5E">dispatch to exactly one handler</text>
+  <path d="M446,182 V 259 H 556" fill="none" stroke="#B5562E" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#rt-ah)"/>
+  <text x="500" y="252" text-anchor="middle" font-size="10" fill="#B5562E">invalid / low conf</text>
+
+  <text x="16" y="300" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = deterministic code · Dashed = data / failure path</text>
+</svg>

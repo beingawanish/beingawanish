@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 356" role="img" aria-labelledby="st-t st-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="st-t">Support triage capstone architecture</title>
+  <desc id="st-d">A ticket fans out to a CRM lookup, a sentiment model and a knowledge-base search in parallel. The router picks one route. A guardrailed draft step generates, validates and repairs the reply. A policy checkpoint either sends the reply automatically or queues it for a human reviewer. An offline eval harness runs the whole pipeline over a fixed case set.</desc>
+  <defs>
+    <marker id="st-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="356" fill="#FBF5EA"/>
+
+  <rect x="16" y="92" width="72" height="48" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="52" y="121" text-anchor="middle" font-size="13" fill="#3B2F2A">Ticket</text>
+  <line x1="88" y1="116" x2="108" y2="116" stroke="#5A4636" stroke-width="1.5" marker-end="url(#st-ah)"/>
+  <path d="M98,116 V 49 H 108" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#st-ah)"/>
+  <path d="M98,116 V 183 H 108" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#st-ah)"/>
+
+  <!-- enrichment -->
+  <text x="176" y="22" text-anchor="middle" font-size="11" font-weight="600" fill="#6B7F5E">#3 PARALLELIZATION</text>
+  <rect x="110" y="32" width="132" height="34" rx="8" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="176" y="54" text-anchor="middle" font-size="12" fill="#3B2F2A">CRM lookup (tool)</text>
+  <rect x="110" y="99" width="132" height="34" rx="8" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="176" y="121" text-anchor="middle" font-size="12" fill="#3B2F2A">sentiment (LLM)</text>
+  <rect x="110" y="166" width="132" height="34" rx="8" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="176" y="188" text-anchor="middle" font-size="12" fill="#3B2F2A">KB search (tool)</text>
+  <path d="M242,49 H 258 V 116" fill="none" stroke="#5A4636" stroke-width="1.5"/>
+  <path d="M242,183 H 258 V 116" fill="none" stroke="#5A4636" stroke-width="1.5"/>
+  <line x1="242" y1="116" x2="276" y2="116" stroke="#5A4636" stroke-width="1.5" marker-end="url(#st-ah)"/>
+
+  <!-- router -->
+  <text x="324" y="80" text-anchor="middle" font-size="11" font-weight="600" fill="#6B7F5E">#2 ROUTING</text>
+  <rect x="278" y="90" width="92" height="52" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="324" y="112" text-anchor="middle" font-size="12" font-weight="600" fill="#3B2F2A">router</text>
+  <text x="324" y="128" text-anchor="middle" font-size="10" fill="#7A6A5E">keywords → LLM</text>
+  <line x1="370" y1="116" x2="392" y2="116" stroke="#5A4636" stroke-width="1.5" marker-end="url(#st-ah)"/>
+
+  <!-- guarded draft -->
+  <text x="466" y="80" text-anchor="middle" font-size="11" font-weight="600" fill="#6B7F5E">#11 GUARDRAILED</text>
+  <rect x="394" y="90" width="144" height="52" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="466" y="112" text-anchor="middle" font-size="12" font-weight="600" fill="#3B2F2A">draft → validate</text>
+  <text x="466" y="128" text-anchor="middle" font-size="10" fill="#7A6A5E">→ repair ≤2 → fallback</text>
+  <line x1="538" y1="116" x2="560" y2="116" stroke="#5A4636" stroke-width="1.5" marker-end="url(#st-ah)"/>
+
+  <!-- policy -->
+  <text x="588" y="72" text-anchor="middle" font-size="11" font-weight="600" fill="#6B7F5E">#17 HITL</text>
+  <polygon points="588,88 616,116 588,144 560,116" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="588" y="120" text-anchor="middle" font-size="10" fill="#3B2F2A">policy</text>
+  <line x1="616" y1="116" x2="652" y2="116" stroke="#5A4636" stroke-width="1.5" marker-end="url(#st-ah)"/>
+  <text x="634" y="108" text-anchor="middle" font-size="10" fill="#6B7F5E">safe</text>
+  <rect x="654" y="92" width="90" height="48" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="699" y="121" text-anchor="middle" font-size="12" fill="#3B2F2A">auto-send</text>
+
+  <path d="M588,144 V 196 H 652" fill="none" stroke="#B5562E" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#st-ah)"/>
+  <text x="600" y="176" font-size="10" fill="#B5562E">risky</text>
+  <rect x="654" y="172" width="90" height="48" rx="10" fill="#F7E9C4" stroke="#B88A1E" stroke-width="1.5"/>
+  <text x="699" y="193" text-anchor="middle" font-size="12" fill="#3B2F2A">review</text>
+  <text x="699" y="208" text-anchor="middle" font-size="10" fill="#7A6A5E">durable queue</text>
+
+  <!-- eval harness -->
+  <rect x="16" y="252" width="728" height="64" rx="10" fill="none" stroke="#6B7F5E" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="32" y="274" font-size="11" font-weight="600" fill="#6B7F5E">#21 EVAL HARNESS (offline)</text>
+  <text x="32" y="294" font-size="12" fill="#3B2F2A">8 fixed tickets → route accuracy · escalation accuracy · PII safety · reply quality (separate judge model)</text>
+  <text x="32" y="309" font-size="11" fill="#7A6A5E">acceptance thresholds come from the brief and are checked on every run of verify.py</text>
+
+  <text x="16" y="344" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = deterministic code · Ochre = human · Dashed = data / external system</text>
+</svg>
