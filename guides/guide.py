@@ -117,7 +117,7 @@ def missing(orig: str, new: str) -> list[str]:
 
 def all_rewrites() -> dict[str, str]:
     merged: dict[str, str] = {}
-    for f in sorted(REWRITES.glob(f"ch{only or '*'}.json")):
+    for f in sorted(REWRITES.glob("ch*.json")):
         merged.update(json.loads(f.read_text()))
     return merged
 
