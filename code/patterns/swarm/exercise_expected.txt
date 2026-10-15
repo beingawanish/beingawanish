@@ -1,0 +1,4 @@
+Swarm — exercise solution
+=========================
+[plain board] stalled: unfinished tasks, but no agent could make progress; done=2, unfinished=1
+[lease board] board empty; done=3, unfinished=0, expired claims=['T1']

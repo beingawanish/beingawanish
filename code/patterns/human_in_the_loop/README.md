@@ -6,7 +6,7 @@ Pause risky actions at a policy checkpoint, persist state, resume exactly once.
 |---|---|
 | Implementation | [`hitl.py`](hitl.py) |
 | Demo | [`main.py`](main.py) |
-| Exercise solution | — (with its chapter) |
+| Exercise solution | [`exercise_solution.py`](exercise_solution.py) |
 | Chapter | [`book/part-3-multi-agent/17-human-in-the-loop.md`](../../../book/part-3-multi-agent/17-human-in-the-loop.md) |
 
 Python 3.10+, standard library only, offline. The model is `agentkit.MockLLM`, so output is deterministic.

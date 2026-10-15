@@ -1,0 +1,4 @@
+Debate — exercise solution
+==========================
+[argument-based judge] order-stable=True
+[recency-biased judge] order-stable=False ('Do not split yet' vs 'Split now') → escalate

@@ -1,0 +1,7 @@
+Human-in-the-loop — exercise solution
+=====================================
+[maya approves] status=pending approvals=['maya']
+[maya approves] status=pending approvals=['maya']
+[omar approves] status=approved approvals=['maya', 'omar']
+[resume] executed
+ledger: ['refund $900']
