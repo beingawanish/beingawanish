@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" role="img" aria-labelledby="swarm-t swarm-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="swarm-t">Swarm structure</title>
+  <desc id="swarm-d">Peer agents with different skills read and write a shared blackboard. Each claims open tasks that match its skill, posts results and follow-up tasks. No agent is in charge. Code provides the only global controls: de-duplication, a task cap and a tick budget.</desc>
+  <defs>
+    <marker id="swarm-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="300" fill="#FBF5EA"/>
+  <rect x="250" y="86" width="260" height="120" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="380.0" y="151.0" text-anchor="middle" font-size="13" fill="#3B2F2A"></text>
+  <text x="380" y="108" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">blackboard</text>
+  <text x="380" y="130" text-anchor="middle" font-size="11" fill="#7A6A5E">T1 report · done</text>
+  <text x="380" y="148" text-anchor="middle" font-size="11" fill="#7A6A5E">T5 repro · done</text>
+  <text x="380" y="166" text-anchor="middle" font-size="11" fill="#7A6A5E">T6 repro · claimed</text>
+  <text x="380" y="184" text-anchor="middle" font-size="11" fill="#7A6A5E">T7 estimate · open</text>
+  <rect x="40" y="40" width="140" height="56" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="110.0" y="65.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">triager</text>
+  <text x="110.0" y="81.0" text-anchor="middle" font-size="11" fill="#7A6A5E">skill: report</text>
+  <rect x="40" y="170" width="140" height="56" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="110.0" y="195.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">reproducer</text>
+  <text x="110.0" y="211.0" text-anchor="middle" font-size="11" fill="#7A6A5E">skill: repro</text>
+  <rect x="580" y="100" width="140" height="56" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="650.0" y="125.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">estimator</text>
+  <text x="650.0" y="141.0" text-anchor="middle" font-size="11" fill="#7A6A5E">skill: estimate</text>
+  <path d="M180,68 L248,110" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#swarm-ah)"/>
+  <path d="M180,198 L248,180" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#swarm-ah)"/>
+  <path d="M578,128 L512,146" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#swarm-ah)"/>
+  <text x="232" y="64" text-anchor="start" font-size="10" fill="#7A6A5E">claim · post</text>
+  <text x="650" y="174" text-anchor="middle" font-size="10" fill="#7A6A5E">claim · post</text>
+  <rect x="250" y="228" width="260" height="40" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="380.0" y="245.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">dedupe · task cap · tick budget</text>
+  <text x="380.0" y="261.0" text-anchor="middle" font-size="11" fill="#7A6A5E">the only global controls</text>
+  <text x="640" y="220" text-anchor="middle" font-size="12" fill="#B5562E" font-weight="600">no controller</text>
+  <text x="640" y="236" text-anchor="middle" font-size="11" fill="#B5562E">behaviour emerges</text>
+  <text x="16" y="290" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = deterministic code · Dashed = data / failure path</text>
+</svg>

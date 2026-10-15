@@ -271,7 +271,292 @@ def deep_research():
     return d.save()
 
 
-ALL = [react, plan_and_execute, reflection, tool_use_loop, agentic_rag, guardrailed_generation, deep_research]
+def supervisor():
+    d = Diagram("supervisor", 760, 300, "Supervisor structure",
+                "A supervisor model delegates one instruction at a time to specialist worker agents. Every result "
+                "returns to the supervisor, which decides again: another worker, or FINISH. Code enforces a turn "
+                "budget, valid worker names and loop detection.")
+    d.box(16, 80, 84, 52, "data", "Task")
+    d.arrow([(100, 106), (138, 106)])
+    d.box(140, 90, 150, 80, "llm", "supervisor", "re-decides every turn")
+    d.arrow([(290, 130), (400, 130)], label="one instruction", at=(345, 122))
+    d.arrow([(400, 47), (400, 183)], head=False)
+    for y, name, sub in ((24, "researcher", "finds facts"), (92, "analyst", "computes"), (160, "writer", "drafts")):
+        d.arrow([(400, y + 23), (468, y + 23)])
+        d.box(470, y, 150, 46, "llm", name, sub, size=12)
+        d.arrow([(620, y + 23), (650, y + 23)], "loop", head=False)
+    d.arrow([(650, 47), (650, 226), (250, 226), (250, 172)], "loop", "every result returns to the supervisor", (450, 220))
+    d.arrow([(140, 160), (58, 160), (58, 194)], "ok", "FINISH", (100, 154))
+    d.box(16, 196, 84, 44, "data", "Answer")
+    d.box(130, 240, 220, 32, "code", "turn budget · valid worker · loop guard", size=11)
+    d.legend(KEY)
+    return d.save()
+
+
+def hierarchical_teams():
+    d = Diagram("hierarchical_teams", 760, 320, "Hierarchical teams structure",
+                "A top-level lead delegates to team leads. Each team lead supervises its own workers with private "
+                "state. Only a short summary flows back up, so the top lead's context stays small.")
+    d.box(300, 20, 160, 52, "llm", "launch lead", "sees summaries only")
+    d.arrow([(340, 72), (180, 118)])
+    d.arrow([(420, 72), (580, 118)])
+    d.text(160, 94, "instruction ↓  summary ↑", 10, MUTED)
+    d.text(610, 94, "instruction ↓  summary ↑", 10, MUTED)
+    d.box(100, 120, 160, 52, "llm", "research lead", "own loop + state")
+    d.box(500, 120, 160, 52, "llm", "content lead", "own loop + state")
+    for x, names in ((40, ("researcher", "analyst")), (440, ("writer", "editor"))):
+        for k, n in enumerate(names):
+            bx = x + k * 150
+            d.box(bx, 220, 130, 44, "llm", n, size=12)
+        d.arrow([(x + 140, 172), (x + 65, 218)])
+        d.arrow([(x + 140, 172), (x + 215, 218)])
+    d.text(380, 290, "team-internal detail and state never leave the team", 11, MUTED)
+    d.legend(KEY)
+    return d.save()
+
+
+def sequential_handoffs():
+    d = Diagram("sequential_handoffs", 760, 250, "Sequential handoffs structure",
+                "One agent owns the conversation at a time. The owner replies, or hands off with an explicit handoff "
+                "object of target, reason and summary. There is no coordinator. The runtime enforces the allowed "
+                "handoff graph and a ping-pong guard that escalates to a human.")
+    d.box(16, 90, 84, 52, "data", "User")
+    d.arrow([(100, 116), (128, 116)])
+    xs = [(130, "triage"), (330, "billing"), (530, "technical")]
+    for x, n in xs:
+        d.box(x, 86, 130, 60, "llm", n, "owns while active")
+    d.arrow([(260, 116), (328, 116)], label="handoff", at=(294, 108))
+    d.arrow([(460, 116), (528, 116)], label="handoff", at=(494, 108))
+    d.box(262, 160, 266, 40, "data", "Handoff {target, reason, summary}", size=11)
+    d.arrow([(395, 146), (395, 158)], "muted", head=False)
+    d.arrow([(595, 86), (595, 40), (58, 40), (58, 88)], "ok", "owner replies to the user", (330, 34))
+    d.box(600, 180, 144, 44, "human", "escalate", "ping-pong / bad target", size=12)
+    d.arrow([(640, 146), (640, 178)], "fail")
+    d.legend(KEY_H)
+    return d.save()
+
+
+def debate():
+    d = Diagram("debate", 760, 270, "Debate structure",
+                "Two peer debaters with assigned positions argue over rounds, each seeing the other's latest "
+                "argument. If all agree, the debate stops early. Otherwise a judge reads the transcript and decides "
+                "with a rationale.")
+    d.box(16, 100, 90, 52, "data", "Question")
+    d.arrow([(106, 116), (148, 70)])
+    d.arrow([(106, 136), (148, 182)])
+    d.box(150, 40, 150, 60, "llm", "debater A", "position: for")
+    d.box(150, 160, 150, 60, "llm", "debater B", "position: against")
+    d.arrow([(240, 100), (240, 158)], "loop", head=True)
+    d.arrow([(210, 160), (210, 102)], "loop", head=True)
+    d.text(225, 240, "each sees the other's latest argument", 10, "#B5562E")
+    d.box(330, 96, 130, 64, "data", "transcript", "rounds 1…R")
+    d.arrow([(300, 70), (330, 110)])
+    d.arrow([(300, 190), (330, 146)])
+    d.diamond(500, 128, 26, "agree?")
+    d.arrow([(460, 128), (474, 128)])
+    d.arrow([(500, 102), (500, 40), (610, 40)], "ok", "yes → stop", (552, 34))
+    d.box(612, 18, 132, 44, "data", "consensus", size=12)
+    d.arrow([(526, 128), (580, 128)], label="no", at=(552, 120))
+    d.box(582, 100, 162, 56, "llm", "judge", "decision + rationale")
+    d.box(582, 180, 162, 46, "code", "check: order-stable?", "swap order, re-judge", size=12)
+    d.arrow([(663, 156), (663, 178)], "muted")
+    d.legend(KEY)
+    return d.save()
+
+
+def critic_reviewer():
+    d = Diagram("critic_reviewer", 760, 280, "Critic–reviewer loop structure",
+                "An author agent produces an artefact. A reviewer agent with its own tools runs tests and checks and "
+                "files itemised findings with severities. The author answers each finding, fixed or won't fix with a "
+                "reason. Code tracks findings: blocking ones must be fixed; approval means none remain open.")
+    d.box(16, 96, 84, 52, "data", "Task")
+    d.arrow([(100, 122), (128, 122)])
+    d.box(130, 90, 140, 64, "llm", "author agent", "writes / revises")
+    d.arrow([(270, 122), (318, 122)], label="artefact", at=(294, 114))
+    d.box(320, 80, 170, 84, "llm", "")
+    d.text(405, 104, "reviewer agent", 13, weight="600")
+    d.text(405, 124, "tools: run tests, lint", 11, MUTED)
+    d.text(405, 140, "never edits the code", 11, MUTED)
+    d.arrow([(490, 122), (536, 122)])
+    d.box(538, 90, 120, 64, "data", "findings", "F1 blocking · F2 nit")
+    d.arrow([(598, 154), (598, 214), (200, 214), (200, 156)], "loop", "author answers each: fixed | won't fix + reason", (400, 208))
+    d.diamond(700, 122, 28, "blocking?")
+    d.arrow([(658, 122), (674, 122)])
+    d.arrow([(700, 96), (700, 46), (560, 46)], "ok", "none: approve", (640, 40))
+    d.box(430, 24, 128, 40, "data", "Approved", size=12)
+    d.text(400, 248, "code tracks finding ids: blocking cannot be waived, nits can (with a reason)", 10, MUTED)
+    d.legend(KEY)
+    return d.save()
+
+
+def human_in_the_loop():
+    d = Diagram("human_in_the_loop", 760, 300, "Human-in-the-loop structure",
+                "An agent proposes an action. A code policy decides whether it needs a human. Safe actions execute. "
+                "Risky ones go to a durable review queue. A reviewer approves, edits or rejects, possibly in a later "
+                "process. Resume executes approved actions exactly once; undecided requests expire to rejected.")
+    d.box(16, 100, 92, 52, "llm", "agent", "proposes action")
+    d.arrow([(108, 126), (152, 126)])
+    d.diamond(182, 126, 30, "policy")
+    d.text(182, 172, "refund > $100? irreversible?", 10, MUTED)
+    d.text(182, 185, "low confidence?", 10, MUTED)
+    d.arrow([(182, 96), (182, 46), (600, 46)], "ok", "no rule fired → execute", (380, 40))
+    d.arrow([(212, 126), (262, 126)], "fail", "risky", (237, 118))
+    d.box(264, 96, 150, 60, "data", "review queue", "JSON on disk")
+    d.arrow([(414, 126), (452, 126)])
+    d.box(454, 96, 120, 60, "human", "reviewer", "approve·edit·reject")
+    d.arrow([(574, 126), (602, 126)])
+    d.box(604, 90, 140, 72, "code", "")
+    d.text(674, 116, "resume", 13, weight="600")
+    d.text(674, 134, "write-ahead mark", 11, MUTED)
+    d.text(674, 150, "execute exactly once", 11, MUTED)
+    d.box(604, 26, 140, 40, "data", "side effect", size=12)
+    d.arrow([(674, 90), (674, 68)], "ok")
+    d.box(264, 210, 310, 44, "code", "deadline passed, undecided → expired (default deny)", size=11)
+    d.arrow([(339, 156), (339, 208)], "muted")
+    d.legend(KEY_H)
+    return d.save()
+
+
+def swarm():
+    d = Diagram("swarm", 760, 300, "Swarm structure",
+                "Peer agents with different skills read and write a shared blackboard. Each claims open tasks that "
+                "match its skill, posts results and follow-up tasks. No agent is in charge. Code provides the only "
+                "global controls: de-duplication, a task cap and a tick budget.")
+    d.box(250, 86, 260, 120, "data", "")
+    d.text(380, 108, "blackboard", 13, weight="600")
+    for i, (t, st) in enumerate((("T1 report", "done"), ("T5 repro", "done"), ("T6 repro", "claimed"),
+                                 ("T7 estimate", "open"))):
+        d.text(380, 130 + i * 18, f"{t} · {st}", 11, MUTED)
+    for x, y, n, sk in ((40, 40, "triager", "skill: report"), (40, 170, "reproducer", "skill: repro"),
+                        (580, 100, "estimator", "skill: estimate")):
+        d.box(x, y, 140, 56, "llm", n, sk, size=12)
+    d.arrow([(180, 68), (248, 110)], "normal", head=True)
+    d.arrow([(180, 198), (248, 180)], "normal", head=True)
+    d.arrow([(578, 128), (512, 146)], "normal", head=True)
+    d.text(232, 64, "claim · post", 10, MUTED, "start")
+    d.text(650, 174, "claim · post", 10, MUTED)
+    d.box(250, 228, 260, 40, "code", "dedupe · task cap · tick budget", "the only global controls", size=12)
+    d.text(640, 220, "no controller", 12, "#B5562E", weight="600")
+    d.text(640, 236, "behaviour emerges", 11, "#B5562E")
+    d.legend(KEY)
+    return d.save()
+
+
+def memory_tiers():
+    d = Diagram("memory_tiers", 760, 300, "Memory tiers structure",
+                "Each user turn enters bounded working memory. An extractor model proposes memory candidates. A code "
+                "write policy sends stable, confident facts to semantic memory, transient facts to episodic memory, "
+                "and drops the rest. Long-term tiers persist to disk; recall is by tag.")
+    d.box(16, 110, 84, 52, "data", "User turn")
+    d.arrow([(100, 136), (128, 136)])
+    d.box(130, 30, 150, 52, "code", "working memory", "last N turns, verbatim", size=12)
+    d.arrow([(115, 136), (115, 56), (128, 56)], head=True)
+    d.box(130, 110, 150, 52, "llm", "extract", "candidate facts")
+    d.arrow([(280, 136), (318, 136)])
+    d.diamond(350, 136, 32, "policy")
+    d.text(350, 190, "code decides", 10, MUTED)
+    d.arrow([(382, 136), (420, 136), (420, 60), (468, 60)], "ok", "stable", (430, 52), "start")
+    d.box(470, 34, 170, 52, "data", "semantic memory", "facts + history + source", size=12)
+    d.arrow([(420, 136), (468, 136)], "normal", "transient", (444, 128))
+    d.box(470, 110, 170, 52, "data", "episodic memory", "session notes", size=12)
+    d.arrow([(350, 168), (350, 222), (468, 222)], "fail", "low confidence", (360, 238), "start")
+    d.box(470, 200, 170, 44, "code", "dropped", size=12)
+    d.box(660, 34, 84, 128, "data", "JSON", "on disk")
+    d.arrow([(640, 60), (658, 60)], "muted", head=False)
+    d.arrow([(640, 136), (658, 136)], "muted", head=False)
+    d.text(555, 274, "recall by tag · newer value supersedes, history kept", 10, MUTED)
+    d.legend(KEY)
+    return d.save()
+
+
+def context_management():
+    d = Diagram("context_management", 760, 326, "Context management structure",
+                "Each model call's context is assembled under a token budget in priority order: pinned system rules "
+                "and task, a one-line tool index with full docs only on request, a running summary of old turns plus "
+                "recent turns verbatim, and reference documents by relevance until the budget is reached.")
+    sections = [("pin", "system rules + task", "always, verbatim", "code"),
+                ("disclose", "tool index", "full docs on request", "code"),
+                ("compact", "summary + recent turns", "old turns summarised", "llm"),
+                ("evict", "reference docs", "by relevance, to budget", "code")]
+    for i, (lever, title, sub, kind) in enumerate(sections):
+        y = 24 + i * 58
+        d.text(70, y + 30, lever, 12, "#6B7F5E", weight="700")
+        d.box(120, y, 220, 48, kind, title, sub, size=12)
+        d.arrow([(340, y + 24), (420, y + 24)])
+    d.box(422, 24, 150, 252, "data", "")
+    d.text(497, 50, "prompt", 13, weight="600")
+    d.text(497, 70, "≤ budget", 11, MUTED)
+    for k, (lbl, h) in enumerate((("pinned", 26), ("tools", 26), ("summary", 22), ("recent", 46), ("docs", 34))):
+        pass
+    y = 84
+    for lbl, h, fill in (("pinned", 30, "#E7EDE1"), ("tools", 28, "#E7EDE1"), ("summary", 24, "#F6E3D3"),
+                         ("recent", 50, "#F6E3D3"), ("docs", 36, "#FFFDF8")):
+        d.parts.append(f'  <rect x="440" y="{y}" width="114" height="{h}" rx="4" fill="{fill}" stroke="#8C7B70"/>')
+        d.text(497, y + h / 2 + 4, lbl, 10)
+        y += h + 4
+    d.box(600, 100, 144, 70, "code", "report", "kept · compacted · evicted", size=12)
+    d.arrow([(572, 135), (598, 135)])
+    d.text(380, 296, "naive prompt 924 tokens → managed 190–285 tokens in the example", 11, MUTED)
+    d.legend("Terracotta = model call (summarizer) · Sage = deterministic code · Dashed = data")
+    return d.save()
+
+
+def eval_harness():
+    d = Diagram("eval_harness", 760, 280, "Eval harness structure",
+                "A fixed case set runs through two versions of the system. Deterministic and model-judge scorers "
+                "produce per-case scores. Reports aggregate by scorer and tag. A per-case comparison finds fixes and "
+                "regressions, and a gate decides ship or block, blocking on any critical regression.")
+    d.box(16, 100, 100, 60, "data", "cases", "input · tags")
+    d.arrow([(116, 116), (158, 76)])
+    d.arrow([(116, 144), (158, 184)])
+    d.box(160, 50, 120, 52, "plain", "system v1", size=12)
+    d.box(160, 158, 120, 52, "plain", "system v2", size=12)
+    d.arrow([(280, 76), (318, 110)])
+    d.arrow([(280, 184), (318, 150)])
+    d.box(320, 96, 140, 68, "code", "scorers", "exact · budget · judge")
+    d.arrow([(460, 130), (496, 130)])
+    d.box(498, 96, 110, 68, "data", "reports", "mean · by tag · fails")
+    d.arrow([(608, 130), (638, 130)])
+    d.diamond(672, 130, 32, "gate")
+    d.text(672, 186, "per-case diff:", 10, MUTED)
+    d.text(672, 199, "critical regression", 10, MUTED)
+    d.text(672, 212, "→ BLOCK", 10, "#B5562E", weight="700")
+    d.text(390, 232, "LLM-judge scorers use a different model from the system under test", 10, MUTED)
+    d.legend("Terracotta = model call · Sage = deterministic code · Plain outline = system under test · Dashed = data")
+    return d.save()
+
+
+def coding_team():
+    d = Diagram("coding_team", 760, 360, "Coding-team capstone architecture",
+                "A tech lead supervises a dev team and a QA team. The dev team's developer is a tool-use loop whose "
+                "prompts are assembled by a context manager under a token budget. The QA team runs a critic-reviewer "
+                "loop with its own tools and calls back to the developer to fix findings. Only summaries reach the "
+                "tech lead.")
+    d.tag(380, 18, "#12 SUPERVISOR")
+    d.box(300, 26, 160, 50, "llm", "tech lead", "summaries only")
+    d.tag(170, 100, "#13 HIERARCHICAL TEAMS")
+    d.arrow([(340, 76), (200, 116)])
+    d.arrow([(420, 76), (560, 116)])
+    d.box(120, 118, 160, 46, "llm", "dev lead", size=12)
+    d.box(480, 118, 160, 46, "llm", "qa lead", size=12)
+    d.arrow([(200, 164), (200, 190)])
+    d.arrow([(560, 164), (560, 190)])
+    d.box(100, 192, 200, 60, "llm", "developer", "tool-use loop (#9)")
+    d.box(460, 192, 200, 60, "llm", "reviewer", "critic–reviewer loop (#16)")
+    d.arrow([(460, 222), (302, 222)], "loop", "findings → fix", (380, 214))
+    d.box(40, 280, 150, 44, "code", "context manager", "#20 · budget 300", size=12)
+    d.arrow([(140, 252), (115, 278)], "muted")
+    d.box(230, 280, 180, 44, "data", "virtual repo", "read · write · run_tests", size=12)
+    d.arrow([(240, 252), (290, 278)])
+    d.box(470, 280, 190, 44, "code", "run tests + checks", "QA's own tools", size=12)
+    d.arrow([(560, 252), (560, 278)])
+    d.legend(KEY)
+    return d.save()
+
+
+ALL = [react, plan_and_execute, reflection, tool_use_loop, agentic_rag, guardrailed_generation, deep_research,
+       supervisor, hierarchical_teams, sequential_handoffs, debate, critic_reviewer, human_in_the_loop, swarm,
+       memory_tiers, context_management, eval_harness, coding_team]
 
 if __name__ == "__main__":
     for fn in ALL:

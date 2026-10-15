@@ -14,6 +14,7 @@ python3 code/verify.py     # code is green and every console listing quoted here
 | `00-front/` | Preface |
 | `part-*/` | Part introductions and pattern chapters |
 | `capstones/` | Capstone chapters (briefs live with the code) |
-| `solutions/` | Exercise solutions, kept apart from chapters |
+| `appendix/` | Appendix A: pattern boundaries and overlap matrix |
+| `solutions/` | Exercise solutions (Appendix B), kept apart from chapters |
 | `diagrams/` | Editable SVG figures (colour key: terracotta = model, sage = code, ochre = human, dashed = data) |
 | `build.py` | Standard-library assembler: TOC, part/chapter nav, cross-links, print CSS |

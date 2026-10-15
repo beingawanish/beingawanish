@@ -68,7 +68,8 @@ CATALOG = [
         ("capstones/deep-research.md", "2. Deep-research agent"),
         ("capstones/coding-team.md", "3. Multi-agent coding team"),
     ]),
-    ("solutions", "Appendix — Exercise solutions", [
+    ("appendix", "Appendix A — Pattern boundaries", [("appendix/boundaries.md", "Boundaries & overlap matrix")]),
+    ("solutions", "Appendix B — Exercise solutions", [
         (f"solutions/{n}", label) for n, label in [
             ("01-prompt-chaining.md", "1. Prompt chaining"), ("02-routing.md", "2. Routing"),
             ("03-parallelization.md", "3. Parallelization"), ("04-orchestrator-workers.md", "4. Orchestrator–workers"),

@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 326" role="img" aria-labelledby="context_management-t context_management-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="context_management-t">Context management structure</title>
+  <desc id="context_management-d">Each model call&#x27;s context is assembled under a token budget in priority order: pinned system rules and task, a one-line tool index with full docs only on request, a running summary of old turns plus recent turns verbatim, and reference documents by relevance until the budget is reached.</desc>
+  <defs>
+    <marker id="context_management-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="326" fill="#FBF5EA"/>
+  <text x="70" y="54" text-anchor="middle" font-size="12" fill="#6B7F5E" font-weight="700">pin</text>
+  <rect x="120" y="24" width="220" height="48" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="230.0" y="45.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">system rules + task</text>
+  <text x="230.0" y="61.0" text-anchor="middle" font-size="11" fill="#7A6A5E">always, verbatim</text>
+  <path d="M340,48 L420,48" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#context_management-ah)"/>
+  <text x="70" y="112" text-anchor="middle" font-size="12" fill="#6B7F5E" font-weight="700">disclose</text>
+  <rect x="120" y="82" width="220" height="48" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="230.0" y="103.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">tool index</text>
+  <text x="230.0" y="119.0" text-anchor="middle" font-size="11" fill="#7A6A5E">full docs on request</text>
+  <path d="M340,106 L420,106" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#context_management-ah)"/>
+  <text x="70" y="170" text-anchor="middle" font-size="12" fill="#6B7F5E" font-weight="700">compact</text>
+  <rect x="120" y="140" width="220" height="48" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="230.0" y="161.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">summary + recent turns</text>
+  <text x="230.0" y="177.0" text-anchor="middle" font-size="11" fill="#7A6A5E">old turns summarised</text>
+  <path d="M340,164 L420,164" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#context_management-ah)"/>
+  <text x="70" y="228" text-anchor="middle" font-size="12" fill="#6B7F5E" font-weight="700">evict</text>
+  <rect x="120" y="198" width="220" height="48" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="230.0" y="219.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">reference docs</text>
+  <text x="230.0" y="235.0" text-anchor="middle" font-size="11" fill="#7A6A5E">by relevance, to budget</text>
+  <path d="M340,222 L420,222" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#context_management-ah)"/>
+  <rect x="422" y="24" width="150" height="252" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="497.0" y="155.0" text-anchor="middle" font-size="13" fill="#3B2F2A"></text>
+  <text x="497" y="50" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">prompt</text>
+  <text x="497" y="70" text-anchor="middle" font-size="11" fill="#7A6A5E">≤ budget</text>
+  <rect x="440" y="84" width="114" height="30" rx="4" fill="#E7EDE1" stroke="#8C7B70"/>
+  <text x="497" y="103.0" text-anchor="middle" font-size="10" fill="#3B2F2A">pinned</text>
+  <rect x="440" y="118" width="114" height="28" rx="4" fill="#E7EDE1" stroke="#8C7B70"/>
+  <text x="497" y="136.0" text-anchor="middle" font-size="10" fill="#3B2F2A">tools</text>
+  <rect x="440" y="150" width="114" height="24" rx="4" fill="#F6E3D3" stroke="#8C7B70"/>
+  <text x="497" y="166.0" text-anchor="middle" font-size="10" fill="#3B2F2A">summary</text>
+  <rect x="440" y="178" width="114" height="50" rx="4" fill="#F6E3D3" stroke="#8C7B70"/>
+  <text x="497" y="207.0" text-anchor="middle" font-size="10" fill="#3B2F2A">recent</text>
+  <rect x="440" y="232" width="114" height="36" rx="4" fill="#FFFDF8" stroke="#8C7B70"/>
+  <text x="497" y="254.0" text-anchor="middle" font-size="10" fill="#3B2F2A">docs</text>
+  <rect x="600" y="100" width="144" height="70" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="672.0" y="132.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">report</text>
+  <text x="672.0" y="148.0" text-anchor="middle" font-size="11" fill="#7A6A5E">kept · compacted · evicted</text>
+  <path d="M572,135 L598,135" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#context_management-ah)"/>
+  <text x="380" y="296" text-anchor="middle" font-size="11" fill="#7A6A5E">naive prompt 924 tokens → managed 190–285 tokens in the example</text>
+  <text x="16" y="316" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call (summarizer) · Sage = deterministic code · Dashed = data</text>
+</svg>

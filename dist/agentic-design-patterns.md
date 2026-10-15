@@ -17,7 +17,7 @@ This book is a pattern catalog for systems built around language models. It foll
 Every chapter answers the same three questions.
 
 1. **Who decides the control flow?** In Part 1 your *code* decides; the model only fills in steps. In Part 2 a *single model* decides what happens next. In Part 3 *several models* with distinct roles coordinate. Each step to the right buys flexibility and costs predictability.
-2. **Who judges the output?** Deterministic code, the same model, a separate model, a peer, or a human. Many patterns differ only in this answer. The scope sheet's overlap table keeps them apart.
+2. **Who judges the output?** Deterministic code, the same model, a separate model, a peer, or a human. Many patterns differ only in this answer. The overlap table in [Appendix A](../appendix/boundaries.md) keeps them apart.
 3. **What is the cheaper alternative?** Every "when to use" section names the simpler thing you should try first and the signal that tells you it is no longer enough.
 
 ## The catalog at a glance
@@ -57,7 +57,7 @@ A mock model cannot show you how *often* a real model fails. It can show you *ho
 
 ## A note on names
 
-Pattern names in this field are not yet stable. Where a pattern is widely known by another name, the chapter lists it under **Also known as**. The boundaries in the scope sheet decide which chapter a technique belongs to, whatever it is called elsewhere.
+Pattern names in this field are not yet stable. Where a pattern is widely known by another name, the chapter lists it under **Also known as**. The boundaries in [Appendix A](../appendix/boundaries.md) decide which chapter a technique belongs to, whatever it is called elsewhere.
 
 
 ---
@@ -1817,6 +1817,1549 @@ The `CARD_NUMBER` regex blocks any 13–16 digit run, so a reply quoting a 16-di
 
 
 
+<!-- ===== Part 3 — Multi-agent coordination ===== -->
+
+
+---
+
+# Part 3 — Multi-agent coordination
+
+> In Part 3, **several model-driven agents with distinct roles** work on one job, and sometimes a human is one of them. The design question shifts from "what should the agent do?" to "who decides, who judges, and what does each one see?"
+
+A second agent is worth adding for one of three reasons: it brings **different instructions** (a specialist), it brings **different tools or authority** (a reviewer that can run tests, a human who can approve a refund), or it brings an **independent view** (a peer who might disagree). If a proposed agent brings none of these, it is just another prompt, and a [chain](../part-1-workflow/01-prompt-chaining.md) or a [router](../part-1-workflow/02-routing.md) will do the job more cheaply.
+
+The seven patterns differ in topology and in who holds authority:
+
+| Pattern | Topology | Who decides what happens next | Who judges |
+|---|---|---|---|
+| [12. Supervisor](12-supervisor.md) | hub and spoke | one supervisor, every turn | the supervisor |
+| [13. Hierarchical teams](13-hierarchical-teams.md) | tree | a lead at each level | each level's lead |
+| [14. Sequential handoffs](14-sequential-handoffs.md) | chain chosen at runtime | the current owner | the current owner |
+| [15. Debate](15-debate.md) | peers, then a judge | fixed rounds | a judge (or consensus) |
+| [16. Critic–reviewer loop](16-critic-reviewer.md) | author ↔ reviewer | the review status | the reviewer, with tools |
+| [17. Human-in-the-loop](17-human-in-the-loop.md) | agent → checkpoint → human | a code policy | a person |
+| [18. Swarm](18-swarm.md) | many peers, shared board | nobody (local rules) | nobody (emergent) |
+
+**Three costs come with every extra agent.** First, *coordination calls*: every hand-off, delegation or round is a model call that does no work itself. Second, *context duplication*: shared facts get re-sent to each agent that needs them. Third, *debuggability*: a failure now has a cast of suspects. The hierarchical-teams example measures the first two directly: more calls, smaller contexts. Each chapter's usage guidance tells you how to keep the third under control.
+
+**Read the swarm chapter last, and honestly.** It is in the catalog because you will be asked about it and because the blackboard idea is genuinely useful. It is also the pattern whose "when not to use" section is longer than its "when to use" section.
+
+The part ends with the [coding-team capstone](../capstones/coding-team.md): a supervisor over hierarchical teams, with a tool-using developer, a critic–reviewer QA loop, and context management keeping every prompt within budget.
+
+
+---
+
+# 12. Supervisor
+
+> **Intent.** Put one coordinating agent in charge of a set of specialist agents: it delegates one instruction at a time, reads every result, and decides again — another specialist, a retry with new instructions, or finish.
+
+**Also known as:** coordinator, manager agent, hub-and-spoke multi-agent · **Part:** 3 — Multi-agent coordination · **Code:** `code/patterns/supervisor/`
+
+## Structure
+
+![Supervisor structure](../book/diagrams/supervisor.svg)
+
+The supervisor model sees the task, the roster of workers with one-line descriptions, and the history of results. It returns `{"next", "instruction"}` or `{"next": "FINISH", "final"}`. Code validates the worker name, refuses an exact repeat of an earlier delegation (loop guard), runs the worker, and appends the result. A turn budget bounds the whole run.
+
+## Design concept & theory
+
+**Core idea.** A [router (#2)](../part-1-workflow/02-routing.md) decides once and leaves. A supervisor stays: after each worker's turn it re-reads the situation and decides again. That makes it the simplest multi-agent pattern that can *notice a gap and send work back*.
+
+**Why it works.**
+
+- *Separation of judgement from execution.* Workers are narrow and good at one thing. The supervisor does none of the work; it judges progress against the goal. Narrow workers with a judging coordinator are easier to prompt, test and swap than one agent that does everything.
+- *Closed-loop control.* Each decision is conditioned on actual results, not on a plan written before anything happened. In the example the writer's first draft lacks numbers, the supervisor sees that, and it sends the analyst in. A fixed pipeline would have shipped the vague draft.
+- *Single point of authority.* Exactly one agent decides what happens next, so there are no conflicting instructions and no deadlocks between peers. The cost is that the supervisor is a bottleneck and a single point of failure, which is why its decisions are validated in code.
+- *Cost grows with turns × history.* Every decision re-reads the history, so supervisor prompt tokens grow roughly quadratically in turns unless worker outputs are kept short (the exercise).
+
+**Invariants.** (1) One supervisor; workers never talk to each other directly. (2) The supervisor re-decides after every worker turn. (3) Code owns validation, loop detection and the turn budget.
+
+**Lineage.** The *Mediator* pattern (colleagues communicate only through the mediator); a scheduler with a work queue; a human team lead doing stand-ups.
+
+## When to use / when not to use
+
+| Use it when | Don't use it when |
+|---|---|
+| The order of specialist work depends on intermediate results. | The order is fixed: use a [chain (#1)](../part-1-workflow/01-prompt-chaining.md). |
+| Work may need to be sent back ("redraft with numbers"). | One decision suffices: use a [router (#2)](../part-1-workflow/02-routing.md). |
+| Specialists have meaningfully different prompts or tools. | "Specialists" are the same model with cosmetic role names. |
+| You need one place to enforce budgets and stop conditions. | More than ~6 workers or deep sub-structure: use [hierarchical teams (#13)](13-hierarchical-teams.md). |
+
+**Cheaper alternative:** a [prompt chain](../part-1-workflow/01-prompt-chaining.md) with a code gate that loops back one step when the gate fails. Upgrade to a supervisor when the *choice* of who works next genuinely needs judgement.
+
+## Forces & trade-offs
+
+| Force | vs. a fixed chain | Why |
+|---|---|---|
+| Latency | ↑ | One supervisor call between every worker call. |
+| Cost | ↑ | Supervisor calls re-read growing history. |
+| Reliability | ↑ on variable tasks | Gaps are noticed and fixed; a bad supervisor decision is a new failure mode. |
+| Complexity | ↑ | Roster, decision schema, validation, loop guard, budget. |
+
+## Trade-off analysis & usage guidance
+
+**Model.** With *w* worker turns, supervisor calls = *w + 1* (the last one says FINISH). In the example: 4 worker turns, 5 supervisor calls. Supervisor prompt tokens ≈ Σ over turns of (roster + history so far), roughly *w²/2 × average result size*. That is why the exercise clips history entries: 1,446 → 523 prompt tokens with no change in behaviour.
+
+**Decision checklist.**
+
+1. Is there a real decision between worker turns, or is the order fixed?
+2. Are worker outputs short, or summarised before the supervisor sees them?
+3. What is the turn budget, and what does the user get when it is spent?
+4. How is "done" defined? Is it in the supervisor's prompt, and checkable by code where possible?
+5. Can a worker failure be represented as a result the supervisor can act on?
+
+**Usage in production.**
+
+- Log every decision with the history length at that point. Supervisor quality problems show up as long, repetitive histories.
+- Keep worker outputs concise and put full artefacts in shared state, not in the supervisor's prompt.
+- Make the roster descriptions precise. The supervisor can only delegate well to workers it understands.
+- Alert on budget exhaustion; it usually means a missing worker or an impossible task.
+
+## Worked example
+
+### Example first: what happens
+
+```
+python3 code/patterns/supervisor/main.py
+```
+
+<!-- expected-output: code/patterns/supervisor/main.py -->
+```text
+Supervisor
+==========
+-- Write a one-sentence pricing brief
+[supervisor → researcher] Collect competitor list prices
+[researcher] Monthly list prices: Acme (us) $49, Beta $59, Gamma $45
+[supervisor → writer] Draft one sentence positioning our price
+[writer] Acme sits between Beta and Gamma on price.
+[supervisor → analyst] Compute our price difference vs each competitor in %
+[analyst] Acme vs competitors: -17% vs Beta, +9% vs Gamma
+[supervisor → writer] Redraft using the percentage comparison
+[writer] Acme is priced mid-market: 17% below Beta and 9% above Gamma.
+[supervisor] FINISH: Acme is priced mid-market: 17% below Beta and 9% above Gamma.
+result: finished after 4 worker turns, 5 supervisor calls
+-- Same task, a supervisor that repeats itself
+[supervisor → researcher] Collect competitor list prices
+[researcher] Monthly list prices: Acme (us) $49, Beta $59, Gamma $45
+[supervisor] STOP — loop: researcher already did 'Collect competitor list prices'
+result: ok=False, loop: researcher already did 'Collect competitor list prices'
+```
+
+The supervisor gets prices, then asks for a draft. The first draft, "Acme sits between Beta and Gamma on price", is vague, and the supervisor's next decision reacts to that by sending the analyst to compute percentages, then the writer to redraft. Then it finishes. Nobody planned the analyst step in advance; it was decided from what the draft lacked.
+
+The second run shows a supervisor that keeps asking the researcher for the same thing. Code detects the exact repeat and stops after one turn instead of burning the budget.
+
+### Why first: why it is built this way
+
+- **Workers are plain callables `(instruction, state) -> str`.** A worker can be an agent, a chain, a tool or a whole team, which is exactly how [hierarchical teams (#13)](13-hierarchical-teams.md) reuses this class.
+- **Shared `state` carries artefacts; the history carries summaries.** The analyst reads prices from `state`, not from the supervisor's prompt. Keeping data out of the coordinator's context is what keeps the coordinator cheap.
+- **The loop guard compares (worker, instruction).** An exact repeat is a strong "stuck" signal. A *different* instruction to the same worker (redraft with numbers) is allowed, because that is the pattern working.
+- **Unknown worker names stop the run.** A supervisor that invents a worker is misconfigured; failing loudly beats guessing.
+
+## Failure modes & guardrails
+
+| Failure mode | Symptom | Guardrail |
+|---|---|---|
+| Ping-pong | Same worker, same instruction, repeatedly. | Exact-repeat guard; turn budget. |
+| Premature FINISH | Ends before the task is complete. | Explicit done criteria; code checks on the final artefact. |
+| Never finishes | Keeps polishing. | Turn budget; "is this good enough?" criterion in the prompt. |
+| Context bloat | Supervisor prompt grows with each verbose result. | Clip or summarise history (exercise); artefacts in state. |
+| Doing the work itself | Supervisor writes the answer instead of delegating. | Instruction "delegate; do not do the work"; FINISH only with worker-produced output. |
+| Invented workers | Delegates to a name not in the roster. | Validate names; stop or re-ask. |
+
+## Variations
+
+- **Supervisor with tools.** The supervisor can also call cheap tools directly (look up status) without delegating.
+- **Parallel delegation.** The supervisor issues several independent instructions per turn and gets results back together ([#3](../part-1-workflow/03-parallelization.md)).
+- **Plan-guided supervisor.** The supervisor first writes a plan ([#7](../part-2-single-agent/07-plan-and-execute.md)), then delegates against it, re-planning on surprises.
+- **Supervisor of teams.** Workers are themselves supervisors: [hierarchical teams (#13)](13-hierarchical-teams.md).
+
+## Try it
+
+The supervisor re-reads every worker's full output on every turn. Clip each history entry to a fixed number of characters (workers keep full results in shared state) and show the run still finishes with far fewer supervisor prompt tokens, *without changing `Supervisor.run()`*.
+
+→ Solution: [Solutions — Supervisor](../solutions/12-supervisor.md)
+
+## 60-second interview lens
+
+- **Say:** "A supervisor is a coordinating agent that delegates one instruction at a time to specialists, reads every result and decides again, so it can notice gaps and send work back."
+- **Trade-off to name:** you gain adaptivity, and you pay a coordination call per turn on a growing history, with a single point of failure.
+- **Expect the follow-up:** "Supervisor or router?" A router decides once and exits; a supervisor stays in the loop. Use a router unless results need to change who works next.
+- **Red flag to avoid:** no turn budget or loop detection, because "the supervisor will know when to stop".
+
+## Related patterns
+
+- [Routing (#2)](../part-1-workflow/02-routing.md): one decision, then exit.
+- [Orchestrator–workers (#4)](../part-1-workflow/04-orchestrator-workers.md): one planning pass over stateless workers; no turn-by-turn re-decision.
+- [Hierarchical teams (#13)](13-hierarchical-teams.md): supervisors of supervisors.
+- [Coding-team capstone](../capstones/coding-team.md): this class as the tech lead and both team leads.
+
+
+---
+
+# 13. Hierarchical teams
+
+> **Intent.** Organise agents as supervisors of supervisors: a top lead delegates to team leads, each team works with its own private context and state, and only a short summary flows back up, so no single agent has to hold the whole job in its head.
+
+**Also known as:** nested supervisors, multi-level delegation, team of teams · **Part:** 3 — Multi-agent coordination · **Code:** `code/patterns/hierarchical_teams/`
+
+## Structure
+
+![Hierarchical teams structure](../book/diagrams/hierarchical_teams.svg)
+
+The launch lead delegates to two team leads. Each team lead is a full [supervisor (#12)](12-supervisor.md) over its own workers, with its own loop and private state. The top lead sends one instruction and receives one summary per team. Team-internal detail (interview notes, drafts, intermediate numbers) never leaves the team.
+
+## Design concept & theory
+
+**Core idea.** A flat supervisor's context grows with every worker it manages and every result they return. Hierarchy bounds that growth by *scoping*: each lead sees only its own level. It is the organisational chart, applied to context windows.
+
+**Why it works.**
+
+- *Context scoping.* The top lead's prompt contains two summaries, not four workers' raw output. In the example its largest prompt is 67 words against the flat supervisor's 237. Smaller contexts mean cheaper calls and less distraction for the agent making the highest-level decisions.
+- *Encapsulation.* A team is a unit with an interface: one instruction in, one summary out. Teams can be developed, tested and replaced independently, and different teams can use different models.
+- *Fault containment.* A failure inside a team can be handled inside the team (the exercise) and surfaced upward as a summary, rather than crashing the whole job.
+- *The price is coordination.* Every level adds supervisor calls: 9 in the example against 5 for the flat version. Hierarchy trades *more* calls for *smaller* ones. It pays off when per-call context size is the binding constraint (quality degrades, or the window overflows), not when call count is.
+
+**Invariants.** (1) Two or more levels of delegation. (2) Each team has private state and its own coordinator. (3) Only summaries cross level boundaries.
+
+**Lineage.** The *Composite* pattern (a team is a worker); organisational hierarchy and span of control; layered architectures, where each layer talks only to its neighbours.
+
+## When to use / when not to use
+
+| Use it when | Don't use it when |
+|---|---|
+| A flat supervisor's context is too large or too noisy to decide well. | A flat supervisor with ≤ 5 workers works fine. Hierarchy is pure overhead there. |
+| Work divides into teams with distinct expertise and little cross-talk. | Teams would need constant fine-grained exchange. |
+| You want to develop, test or swap subsystems independently. | Latency budgets cannot absorb extra coordination calls. |
+| Failures should be contained and summarised, not propagated. | Total call count is the binding cost. |
+
+**Cheaper alternative:** a single [supervisor (#12)](12-supervisor.md) with clipped history (its exercise). Upgrade to hierarchy when, even with clipping, the coordinator has too many workers to choose between or too much detail to read.
+
+## Forces & trade-offs
+
+| Force | vs. a flat supervisor | Why |
+|---|---|---|
+| Latency | ↑ | Extra coordination calls at each level. |
+| Cost | ↑ calls, ↓ tokens per call | More decisions, each over a smaller context. |
+| Reliability | ↑ at scale | Focused leads decide better; failures are contained. |
+| Complexity | ↑ | Team interfaces, summary contracts, multi-level debugging. |
+
+## Trade-off analysis & usage guidance
+
+**Model.** For *L* levels with fan-out *f* and *w* workers per team, coordination calls ≈ Σ over leads of (delegations + 1). The largest context at the top ≈ *f* × summary size, independent of *w*: that is the whole point. The example has 3 + 3 + 3 = 9 lead calls, a largest top-lead prompt of 67 words, and a largest team-lead prompt of 203 (research, with long interview notes); the flat version has 5 calls with a largest prompt of 237.
+
+**Decision checklist.**
+
+1. Is the flat coordinator's context actually a problem (quality, window, cost per call)?
+2. Do the teams have natural boundaries with little cross-traffic?
+3. What is each team's summary contract: what must it contain, and how long may it be?
+4. How do team failures surface to the parent?
+5. Is the depth ≤ 3? Every level adds latency and indirection.
+
+**Usage in production.**
+
+- Define summary contracts explicitly ("status, result, open questions, ≤ 60 words"). Summaries are the API between levels.
+- Trace with level-aware ids (`launch/content/editor`) so a failure can be located in the tree.
+- Budget per team, not just globally, so one team cannot starve the others.
+- Prefer two levels; reach for three only with evidence.
+
+## Worked example
+
+### Example first: what happens
+
+```
+python3 code/patterns/hierarchical_teams/main.py
+```
+
+<!-- expected-output: code/patterns/hierarchical_teams/main.py -->
+```text
+Hierarchical teams
+==================
+-- hierarchical: launch_lead → {research_lead, content_lead} → 4 workers
+[launch_lead → research_team] Establish demand for scheduled exports
+[research_lead → market_researcher] Survey admins about exports
+[market_researcher] Findings: 62% of surveyed admins export reports weekly. Interview note: customers export weekly rep…
+[research_lead → data_analyst] Pull CSV export usage
+[data_analyst] Usage data: 41% of active teams used CSV export last month; median 3 exports/week. Interview note:…
+[research_lead] FINISH: Demand is real: 62% export weekly by hand; 41% of teams used CSV export last month.
+[research_team] Demand is real: 62% export weekly by hand; 41% of teams used CSV export last month.
+[launch_lead → content_team] Write the launch headline
+[content_lead → writer] Draft the launch headline
+[writer] Draft: Scheduled exports are here — set it once, get your report every Monday.
+[content_lead → editor] Tighten the headline
+[editor] Edited: Scheduled exports: set it once and your report arrives every Monday.
+[content_lead] FINISH: Headline: 'Scheduled exports: set it once and your report arrives every Monday.'
+[content_team] Headline: 'Scheduled exports: set it once and your report arrives every Monday.'
+[launch_lead] FINISH: Headline: 'Scheduled exports: set it once and your report arrives every Monday.'
+-- flat: one supervisor over the same 4 workers
+-- comparison (supervisor calls; largest supervisor prompt in words)
+[launch_lead] 3 calls, largest prompt 67 words
+[research_lead] 3 calls, largest prompt 203 words
+[content_lead] 3 calls, largest prompt 60 words
+[flat_lead] 5 calls, largest prompt 237 words
+```
+
+The launch lead delegates "establish demand" to the research team. Inside it, the research lead runs its own loop over two workers whose outputs are long (interview notes), then finishes with a two-figure summary. Only that summary reaches the launch lead. The content team does the same for the headline.
+
+The comparison block is the point of the chapter: the hierarchy made **more** coordination calls (9 against 5) but its top-level prompts were **much smaller** (67 words against 237). Both produced the same final headline.
+
+### Why first: why it is built this way
+
+- **`team_as_worker` adapts a Supervisor to the worker interface.** A team becomes `(instruction, state) -> summary`. The top lead cannot tell a team from a single worker, which is the Composite pattern at work.
+- **Private state per team run.** `team_as_worker` gives each team a fresh dict; only the summary is written to the parent's state. Leakage would defeat the scoping.
+- **Failures become summaries.** A team that does not finish returns `[team failed: reason]` rather than raising, so the parent can decide what to do.
+- **The measurement is built in.** The demo prints calls and largest prompt per lead, because "hierarchy helps" is a claim about numbers you should check on your own workload.
+
+## Failure modes & guardrails
+
+| Failure mode | Symptom | Guardrail |
+|---|---|---|
+| Lossy summaries | The top lead decides on missing facts. | Summary contracts with required fields; numbers preserved verbatim. |
+| Coordination overhead | Most calls are leads talking to leads. | Flatten levels that have one worker; measure the call mix. |
+| Error swallowing | A team fails silently; parent thinks it succeeded. | Explicit failure summaries; status field. |
+| Exception propagation | One worker's crash kills the whole tree. | Contain errors at worker boundaries (exercise). |
+| Cross-team dependencies | Teams need each other's internals. | Redraw boundaries, or route the shared artefact through parent state. |
+| Depth creep | Four levels "for organisation". | Cap depth; justify each level with a context measurement. |
+
+## Variations
+
+- **Heterogeneous teams.** Each team uses a different model size, or a different pattern internally (a chain, a debate).
+- **Static hierarchy with dynamic teams.** The top lead spins up a team per subtask from a template.
+- **Hierarchical planning.** The top lead plans ([#7](../part-2-single-agent/07-plan-and-execute.md)) and teams execute plan steps.
+- **Matrix teams.** A specialist (security review) serves several teams. Use with care: it reintroduces cross-talk.
+
+## Try it
+
+One worker deep inside a team raises an exception, which propagates up and kills the entire hierarchy. Contain failures at the worker boundary so that the team lead sees an error *result*, can finish on its own terms, and the level above receives a summary instead of a crash.
+
+→ Solution: [Solutions — Hierarchical teams](../solutions/13-hierarchical-teams.md)
+
+## 60-second interview lens
+
+- **Say:** "Hierarchical teams are supervisors of supervisors: each team has its own lead, loop and private state, and only summaries flow upward, which keeps every coordinator's context small."
+- **Trade-off to name:** more coordination calls in exchange for smaller, more focused contexts. Worth it when per-call context is the problem, not when call count is.
+- **Expect the follow-up:** "How do you stop information loss between levels?" Summary contracts with required fields, numbers preserved verbatim, and explicit failure status.
+- **Red flag to avoid:** adding levels for neatness without measuring context size or quality.
+
+## Related patterns
+
+- [Supervisor (#12)](12-supervisor.md): one level; the building block.
+- [Orchestrator–workers (#4)](../part-1-workflow/04-orchestrator-workers.md): one-pass decomposition, no nested coordinators.
+- [Context management (#20)](../part-4-cross-cutting/20-context-management.md): the same goal (bounded context) within a single agent.
+- [Coding-team capstone](../capstones/coding-team.md): tech lead over dev and QA teams.
+
+
+---
+
+# 14. Sequential handoffs
+
+> **Intent.** Let exactly one agent own a live conversation at a time, and let the owner transfer that ownership to a better-suited agent with an explicit handoff object (target, reason, summary), with no central coordinator.
+
+**Also known as:** agent handoff, transfer of control, relay · **Part:** 3 — Multi-agent coordination · **Code:** `code/patterns/sequential_handoffs/`
+
+## Structure
+
+![Sequential handoffs structure](../book/diagrams/sequential_handoffs.svg)
+
+The user talks to whichever agent currently owns the conversation. The owner either replies or hands off. A handoff carries a target, a reason and a summary, and the new owner starts with that brief plus the recent transcript. The runtime has no opinion about content. It enforces only the allowed handoff graph, a per-turn handoff cap, and a ping-pong guard that escalates to a human.
+
+## Design concept & theory
+
+**Core idea.** Many conversations change topic: a billing question becomes a technical one. Instead of a coordinator in the middle of every exchange, the current specialist recognises it is no longer the right owner and passes the conversation on, the way a good support desk transfers a call *with a summary*.
+
+**Why it works.**
+
+- *Ownership is unambiguous.* At any moment exactly one agent is responsible, so there is no supervisor to consult, no committee and no conflicting replies. That makes conversations fast and the transcript easy to follow.
+- *The handoff object is the contract.* A summary like "duplicate March charge already refunded; now: app crashes opening Reports" lets the next agent pick up without re-asking. In the example the technical agent opens by acknowledging the refund it never processed.
+- *Local decisions scale.* Each agent only needs to know its own scope and its allowed targets. Adding a new specialist means adding it to some agents' handoff lists, not retraining a central router.
+- *But nothing global watches the whole.* Without a coordinator, cycles are possible: billing thinks it is an account matter, and account thinks it is billing. The ping-pong guard is the minimum global property the runtime must enforce.
+
+**Invariants.** (1) One owner at a time. (2) Ownership moves only through an explicit handoff object. (3) The runtime enforces the handoff graph and cycle limits; it does not coordinate content.
+
+**Lineage.** Call transfer in contact centres; the *Chain of Responsibility* pattern (a request passes along handlers until one handles it), with the chain chosen at runtime; the *State* pattern, where the active agent is the conversation's state.
+
+## When to use / when not to use
+
+| Use it when | Don't use it when |
+|---|---|
+| Conversations drift between domains handled by different specialists. | The steps are known in advance ([prompt chaining, #1](../part-1-workflow/01-prompt-chaining.md)). |
+| Each specialist needs its own tools and instructions. | Work must be combined from several specialists at once ([supervisor, #12](12-supervisor.md)). |
+| Low latency matters: no coordinator call on every turn. | Nobody can define which agent may hand off to which. |
+| A summary is enough context for the next owner. | Every agent needs the full history verbatim; handoff summaries will lose too much. |
+
+**Cheaper alternative:** a [router (#2)](../part-1-workflow/02-routing.md) at the start of each *user turn*, with no ownership. Upgrade to handoffs when specialists need to carry state across turns, or decide themselves that the topic has moved on.
+
+## Forces & trade-offs
+
+| Force | vs. a supervisor | Why |
+|---|---|---|
+| Latency | ↓ | No coordinator call per turn; one extra call only at a handoff. |
+| Cost | ↓ | Owners act directly; handoffs are rare events. |
+| Reliability | ≈, with different risks | No coordinator bottleneck, but cycles and lossy summaries are possible. |
+| Complexity | ↓ in the runtime, ↑ in the graph design | A tiny runtime; the handoff graph and summaries need care. |
+
+## Trade-off analysis & usage guidance
+
+**Model.** Calls per user turn = 1 + (handoffs in that turn). In conversation 1 of the example: turn 1 = 2 calls (triage hands off, billing replies), turn 2 = 2, and turn 3 = 1. A supervisor design would pay at least one extra coordinator call on *every* turn.
+
+**Designing the graph.** Draw the allowed handoffs as a directed graph. Every edge should have a reason you could write down. Then check the cycles: each cycle is a potential ping-pong the guard will have to catch.
+
+**Decision checklist.**
+
+1. Can each agent's scope be stated in one sentence?
+2. Is the allowed handoff graph explicit, and are its cycles intentional?
+3. What must a handoff summary contain for the next owner to continue without re-asking?
+4. What happens on ping-pong or an invalid target: escalation, and to whom?
+5. How many handoffs per user turn are acceptable? Usually ≤ 2.
+
+**Usage in production.**
+
+- Log every handoff (from, to, reason). Handoff-reason histograms reveal mis-scoped agents.
+- Measure re-asking: a new owner asking for information the user already gave means the summaries are lossy.
+- Escalate to a human with the full transcript, never just the last summary.
+- Keep the ping-pong guard per user turn, and track repeated cycles across turns too.
+
+## Worked example
+
+### Example first: what happens
+
+```
+python3 code/patterns/sequential_handoffs/main.py
+```
+
+<!-- expected-output: code/patterns/sequential_handoffs/main.py -->
+```text
+Sequential handoffs
+===================
+-- conversation 1
+[user] Hi, I was charged twice for March.
+[triage ⇒ billing] billing issue | summary: Customer reports a duplicate March charge.
+[billing] Found it — the duplicate March charge is refunded; expect it in 3-5 days.
+[user] Thanks! Also the app crashes when I open Reports.
+[billing ⇒ technical] app crash | summary: Duplicate March charge already refunded. Now: app crashes opening Reports.
+[technical] I can see billing already refunded your duplicate charge. The Reports crash is fixed in 3.2.1 — please update and reopen.
+[user] Updated — that fixed it.
+[technical] Glad to hear it! Your refund is still on its way. Anything else?
+owner now: technical; handoffs: triage → billing → technical
+-- conversation 2
+[user] Can you change my plan and fix my login?
+[triage ⇒ billing] plan change | summary: Wants to change plan; also login.
+[billing ⇒ account] plans are account settings | summary: Plan change requested.
+[escalate] ping-pong: triage → billing → account → billing
+escalated: True
+```
+
+**Conversation 1:** triage hands the duplicate-charge complaint to billing, which resolves it and keeps ownership. When the customer raises a crash, billing hands off to technical, and its summary records that the refund is done. Technical acknowledges the refund, fixes the crash, and stays the owner for the customer's thank-you.
+
+**Conversation 2:** triage → billing → account → billing. The runtime detects the cycle (billing would become the owner a second time in the same turn) and escalates to a human instead of letting two agents bounce the customer.
+
+### Why first: why it is built this way
+
+- **`visited` is per user turn.** Revisiting an agent across turns is normal (billing could take the conversation back next week); revisiting within one turn means nobody is willing to own it.
+- **The handoff graph is data on each agent** (`can_handoff_to`). A handoff outside it is refused by the runtime, not trusted, because an agent's model can name any string.
+- **The brief goes into the prompt, not the transcript.** The new owner sees "HANDOFF from billing: app crash. Summary: …" once, at the moment of transfer. The user-visible transcript stays clean.
+- **Escalation is fixed text.** The user gets a predictable message, and the transcript gets a `SYSTEM: escalated (…)` line for the human picking it up.
+
+## Failure modes & guardrails
+
+| Failure mode | Symptom | Guardrail |
+|---|---|---|
+| Ping-pong | Agents bounce the conversation. | Per-turn visited set; escalate on a cycle. |
+| Invalid target | Handoff to a non-existent or disallowed agent. | Graph validation; one corrective re-ask (exercise), then escalate. |
+| Lossy summary | New owner re-asks known facts. | Required summary fields; measure re-asking. |
+| Reluctant owner | Every agent hands off; nobody answers. | Handoff cap per turn; scope instructions with examples. |
+| Sticky owner | Agent answers outside its scope instead of handing off. | Scope tests in the eval set; out-of-scope detection. |
+
+## Variations
+
+- **Handoff with return.** A specialist takes the conversation for a subtask and hands it back automatically.
+- **Human as a node.** A human agent in the graph, reachable by handoff ([#17](17-human-in-the-loop.md)).
+- **Router entry.** The entry agent is a pure [router (#2)](../part-1-workflow/02-routing.md) that never answers. That is triage in the example.
+- **Structured handoff payload.** Typed fields (customer id, completed actions, open questions) instead of a free-text summary.
+
+## Try it
+
+The technical agent tries to hand off to `refunds`, an agent that does not exist, and the runtime escalates the whole conversation. Give the agent **one chance to correct** an invalid target (tell it the valid targets) before escalation applies, without modifying `HandoffRuntime`.
+
+→ Solution: [Solutions — Sequential handoffs](../solutions/14-sequential-handoffs.md)
+
+## 60-second interview lens
+
+- **Say:** "With sequential handoffs, one agent owns the conversation at a time and transfers ownership with an explicit handoff object (target, reason, summary), with no central coordinator."
+- **Trade-off to name:** lower latency and cost than a supervisor, but nothing global watches the conversation, so you need a handoff graph, cycle detection and good summaries.
+- **Expect the follow-up:** "How is this different from prompt chaining?" Chain steps are fixed calls owned by one program; handoffs move a live conversation between autonomous agents, and the target is chosen at runtime.
+- **Red flag to avoid:** handoffs without a summary, which force the next agent to re-interview the user.
+
+## Related patterns
+
+- [Prompt chaining (#1)](../part-1-workflow/01-prompt-chaining.md): a fixed sequence of calls, not agents transferring ownership.
+- [Routing (#2)](../part-1-workflow/02-routing.md): one-shot dispatch without ownership.
+- [Supervisor (#12)](12-supervisor.md): a central coordinator decides every turn instead.
+- [Human-in-the-loop (#17)](17-human-in-the-loop.md): where escalations should land.
+
+
+---
+
+# 15. Debate / peer critique
+
+> **Intent.** Have two or more peer agents argue assigned positions over a few rounds, each responding to the others' latest arguments, then let a judge decide with a rationale. Stop early, with no judge, if the peers converge.
+
+**Also known as:** multi-agent debate, adversarial collaboration, red team / blue team · **Part:** 3 — Multi-agent coordination · **Code:** `code/patterns/debate/`
+
+## Structure
+
+![Debate structure](../book/diagrams/debate.svg)
+
+Debaters A and B take assigned positions. In each round, each one sees the question, its own position and the other's latest argument, and may concede. The transcript accumulates. If all debaters agree, the debate ends with a consensus and no judge call. Otherwise a judge reads the transcript and returns a decision with a rationale that cites the arguments it relied on. An optional check re-judges with the order swapped, to catch position bias.
+
+## Design concept & theory
+
+**Core idea.** One model asked for a decision gives you its first framing of the problem. Two models *assigned* opposing positions are forced to find the strongest case on each side, and the weaknesses of the other. A judge then weighs arguments rather than generating them.
+
+**Why it works, and when it doesn't.**
+
+- *Assigned positions counter single-framing bias.* A single model tends to commit to its first framing and then justify it. Forcing a "con" role surfaces considerations (14 shared tables, no owning team) that a single "should we split billing?" answer may omit.
+- *Rebuttal rounds expose weak claims.* An argument that cannot survive a direct reply ("ownership is solvable by assigning two engineers") gets refined or dropped. This is the mechanism humans use in design reviews.
+- *Judging is easier than arguing.* Like the evaluator in [#5](../part-1-workflow/05-evaluator-optimizer.md), the judge compares rather than generates, and compares against a transcript rather than its own priors.
+- *Limits.* Debaters that share a model share its blind spots, so debate surfaces *disagreement the model can generate*, not facts it lacks. Judges can favour eloquence, length or the last speaker (the exercise). Debate is a structured way to see two sides; it does not produce truth.
+
+**Invariants.** (1) Debaters are symmetric peers: same powers, opposing assignments. (2) Each round, every debater sees the others' latest arguments. (3) Resolution is by consensus or by a separate judge with a rationale.
+
+**Lineage.** Adversarial legal process; red team / blue team exercises; architecture decision reviews with a devil's advocate. In ML research: "debate" as a scalable-oversight proposal (Irving et al., 2018), and multi-agent debate for reasoning (Du et al., 2023).
+
+## When to use / when not to use
+
+| Use it when | Don't use it when |
+|---|---|
+| The decision has real trade-offs and you need both sides surfaced. | The question has a checkable answer. Check it. |
+| Single-model answers seem one-sided or overconfident. | Cost or latency allows only one call. |
+| You want an auditable rationale (decision records, ADRs). | The participants would need facts that no one in the debate has; add retrieval first. |
+| Stakes justify ~5× the calls of a single answer. | One side is plainly unacceptable (policy, safety). Don't debate it. |
+
+**Cheaper alternative:** a single call that is asked to "list the strongest arguments for and against, then decide", which is a one-prompt debate. Upgrade when evaluation shows single-call answers miss the opposing considerations that matter.
+
+## Forces & trade-offs
+
+| Force | vs. a single "pros and cons" call | Why |
+|---|---|---|
+| Latency | ↑ | Rounds are sequential; the judge waits for the transcript. |
+| Cost | ↑ ×(debaters × rounds + 1) | Two debaters × two rounds + judge = 5 calls. |
+| Reliability | ↑ on contested decisions | Stronger arguments on both sides; a judge can still be biased. |
+| Complexity | ↑ moderately | Positions, round protocol, judge prompt, bias checks. |
+
+## Trade-off analysis & usage guidance
+
+**Model.** Calls = *d × r_used + (judge ? 1 : 0)*. In the example: the contested question used 2 × 2 + 1 = 5 calls; the uncontested index question used 2 × 1 + 0 = 2, because early consensus skips both the second round and the judge.
+
+**Decision checklist.**
+
+1. Is the question genuinely contested, with no ground truth to look up?
+2. Do the debaters have the facts they need (retrieval, data)?
+3. Is the judge separate from the debaters, ideally a different model?
+4. Have you checked the judge for order and length bias (exercise)?
+5. What happens with the decision: is it advice to a human, or an automated action?
+
+**Usage in production.**
+
+- Use 2 debaters and 1–2 rounds. More rounds mostly add repetition.
+- Require the judge to cite the specific arguments relied on, and store the transcript as the decision record.
+- Swap order and re-judge on high-stakes calls. Escalate if the verdict flips.
+- Track the early-consensus rate: high consensus on a question type means debate is not needed there.
+
+## Worked example
+
+### Example first: what happens
+
+```
+python3 code/patterns/debate/main.py
+```
+
+<!-- expected-output: code/patterns/debate/main.py -->
+```text
+Debate
+======
+-- Should we split billing out of the monolith this quarter?
+[r1 pro] Yes: billing deploys are blocked by unrelated monolith releases twice a month.
+[r1 con] No: no team owns billing today, so a new service would be orphaned.
+[r2 pro] Ownership is solvable by assigning two engineers; deploy coupling costs us a blocked release every sprint.
+[r2 con] Billing shares 14 tables with orders; splitting now means distributed transactions before we have an API boundary.
+[judge] Not this quarter: first put billing behind an internal API inside the monolith, then split. — Con's shared-tables point (r2) makes a split now risky; Pro's deploy-blocking cost (r1) is real, so the API boundary should start now to enable the split next quarter.
+result: consensus=False, rounds=2
+-- Should we add an index on orders.customer_id (queries scan 4M rows)?
+[r1 pro] Yes: every lookup scans 4M rows; the index is cheap to add online.
+[r1 con] Yes from me too: the write overhead is negligible next to the read savings.
+[consensus] all debaters agree after round 1 — no judge needed
+result: consensus=True, rounds=1; judge calls in total: 1
+```
+
+**Split billing now?** Round 1 states positions: deploys are blocked versus no owning team. Round 2 rebuts. Pro answers the ownership objection, and con raises a stronger one: 14 shared tables mean distributed transactions. The judge decides "not this quarter, but build the API boundary now", citing con's round-2 point *and* pro's round-1 cost. That is a decision neither side proposed, made from both.
+
+**Add an index?** Both sides agree in round 1, so the debate stops at consensus. The judge is never called, and the total cost is 2 calls.
+
+### Why first: why it is built this way
+
+- **Positions are assigned, not chosen.** Letting each debater pick a side tends to produce two debaters on the same side.
+- **Rounds are simultaneous.** Within a round, each debater sees only the *previous* round's arguments, so neither gets a structural last-word advantage inside a round.
+- **`agree_with_opponents` enables early exit.** Consensus is checked in code after each round. Debating a settled question wastes calls.
+- **The judge's rationale must cite arguments.** The prompt asks for it, and the transcript is kept so the citation can be checked. A decision you cannot trace to an argument is just another opinion.
+
+## Failure modes & guardrails
+
+| Failure mode | Symptom | Guardrail |
+|---|---|---|
+| Position bias | The verdict follows the last speaker. | Swap order and re-judge; escalate on a flip (exercise). |
+| Eloquence bias | The longer or more confident argument wins. | Length limits; the judge prompt says "arguments, not style". |
+| Collapse | Both debaters converge on the same view in round 1 by default. | Assigned positions; instruct "concede only if persuaded". |
+| Shared blind spot | Both miss the same key fact. | Give debaters retrieval tools ([#10](../part-2-single-agent/10-agentic-rag.md)); different models. |
+| Debate theatre | Many rounds, repeated points. | 1–2 rounds; stop when arguments repeat. |
+
+## Variations
+
+- **Multi-perspective panel.** Three or more roles (security, cost, UX), each arguing from its lens.
+- **Debate with evidence.** Debaters must cite retrieved sources; the judge discounts uncited claims.
+- **Peer critique without a judge.** Agents critique each other's drafts and each revises, a symmetric cousin of [critic–reviewer (#16)](16-critic-reviewer.md).
+- **Human judge.** The transcript goes to a person as a decision brief.
+
+## Try it
+
+Judges can be swayed by **order** rather than arguments. Detect it: run the judge twice with the debaters' order swapped. If the decision changes, the verdict is order-sensitive and must be escalated. Show the argument-based judge passing and a recency-biased judge being caught.
+
+→ Solution: [Solutions — Debate](../solutions/15-debate.md)
+
+## 60-second interview lens
+
+- **Say:** "Debate assigns peer agents opposing positions, lets them rebut each other for a round or two, and has a separate judge decide with a cited rationale, or stops early if they agree."
+- **Trade-off to name:** several times the calls of one answer, in exchange for both sides being argued well. It does not create facts, and judges have biases you must test.
+- **Expect the follow-up:** "Debate or critic–reviewer?" Debate is symmetric (either side can be right). Critic–reviewer is asymmetric: an author owns the artefact and a reviewer checks it.
+- **Red flag to avoid:** treating the judge's verdict as ground truth without bias checks.
+
+## Related patterns
+
+- [Parallelization: voting (#3)](../part-1-workflow/03-parallelization.md): independent answers, no interaction. Debate adds rebuttal.
+- [Critic–reviewer loop (#16)](16-critic-reviewer.md): an asymmetric author/reviewer relationship.
+- [Evaluator–optimizer (#5)](../part-1-workflow/05-evaluator-optimizer.md): judge-like evaluation of one artefact against a rubric.
+- [Human-in-the-loop (#17)](17-human-in-the-loop.md): where order-unstable verdicts go.
+
+
+---
+
+# 16. Critic–reviewer loop
+
+> **Intent.** Pair an author agent that produces an artefact with a reviewer agent that has *different tools* (tests, linters, checks) and returns itemised findings with ids and severities. The author answers every finding (fixed, or won't fix with a reason), and code tracks the findings until no blocking ones remain.
+
+**Also known as:** code review loop, author–reviewer, maker–checker · **Part:** 3 — Multi-agent coordination · **Code:** `code/patterns/critic_reviewer/` *(imported by the coding-team capstone)*
+
+## Structure
+
+![Critic–reviewer structure](../book/diagrams/critic_reviewer.svg)
+
+The author agent writes or revises the artefact. The reviewer agent runs its own tools on it (here: real tests and a lint check) and turns the evidence into findings like `F1 [blocking]` and `F2 [nit]`. The author answers each finding. Code keeps the ledger: a blocking finding can only be closed by fixing it; a nit can be declined with a reason. Approval means no open blocking findings.
+
+## Design concept & theory
+
+**Core idea.** Code review works because the reviewer is *not* the author, *can run things*, and writes *specific comments that must each be answered*. This pattern encodes all three for agents.
+
+**Why it works.**
+
+- *Independent evidence.* The reviewer's findings come from running tests and checks, not from re-reading the code with the author's assumptions. A failing test is evidence that neither [reflection (#8)](../part-2-single-agent/08-reflection.md) nor a rubric judge ([#5](../part-1-workflow/05-evaluator-optimizer.md)) can produce.
+- *Itemised findings make progress measurable.* "F1 blocking, F2 blocking, F3 nit" can be tracked across rounds; a score of 6/10 cannot. Each finding has an owner (the author) and a required response.
+- *Severity separates must from should.* Blocking findings gate approval; nits do not. Without severities, review loops either never converge (every nit blocks) or approve real bugs (nothing blocks).
+- *Asymmetric authority prevents both bad outcomes.* The reviewer cannot edit the artefact, so it cannot "fix" things the author then fails to understand. The author cannot waive blocking findings, so it cannot argue its way past a failing test.
+
+**Invariants.** (1) Two distinct agents: the author owns the artefact, the reviewer owns the findings. (2) The reviewer has evidence-producing tools. (3) Every finding gets a response, and blocking findings close only by being fixed.
+
+**Lineage.** The four-eyes principle; the *maker–checker* control in banking; pull-request review.
+
+## When to use / when not to use
+
+| Use it when | Don't use it when |
+|---|---|
+| The artefact can be checked by running something (code, configs, SQL, data). | Only subjective quality matters ([evaluator–optimizer, #5](../part-1-workflow/05-evaluator-optimizer.md) is cheaper). |
+| Mistakes are expensive enough to justify a second agent. | All checks are deterministic. Run them in a [guardrail (#11)](../part-2-single-agent/11-guardrailed-generation.md), with no reviewer model. |
+| Findings need judgement to prioritise (blocking vs nit). | The reviewer would have the same tools and context as the author: that is reflection with extra steps. |
+| You want an audit trail of what was raised and how it was resolved. | Latency allows only one pass. |
+
+**Cheaper alternative:** run the tests as a deterministic gate and feed failures back to the author, which is guardrailed generation with tests as validators. Upgrade when you need judgement on top of the tools: severity, missing tests, design concerns.
+
+## Forces & trade-offs
+
+| Force | vs. tests-as-a-gate | Why |
+|---|---|---|
+| Latency | ↑ | Reviewer call per round, plus author revision. |
+| Cost | ↑ | Two agents; the reviewer reads tool evidence each round. |
+| Reliability | ↑ | Catches what tests do not (missing tests, unclear API) and prioritises. |
+| Complexity | ↑ | Finding schema, ledger, waiver rules, round budget. |
+
+## Trade-off analysis & usage guidance
+
+**Model.** Per round: tool runs (cheap) + 1 reviewer call + 1 author call (except the final approving round). In the example, 2 rounds took 2 reviewer calls and 2 author calls (the initial draft and one revision). Budget 3–4 rounds; a blocking finding still open after that needs a human.
+
+**Decision checklist.**
+
+1. What tools does the reviewer have that the author does not use?
+2. What is the severity scale, and who may waive what?
+3. Must every finding get a response? (Yes.) What counts as "fixed"? (The reviewer no longer finds it.)
+4. What is the round budget, and where do unresolved blockers go?
+5. Do you guard against regressions: fixes that break what already worked (exercise)?
+
+**Usage in production.**
+
+- Keep finding ids stable across rounds, so you can tell "F2 still open" from "new F4".
+- Log declined nits with their reasons. They are useful signal for tuning the reviewer.
+- Sandbox anything the reviewer executes. Model-written code is untrusted.
+- Track first-round blocking-finding counts by author model or prompt version. That is your author-quality metric.
+
+## Worked example
+
+### Example first: what happens
+
+```
+python3 code/patterns/critic_reviewer/main.py
+```
+
+<!-- expected-output: code/patterns/critic_reviewer/main.py -->
+```text
+Critic–reviewer loop
+====================
+[review 1] F1[blocking] accents are not transliterated; F2[blocking] separators wrong: want single dashes between words, none at ends; F3[nit] add a docstring
+[author F1] fixed: NFKD + ASCII fold → noted
+[author F2] fixed: collapse non-alnum runs, strip dashes → noted
+[author F3] wont_fix: one-line helper; the name is the doc → accepted
+[review 2] no findings
+result: approved=True in 2 rounds; remaining findings: none; tests failing now: 0
+calls: author=2, reviewer=2
+```
+
+The author's first `slugify` lower-cases and swaps spaces for dashes. The reviewer *runs four real tests*: accents survive (F1, blocking), and leading, trailing or repeated separators leak through (F2, blocking). Its lint check notes the missing docstring (F3, nit). The author fixes F1 and F2 and declines F3 with a reason, and the ledger accepts the waiver because F3 is a nit. Round 2: the tests pass, nothing is open, and the reviewer approves. Zero tests fail at the end, and that is measured, not claimed.
+
+### Why first: why it is built this way
+
+- **The reviewer's evidence is real.** `run_tests` executes the author's code against fixed cases, and the reviewer model only *interprets* tool output into findings. Findings are grounded in execution.
+- **The ledger lives in `review_loop`, not in either agent.** Code decides whether a waiver is accepted (nits only) and whether approval is reached (no open blockers), so neither agent can talk its way past the rules.
+- **Author responses are per finding.** An unanswered finding stays open, and the trace says so.
+- **Waived nits are filtered from later rounds.** Without this, a declined nit would be re-raised forever and the loop would never converge.
+
+## Failure modes & guardrails
+
+| Failure mode | Symptom | Guardrail |
+|---|---|---|
+| Rubber-stamp reviewer | Approves without running anything. | Findings must cite tool evidence; tool runs are logged. |
+| Nit storm | Dozens of style findings; real issues buried. | Severity scale; cap nits per round; blocking first. |
+| Regression | A fix breaks a previously passing test. | Reviewer memory of past passes → automatic blocking finding (exercise). |
+| Waiving blockers | Author declines a failing test. | Code refuses waivers on blocking findings. |
+| Endless loop | Same blocker every round. | Round budget; escalate unresolved blockers to a human. |
+| Unsafe execution | Reviewer runs hostile code. | Sandbox: separate process, no network, resource limits. |
+
+## Variations
+
+- **Multi-reviewer.** Separate reviewers for correctness, security and performance, with findings merged.
+- **Reviewer writes tests.** The reviewer adds failing tests as findings, so the evidence becomes executable.
+- **Human reviewer for blockers only.** The model reviewer files findings; a human confirms blocking ones before they gate ([#17](17-human-in-the-loop.md)).
+- **Pair mode.** Author and reviewer alternate on small diffs, giving a shorter loop with smaller findings.
+
+## Try it
+
+An author can "fix" one finding and silently break something that already worked. Give the reviewer memory: any test that **passed in an earlier round and fails now** becomes an automatic blocking `REGRESSION` finding. Show a regressing revision being caught and the loop still converging.
+
+→ Solution: [Solutions — Critic–reviewer loop](../solutions/16-critic-reviewer.md)
+
+## 60-second interview lens
+
+- **Say:** "A critic–reviewer loop pairs an author agent with a reviewer agent that has its own tools, such as tests. The reviewer files itemised findings with severities, the author answers each, and code tracks them until no blocking findings remain."
+- **Trade-off to name:** two agents and several rounds, in exchange for independent, executable evidence and a clear ledger. Pointless if the reviewer has no tools or context the author lacks.
+- **Expect the follow-up:** "Why not just run the tests?" Do, as a gate. The reviewer adds judgement on top: missing tests, severity, design issues.
+- **Red flag to avoid:** letting the author waive a failing test.
+
+## Related patterns
+
+- [Evaluator–optimizer (#5)](../part-1-workflow/05-evaluator-optimizer.md): one artefact, a rubric judge, no tools, a score rather than a ledger.
+- [Reflection (#8)](../part-2-single-agent/08-reflection.md): the same model reviewing itself, with no independent evidence.
+- [Debate (#15)](15-debate.md): symmetric peers rather than author and reviewer.
+- [Coding-team capstone](../capstones/coding-team.md): QA's review loop with callbacks to the developer.
+
+
+---
+
+# 17. Human-in-the-loop
+
+> **Intent.** Pause an agent's risky actions at a checkpoint chosen by code policy, persist the paused state durably, let a person approve, edit or reject (possibly hours later, in a different process), and resume so that each approved action executes exactly once.
+
+**Also known as:** approval gate, human checkpoint, interrupt-and-resume · **Part:** 3 — Multi-agent coordination · **Code:** `code/patterns/human_in_the_loop/` *(canonical module, imported by the support-triage capstone)*
+
+## Structure
+
+![Human-in-the-loop structure](../book/diagrams/human_in_the_loop.svg)
+
+An agent proposes an action. A code policy checks it: amount limits, irreversibility, model confidence. Safe actions execute immediately. Risky ones become requests in a durable review queue (a JSON file here; a database in production). A reviewer approves, edits or rejects. Resume marks the request as executing *before* the side effect (write-ahead), runs it, and marks it executed. Requests not decided by their deadline expire to rejected.
+
+## Design concept & theory
+
+**Core idea.** Some decisions should not be fully automated: the cost of a mistake is high, the action is irreversible, or the model is unsure. HITL makes "ask a person" a first-class, reliable step in the workflow rather than an exception handler.
+
+**Why it works.**
+
+- *Policy in code, not in the model.* Whether a refund needs approval is decided by `amount > 100`, not by asking the agent whether it thinks it needs oversight. A model must never decide its own supervision.
+- *Durability turns waiting into a state.* People take minutes or days. Holding a process open that long is fragile. Persisting the request (action, reasons, context, deadline) means the agent's process can exit, and *any* process can resume later. The example uses three separate "processes" over one file.
+- *Exactly-once needs a write-ahead mark.* Resume can be called twice (a retry, or a duplicate click). Recording `executed` makes a second resume a no-op. Recording `executing` *before* the side effect means a crash in between becomes `needs-reconcile` rather than a silent double refund.
+- *Silence is not consent.* Undecided requests expire to *rejected*. A default-allow timeout would turn reviewer absence into automatic approval of exactly the actions that needed review.
+
+**Invariants.** (1) A code policy decides what needs review. (2) Paused state is persisted durably. (3) Each approved action executes at most once. (4) Expiry defaults to deny.
+
+**Lineage.** Maker–checker controls; durable workflow engines (sagas, human tasks in BPM); the two-phase commit's "prepare, then commit" applied to a person.
+
+## When to use / when not to use
+
+| Use it when | Don't use it when |
+|---|---|
+| An action is irreversible, high-value or regulated. | The action is trivially reversible. Undo beats approve. |
+| Model confidence is low and errors are costly. | Volume is so high that review becomes rubber-stamping. Fix the policy or automation first. |
+| Accountability requires a named human decision. | Latency must be sub-second for every request. |
+| You can define the risky subset precisely in code. | Nobody is staffed to review, or no deadline and default can be set. |
+
+**Cheaper alternative:** automatic execution with *undo* (soft delete, refund reversal window) plus sampling-based audit. Upgrade to HITL when undo is impossible or too costly, or when rules require prior approval.
+
+## Forces & trade-offs
+
+| Force | vs. full automation | Why |
+|---|---|---|
+| Latency | ↑↑ for gated actions | Minutes to days of human time, for the gated subset only. |
+| Cost | ↑ (people) | Reviewer time; queue infrastructure. |
+| Reliability | ↑ | High-risk errors caught; accountability recorded. |
+| Complexity | ↑ | Durable state, idempotent resume, expiry, review UI. |
+
+## Trade-off analysis & usage guidance
+
+**Model.** Let *g* be the gated fraction, *t_h* the human decision time and *c_h* the reviewer cost per decision. Median latency stays automated for (1 − *g*) of actions. Review cost = *g × volume × c_h*. Tune the policy so *g* is as small as safety allows. In the example, 1 of 4 proposed actions runs automatically and 3 are held.
+
+**Decision checklist.**
+
+1. Which actions need review, written as code predicates?
+2. Where does paused state live, and does it survive a restart?
+3. What happens on a duplicate resume, or a crash mid-execution?
+4. What is the deadline, and is the default *deny*?
+5. Can the reviewer *edit* (change the amount), not just approve or reject?
+
+**Usage in production.**
+
+- Show reviewers the context: the ticket, the agent's reasoning, the policy reasons that fired.
+- Measure approval rate per rule. A rule approved 99.9% of the time is a candidate for automation; one rejected often signals agent problems.
+- Pass the request id to the executor as an idempotency key, so the downstream system also refuses duplicates.
+- Treat `needs-reconcile` as a page. A side effect in an unknown state is an incident.
+
+## Worked example
+
+### Example first: what happens
+
+```
+python3 code/patterns/human_in_the_loop/main.py
+```
+
+<!-- expected-output: code/patterns/human_in_the_loop/main.py -->
+```text
+Human-in-the-loop
+=================
+-- process 1 (hour 0): agent proposes actions
+[executed] refund {'customer': 'sam', 'amount': 20} auto: no policy rule fired
+[pending] refund {'customer': 'lee', 'amount': 140} R001 refund $140 > $100
+[pending] close_account {'customer': 'kim'} R002 irreversible action
+[pending] refund {'customer': 'ana', 'amount': 35} R003 low confidence 0.55
+-- process 2 (hour 3): reviewer works the queue
+[pending] R001, R002, R003
+[resume R001] executed — edit by maya
+[resume R002] rejected — customer has open dispute
+[resume R001] already-executed — idempotent: not re-run
+-- process 3 (hour 30): nobody decided R003
+[expired] R003
+[resume R003] expired — default deny
+ledger: refund(amount=20, customer=sam) | refund(amount=100, customer=lee)
+```
+
+In **process 1**, the agent proposes four actions. A $20 refund runs automatically. A $140 refund (over $100), an account closure (irreversible) and a low-confidence refund are queued, each with the reason that fired. Then the process exits.
+
+In **process 2**, three hours later, a reviewer loads the queue from disk. Maya edits R001 down to $100 and rejects R002. Resuming R001 executes the *edited* action. Resuming R001 again is a no-op (`already-executed`).
+
+In **process 3**, at hour 30, nobody has decided R003, so it expires and resume refuses it. The ledger shows exactly two side effects.
+
+### Why first: why it is built this way
+
+- **`Policy` is a list of functions returning reasons.** Every queued request records *why* it was held, which is the first thing a reviewer needs.
+- **Atomic file writes.** `_save` writes a temp file and renames it, so a crash never leaves a half-written queue.
+- **Edits merge over the original payload.** The reviewer changes only what they change, and the rest of the action is preserved.
+- **Status is a small state machine:** pending → approved/rejected/expired → executing → executed. `resume` handles every state explicitly, including the awkward ones.
+- **Time is injected (`now`).** Expiry is testable and deterministic. Never read the wall clock inside the policy.
+
+## Failure modes & guardrails
+
+| Failure mode | Symptom | Guardrail |
+|---|---|---|
+| Double execution | Two refunds for one approval. | Executed status + idempotency key; write-ahead "executing" mark. |
+| Lost pause | Approval arrives; the agent's state is gone. | Persist the full action and context with the request. |
+| Default-allow timeout | Unreviewed actions run after a delay. | Expire to rejected; alert on expiries. |
+| Rubber-stamping | Reviewers approve everything quickly. | Reduce volume via policy; sample audits; show reasons and context. |
+| Model self-exemption | Agent phrases actions to avoid triggers. | Policy on structured fields (amount, kind), not on text. |
+| Single approver for huge actions | One person can move large sums. | Dual control (exercise). |
+
+## Variations
+
+- **Approve the plan, not each step.** Review a [plan (#7)](../part-2-single-agent/07-plan-and-execute.md) once, then execute without further gates.
+- **Confidence-gated review.** Only low-confidence outputs go to people; the rest are sampled.
+- **Human as a handoff target.** A person joins a [handoff graph (#14)](14-sequential-handoffs.md) as an agent.
+- **Ask-the-human tool.** The agent can request clarification as a tool call, and the loop pauses for the answer.
+
+## Try it
+
+Add **dual control**: refunds above $500 need approvals from two *different* reviewers before they can execute. One approval leaves the request pending, the same reviewer approving twice does not count twice, and one rejection rejects.
+
+→ Solution: [Solutions — Human-in-the-loop](../solutions/17-human-in-the-loop.md)
+
+## 60-second interview lens
+
+- **Say:** "Human-in-the-loop pauses risky actions at a checkpoint chosen by code policy, persists the paused state, lets a person approve, edit or reject later, and resumes so each approved action executes exactly once."
+- **Trade-off to name:** safety and accountability for the gated subset, at the cost of human latency and staffing, so keep the gated fraction small and precise.
+- **Expect the follow-up:** "What if the process crashes during execution?" A write-ahead executing mark, an idempotency key at the downstream service, and reconciliation when the state is unknown.
+- **Red flag to avoid:** letting the model decide when it needs approval, or approving by default on timeout.
+
+## Related patterns
+
+- [Guardrailed generation (#11)](../part-2-single-agent/11-guardrailed-generation.md): code validators decide validity; HITL decides risk.
+- [Tool-use loop (#9)](../part-2-single-agent/09-tool-use-loop.md): the in-process confirmation callback this pattern makes durable.
+- [Sequential handoffs (#14)](14-sequential-handoffs.md): escalations land here.
+- [Support-triage capstone](../capstones/support-triage.md): this module gating refunds and uncertain replies.
+
+
+---
+
+# 18. Swarm
+
+> **Intent.** Let many peer agents coordinate without any controller, through local rules over shared state (a blackboard): each agent claims work matching its skills, posts results and follow-up work, and the overall behaviour emerges from these interactions.
+
+**Also known as:** blackboard system, decentralised multi-agent, stigmergy · **Part:** 3 — Multi-agent coordination · **Code:** `code/patterns/swarm/`
+
+## Structure
+
+![Swarm structure](../book/diagrams/swarm.svg)
+
+Peer agents (triager, reproducer, estimator) watch a shared blackboard of tasks. Each tick, each agent claims at most one open task matching its skill (claims are atomic), works it, writes the result, and may post follow-up tasks. No agent assigns work to another. Code supplies the only global controls: de-duplication of identical tasks, a cap on total tasks, and a tick budget.
+
+## Design concept & theory
+
+**Core idea.** Instead of a coordinator deciding who does what, work is *published* and *claimed*. Agents react to the state of the board, not to instructions. Coordination emerges, the way an ant colony's trails emerge from individual ants reacting to pheromones (stigmergy).
+
+**Why it can work.**
+
+- *No coordinator bottleneck.* Adding agents adds capacity without adding a supervisor's context or decision calls.
+- *Work appears where it is needed.* A triager posts a repro task only for real bugs. A reproducer posts an estimate only when it reproduced the bug. In the example, 4 reports led to 7 model calls, not 12, because the feature request and the duplicate never generated downstream work.
+- *Robust to individual failure*, if claims expire (the exercise). Another agent picks the work up.
+
+**Why it usually shouldn't be your choice.**
+
+- *Emergence is a polite word for "unpredictable".* You cannot write the call count in advance, and runs depend on timing and claim order. In production, with concurrency, two runs of the same input can take different paths.
+- *Termination is not guaranteed.* An agent that posts follow-ups faster than the swarm completes them grows the board without bound. The runaway example hits the task cap with work unfinished.
+- *Debugging is archaeology.* There is no decision log of "who decided X", only a board history to reconstruct.
+- *Every benefit above has a cheaper, controlled equivalent.* The skip-unneeded-work property comes just as well from [routing (#2)](../part-1-workflow/02-routing.md) plus a [chain (#1)](../part-1-workflow/01-prompt-chaining.md); the scalability from [parallelization (#3)](../part-1-workflow/03-parallelization.md) with a queue.
+
+**Invariants.** (1) No agent assigns work to another; agents claim from shared state. (2) Agents act on local rules and the board. (3) Global properties (termination, size) are enforced only by the board's code.
+
+**Lineage.** Blackboard architectures (Hearsay-II, 1970s); tuple spaces (Linda); swarm intelligence and stigmergy; job queues with competing consumers.
+
+## When to use / when not to use (the honest section)
+
+| Use it when (rarely) | Don't use it when (usually) |
+|---|---|
+| Work is open-ended and discovered during processing, from many sources. | You can draw the workflow. Draw it and build it in Part 1. |
+| Many heterogeneous agents must cooperate, and a central coordinator would be a real bottleneck. | You need predictable cost, latency or termination. |
+| Partial results are useful, and completion of everything is not required. | You must explain *why* the system did something. |
+| You are simulating or researching emergent behaviour. | You have fewer than ~10 agent types: a supervisor will do. |
+| Teams already run a queue with competing consumers; agents slot in. | Compliance or safety requires a decision record. |
+
+**Cheaper alternative, almost always:** a job queue with typed tasks and a [supervisor (#12)](12-supervisor.md), or [routing (#2)](../part-1-workflow/02-routing.md) plus [parallelization (#3)](../part-1-workflow/03-parallelization.md). Keep the useful idea, *work published as typed tasks on shared state*, and add a controller that owns termination.
+
+## Forces & trade-offs
+
+| Force | vs. a supervisor over the same agents | Why |
+|---|---|---|
+| Latency | ≈ to ↓ | Parallel claiming; no coordinator round trips. |
+| Cost | unpredictable | Calls depend on emergent task generation; can explode. |
+| Reliability | ↓ predictability, ↑ fault tolerance | No single point of failure, but no guarantee of completion. |
+| Complexity | ↑↑ to operate | Simple agents, hard system behaviour to reason about. |
+
+## Trade-off analysis & usage guidance
+
+**Model.** Calls = tasks processed, and tasks processed depends on the posting behaviour. If each task spawns on average *b* follow-ups, the task count grows like *b^depth*. With *b* < 1 the swarm terminates; with *b* ≥ 1 only the cap stops it. The runaway agent in the example has *b* = 2.
+
+**If you must use one, the checklist:**
+
+1. Is there a hard cap on tasks, ticks and cost, and a defined result when the cap is hit?
+2. Are identical tasks de-duplicated by key?
+3. Do claims have leases, so a crashed agent's work returns to the pool?
+4. Is every post logged with its author and parent task, so causality can be reconstructed?
+5. Is the branching factor measured and alerted on?
+
+**Usage in production.**
+
+- Treat the board as the system of record: typed tasks, statuses, provenance (`posted_by`).
+- Put admission control on posting: rate limits per agent, per-kind quotas.
+- Run a "janitor" that expires stale claims and closes abandoned branches. At that point you have reintroduced a little central control, which is usually the right move.
+
+## Worked example
+
+### Example first: what happens
+
+```
+python3 code/patterns/swarm/main.py
+```
+
+<!-- expected-output: code/patterns/swarm/main.py -->
+```text
+Swarm
+=====
+-- bug-report swarm (no controller; agents claim by skill)
+[t1 triager] T1 report: bug → posted ['T5']
+[t1 reproducer] T5 repro: could not reproduce on Safari 18; asked reporter for version
+[t2 triager] T2 report: feature request → product backlog
+[t3 triager] T3 report: bug
+[t4 triager] T4 report: bug → posted ['T6']
+[t4 reproducer] T6 repro: reproduced: rounding applied before VAT → posted ['T7']
+[t4 estimator] T7 estimate: small: 1 day
+result: board empty after 4 ticks; 7 model calls for 4 reports; duplicate repro tasks suppressed by the board
+-- runaway swarm: an agent that posts 2 follow-ups per task
+result: tick budget 4 spent; 8 calls; tasks=12 (cap 12), unfinished=4, posts rejected by cap=5
+```
+
+**Bug-report swarm.** The triager processes reports one per tick. The first Safari report spawns a repro task, which the reproducer picks up *in the same tick* (it could not reproduce, so it asked for the version). The dark-mode report goes to the backlog with no follow-up. The *second* Safari report would post an identical repro task, so the board's de-duplication absorbs it. The VAT report leads to a reproduced bug, then an estimate. The board empties after 4 ticks and 7 calls.
+
+**Runaway swarm.** Two explorers that each post two follow-ups per task fill the 12-task cap within 4 ticks. Five posts are refused, and 4 tasks are left unfinished. Nothing in the swarm *decided* to stop; the cap and the tick budget stopped it.
+
+### Why first: why it is built this way
+
+- **Ticks run agents in a fixed order.** Real swarms are concurrent; this one is sequential so that the book's output is reproducible. Do not mistake that for the production behaviour, which is less predictable.
+- **`claim()` is the only coordination primitive.** It is atomic, so two agents can never work the same task. Everything else is local.
+- **De-duplication is by (kind, payload).** It is crude but effective. Normalising payloads before posting (the triager writes "export crash on Safari" for both phrasings) is what lets it work.
+- **The cap rejects posts rather than crashing.** `rejected` counts them, so you can see the pressure the swarm was under.
+
+## Failure modes & guardrails
+
+| Failure mode | Symptom | Guardrail |
+|---|---|---|
+| Task explosion | Board grows faster than work completes. | Task cap; per-agent posting quotas; branching-factor alerts. |
+| Duplicate work | Same task posted in different words. | Normalised payload keys; de-duplication. |
+| Orphaned claims | A crashed agent's task stays claimed forever. | Claim leases that expire (exercise). |
+| Starvation | Tasks no agent has the skill to take. | "Stalled" detection; skill coverage check at startup. |
+| Non-termination | No natural end state. | Tick and cost budgets; define "done" as an empty board or the budget. |
+| Untraceable outcomes | Nobody can say why X happened. | `posted_by` and parent ids on every task; board history. |
+
+## Variations
+
+- **Contract net.** Tasks are announced, agents *bid*, and the board awards. More control, same spirit.
+- **Market-based allocation.** Tasks carry budgets; agents spend to claim.
+- **Blackboard + controller.** A lightweight controller schedules which agent looks next (Hearsay-II's design). Usually the best compromise.
+- **Simulation swarms.** Many agents with personas interact to model a population, for research rather than production.
+
+## Try it
+
+An agent crashes right after claiming a task. With no controller, nobody notices: the task stays claimed forever and the swarm stalls. Add claim **leases**: a claim not completed within *N* board operations expires and the task reopens. Show the plain board stalling and the lease board finishing.
+
+→ Solution: [Solutions — Swarm](../solutions/18-swarm.md)
+
+## 60-second interview lens
+
+- **Say:** "A swarm has peer agents coordinate through a shared blackboard: they claim matching work and post results and follow-ups, with no controller, so the behaviour emerges."
+- **Trade-off to name:** no coordinator bottleneck and some fault tolerance, in exchange for unpredictable cost, no termination guarantee and hard debugging.
+- **Expect the follow-up:** "Would you use one in production?" Rarely. I'd keep the typed-task blackboard idea and add a controller that owns termination, which is a supervisor over a queue.
+- **Red flag to avoid:** presenting emergence as a feature without caps, leases and provenance.
+
+## Related patterns
+
+- [Parallelization (#3)](../part-1-workflow/03-parallelization.md): fixed, known work, with no interaction between branches.
+- [Supervisor (#12)](12-supervisor.md): the controlled alternative over the same specialists.
+- [Sequential handoffs (#14)](14-sequential-handoffs.md): decentralised too, but one owner at a time.
+- [Eval harness (#21)](../part-4-cross-cutting/21-eval-harness.md): essential if you ship one. Measure the cost distribution, not just the mean.
+
+
+---
+
+
+
+<!-- ===== Part 4 — Cross-cutting ===== -->
+
+
+---
+
+# Part 4 — Cross-cutting concerns
+
+> Parts 1–3 are *structures*: who calls whom, in what shape. Part 4 is about *concerns* that every structure has: what the system remembers, what each call can see, and how you know any of it works.
+
+These three patterns are not alternatives to the others; they apply *to* them. Every capstone in this book uses at least one:
+
+| Pattern | The question it answers | Used by |
+|---|---|---|
+| [19. Memory tiers](19-memory-tiers.md) | What should survive beyond this call, this session, this process? | Deep-research capstone (findings reused across sessions) |
+| [20. Context management](20-context-management.md) | What goes into *this* call's window, given a budget? | Coding-team capstone (developer prompts ≤ 300 tokens) |
+| [21. Eval harness](21-eval-harness.md) | Is the new version better, and did anything get worse? | Support-triage capstone (acceptance thresholds) |
+
+Two of them are easy to confuse, so here is the boundary again:
+
+- **Memory** is about *time*: what is stored, how it is updated, how it is recalled later.
+- **Context** is about *space*: what fits in one call, and what must be pinned, summarised or left out.
+
+Compaction is where they touch. A summary written to keep this call small may also be worth storing in memory. The decision to *store* belongs to the memory write policy; the decision to *include* belongs to the context budget.
+
+The **eval harness** is different in kind. It runs at development time, not at runtime. It is the reason the other twenty patterns can be changed safely: every claim in this book that "the new version is better" should be backed by a harness run, and every capstone ends with one.
+
+
+---
+
+# 19. Memory tiers
+
+> **Intent.** Separate what an agent remembers by lifetime and access path (working memory in context, episodic notes per session, durable semantic facts with history) and let code, not the model, decide what gets written, how conflicts resolve, and what gets recalled.
+
+**Also known as:** long-term memory, agent memory, user memory · **Part:** 4 — Cross-cutting · **Code:** `code/patterns/memory_tiers/` *(canonical module, imported by the deep-research capstone)*
+
+## Structure
+
+![Memory tiers structure](../book/diagrams/memory_tiers.svg)
+
+Each user turn enters **working memory**, a bounded window of the last *N* turns, verbatim. An extractor model proposes memory candidates: key, value, tags, durability and confidence. A **code write policy** sends stable, confident facts to **semantic memory** (with source, session and history), transient facts to **episodic memory**, and drops the rest. Long-term tiers persist to disk; recall is by tag.
+
+## Design concept & theory
+
+**Core idea.** Human memory is not one store, and agent memory should not be either. "I'm vegetarian" should be remembered for months. "I'm in Porto this week" for days. "I think I might like Thai?" probably not at all. A single "memory" list that keeps everything gets both noisy and stale.
+
+**Why tiers work.**
+
+- *Different lifetimes need different stores.* Working memory is cheap and exact but small. Episodic memory is cheap to write and searched only on demand. Semantic memory is curated, small, high-precision and always worth recalling. Each tier has its own write cost, recall cost and staleness risk.
+- *The write policy is the quality control.* Models extract candidates eagerly. Code applies the policy: a confidence floor, a durability check, and later on a PII filter. In the example, the 0.45-confidence Thai preference is dropped and the transient Porto location goes to episodic notes only. What is *not* remembered matters as much as what is.
+- *Facts change; history must not vanish.* "Vegetarian" becomes "pescatarian". Overwriting loses the audit trail, while appending creates contradictions. Superseding with history (the current value plus prior values and their sessions) gives both a clean current answer and the record.
+- *Provenance enables trust and deletion.* Every fact keeps the turn it came from. You can show users why the agent believes something, and delete it properly when asked (the exercise).
+
+**Invariants.** (1) At least two tiers with different lifetimes. (2) Writes go through a code policy. (3) Updates supersede with history and provenance. (4) Long-term tiers survive restarts.
+
+**Lineage.** Cognitive psychology's working, episodic and semantic memory (Tulving, 1972); the memory hierarchy in computer architecture (registers, cache, disk); event sourcing for history.
+
+## When to use / when not to use
+
+| Use it when | Don't use it when |
+|---|---|
+| The same user or project returns across sessions. | Interactions are one-off and stateless. |
+| Repeating questions or re-doing work is costly (the research capstone). | The "memory" is really a document corpus. Use [agentic RAG (#10)](../part-2-single-agent/10-agentic-rag.md). |
+| Personal facts must persist, update and be deletable. | You cannot meet privacy obligations for stored personal data. |
+| You need to explain why the agent knows something. | The full history fits in context. Keep it simple. |
+
+**Cheaper alternative:** keep the last *N* turns verbatim and a single running summary (working memory plus compaction from [#20](20-context-management.md)). Upgrade when facts must outlive sessions, change over time, or be individually recalled and deleted.
+
+## Forces & trade-offs
+
+| Force | vs. no persistent memory | Why |
+|---|---|---|
+| Latency | ≈ | Extraction can run asynchronously; recall is a lookup. |
+| Cost | ↑ small | One extraction call per turn, often on a small model; saved repeat work can outweigh it. |
+| Reliability | ↑ personalisation and continuity; ↓ if the policy is weak | Stale or wrong memories are worse than none. |
+| Complexity | ↑ | Policy, schema, persistence, conflict resolution, deletion. |
+
+## Trade-off analysis & usage guidance
+
+**Model.** Write cost ≈ one extraction call per turn (or per session, batched). Recall cost ≈ a lookup plus the tokens of recalled facts in context. The payoff is avoided work: in the deep-research capstone, the follow-up session made 0 retrieval-agent calls where the first session made 14.
+
+**Decision checklist.**
+
+1. Which facts are durable, which are transient, and which should never be stored?
+2. What is the confidence floor, and who calibrates it?
+3. How do updates resolve: supersede, keep history, ask the user?
+4. How is recall scoped: by tag, by user, by recency? How many facts at most?
+5. How does a user see and delete what is remembered?
+
+**Usage in production.**
+
+- Run extraction on a small model, asynchronously after the turn.
+- Cap recalled facts per call, and prefer specific tags over "recall everything".
+- Expire episodic notes on a schedule. Transient facts should not quietly become permanent.
+- Log every write with its policy decision. Dropped candidates are your tuning data.
+- Never store secrets or credentials, and filter PII by policy.
+
+## Worked example
+
+### Example first: what happens
+
+```
+python3 code/patterns/memory_tiers/main.py
+```
+
+<!-- expected-output: code/patterns/memory_tiers/main.py -->
+```text
+Memory tiers
+============
+-- session s1
+[s1 write] name=Ana -> semantic (added)
+[s1 write] diet=vegetarian -> semantic (added)
+[s1 write] allergy=peanuts -> semantic (added)
+[s1 write] location_this_week=Porto -> episodic (transient)
+[s1 write] cuisine=Thai -> dropped (confidence 0.45 < 0.7)
+[s1 working] last 2 turns only: This week I'm in Porto… | I think I might like T…
+-- session s2 (new process): 'Suggest a dinner recipe'
+[s2 recall] allergy=peanuts, diet=vegetarian
+[s2 episodic] search 'Porto' -> ['location_this_week=Porto']
+[s2 write] diet=pescatarian -> semantic (updated)
+-- session s3 (new process)
+[s3 recall] diet=pescatarian (history: ['vegetarian'], source: 'Actually, I eat fish now.')
+[s3 store] 3 semantic facts, 1 episodic notes
+```
+
+**Session s1:** three turns produce five candidates. Name, diet and allergy are stable and confident, so they go to semantic memory. The location is transient, so it becomes an episodic note. The Thai guess falls below the confidence floor and is dropped. Working memory keeps only the last two turns.
+
+**Session s2** is a new process, with only the file carried over. A dinner request recalls by tag `food`: the allergy and diet, nothing else. The Porto note is findable in episodic memory but is not volunteered. "Actually, I eat fish now" *updates* the diet.
+
+**Session s3:** the diet is `pescatarian`, with `vegetarian` in its history and the source sentence attached.
+
+### Why first: why it is built this way
+
+- **The extractor proposes; `MemoryManager.observe` disposes.** The prompt asks for candidates with durability and confidence. The policy (floor, durability routing) is ten lines of code you can test without a model.
+- **`upsert` returns `added`, `updated` or `unchanged`.** Identical re-statements do not churn history, and every write is classified for logging.
+- **Tags drive recall.** A dinner request needs food facts, not the user's name or travel. Tag recall is crude and predictable; embeddings are a drop-in upgrade for larger stores.
+- **Atomic file writes.** Temp file, then rename, so a crash cannot corrupt the store, the same as the [HITL queue](../part-3-multi-agent/17-human-in-the-loop.md).
+
+## Failure modes & guardrails
+
+| Failure mode | Symptom | Guardrail |
+|---|---|---|
+| Memory pollution | Guesses and jokes stored as facts. | Confidence floor; durability classification; user confirmation for sensitive keys. |
+| Stale facts | Old preferences override new ones. | Supersede with history; recency wins; periodic review. |
+| Contradictions | Two values for one key. | One key, one current value; history for the rest. |
+| Over-recall | Every fact injected into every prompt. | Tag-scoped recall; per-call cap. |
+| Privacy leak | Deleted data survives in history or notes. | Forget removes history, scrubs notes, and leaves a tombstone (exercise). |
+| Cross-user bleed | One user's memory recalled for another. | Partition stores by user or tenant; test it. |
+
+## Variations
+
+- **Procedural memory.** Store *how-to* lessons learned from failures (see the [reflection](../part-2-single-agent/08-reflection.md) exercise).
+- **Embedding-based recall.** Semantic similarity instead of tags, for large or unstructured stores.
+- **User-editable memory.** Show the semantic store to the user, who can correct or delete entries.
+- **Shared team memory.** A project-level store several agents read and write, with stricter write policies.
+
+## Try it
+
+A user says "forget my allergy". Deleting the current value is not enough: superseded history and episodic notes still contain it. Implement `forget(key)` that removes the fact *and its history*, scrubs episodic notes about it, and leaves a **tombstone**, so that a replayed old transcript cannot silently re-add it while a new, explicit request still can.
+
+→ Solution: [Solutions — Memory tiers](../solutions/19-memory-tiers.md)
+
+## 60-second interview lens
+
+- **Say:** "Memory tiers split agent memory by lifetime: working memory in context, episodic notes per session, and durable semantic facts with history and provenance, with code owning the write policy and recall."
+- **Trade-off to name:** continuity and less repeated work, against the risk of stale or polluted memories and real privacy obligations. The write policy is where quality is won.
+- **Expect the follow-up:** "Memory or RAG?" RAG reads an external corpus you don't own; memory is the agent's own history, which it writes, updates and must be able to delete.
+- **Red flag to avoid:** letting the model decide what to store with no policy, confidence floor or deletion path.
+
+## Related patterns
+
+- [Context management (#20)](20-context-management.md): what fits in *this* call; memory is what persists *across* calls.
+- [Agentic RAG (#10)](../part-2-single-agent/10-agentic-rag.md): retrieval over a corpus the agent does not own.
+- [Reflection (#8)](../part-2-single-agent/08-reflection.md): trajectory lessons are a kind of procedural memory.
+- [Deep-research capstone](../capstones/deep-research.md): findings stored and reused across sessions.
+
+
+---
+
+# 20. Context management (compaction and progressive disclosure)
+
+> **Intent.** Assemble every model call's context deliberately under a token budget: pin what must always be there, disclose tool and document detail only when needed, compact old conversation into a running summary, and evict low-value material, with a report of every decision.
+
+**Also known as:** context engineering, prompt budgeting, compaction · **Part:** 4 — Cross-cutting · **Code:** `code/patterns/context_management/` *(imported by the coding-team capstone)*
+
+## Structure
+
+![Context management structure](../book/diagrams/context_management.svg)
+
+Four levers, applied in priority order:
+
+- **Pin:** system rules and the task are always included, verbatim.
+- **Disclose:** tools appear as a one-line index; full docs load only for tools the model asked about.
+- **Compact:** old turns are folded into a running summary by a small model, and recent turns stay verbatim.
+- **Evict:** reference documents are added by relevance (above a floor) until the budget is reached.
+
+Every assembly returns a report: section sizes, compacted turns, evicted documents, loaded tool docs, and whether the pinned parts alone exceeded the budget.
+
+## Design concept & theory
+
+**Core idea.** The context window is the agent's working memory, and it is finite, priced per token, and sensitive to noise. Long-running agents fail less from lack of intelligence than from context that is too long, too noisy, or missing the one fact that mattered. Context management treats each prompt as an *assembled artefact* with a budget, not as a log you keep appending to.
+
+**Why it works.**
+
+- *Relevance beats completeness.* Including a 25-paragraph style guide in an incident rollback prompt costs tokens and attention and adds nothing. Relevance-ranked inclusion with a floor drops it. In the example, two of three documents are evicted for low relevance, not just for size.
+- *Progressive disclosure keeps the menu cheap.* Six tools at full documentation would dominate the prompt. Six one-liners cost little, and the model asks for the one it needs (`help(deploy)`). This is lazy loading for prompts.
+- *Compaction converts growth from linear to roughly constant.* Without it, prompt size grows with every turn. With a running summary plus the last *k* turns, size stays roughly flat. The summary is updated *incrementally* (only new turns are summarised), so compaction costs one small call per *k* turns, not one per call.
+- *Pinning protects what must never be lost.* Rules ("never deploy on Fridays without a ticket") and the task are never summarised. A summary can paraphrase a rule into something weaker; pinning prevents that.
+
+**Invariants.** (1) A token budget per call. (2) A fixed priority order: pinned > tools index > summary + recent > documents. (3) Every assembly is observable (the report).
+
+**Lineage.** Virtual memory and paging (working set in RAM, the rest on disk); cache eviction policies; lazy loading in UIs. The running summary is a lossy log compaction.
+
+## When to use / when not to use
+
+| Use it when | Don't use it when |
+|---|---|
+| Conversations or agent loops run for many turns. | Calls are single-turn and small. |
+| Tool catalogs or reference material exceed what one call should carry. | Everything relevant fits comfortably, with headroom. |
+| Cost per call matters at volume. | You cannot tolerate any lossy summarisation (legal transcripts); keep full logs and retrieve instead. |
+| Quality drops as context grows (lost-in-the-middle effects). | The extra summarizer calls cost more than the tokens they save. |
+
+**Cheaper alternative:** a sliding window, keeping the last *N* turns and dropping the rest. It is fine until a dropped turn contained the one fact you needed (the ticket id). Upgrade when that happens, or when tool and document context crowds out the conversation.
+
+## Forces & trade-offs
+
+| Force | vs. send-everything | Why |
+|---|---|---|
+| Latency | ↓ | Shorter prompts are faster; occasional summarizer calls add a little. |
+| Cost | ↓↓ at volume | 924 → 190 tokens in the example; summarizer calls are small-model calls. |
+| Reliability | ↑ (less noise), with a new risk | Lossy summaries can drop facts; pinning and id-preservation mitigate. |
+| Complexity | ↑ | Budget, priorities, summarizer prompt, eviction policy, reporting. |
+
+## Trade-off analysis & usage guidance
+
+**Model.** For a session of *T* turns, keep-recent *k*, summary size *S* and turn size *t*: managed prompt ≈ pinned + index + *S* + *k·t* + docs, which is roughly constant in *T*. Send-everything ≈ pinned + full tools + *T·t* + all docs, which is linear in *T*. Summarizer calls ≈ *T / k* with incremental updates.
+
+**Decision checklist.**
+
+1. What must *never* leave the context? Pin it.
+2. Which identifiers (tickets, ids, amounts) must survive summarisation verbatim? (Exercise.)
+3. Can tools and documents be disclosed lazily?
+4. What is the relevance floor, and how is relevance scored?
+5. What happens when the pinned parts alone exceed the budget? (`over_budget` must be surfaced, not hidden.)
+
+**Usage in production.**
+
+- Log the report for every call. Section sizes over time show what is crowding the window.
+- Use a small, cheap model for compaction, with a strict "keep decisions, facts, ids, open items" prompt.
+- Keep compaction incremental: summarise only turns not yet folded in.
+- Re-check budgets when switching models; tokenisers differ.
+
+## Worked example
+
+### Example first: what happens
+
+An on-call session: incident INC-4411, a bad deploy, a Friday, and a change ticket. Six tools with long docs and three reference documents. The budget is 300 tokens.
+
+```
+python3 code/patterns/context_management/main.py
+```
+
+<!-- expected-output: code/patterns/context_management/main.py -->
+```text
+Context management
+==================
+-- call 1: nothing loaded yet
+[naive prompt] 924 tokens
+[managed prompt] 190 tokens (budget 300): system=20, task=12, tools=77, summary=29, recent=31, docs=21
+[compacted] 5 old turns → 1 summary (1 summarizer call)
+[evicted] postmortem-2025 (relevance 0.40), style-guide (relevance 0.10)
+-- call 2: the model asked help(deploy); two more turns happened
+[managed prompt] 285 tokens: system=20, task=12, tools=187, summary=29, recent=16, docs=21
+[evicted] postmortem-2025 (relevance 0.40), style-guide (relevance 0.10)
+[progressive disclosure] full docs loaded for ['deploy']; other 5 tools stay one-liners
+[compacted] 7 turns folded in total; summarizer calls=2 (incremental)
+[pinned + recalled] rule present=True, CHG-881 present=True, INC-4411 present=True
+```
+
+**Call 1:** the naive prompt is 924 tokens; the managed prompt is 190. Five old turns become one summary, and the two irrelevant documents are evicted by the relevance floor. **Call 2:** the model asked for `help(deploy)`, so only that tool's full docs are loaded (tools: 77 → 187 tokens), and the total is still within budget at 285. Compaction is *incremental*: the summarizer folds in only the two turns that aged out. Throughout, the Friday rule is pinned and both ticket ids are present.
+
+### Why first: why it is built this way
+
+- **Sections are assembled in priority order, and documents fill what is left.** The budget is enforced where it is cheapest to give things up.
+- **The relevance floor comes before the budget check.** A low-relevance document is noise even when it fits.
+- **`over_budget` is reported, not silently fixed.** If the pinned parts alone exceed the budget, that is a design problem (rules too long, task too verbose). Truncating pinned content would be worse.
+- **`loop_render` adapts the manager to the [tool-use loop (#9)](../part-2-single-agent/09-tool-use-loop.md).** The coding-team capstone plugs it in, and the loop does not change.
+
+## Failure modes & guardrails
+
+| Failure mode | Symptom | Guardrail |
+|---|---|---|
+| Lossy summary drops a key id | Agent re-asks, or acts without it. | Extract and pin ids before summarising (exercise). |
+| Rule paraphrased away | "Never on Fridays" becomes "be careful on Fridays". | Pin rules; never summarise them. |
+| Summary drift | Repeated re-summarising distorts facts. | Incremental summaries; keep original turns in a log for retrieval. |
+| Thrashing tool docs | Model keeps requesting docs it was just shown. | Keep loaded docs for several turns; cap disclosures. |
+| Silent truncation | Prompt cut mid-section by the API. | Assemble under your own budget with headroom; report `over_budget`. |
+| Relevance mis-scoring | The needed runbook is evicted. | Calibrate scoring on real sessions; log evictions. |
+
+## Variations
+
+- **Retrieval-backed history.** Store all turns, and retrieve old ones by relevance instead of summarising.
+- **Hierarchical summaries.** Summaries of summaries for very long sessions.
+- **Sub-agent offloading.** Push a large sub-task into a fresh agent with its own clean context, and keep only its result. This is the context argument for [hierarchical teams (#13)](../part-3-multi-agent/13-hierarchical-teams.md).
+- **Prompt caching awareness.** Keep pinned prefixes byte-stable so provider-side caching can reuse them.
+
+## Try it
+
+Summaries are lossy. A cheaper summarizer drops the incident id `INC-4411`, so the agent can no longer reference the incident. Make identifiers survive compaction **verbatim**: extract ticket-style ids from turns before they are summarised, and keep them in a pinned line of the summary.
+
+→ Solution: [Solutions — Context management](../solutions/20-context-management.md)
+
+## 60-second interview lens
+
+- **Say:** "Context management assembles each call's context under a token budget: pin rules and the task, disclose tool docs on demand, compact old turns into a running summary, and fill the rest with the most relevant documents, logging every decision."
+- **Trade-off to name:** big savings in cost and noise, against lossy summaries, so pin rules and identifiers and keep the full log retrievable.
+- **Expect the follow-up:** "How is this different from memory?" Memory decides what persists across time; context management decides what goes into this one call.
+- **Red flag to avoid:** letting the provider truncate silently, or summarising the rules.
+
+## Related patterns
+
+- [Memory tiers (#19)](19-memory-tiers.md): persistence across calls and sessions.
+- [Tool-use loop (#9)](../part-2-single-agent/09-tool-use-loop.md): the runtime whose transcript this pattern keeps in budget.
+- [Hierarchical teams (#13)](../part-3-multi-agent/13-hierarchical-teams.md): context scoping by splitting agents.
+- [Coding-team capstone](../capstones/coding-team.md): every developer prompt ≤ 300 tokens.
+
+
+---
+
+# 21. Eval harness
+
+> **Intent.** Measure any LLM system offline against a fixed, versioned set of cases with deterministic scorers (plus calibrated model-judge scorers where needed), and compare versions *case by case*, so that "better on average" can never hide "broken where it matters".
+
+**Also known as:** offline evals, regression suite for prompts, LLM test harness · **Part:** 4 — Cross-cutting · **Code:** `code/patterns/eval_harness/` *(canonical module, imported by the support-triage capstone)*
+
+## Structure
+
+![Eval harness structure](../book/diagrams/eval_harness.svg)
+
+Cases (input, expected values, tags such as `critical`) run through each version of the system. Scorers turn each output into numbers between 0 and 1: exact field checks, budget checks, and optionally an LLM judge from a *different* model. Reports aggregate by scorer and by tag, and list the failing cases. A comparison diffs two reports case by case, and a gate decides: any critical regression blocks, whatever the averages say.
+
+## Design concept & theory
+
+**Core idea.** LLM systems change constantly: prompts, models, retrieval settings, tools. Without measurement, every change is a guess, and regressions are found by users. An eval harness makes changes *testable* the way unit tests make code changes testable, adapted for outputs that are probabilistic and judged rather than exact.
+
+**Why it works.**
+
+- *Fixed cases make versions comparable.* The same inputs, scored the same way, isolate the effect of the change. Cases are data, versioned with the code.
+- *Deterministic scorers first.* Route equals expected, field present, under budget, no card number: these are exact, free and stable. Use model judges only for what code cannot check, and fail them closed on unparseable output.
+- *Per-case comparison catches what averages hide.* In the example, v2 improves route accuracy from 0.70 to 0.90, a clear win on average, and still breaks `c08`, a *critical* billing case. Simpson's-paradox-style surprises are the norm in LLM evals, because improvements and regressions land on different slices.
+- *Tags define what matters.* `critical` marks the cases where a regression is unacceptable regardless of the average. Slice gates (the exercise) turn that policy into data.
+- *Judges need calibration.* A judge from the same model as the system grades itself generously (the support-triage capstone hit this). A judge with position bias picks whichever answer came second ([debate](../part-3-multi-agent/15-debate.md) exercise). A judge is a model with error rates, so measure it.
+
+**Invariants.** (1) Fixed, versioned cases. (2) Scorers return 0..1, and crashes score 0 rather than aborting the run. (3) Comparison is per case, with critical slices gated separately. (4) Evaluation is offline and development-time.
+
+**Lineage.** Unit and regression testing; golden-file tests; A/B testing's guardrail metrics; ML's held-out test sets, with tags as slices.
+
+## When to use / when not to use
+
+| Use it when | Don't use it when |
+|---|---|
+| You will change prompts, models or parameters more than once. | Never. Even a 10-case harness beats none. |
+| A regression on some inputs would be costly. | (Scale it down rather than skip it.) |
+| You need to justify "the new version is better". | Using it as a *runtime* loop. That is [evaluator–optimizer (#5)](../part-1-workflow/05-evaluator-optimizer.md). |
+| Several people change the system. | Treating eval scores as product truth: they are evidence about your cases. |
+
+**Cheaper alternative:** a handful of manual spot-checks before each release. It works for a prototype, but it misses regressions on cases nobody re-checked. The harness is the cheapest *reliable* option, and every capstone here ends with one.
+
+## Forces & trade-offs
+
+| Force | vs. manual spot-checks | Why |
+|---|---|---|
+| Latency (of the dev loop) | ↓ | Run the whole suite in minutes instead of hours of review. |
+| Cost | ↑ small | Model calls per case per version, plus judge calls; deterministic scorers are free. |
+| Reliability (of releases) | ↑↑ | Regressions caught before users see them. |
+| Complexity | ↑ | Curating cases, writing scorers, calibrating judges, maintaining gates. |
+
+## Trade-off analysis & usage guidance
+
+**Model.** Cost per run ≈ cases × (system calls + judge calls). For 200 cases, 3 system calls each and 1 judge call, that is 800 calls per version. Run on every prompt or model change, not every commit. Keep a fast deterministic subset for every commit.
+
+**Building the case set.**
+
+- Start from real traffic, plus the failures users reported (each bug becomes a case).
+- Tag by slice: `critical`, intent type, language, length. Write expected values from the *spec*, before the system exists (as every capstone brief did).
+- Include *should-fail* cases: inputs where the right answer is to abstain, escalate or refuse.
+- Keep it small enough to run often (tens to hundreds), and grow it with every incident.
+
+**Decision checklist.**
+
+1. Are expected values written from the spec, not from the current output?
+2. Which scorers are deterministic, and which judges need calibration?
+3. What are the gates: overall thresholds, slice thresholds, and zero critical regressions?
+4. Is the judge a different model, and has it been checked for position and length bias?
+5. Is the harness wired into the release process, so that it can block?
+
+**Usage in production.**
+
+- Store reports per version, and diff them in code review like test results.
+- Add every production incident as a tagged case before fixing it.
+- Track judge–human agreement on a sample; re-calibrate when the judge model changes.
+- Never tune on the full eval set. Hold out a slice so the system does not overfit to its own tests.
+
+## Worked example
+
+### Example first: what happens
+
+```
+python3 code/patterns/eval_harness/main.py
+```
+
+<!-- expected-output: code/patterns/eval_harness/main.py -->
+```text
+Eval harness
+============
+v1 keywords:
+  route_correct    0.70  [critical] 1.00  fails: c05, c09, c10
+  llm_calls<=1     1.00  [critical] 1.00  fails: -
+v2 llm:
+  route_correct    0.90  [critical] 0.67  fails: c08
+  llm_calls<=1     1.00  [critical] 1.00  fails: -
+comparison:
+  route_correct    0.70 -> 0.90 (+0.20)
+  llm_calls<=1     1.00 -> 1.00 (+0.00)
+  fixed:      c05/route_correct, c09/route_correct, c10/route_correct
+  regressed:  c08/route_correct (critical)
+  verdict:    BLOCK — 1 critical regression(s)
+```
+
+**v1** (ordered keyword rules) gets 0.70: it misroutes a payment error as billing, and misses "declined" and "slow". **v2** (LLM classifier) gets 0.90 and fixes all three, but routes "Invoice shows the wrong company name" to *account*. That case is tagged `critical`, so the comparison lists it as a critical regression and the verdict is **BLOCK**, even though every average improved. The exercise turns this into a gate policy and shows a v3 that fixes `c08` passing.
+
+### Why first: why it is built this way
+
+- **Scorers are plain functions with a name and, for graded scorers, a pass mark.** Reports list failures per scorer, and a 0.86 quality mean with `fails: TK-106` is actionable in a way a bare 0.86 is not.
+- **Crashes score zero.** `run_eval` catches system exceptions per case, records them, and keeps going. A partial report is far more useful than a stack trace.
+- **`compare` works per case.** Regressions are tuples (case, scorer, critical?), and the verdict reads them. Averages are reported but never decide alone.
+- **The verdict is conservative.** Any critical regression blocks; any drop in a mean blocks; only then SHIP. Shipping is the claim that needs evidence.
+
+## Failure modes & guardrails
+
+| Failure mode | Symptom | Guardrail |
+|---|---|---|
+| Averages hide regressions | Mean up, key case broken. | Per-case diff; critical tags; slice gates. |
+| Self-grading judge | Inflated quality scores. | A different judge model; calibrate on human labels. |
+| Biased judge | Order or length decides. | Swap-order checks; length-controlled prompts. |
+| Overfitting to the eval set | Scores rise, users unhappy. | Held-out slice; refresh cases from real traffic. |
+| Expected values copied from outputs | The harness "passes" whatever the system does. | Write expectations from the spec, before the run. |
+| Flaky scores | Same version, different results. | Fixed seeds and temperatures for evals; repeat runs on noisy cases. |
+
+## Variations
+
+- **Pairwise comparison.** A judge picks the better of two outputs, which is more sensitive than absolute scores but needs order-swapping.
+- **Online evals.** Sample production traffic and score it continuously, alongside the offline gate.
+- **Trajectory evals.** Score the steps an agent took (tool calls, cost, turns), not just the final answer.
+- **Eval-driven development.** Write the failing case first, then change the prompt until it passes, which is TDD for prompts.
+
+## Try it
+
+Turn the acceptance policy into data: write `gate(report, thresholds)` where a threshold may name a tag slice (`"route_correct@critical": 1.0`). Show that v1 fails the overall bar, v2 fails the critical-slice bar, and a v3 that fixes `c08` passes both.
+
+→ Solution: [Solutions — Eval harness](../solutions/21-eval-harness.md)
+
+## 60-second interview lens
+
+- **Say:** "An eval harness runs a fixed, tagged case set through each version with deterministic scorers first and calibrated judges second, and compares versions case by case, with critical slices gated separately."
+- **Trade-off to name:** curation and run cost, in exchange for catching regressions before users do. Averages alone will mislead you.
+- **Expect the follow-up:** "How do you trust an LLM judge?" Use a different model, calibrate it against human labels, check for position and length bias, and fail closed on unparseable verdicts.
+- **Red flag to avoid:** declaring a change better because the mean went up.
+
+## Related patterns
+
+- [Evaluator–optimizer (#5)](../part-1-workflow/05-evaluator-optimizer.md): runtime improvement of one output, not development-time measurement.
+- [Guardrailed generation (#11)](../part-2-single-agent/11-guardrailed-generation.md): the same deterministic checks, as validators at runtime.
+- [Debate (#15)](../part-3-multi-agent/15-debate.md): its exercise is the judge-bias check you need here too.
+- [Support-triage capstone](../capstones/support-triage.md): acceptance thresholds from the brief, enforced by this harness.
+
+
+---
+
+
+
 <!-- ===== Capstones ===== -->
 
 
@@ -2050,9 +3593,189 @@ The illustrative economics: retrieval and grading run on the small model (priced
 
 ---
 
+# Capstone 3 — Multi-agent coding team
+
+> **Composes:** [Supervisor (#12)](../part-3-multi-agent/12-supervisor.md) · [Hierarchical teams (#13)](../part-3-multi-agent/13-hierarchical-teams.md) · [Critic–reviewer loop (#16)](../part-3-multi-agent/16-critic-reviewer.md) · [Tool-use loop (#9)](../part-2-single-agent/09-tool-use-loop.md) · [Context management (#20)](../part-4-cross-cutting/20-context-management.md)
+> **Code:** `code/capstones/coding_team/` · **Run:** `python3 code/capstones/coding_team/main.py`
+
+Coding is where multi-agent systems are most tempting and most often over-built. This capstone uses the minimum structure that still earns its keep: a lead that never reads code, a developer that only touches files through tools, a reviewer that only trusts tests it ran itself, and a context budget that every developer prompt must fit. Every claim in the acceptance block is a measurement.
+
+## 1. The brief (written first)
+
+The full brief is in `code/capstones/coding_team/brief.md`. The request is *"Add a `--json` flag that prints the report as JSON. Text output must not change."*
+
+| ID | Requirement | Pattern |
+|---|---|---|
+| R1 | A tech lead coordinates turn by turn and decides when the work is done. | Supervisor |
+| R2 | Dev and QA teams with their own leads; the tech lead sees summaries, never file contents. | Hierarchical teams |
+| R3 | The developer changes code only through validated tools. | Tool-use loop |
+| R4 | QA reviews with its own tools, files itemised findings, and blocks on blocking findings. | Critic–reviewer loop |
+| R5 | Every developer prompt fits a token budget via compaction and progressive disclosure. | Context management |
+
+**Acceptance criteria:** all tests pass, including new ones · the original tests pass unmodified · QA approval with zero open blocking findings · every developer prompt ≤ 300 tokens with at least one compaction · no file contents in any tech-lead prompt.
+
+## 2. Architecture
+
+![Coding-team architecture](../book/diagrams/coding_team.svg)
+
+`team.py` builds three supervisors from the same class: the tech lead, the dev lead and the QA lead. The dev team's only worker is the developer, a `ToolLoop` whose `render` is a `ContextManager`. The QA team's only worker runs `review_loop`, whose *author* callback asks the developer to address the findings. That is the one deliberate cross-team link, and it is narrow: findings in, a summary out.
+
+The repository is a dictionary of files, but `run_tests` really executes them: it loads `cli.py` as a module and runs every `test_*` function. "Tests pass" is therefore something the code checked, not something a mock said.
+
+## 3. Example first: the run
+
+<!-- expected-output: code/capstones/coding_team/main.py -->
+```text
+Coding-team capstone
+====================
+[tech_lead → dev_team] Implement: Add a --json flag that prints the report as JSON. Text output must not change.
+[dev_lead → developer] Implement: Add a --json flag that prints the report as JSON. Text output must not change.
+[call 1] read_file({"path": "cli.py"})
+[result 1] "USAGE = \"usage: report [--verbose]\"\n\ndef build_report(rows):\n    return {\"total\": sum(r[\"amount\"] f…
+[call 2] write_file({"path": "cli.py", "content": "USAGE = \"usage: report [--verbose]\"\n\nimport json\n\ndef build_r…
+[result 2] {"written": "cli.py", "lines": 15}
+[call 3] run_tests({})
+[result 3] {"passed": 2, "failed": []}
+[final] Implemented --json in cli.py; existing tests pass.
+[developer] Implemented --json in cli.py; existing tests pass.
+[dev_lead] FINISH: Implemented --json in cli.py; existing tests pass.
+[dev_team] Implemented --json in cli.py; existing tests pass.
+[tech_lead → qa_team] Review the --json change and get blocking findings fixed
+[qa_lead → reviewer] Review the --json change against: Add a --json flag that prints the report as JSON. Text output must not chan…
+[review 1] F1[blocking] no test covers --json output; F2[nit] USAGE text does not list --json
+[call 1] write_file({"path": "test_cli_json.py", "content": "import json\nfrom cli import main\n\ndef test_json():\n…
+[result 1] {"written": "test_cli_json.py", "lines": 6}
+[call 2] read_file({"path": "cli.py"})
+[result 2] "USAGE = \"usage: report [--verbose]\"\n\nimport json\n\ndef build_report(rows):\n    return {\"total\": sum(…
+[call 3] write_file({"path": "cli.py", "content": "USAGE = \"usage: report [--verbose] [--json]\"\n\nimport json\n\nde…
+[result 3] {"written": "cli.py", "lines": 15}
+[call 4] run_tests({})
+[result 4] {"passed": 3, "failed": []}
+[final] Added test_cli_json.py; USAGE now lists --json; all tests pass.
+[author F1] fixed: Added test_cli_json.py; USAGE now lists --json; all tests pass. → noted
+[author F2] fixed: Added test_cli_json.py; USAGE now lists --json; all tests pass. → noted
+[review 2] no findings
+[reviewer] approved=True after 2 review round(s); open blocking findings=none
+[qa_lead] FINISH: approved=True after 2 review round(s); open blocking findings=none
+[qa_team] approved=True after 2 review round(s); open blocking findings=none
+[tech_lead] FINISH: Implemented --json in cli.py; existing tests pass. | approved=True after 2 review round(s); open bloc…
+-- acceptance
+tech lead: finished; files now: ['cli.py', 'test_cli.py', 'test_cli_json.py']
+[PASS] all tests pass: passed=3 failed=0
+[PASS] text output unchanged: original test_cli.py passes unmodified
+[PASS] QA approval: approved=True, rounds=2
+[PASS] developer context: 9 prompts, largest 270 tokens (budget 300), compactions=5
+[PASS] tech-lead scoping: 3 tech-lead prompts, file contents leaked into 0
+model calls: developer=9, summarizer=5, qa=2, tech-lead=3, dev-lead=2, qa-lead=2
+```
+
+Read it top to bottom:
+
+1. **Tech lead → dev team.** The developer reads `cli.py`, writes a version with a `--json` branch, runs the existing tests (2 pass), and reports. The dev lead passes the summary up. The tech lead never sees the code.
+2. **Tech lead → QA team.** The reviewer runs the tests and two repository checks. Tests pass, but *no test covers `--json`* (blocking) and the usage text does not mention the flag (nit).
+3. **Review loop.** The author callback sends both findings to the developer. It writes `test_cli_json.py`, re-reads `cli.py`, updates `USAGE`, and runs the tests: 3 pass. Round 2 of review finds nothing, and QA approves.
+4. **Acceptance.** Everything is measured: tests 3/3, the original test file passes unmodified, 9 developer prompts with the largest at 270 tokens (budget 300) and 5 compactions, and the tech lead's 3 prompts contain no file contents.
+
+## 4. Why first: the design decisions
+
+**The reviewer's blocking finding is about a missing test, not a failing one.** All tests passed after step 1, and a tests-as-a-gate design would have shipped an untested feature. The reviewer's judgement on top of the evidence (*nothing exercises the new flag*) is the reason this is a critic–reviewer loop rather than a guardrail.
+
+**One cross-team call, by design.** In a strict hierarchy, QA would report to the tech lead, who would re-delegate to dev: two extra lead calls per review round. Letting QA's review loop call the developer directly (through `_author`) is a pragmatic shortcut. It is narrow (findings in, summary out) and it keeps the tech lead's context small. The trade-off is documented here, rather than hidden in the code.
+
+**Context management sits in the developer, where context grows.** The developer's transcript accumulates file contents and tool results. Leads only ever see short summaries, so they do not need a budget. Five compactions over two developer runs kept every prompt under 300 tokens, and the summarizer's job is narrow: record which files were read and written and what the test results were. That is exactly what the developer needs in order not to repeat itself.
+
+**Every acceptance check reads a different source.** Test results come from executing the repository. Context size comes from the `ContextReport` log. Scoping comes from the tech-lead model's recorded prompts. No check trusts an agent's own summary.
+
+## 5. Cost and latency
+
+From the run: 9 developer calls, 5 summarizer calls (small model), 2 QA calls, and 3 + 2 + 2 lead calls. Coordination (7 lead calls out of 23) is about 30% of model calls here, which is typical for small tasks and is exactly why the [hierarchical-teams](../part-3-multi-agent/13-hierarchical-teams.md) chapter warns against structure you do not need. For a one-line change, a single developer loop with a test gate would be cheaper. The team structure pays off as tasks grow: bigger diffs, more files, independent review.
+
+## 6. Extending it
+
+1. Add a security reviewer to the QA team (a second worker for the QA lead) that files a blocking finding when `eval(` appears in any file.
+2. Lower the budget to 200 tokens. Which section of the developer's prompt breaks first? Fix it with progressive disclosure of file contents (read files in chunks).
+3. Replace the hand-written acceptance block with the [eval harness (#21)](../part-4-cross-cutting/21-eval-harness.md) over three different feature requests.
 
 
-<!-- ===== Appendix — Exercise solutions ===== -->
+---
+
+
+
+<!-- ===== Appendix A — Pattern boundaries ===== -->
+
+
+---
+
+# Appendix A — Pattern boundaries
+
+Every pattern in this catalog has a one-line boundary that says what it is and, after **Not:**, the neighbour it is most often confused with. The overlap table at the end answers the questions that separate the confusable clusters. These boundaries were fixed before any chapter was written, and each chapter's *Related patterns* section repeats the relevant lines.
+
+Two axes keep the catalog orthogonal:
+
+- **Who decides control flow?** Code (Part 1) → one model (Part 2) → several models (Part 3).
+- **Is it a structure or a concern?** Parts 1–3 are structures; Part 4 patterns are concerns that apply to any structure.
+
+## Part 1 — Workflow patterns (control flow fixed in code)
+
+| # | Pattern | One-line boundary |
+|---|---------|-------------------|
+| 1 | Prompt chaining | A fixed, linear sequence of LLM calls where each step's output is the next step's input, with optional code "gates" between steps. **Not:** sequential handoffs (#14) — chain steps are stateless calls owned by one program, not autonomous agents transferring ownership of a conversation. |
+| 2 | Routing | Classify an input once, then dispatch it to exactly one specialised downstream path. **Not:** supervisor (#12) — a router decides once and exits; a supervisor stays in the loop and re-decides after every worker turn. |
+| 3 | Parallelization (fan-out/fan-in) | Run N independent LLM calls concurrently on a statically known split (sectioning) or on the same input (voting), then aggregate in code. **Not:** orchestrator–workers (#4) — the subtasks are known before runtime; nothing is decomposed by a model. |
+| 4 | Orchestrator–workers | An LLM decomposes a task into subtasks at runtime, dispatches them to worker calls, and synthesises the results — in a single pass. **Not:** supervisor (#12) — workers are stateless function calls and there is no ongoing multi-turn delegation; **not** plan-and-execute (#7) — no re-planning on observed results. |
+| 5 | Evaluator–optimizer | A generator call and a *separate* evaluator call (prompted with an explicit rubric) loop until the evaluator passes or a budget runs out. **Not:** reflection (#8) — the evaluator is a distinct role with its own rubric, not the generator critiquing itself; **not** guardrailed generation (#11) — the check is a judgement of quality, not a deterministic validity test. |
+
+## Part 2 — Single-agent reasoning (one model drives control flow)
+
+| # | Pattern | One-line boundary |
+|---|---------|-------------------|
+| 6 | ReAct | Interleave explicit *Thought → Action → Observation* steps in one growing trace, so reasoning is grounded in each observation before the next action. **Not:** tool-use loop (#9) — ReAct is about the *reasoning trace* format and its interpretability; the tool-use loop is the *runtime mechanics* (schemas, dispatch, errors, stop conditions) that any agent needs, with or without visible thoughts. |
+| 7 | Plan-and-execute (with re-planning) | Produce an explicit multi-step plan up front, execute steps (often with a cheaper executor), and re-plan when observations invalidate the remaining plan. **Not:** ReAct (#6) — the plan is a first-class artefact decided before acting, not decided one step at a time; **not** orchestrator–workers (#4) — it revisits the plan. |
+| 8 | Reflection / self-critique | The same agent reviews its own output (or trajectory), writes a critique, and revises — no external judge. **Not:** evaluator–optimizer (#5) or critic–reviewer (#16) — those use a separate evaluator role; reflection is cheap, introspective, and shares the generator's blind spots. |
+| 9 | Tool-use loop | The canonical agent runtime: model emits a structured tool call → host validates and executes it → result is appended → repeat until the model emits a final answer or a step/cost limit trips. **Not:** ReAct (#6) — see above; this chapter owns tool schemas, error results, retries, and termination. |
+| 10 | Agentic RAG | The agent decides *whether, what, and where* to retrieve, judges relevance of what came back, and re-queries until evidence suffices — retrieval as a tool inside the loop. **Not:** classic RAG (retrieve-once-then-generate, the cheaper alternative); **not** memory tiers (#19) — RAG reads an external corpus the agent doesn't own; memory is the agent's own written history. |
+| 11 | Guardrailed generation | Generate → validate with deterministic checks (schema, policy, PII, citations) → repair with targeted error feedback, with a hard retry cap and safe fallback. **Not:** evaluator–optimizer (#5) — validators are code with pass/fail semantics, not an LLM's quality opinion.  |
+
+## Part 3 — Multi-agent coordination (several models, explicit roles)
+
+| # | Pattern | One-line boundary |
+|---|---------|-------------------|
+| 12 | Supervisor | One coordinating agent repeatedly chooses which specialist agent acts next, sees each result, and decides when the job is done (hub-and-spoke, multi-turn). **Not:** routing (#2) — it never exits after one decision; **not** hierarchical teams (#13) — exactly one level. |
+| 13 | Hierarchical teams | Supervisors of supervisors: a top-level lead delegates to team leads, each running its own sub-team, with summaries flowing up. **Not:** supervisor (#12) — the defining feature is ≥2 levels with scoped context per team. |
+| 14 | Sequential handoffs | Agents transfer *ownership* of a live task/conversation to the next agent via an explicit handoff object (state + reason), with no central coordinator. **Not:** prompt chaining (#1) — participants are agents with their own tools and instructions, and the handoff target can be chosen at runtime. |
+| 15 | Debate / peer critique | Two or more *peer* agents argue positions over rounds and a judge (or vote) resolves — used to surface disagreement and reduce single-model bias. **Not:** critic–reviewer (#16) — peers are symmetric and each can be right; there is no fixed author/reviewer hierarchy. |
+| 16 | Critic–reviewer loop | An *author* agent produces an artefact and a *reviewer* agent with different instructions/tools (e.g. can run tests) returns structured findings until approval. **Not:** evaluator–optimizer (#5) — both sides are full agents that can act with tools across turns, and findings are itemised review comments, not a score; **not** debate (#15) — roles are asymmetric. |
+| 17 | Human-in-the-loop | Pause execution at defined checkpoints (approve, edit, reject, answer) based on risk/confidence policy, persist state, and resume deterministically. **Not:** guardrailed generation (#11) — a human, not code, is the validator, and the system must survive waiting.  |
+| 18 | Swarm | Many peer agents with no central controller coordinate through local rules, shared state (blackboard), or peer handoffs; behaviour emerges. Chapter includes an honest **"when not to use"** section (usually: don't). **Not:** parallelization (#3) — agents interact and the workload is not fixed in advance; **not** sequential handoffs (#14) — many concurrent agents, not one owner at a time. |
+
+## Part 4 — Cross-cutting concerns (apply to any structure)
+
+| # | Pattern | One-line boundary |
+|---|---------|-------------------|
+| 19 | Memory tiers | Separate what the agent remembers by lifetime and access: working (in-context), short-term (session/episodic), long-term (semantic/procedural store) with explicit write, consolidate, and recall policies. **Not:** context management (#20) — memory is about *what is stored across time*; context management is about *what fits in this one call*. **Not:** agentic RAG (#10) — see above. |
+| 20 | Context management | Budget the context window per call: progressive disclosure (load detail only when needed), compaction (summarise old turns), pinning, and eviction. **Not:** memory tiers (#19) — compaction may write to memory, but this chapter owns the per-call token budget. |
+| 21 | Eval harness | Fixed datasets + deterministic scorers + (optional) LLM-judge scorers + regression reports, run offline against any pattern to decide whether a change is better. **Not:** evaluator–optimizer (#5) — that's a *runtime* loop improving one output; the harness is *development-time* measurement across many cases.  |
+
+
+## Overlap matrix
+
+| Confusable cluster | Dividing question | Answer → pattern |
+|---|---|---|
+| Evaluator–optimizer / Reflection / Critic–reviewer / Debate / Guardrailed generation | Who judges, and how? | Code → **#11** · same model → **#8** · separate rubric-driven call → **#5** · separate tool-using agent with itemised findings → **#16** · symmetric peers + judge → **#15** |
+| Routing / Supervisor | How many decisions? | One, then exit → **#2** · repeated, stays in loop → **#12** |
+| Parallelization / Orchestrator–workers / Swarm | Who splits the work? | Code, statically → **#3** · an LLM, once → **#4** · nobody centrally, emergent → **#18** |
+| Orchestrator–workers / Supervisor / Hierarchical / Plan-and-execute | Single pass vs. ongoing; levels; re-planning? | One pass, stateless workers → **#4** · ongoing, one level → **#12** · ≥2 levels → **#13** · single agent with re-planning → **#7** |
+| Prompt chaining / Sequential handoffs | Calls or agents? | Fixed calls in code → **#1** · agents transferring ownership → **#14** |
+| ReAct / Tool-use loop | Reasoning format or runtime mechanics? | Visible thought trace → **#6** · dispatch, validation, termination → **#9** |
+| Agentic RAG / Memory tiers / Context management | External corpus, own history, or this call's window? | **#10** · **#19** · **#20** |
+| Evaluator–optimizer / Eval harness | Runtime or development-time? | **#5** · **#21** |
+
+
+---
+
+
+
+<!-- ===== Appendix B — Exercise solutions ===== -->
 
 
 ---
@@ -2451,4 +4174,374 @@ Guardrailed generation — exercise solution
 ```
 
 **Discussion.** About one random 16-digit number in ten passes Luhn, so some order numbers will still be blocked. The false-positive rate drops tenfold, not to zero. If that matters, add a prefix check (card networks use known IIN ranges) or exempt numbers preceded by "order". The general lesson: a validator is code with its own error rates, so test it on real samples of valid output, not only on the bad cases it was written for.
+
+
+---
+
+# Solution — 12. Supervisor
+
+**Exercise.** Cut supervisor prompt growth without changing `Supervisor.run()`.
+
+**Approach.** Subclass and override only `_decide`. Give the supervisor a clipped copy of the history; workers still keep full results in shared state.
+
+```python
+class BriefingSupervisor(Supervisor):
+    def __init__(self, *a, max_chars: int = 80, **kw):
+        super().__init__(*a, **kw)
+        self.max_chars = max_chars
+
+    def _decide(self, task, run):
+        clipped = SupervisorRun(run.ok, run.final,
+                                [(w, i, o if len(o) <= self.max_chars else o[: self.max_chars] + "…")
+                                 for w, i, o in run.turns])
+        return super()._decide(task, clipped)
+```
+
+Run: `python3 code/patterns/supervisor/exercise_solution.py`
+
+<!-- expected-output: code/patterns/supervisor/exercise_solution.py -->
+```text
+Supervisor — exercise solution
+==============================
+[full history] ok=True turns=4 supervisor prompt tokens=1446
+[clipped history] ok=True turns=4 supervisor prompt tokens=523
+```
+
+**Discussion.** Same decisions, about a third of the prompt tokens. It works because the supervisor only needs to know *what happened*, not the full content; the analyst read prices from `state`. Clipping by character count is the bluntest tool. Better is to have each worker return a one-line status plus an artefact id, which is the summary contract from [hierarchical teams](../part-3-multi-agent/13-hierarchical-teams.md).
+
+
+---
+
+# Solution — 13. Hierarchical teams
+
+**Exercise.** Contain a worker exception inside its team.
+
+**Approach.** Wrap workers so that an exception becomes an error *result*. The team lead then sees `[error: …]` in its history and can decide what to do, here finishing with an unedited headline and saying so.
+
+```python
+def contained(worker):
+    def run(instruction, state):
+        try:
+            return worker(instruction, state)
+        except Exception as exc:
+            return f"[error: {type(exc).__name__}: {exc}]"
+    return run
+```
+
+Run: `python3 code/patterns/hierarchical_teams/exercise_solution.py`
+
+<!-- expected-output: code/patterns/hierarchical_teams/exercise_solution.py -->
+```text
+Hierarchical teams — exercise solution
+======================================
+[launch_lead → content_team] Write the launch headline
+[content_lead → writer] Draft
+[writer] Draft: Scheduled exports are here — set it once, get your report every Monday.
+[content_lead → editor] Tighten
+[editor] [error: TimeoutError: style-guide service unavailable]
+[content_lead] FINISH: Unedited headline (editor unavailable): 'Scheduled exports are here — set it once.'
+[content_team] Unedited headline (editor unavailable): 'Scheduled exports are here — set it once.'
+[launch_lead] FINISH: Launch copy ready (unedited).
+result: ok=True; launch_lead saw: "Unedited headline (editor unavailable): 'Scheduled exports are here — set it once.'"
+```
+
+**Discussion.** The fault stopped at the team boundary and the parent got a *truthful* summary ("unedited, editor unavailable"). The containment belongs at the worker boundary, not in `Supervisor.run`, so each team decides its own failure semantics. A team whose lead cannot finish still returns `[team failed: …]` through `team_as_worker`.
+
+
+---
+
+# Solution — 14. Sequential handoffs
+
+**Exercise.** Give an agent one chance to correct an invalid handoff target, without modifying the runtime.
+
+**Approach.** Wrap the agent's model. If its reply names a target outside the allowed set, re-ask once with the valid targets appended; otherwise pass the reply through. The runtime still enforces the graph, so a second invalid target escalates as before.
+
+```python
+class GraphAwareLLM:
+    def __init__(self, inner, allowed: frozenset[str]):
+        self.inner, self.allowed, self.corrections = inner, allowed, 0
+
+    def complete(self, prompt, system=""):
+        raw = self.inner.complete(prompt, system)
+        target = extract_json(raw).get("handoff_to")
+        if target is None or target in self.allowed:
+            return raw
+        self.corrections += 1
+        return self.inner.complete(f"{prompt}\nCORRECTION: '{target}' does not exist. "
+                                   f"Valid targets: {sorted(self.allowed)}.", system)
+```
+
+Run: `python3 code/patterns/sequential_handoffs/exercise_solution.py`
+
+<!-- expected-output: code/patterns/sequential_handoffs/exercise_solution.py -->
+```text
+Sequential handoffs — exercise solution
+=======================================
+-- without correction
+[escalate] technical tried to hand off to 'refunds' (not allowed)
+escalated=True, owner=technical
+-- with correction
+[technical ⇒ billing] refund request | summary: Wants refund for outage.
+[billing] Per our SLA I've applied a one-day service credit to your next invoice.
+escalated=False, owner=billing
+```
+
+**Discussion.** This is the repair idea from [guardrailed generation](../part-2-single-agent/11-guardrailed-generation.md) applied to a handoff: a precise error plus one retry, then the hard rule. Count corrections per agent. An agent that needs them often has a scope description that does not match the graph.
+
+
+---
+
+# Solution — 15. Debate
+
+**Exercise.** Detect a judge whose verdict depends on speaking order.
+
+**Approach.** Run the same debate twice with the debaters' order reversed. An argument-weighing judge decides the same way both times; a biased one flips.
+
+```python
+def order_robust(judge_llm, debaters, question):
+    a = debate(debaters, judge_llm, question)
+    b = debate(list(reversed(debaters)), judge_llm, question)
+    return a.decision == b.decision, a.decision, b.decision
+```
+
+Run: `python3 code/patterns/debate/exercise_solution.py`
+
+<!-- expected-output: code/patterns/debate/exercise_solution.py -->
+```text
+Debate — exercise solution
+==========================
+[argument-based judge] order-stable=True
+[recency-biased judge] order-stable=False ('Do not split yet' vs 'Split now') → escalate
+```
+
+**Discussion.** The check doubles the cost of a debate, so reserve it for decisions that matter, or run it on a sample to certify a judge model. The same trick catches position bias in [LLM-judge scorers](../part-4-cross-cutting/21-eval-harness.md) when comparing two candidate outputs: score A-then-B and B-then-A.
+
+
+---
+
+# Solution — 16. Critic–reviewer loop
+
+**Exercise.** Turn any test that passed before and fails now into an automatic blocking regression finding.
+
+**Approach.** Wrap the reviewer with memory of every test that has ever passed. Each review computes current results, flags regressions, and adds them to the reviewer's normal findings.
+
+```python
+class RegressionAwareReviewer:
+    def __init__(self, inner):
+        self.inner, self.ever_passed = inner, set()
+
+    def __call__(self, code):
+        now = results(code)
+        regressions = [i for i in self.ever_passed if not now[i]]
+        self.ever_passed |= {i for i, ok in now.items() if ok}
+        return self.inner(code) + [Finding(f"R{n}", "blocking", f"REGRESSION: {i!r} passed before, fails now")
+                                   for n, i in enumerate(sorted(regressions), 1)]
+```
+
+Run: `python3 code/patterns/critic_reviewer/exercise_solution.py`
+
+<!-- expected-output: code/patterns/critic_reviewer/exercise_solution.py -->
+```text
+Critic–reviewer — exercise solution
+===================================
+[review 1] F1[blocking] accents are not transliterated; F2[blocking] separators wrong: want single dashes between words, none at ends; F3[nit] add a docstring
+[author F1] fixed: addressed → noted
+[author F2] fixed: addressed → noted
+[author F3] fixed: addressed → noted
+[review 2] F2[blocking] separators wrong: want single dashes between words, none at ends; F3[nit] add a docstring; R1[blocking] REGRESSION: 'Hello World' passed before, fails now
+[author F2] fixed: addressed → noted
+[author F3] fixed: addressed → noted
+[author R1] fixed: addressed → noted
+[review 3] F3[nit] add a docstring
+result: approved=True in 3 rounds
+```
+
+**Discussion.** The regressing revision fixed accents but broke `'Hello World'`. Without memory, the reviewer would have reported only the current failures, and the author could have oscillated between two half-fixes indefinitely. Naming the finding `REGRESSION` matters: it tells the author that its last change caused the problem, which is the fastest route to the fix.
+
+
+---
+
+# Solution — 17. Human-in-the-loop
+
+**Exercise.** Require two different approvers for refunds above $500.
+
+**Approach.** Subclass `ReviewQueue` and override `decide`. For large refunds, approvals accumulate in a set of reviewer names, and the request only becomes `approved` at two distinct names. A rejection by anyone rejects immediately.
+
+```python
+class DualControlQueue(ReviewQueue):
+    def decide(self, rid, verdict, reviewer, edits=None, note=""):
+        req = self.get(rid)
+        needs_two = req["action"]["kind"] == "refund" and req["action"]["payload"]["amount"] > self.threshold
+        if not needs_two or verdict == "reject":
+            return super().decide(rid, verdict, reviewer, edits, note)
+        approvals = req.setdefault("approvals", [])
+        if reviewer not in approvals:
+            approvals.append(reviewer)
+        self._save()
+        if len(approvals) >= 2:
+            super().decide(rid, verdict, reviewer, edits, f"approved by {' + '.join(approvals)}")
+```
+
+Run: `python3 code/patterns/human_in_the_loop/exercise_solution.py`
+
+<!-- expected-output: code/patterns/human_in_the_loop/exercise_solution.py -->
+```text
+Human-in-the-loop — exercise solution
+=====================================
+[maya approves] status=pending approvals=['maya']
+[maya approves] status=pending approvals=['maya']
+[omar approves] status=approved approvals=['maya', 'omar']
+[resume] executed
+ledger: ['refund $900']
+```
+
+**Discussion.** Approvals persist with the request, so the two reviewers can act in different processes on different days. In production the reviewer identity must come from authentication, not a free-text field, or dual control is theatre. Also decide what an *edit* by the second approver means: the safest rule is that an edit resets the approvals.
+
+
+---
+
+# Solution — 18. Swarm
+
+**Exercise.** Make claims expire so that work held by a crashed agent returns to the board.
+
+**Approach.** Keep a logical clock (one tick per claim attempt) and the time each task was claimed. Before every claim, reopen tasks whose claim is older than the lease.
+
+```python
+class LeaseBoard(Blackboard):
+    def __init__(self, lease: int = 1, **kw):
+        super().__init__(**kw)
+        self.lease, self.clock, self.claimed_at, self.expired = lease, 0, {}, []
+
+    def claim(self, agent):
+        self.clock += 1
+        for t in self.tasks:  # reopen stale claims before looking for work
+            if t.status == "claimed" and self.clock - self.claimed_at.get(t.id, self.clock) > self.lease:
+                t.status, t.claimed_by = "open", None
+                self.expired.append(t.id)
+        task = super().claim(agent)
+        if task:
+            self.claimed_at[task.id] = self.clock
+        return task
+```
+
+Run: `python3 code/patterns/swarm/exercise_solution.py`
+
+<!-- expected-output: code/patterns/swarm/exercise_solution.py -->
+```text
+Swarm — exercise solution
+=========================
+[plain board] stalled: unfinished tasks, but no agent could make progress; done=2, unfinished=1
+[lease board] board empty; done=3, unfinished=0, expired claims=['T1']
+```
+
+**Discussion.** The first version used a lease of 3, and the swarm stalled *before* the lease expired, because no agent made a claim attempt to advance the clock. A logical clock only moves when someone acts. Real systems use wall-clock leases plus a janitor process, which is a small piece of central control. That is the recurring lesson of the swarm chapter: the fixes for swarm failure modes reintroduce coordination.
+
+
+---
+
+# Solution — 19. Memory tiers
+
+**Exercise.** Forget a fact completely, and keep it forgotten.
+
+**Approach.** Three parts. Remove the semantic fact (its history goes with it). Scrub episodic notes written about the key. Leave a tombstone, so that the write path can refuse silent re-adds while still allowing an explicit new request.
+
+```python
+def forget(store: Store, key: str) -> None:
+    store.semantic.pop(key, None)
+    store.episodic = [e for e in store.episodic if not e["text"].startswith(f"{key}=")]
+    store.episodic.append({"session": "-", "text": f"TOMBSTONE {key}"})
+    store.save()
+
+class RespectfulSemanticMemory(SemanticMemory):
+    def upsert(self, key, value, tags, source, session):
+        if any(e["text"] == f"TOMBSTONE {key}" for e in self.store.episodic) and "remember" not in source.lower():
+            return "blocked (user asked to forget)"
+        return super().upsert(key, value, tags, source, session)
+```
+
+Run: `python3 code/patterns/memory_tiers/exercise_solution.py`
+
+<!-- expected-output: code/patterns/memory_tiers/exercise_solution.py -->
+```text
+Memory tiers — exercise solution
+================================
+[after forget] semantic has allergy=False; episodic leaks=0
+[replayed extraction] blocked (user asked to forget)
+[explicit new request] added
+```
+
+**Discussion.** The tombstone records *that* something was forgotten, never *what*. The "remember" keyword check is a stand-in for real intent detection; in production, re-adding a forgotten fact should need an explicit user action in the UI. Remember also the copies outside the memory store: logs, caches and eval sets. A deletion request covers those too.
+
+
+---
+
+# Solution — 20. Context management
+
+**Exercise.** Keep identifiers verbatim through lossy compaction.
+
+**Approach.** Before turns are summarised, scan them for ticket-style ids and keep those in a pinned list. After the summarizer runs, append a `PINNED IDS:` line to the summary. The summarizer can paraphrase everything else.
+
+```python
+ID = re.compile(r"\b[A-Z]{2,6}-\d+\b")
+
+class PinningContextManager(ContextManager):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.pinned: list[str] = []
+
+    def _compact(self, transcript):
+        for turn in transcript[self.summarized_upto: max(0, len(transcript) - self.keep_recent)]:
+            self.pinned += [i for i in ID.findall(turn) if i not in self.pinned]
+        recent = super()._compact(transcript)
+        if self.pinned and "PINNED IDS" not in self.summary:
+            self.summary += f" PINNED IDS: {', '.join(self.pinned)}."
+        return recent
+```
+
+Run: `python3 code/patterns/context_management/exercise_solution.py`
+
+<!-- expected-output: code/patterns/context_management/exercise_solution.py -->
+```text
+Context management — exercise solution
+======================================
+[plain] CHG-881 in context=True, INC-4411 in context=False, tokens=177
+[pinning] CHG-881 in context=True, INC-4411 in context=True, tokens=182
+```
+
+**Discussion.** Five extra tokens buy the guarantee. Note that `CHG-881` survived even without pinning, but only by luck: a recent turn repeated it. Extend the pattern to amounts, dates and names that later steps depend on. The general rule is to never let a summarizer be the only keeper of a fact that a decision depends on.
+
+
+---
+
+# Solution — 21. Eval harness
+
+**Exercise.** Express the acceptance policy as data, including tag slices.
+
+**Approach.** A threshold key is `scorer` or `scorer@tag`. The gate computes each mean, using the tag slice where one is named, and returns a list of failures. An empty list means pass.
+
+```python
+def gate(report, thresholds: dict[str, float]) -> list[str]:
+    failures = []
+    for key, bar in thresholds.items():
+        scorer, _, tag = key.partition("@")
+        value = report.mean(scorer, tag or None)
+        if value < bar:
+            failures.append(f"{key} {value:.2f} < {bar:.2f}")
+    return failures
+
+THRESHOLDS = {"route_correct": 0.85, "route_correct@critical": 1.0, "llm_calls<=1": 1.0}
+```
+
+Run: `python3 code/patterns/eval_harness/exercise_solution.py`
+
+<!-- expected-output: code/patterns/eval_harness/exercise_solution.py -->
+```text
+Eval harness — exercise solution
+================================
+[v1] FAIL: route_correct 0.70 < 0.85
+[v2] FAIL: route_correct@critical 0.67 < 1.00
+[v3] PASS
+```
+
+**Discussion.** v1 fails on overall accuracy, v2 on the critical slice, and v3 passes both. The v3 fix (a keyword override for "invoice") came from reading the per-case report, which is the harness doing its real job: pointing at the exact case to fix. Keep thresholds in version control next to the cases, so that changing a bar is a reviewed change, not a quiet edit.
 

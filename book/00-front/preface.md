@@ -7,7 +7,7 @@ This book is a pattern catalog for systems built around language models. It foll
 Every chapter answers the same three questions.
 
 1. **Who decides the control flow?** In Part 1 your *code* decides; the model only fills in steps. In Part 2 a *single model* decides what happens next. In Part 3 *several models* with distinct roles coordinate. Each step to the right buys flexibility and costs predictability.
-2. **Who judges the output?** Deterministic code, the same model, a separate model, a peer, or a human. Many patterns differ only in this answer. The scope sheet's overlap table keeps them apart.
+2. **Who judges the output?** Deterministic code, the same model, a separate model, a peer, or a human. Many patterns differ only in this answer. The overlap table in [Appendix A](../appendix/boundaries.md) keeps them apart.
 3. **What is the cheaper alternative?** Every "when to use" section names the simpler thing you should try first and the signal that tells you it is no longer enough.
 
 ## The catalog at a glance
@@ -47,4 +47,4 @@ A mock model cannot show you how *often* a real model fails. It can show you *ho
 
 ## A note on names
 
-Pattern names in this field are not yet stable. Where a pattern is widely known by another name, the chapter lists it under **Also known as**. The boundaries in the scope sheet decide which chapter a technique belongs to, whatever it is called elsewhere.
+Pattern names in this field are not yet stable. Where a pattern is widely known by another name, the chapter lists it under **Also known as**. The boundaries in [Appendix A](../appendix/boundaries.md) decide which chapter a technique belongs to, whatever it is called elsewhere.

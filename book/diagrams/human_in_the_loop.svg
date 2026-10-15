@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" role="img" aria-labelledby="human_in_the_loop-t human_in_the_loop-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="human_in_the_loop-t">Human-in-the-loop structure</title>
+  <desc id="human_in_the_loop-d">An agent proposes an action. A code policy decides whether it needs a human. Safe actions execute. Risky ones go to a durable review queue. A reviewer approves, edits or rejects, possibly in a later process. Resume executes approved actions exactly once; undecided requests expire to rejected.</desc>
+  <defs>
+    <marker id="human_in_the_loop-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="300" fill="#FBF5EA"/>
+  <rect x="16" y="100" width="92" height="52" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="62.0" y="123.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">agent</text>
+  <text x="62.0" y="139.0" text-anchor="middle" font-size="11" fill="#7A6A5E">proposes action</text>
+  <path d="M108,126 L152,126" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#human_in_the_loop-ah)"/>
+  <polygon points="182,96 212,126 182,156 152,126" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="182" y="130" text-anchor="middle" font-size="10" fill="#3B2F2A">policy</text>
+  <text x="182" y="172" text-anchor="middle" font-size="10" fill="#7A6A5E">refund &gt; $100? irreversible?</text>
+  <text x="182" y="185" text-anchor="middle" font-size="10" fill="#7A6A5E">low confidence?</text>
+  <path d="M182,96 L182,46 L600,46" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#human_in_the_loop-ah)"/>
+  <text x="380" y="40" text-anchor="middle" font-size="10" fill="#6B7F5E">no rule fired → execute</text>
+  <path d="M212,126 L262,126" fill="none" stroke="#B5562E" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#human_in_the_loop-ah)"/>
+  <text x="237" y="118" text-anchor="middle" font-size="10" fill="#B5562E">risky</text>
+  <rect x="264" y="96" width="150" height="60" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="339.0" y="123.0" text-anchor="middle" font-size="13" fill="#3B2F2A">review queue</text>
+  <text x="339.0" y="139.0" text-anchor="middle" font-size="11" fill="#7A6A5E">JSON on disk</text>
+  <path d="M414,126 L452,126" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#human_in_the_loop-ah)"/>
+  <rect x="454" y="96" width="120" height="60" rx="10" fill="#F7E9C4" stroke="#B88A1E" stroke-width="1.5"/>
+  <text x="514.0" y="123.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">reviewer</text>
+  <text x="514.0" y="139.0" text-anchor="middle" font-size="11" fill="#7A6A5E">approve·edit·reject</text>
+  <path d="M574,126 L602,126" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#human_in_the_loop-ah)"/>
+  <rect x="604" y="90" width="140" height="72" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="674.0" y="131.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600"></text>
+  <text x="674" y="116" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">resume</text>
+  <text x="674" y="134" text-anchor="middle" font-size="11" fill="#7A6A5E">write-ahead mark</text>
+  <text x="674" y="150" text-anchor="middle" font-size="11" fill="#7A6A5E">execute exactly once</text>
+  <rect x="604" y="26" width="140" height="40" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="674.0" y="51.0" text-anchor="middle" font-size="12" fill="#3B2F2A">side effect</text>
+  <path d="M674,90 L674,68" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#human_in_the_loop-ah)"/>
+  <rect x="264" y="210" width="310" height="44" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="419.0" y="237.0" text-anchor="middle" font-size="11" fill="#3B2F2A" font-weight="600">deadline passed, undecided → expired (default deny)</text>
+  <path d="M339,156 L339,208" fill="none" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#human_in_the_loop-ah)"/>
+  <text x="16" y="290" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = code · Ochre = human · Dashed = data / failure path</text>
+</svg>

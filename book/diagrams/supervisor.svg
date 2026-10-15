@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" role="img" aria-labelledby="supervisor-t supervisor-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="supervisor-t">Supervisor structure</title>
+  <desc id="supervisor-d">A supervisor model delegates one instruction at a time to specialist worker agents. Every result returns to the supervisor, which decides again: another worker, or FINISH. Code enforces a turn budget, valid worker names and loop detection.</desc>
+  <defs>
+    <marker id="supervisor-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="300" fill="#FBF5EA"/>
+  <rect x="16" y="80" width="84" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="58.0" y="111.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Task</text>
+  <path d="M100,106 L138,106" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#supervisor-ah)"/>
+  <rect x="140" y="90" width="150" height="80" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="215.0" y="127.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">supervisor</text>
+  <text x="215.0" y="143.0" text-anchor="middle" font-size="11" fill="#7A6A5E">re-decides every turn</text>
+  <path d="M290,130 L400,130" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#supervisor-ah)"/>
+  <text x="345" y="122" text-anchor="middle" font-size="10" fill="#7A6A5E">one instruction</text>
+  <path d="M400,47 L400,183" fill="none" stroke="#5A4636" stroke-width="1.5"/>
+  <path d="M400,47 L468,47" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#supervisor-ah)"/>
+  <rect x="470" y="24" width="150" height="46" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="545.0" y="44.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">researcher</text>
+  <text x="545.0" y="60.0" text-anchor="middle" font-size="11" fill="#7A6A5E">finds facts</text>
+  <path d="M620,47 L650,47" fill="none" stroke="#B5562E" stroke-width="1.5"/>
+  <path d="M400,115 L468,115" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#supervisor-ah)"/>
+  <rect x="470" y="92" width="150" height="46" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="545.0" y="112.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">analyst</text>
+  <text x="545.0" y="128.0" text-anchor="middle" font-size="11" fill="#7A6A5E">computes</text>
+  <path d="M620,115 L650,115" fill="none" stroke="#B5562E" stroke-width="1.5"/>
+  <path d="M400,183 L468,183" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#supervisor-ah)"/>
+  <rect x="470" y="160" width="150" height="46" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="545.0" y="180.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">writer</text>
+  <text x="545.0" y="196.0" text-anchor="middle" font-size="11" fill="#7A6A5E">drafts</text>
+  <path d="M620,183 L650,183" fill="none" stroke="#B5562E" stroke-width="1.5"/>
+  <path d="M650,47 L650,226 L250,226 L250,172" fill="none" stroke="#B5562E" stroke-width="1.5" marker-end="url(#supervisor-ah)"/>
+  <text x="450" y="220" text-anchor="middle" font-size="10" fill="#B5562E">every result returns to the supervisor</text>
+  <path d="M140,160 L58,160 L58,194" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#supervisor-ah)"/>
+  <text x="100" y="154" text-anchor="middle" font-size="10" fill="#6B7F5E">FINISH</text>
+  <rect x="16" y="196" width="84" height="44" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="58.0" y="223.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Answer</text>
+  <rect x="130" y="240" width="220" height="32" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="240.0" y="261.0" text-anchor="middle" font-size="11" fill="#3B2F2A" font-weight="600">turn budget · valid worker · loop guard</text>
+  <text x="16" y="290" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = deterministic code · Dashed = data / failure path</text>
+</svg>
