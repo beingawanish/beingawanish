@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 290" role="img" aria-labelledby="tool_use_loop-t tool_use_loop-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="tool_use_loop-t">Tool-use loop structure</title>
+  <desc id="tool_use_loop-d">The model emits one structured call. The host validates it, asks for confirmation if the tool has side effects, executes it, and appends the result or the error as an observation. The host owns all stop conditions: final answer, step limit, and consecutive errors.</desc>
+  <defs>
+    <marker id="tool_use_loop-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="290" fill="#FBF5EA"/>
+  <rect x="16" y="106" width="84" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="58.0" y="137.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Task</text>
+  <path d="M100,132 L126,132" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#tool_use_loop-ah)"/>
+  <rect x="128" y="100" width="140" height="64" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="198.0" y="129.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">model</text>
+  <text x="198.0" y="145.0" text-anchor="middle" font-size="11" fill="#7A6A5E">{&quot;tool&quot;,&quot;args&quot;} or final</text>
+  <path d="M268,132 L300,132" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#tool_use_loop-ah)"/>
+  <polygon points="326,106 352,132 326,158 300,132" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="326" y="136" text-anchor="middle" font-size="10" fill="#3B2F2A">valid?</text>
+  <path d="M352,132 L384,132" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#tool_use_loop-ah)"/>
+  <polygon points="410,106 436,132 410,158 384,132" fill="#F7E9C4" stroke="#B88A1E" stroke-width="1.5"/>
+  <text x="410" y="136" text-anchor="middle" font-size="10" fill="#3B2F2A">confirm?</text>
+  <text x="410" y="176" text-anchor="middle" font-size="10" fill="#7A6A5E">side effects only</text>
+  <path d="M436,132 L466,132" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#tool_use_loop-ah)"/>
+  <rect x="468" y="106" width="120" height="52" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="528.0" y="129.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">execute</text>
+  <text x="528.0" y="145.0" text-anchor="middle" font-size="11" fill="#7A6A5E">tool registry</text>
+  <path d="M528,158 L528,220 L198,220 L198,166" fill="none" stroke="#B5562E" stroke-width="1.5" marker-end="url(#tool_use_loop-ah)"/>
+  <text x="363" y="240" text-anchor="middle" font-size="10" fill="#B5562E">result — or ERROR text — appended to the transcript</text>
+  <path d="M326,158 L326,220" fill="none" stroke="#B5562E" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <path d="M198,100 L198,52 L640,52 L640,104" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#tool_use_loop-ah)"/>
+  <text x="420" y="46" text-anchor="middle" font-size="10" fill="#6B7F5E">final</text>
+  <rect x="600" y="106" width="144" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="672.0" y="137.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Answer</text>
+  <rect x="600" y="186" width="144" height="50" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="672.0" y="208.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">host stops at</text>
+  <text x="672.0" y="224.0" text-anchor="middle" font-size="11" fill="#7A6A5E">steps · errors · budget</text>
+  <text x="16" y="280" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = code · Ochre = human · Dashed = data / failure path</text>
+</svg>

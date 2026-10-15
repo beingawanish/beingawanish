@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 250" role="img" aria-labelledby="reflection-t reflection-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="reflection-t">Reflection structure</title>
+  <desc id="reflection-d">One model drafts an answer, critiques its own draft, and revises. The loop stops when the critique reports no issues or after a small number of rounds. No external judge is involved.</desc>
+  <defs>
+    <marker id="reflection-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="250" fill="#FBF5EA"/>
+  <rect x="16" y="88" width="80" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="56.0" y="119.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Task</text>
+  <path d="M96,114 L124,114" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#reflection-ah)"/>
+  <rect x="126" y="82" width="130" height="64" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="191.0" y="111.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">draft</text>
+  <text x="191.0" y="127.0" text-anchor="middle" font-size="11" fill="#7A6A5E">same model</text>
+  <path d="M256,114 L296,114" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#reflection-ah)"/>
+  <rect x="298" y="82" width="150" height="64" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="373.0" y="111.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">self-critique</text>
+  <text x="373.0" y="127.0" text-anchor="middle" font-size="11" fill="#7A6A5E">same model, own draft</text>
+  <polygon points="500,90 524,114 500,138 476,114" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="500" y="118" text-anchor="middle" font-size="10" fill="#3B2F2A">issues?</text>
+  <path d="M448,114 L474,114" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#reflection-ah)"/>
+  <path d="M524,114 L610,114" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#reflection-ah)"/>
+  <text x="566" y="106" text-anchor="middle" font-size="10" fill="#6B7F5E">NO ISSUES</text>
+  <rect x="612" y="88" width="132" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="678.0" y="119.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Answer</text>
+  <rect x="298" y="178" width="150" height="46" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="373.0" y="198.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">revise</text>
+  <text x="373.0" y="214.0" text-anchor="middle" font-size="11" fill="#7A6A5E">fix every point</text>
+  <path d="M500,138 L500,201 L450,201" fill="none" stroke="#B5562E" stroke-width="1.5" marker-end="url(#reflection-ah)"/>
+  <text x="512" y="172" text-anchor="start" font-size="10" fill="#B5562E">yes</text>
+  <path d="M298,201 L191,201 L191,148" fill="none" stroke="#B5562E" stroke-width="1.5" marker-end="url(#reflection-ah)"/>
+  <text x="620" y="200" text-anchor="middle" font-size="11" fill="#B5562E">shares the drafter&#x27;s blind spots</text>
+  <text x="16" y="240" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call (all the same model) · Sage = code · Dashed = data</text>
+</svg>
