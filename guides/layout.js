@@ -21,7 +21,10 @@
   var side = document.createElement('nav');
   side.className = 'side';
   side.setAttribute('aria-label', 'Contents');
-  var html = '<p class="brand-s">CCAR-P Preparation Guide</p><p class="sub">Claude Certified Architect — Professional</p><ol>';
+  var full = (document.querySelector('#title-block-header .title') || {}).textContent || document.title;
+  var m0 = full.match(/^(.*?)\s*\((CCAR-[A-Z])\)/);
+  var html = '<p class="brand-s">' + (m0 ? m0[2] + ' Preparation Guide' : document.title) + '</p><p class="sub">' +
+             (m0 ? m0[1].replace(/\s*[—–-]\s*/, ' — ') : '') + '</p><ol>';
   h1s.forEach(function (h) {
     html += '<li class="ch" data-ch="' + h.id + '"><a href="#' + h.id + '"><span class="n">' + (h.dataset.n || '') +
             '</span>' + (h.dataset.short || h.textContent) + '</a><ol class="secs">';

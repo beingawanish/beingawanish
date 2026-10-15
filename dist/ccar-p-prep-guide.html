@@ -379,6 +379,7 @@ details.answer > p:last-child{ margin-bottom:14px; }
 .dg-langbar{ flex-wrap:wrap; max-width:100%; }
 @media (max-width:980px){ .doc table{ display:block; overflow-x:auto; max-width:100%; } .doc pre, .doc .sourceCode{ max-width:100%; } }
 @media (max-width:980px){ .doc{ overflow-x:hidden; } .doc pre{ overflow-x:auto; } }
+.doc{ min-width:0; } .doc table{ display:block; overflow-x:auto; max-width:100%; }
 
 </style>
 </head>
@@ -27675,7 +27676,10 @@ Caching beats not caching when <i>c &lt; 1</i>, which solves to <i>e<sup>&minus;
   var side = document.createElement('nav');
   side.className = 'side';
   side.setAttribute('aria-label', 'Contents');
-  var html = '<p class="brand-s">CCAR-P Preparation Guide</p><p class="sub">Claude Certified Architect — Professional</p><ol>';
+  var full = (document.querySelector('#title-block-header .title') || {}).textContent || document.title;
+  var m0 = full.match(/^(.*?)\s*\((CCAR-[A-Z])\)/);
+  var html = '<p class="brand-s">' + (m0 ? m0[2] + ' Preparation Guide' : document.title) + '</p><p class="sub">' +
+             (m0 ? m0[1].replace(/\s*[—–-]\s*/, ' — ') : '') + '</p><ol>';
   h1s.forEach(function (h) {
     html += '<li class="ch" data-ch="' + h.id + '"><a href="#' + h.id + '"><span class="n">' + (h.dataset.n || '') +
             '</span>' + (h.dataset.short || h.textContent) + '</a><ol class="secs">';

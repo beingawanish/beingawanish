@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Rewrite pipeline for the CCAR-P prep guide.
 
-    python3 guides/ccar-p/guide.py extract 01     # dump chapter 01's prose blocks to work/ch01.json
-    python3 guides/ccar-p/guide.py check          # fact-check every rewrite against its original
-    python3 guides/ccar-p/guide.py build          # apply rewrites + new layout -> dist/ccar-p-prep-guide.html
+    python3 guides/guide.py ccar-p extract 01   # dump chapter 01's prose blocks to guides/ccar-p/work/ch01.json
+    python3 guides/guide.py ccar-p check        # fact-check every rewrite against its original
+    python3 guides/guide.py ccar-p build        # apply rewrites + layout -> dist/ccar-p-prep-guide.html
+
+Each guide lives in guides/<name>/: source/<name>-prep-guide.original.html and rewrites/chNN.json.
+The readability layer (layout.css, layout.js) is shared by all guides.
 
 Only prose is rewritten: single-line <p> and <li> blocks outside code, SVG and tables.
 Figures, tables, code, formulas and headings are copied byte-for-byte.
@@ -28,11 +31,13 @@ import sys
 from collections import Counter
 
 HERE = pathlib.Path(__file__).resolve().parent
-ROOT = HERE.parents[1]
-SOURCE = HERE / "source" / "ccar-p-prep-guide.original.html"
-REWRITES = HERE / "rewrites"
-WORK = HERE / "work"
-OUT = ROOT / "dist" / "ccar-p-prep-guide.html"
+ROOT = HERE.parent
+NAME = sys.argv[1] if len(sys.argv) > 1 else "ccar-p"
+GUIDE = HERE / NAME
+SOURCE = GUIDE / "source" / f"{NAME}-prep-guide.original.html"
+REWRITES = GUIDE / "rewrites"
+WORK = GUIDE / "work"
+OUT = ROOT / "dist" / f"{NAME}-prep-guide.html"
 
 H1 = re.compile(r'^<h1 id="(\d\d)--')
 BLOCK = re.compile(r"^(<(p|li)(?: class=\"[^\"]*\")?>)(.*)(</\2>)\s*$")
@@ -161,7 +166,7 @@ def cmd_build() -> None:
         for i, open_tag, inner, close in list(blocks(lines, s, e)):
             new = rw.get(block_id(inner))
             if new is not None:
-                lines[i] = f"{open_tag}{new}{close}"
+                lines[i] = f"{open_tag}{new}{close}".replace(f"{open_tag}</p>", "").replace("<p></p>", "")
                 applied += 1
     doc = "\n".join(lines)
     # Answer options are lettered A-D in every answer key: show them as letters.
@@ -182,7 +187,7 @@ def cmd_build() -> None:
 
 
 if __name__ == "__main__":
-    cmd, *rest = sys.argv[1:] or ["build"]
+    cmd, *rest = sys.argv[2:] or ["build"]
     if cmd == "extract":
         cmd_extract(rest[0])
     elif cmd == "check":
