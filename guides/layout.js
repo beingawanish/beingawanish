@@ -9,7 +9,10 @@
   // Chapter number badge: "01 · Title" -> data-num="CHAPTER 01", text "Title"
   h1s.forEach(function (h) {
     var m = h.textContent.match(/^(\d\d) · (.*)$/);
-    if (m) { h.setAttribute('data-num', 'CHAPTER ' + m[1]); h.dataset.short = m[2]; h.dataset.n = m[1]; h.textContent = m[2]; }
+    if (m) { h.setAttribute('data-num', 'CHAPTER ' + m[1]); h.dataset.short = m[2]; h.dataset.n = m[1]; h.textContent = m[2]; return; }
+    // "Module 3 — Title" / "Capstone 2 — Title" -> data-num="MODULE 3", text "Title"
+    m = h.textContent.replace(/\s+/g, ' ').trim().match(/^(?:\d+\.\s*)?(Module|Capstone) (\d+) [—–-] (.*)$/);
+    if (m) { h.setAttribute('data-num', m[1].toUpperCase() + ' ' + m[2]); h.dataset.short = m[3]; h.dataset.n = (m[1] === 'Capstone' ? 'C' : 'M') + m[2]; h.textContent = m[3]; }
   });
   // Section number chips: "03 Title" -> <span class=secnum>03</span>Title
   doc.querySelectorAll('h2[id]').forEach(function (h) {
@@ -23,8 +26,9 @@
   side.setAttribute('aria-label', 'Contents');
   var full = (document.querySelector('#title-block-header .title') || {}).textContent || document.title;
   var m0 = full.match(/^(.*?)\s*\((CCAR-[A-Z])\)/);
-  var html = '<p class="brand-s">' + (m0 ? m0[2] + ' Preparation Guide' : document.title) + '</p><p class="sub">' +
-             (m0 ? m0[1].replace(/\s*[—–-]\s*/, ' — ') : '') + '</p><ol>';
+  var m1 = full.replace(/\s+/g, ' ').match(/^([^:]+):\s*(.*)$/);
+  var html = '<p class="brand-s">' + (m0 ? m0[2] + ' Preparation Guide' : m1 ? m1[1] : document.title) + '</p><p class="sub">' +
+             (m0 ? m0[1].replace(/\s*[—–-]\s*/, ' — ') : m1 ? m1[2] : '') + '</p><ol>';
   h1s.forEach(function (h) {
     html += '<li class="ch" data-ch="' + h.id + '"><a href="#' + h.id + '"><span class="n">' + (h.dataset.n || '') +
             '</span>' + (h.dataset.short || h.textContent) + '</a><ol class="secs">';

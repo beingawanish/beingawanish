@@ -34,10 +34,10 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 NAME = sys.argv[1] if len(sys.argv) > 1 else "ccar-p"
 GUIDE = HERE / NAME
-SOURCE = GUIDE / "source" / f"{NAME}-prep-guide.original.html"
+SOURCE = next((GUIDE / "source").glob("*.original.html"))
 REWRITES = GUIDE / "rewrites"
 WORK = GUIDE / "work"
-OUT = ROOT / "dist" / f"{NAME}-prep-guide.html"
+OUT = ROOT / "dist" / SOURCE.name.replace(".original", "")
 
 H1 = re.compile(r'^<h1 id="(\d\d)--')
 BLOCK = re.compile(r"^(<(p|li)(?: class=\"[^\"]*\")?>)(.*)(</\2>)\s*$")
@@ -46,7 +46,13 @@ PROTECT_CLOSE = {"pre": "</pre>", "svg": "</svg>", "table": "</table>", "code cl
 
 
 def load() -> list[str]:
-    return SOURCE.read_text().split("\n")
+    text = SOURCE.read_text()
+    fixes = GUIDE / "prose_fixes.py"  # optional sentence-level edits for guides not rewritten block by block
+    if fixes.exists():
+        ns: dict = {}
+        exec(compile(fixes.read_text(), str(fixes), "exec"), ns)
+        text = ns["apply"](text)
+    return text.split("\n")
 
 
 def chapters(lines: list[str]) -> dict[str, tuple[int, int]]:
