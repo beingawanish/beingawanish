@@ -117,7 +117,7 @@ def missing(orig: str, new: str) -> list[str]:
 
 def all_rewrites() -> dict[str, str]:
     merged: dict[str, str] = {}
-    for f in sorted(REWRITES.glob("ch*.json")):
+    for f in sorted(REWRITES.glob(f"ch{only or '*'}.json")):
         merged.update(json.loads(f.read_text()))
     return merged
 
@@ -128,19 +128,20 @@ def cmd_extract(num: str) -> None:
     lines = load()
     s, e = chapters(lines)[num]
     WORK.mkdir(exist_ok=True)
-    data = {block_id(inner): inner for _, _, inner, _ in blocks(lines, s, e)}
+    data = {block_id(inner): {"tag": open_tag[1:3].strip(">"), "html": inner}
+            for _, open_tag, inner, _ in blocks(lines, s, e)}
     path = WORK / f"ch{num}.json"
     path.write_text(json.dumps(data, indent=1, ensure_ascii=False))
-    words = sum(len(re.sub(r"<[^>]+>", "", v).split()) for v in data.values())
+    words = sum(len(re.sub(r"<[^>]+>", "", v["html"]).split()) for v in data.values())
     print(f"{path.relative_to(ROOT)}: {len(data)} blocks, {words} words")
 
 
-def cmd_check() -> int:
+def cmd_check(only: str | None = None) -> int:
     lines = load()
     originals = {block_id(inner): inner for num, (s, e) in chapters(lines).items()
                  for _, _, inner, _ in blocks(lines, s, e)}
     problems = 0
-    for f in sorted(REWRITES.glob("ch*.json")):
+    for f in sorted(REWRITES.glob(f"ch{only or '*'}.json")):
         rw = json.loads(f.read_text())
         bad = 0
         for bid, new in rw.items():
@@ -191,6 +192,6 @@ if __name__ == "__main__":
     if cmd == "extract":
         cmd_extract(rest[0])
     elif cmd == "check":
-        sys.exit(cmd_check())
+        sys.exit(cmd_check(rest[0] if rest else None))
     else:
         cmd_build()
