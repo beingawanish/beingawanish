@@ -92,8 +92,8 @@ NUM = re.compile(r"(?<![\w.])[$€£]?\d[\d,]*(?:\.\d+)?%?(?![\w])")
 
 
 def facts(inner: str) -> dict[str, Counter]:
-    text = html.unescape(re.sub(r"<code>.*?</code>", " ", inner))
-    plain = re.sub(r"<[^>]+>", " ", text)
+    # Strip tags before unescaping, so a literal "&lt;" in prose is not read as a tag.
+    plain = html.unescape(re.sub(r"<[^>]+>", " ", re.sub(r"<code>.*?</code>", " ", inner)))
     return {
         "numbers": Counter(n.rstrip(",") for n in NUM.findall(plain)),
         "code": Counter(re.findall(r"<code>(.*?)</code>", inner)),
