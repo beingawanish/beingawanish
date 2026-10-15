@@ -1,0 +1,16 @@
+Human-in-the-loop
+=================
+-- process 1 (hour 0): agent proposes actions
+[executed] refund {'customer': 'sam', 'amount': 20} auto: no policy rule fired
+[pending] refund {'customer': 'lee', 'amount': 140} R001 refund $140 > $100
+[pending] close_account {'customer': 'kim'} R002 irreversible action
+[pending] refund {'customer': 'ana', 'amount': 35} R003 low confidence 0.55
+-- process 2 (hour 3): reviewer works the queue
+[pending] R001, R002, R003
+[resume R001] executed — edit by maya
+[resume R002] rejected — customer has open dispute
+[resume R001] already-executed — idempotent: not re-run
+-- process 3 (hour 30): nobody decided R003
+[expired] R003
+[resume R003] expired — default deny
+ledger: refund(amount=20, customer=sam) | refund(amount=100, customer=lee)

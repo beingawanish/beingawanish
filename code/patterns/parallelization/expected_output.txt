@@ -1,0 +1,13 @@
+Parallelization
+===============
+-- sectioning: three independent guardrail checks on a draft reply
+[check:tone] pass=True — warm and professional
+[check:policy] pass=False — promises a refund above the $50 agent limit
+[check:facts] pass=True — order number and dates match the record
+[fan-in] approved=False
+[timing] parallel faster than sequential: True
+-- voting: three judges on one email
+[judge:A] PHISHING
+[judge:B] PHISHING
+[judge:C] discarded ("I'm not sure, it could be either.")
+[fan-in] verdict=PHISHING agreement=1.00 from 2 usable votes

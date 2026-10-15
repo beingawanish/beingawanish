@@ -1,0 +1,7 @@
+Prompt chaining — exercise solution
+===================================
+[extract] v2.5 | - Bulk edit for tasks | - Calendar sync
+[gate:extract] pass
+[draft] Version 2.5 brings bulk edit (JIRA-412) and calendar sync (JIRA-418)!
+[gate:draft] STOP — internal ticket id(s) leaked: JIRA-412, JIRA-418
+result: ok=False stopped_at=draft; calls=2
