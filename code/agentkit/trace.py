@@ -6,12 +6,15 @@ import threading
 
 
 class Trace:
-    def __init__(self, title: str) -> None:
+    def __init__(self, title: str, width: int | None = None) -> None:
         self.title = title
+        self.width = width  # truncate step details longer than this (None = never)
         self.lines: list[str] = []
         self._lock = threading.Lock()
 
     def step(self, label: str, detail: str = "") -> None:
+        if self.width and len(detail) > self.width:
+            detail = detail[: self.width - 1].rstrip() + "…"
         line = f"[{label}] {detail}".rstrip()
         with self._lock:
             self.lines.append(line)

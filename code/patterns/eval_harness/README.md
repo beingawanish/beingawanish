@@ -7,7 +7,7 @@ Fixed cases + scorers → report; per-case comparison decides ship or block.
 | Implementation | [`harness.py`](harness.py) |
 | Demo | [`main.py`](main.py) |
 | Exercise solution | — (with its chapter) |
-| Chapter | — (written in its assigned part) |
+| Chapter | [`book/part-4-cross-cutting/21-eval-harness.md`](../../../book/part-4-cross-cutting/21-eval-harness.md) |
 
 Python 3.10+, standard library only, offline. The model is `agentkit.MockLLM`, so output is deterministic.
 
@@ -36,6 +36,6 @@ comparison:
   verdict:    BLOCK — 1 critical regression(s)
 ```
 
-> **Canonical module.** Built early for the support-triage capstone, which imports it. Its chapter is written in its assigned part.
+> **Reused, not copied:** the support-triage capstone imports this module.
 
 Verified by `python3 code/verify.py eval_harness`.

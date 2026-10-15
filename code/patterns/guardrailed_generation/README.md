@@ -6,8 +6,8 @@ Generate → validate with deterministic code → repair with targeted errors; s
 |---|---|
 | Implementation | [`guardrails.py`](guardrails.py) |
 | Demo | [`main.py`](main.py) |
-| Exercise solution | — (with its chapter) |
-| Chapter | — (written in its assigned part) |
+| Exercise solution | [`exercise_solution.py`](exercise_solution.py) |
+| Chapter | [`book/part-2-single-agent/11-guardrailed-generation.md`](../../../book/part-2-single-agent/11-guardrailed-generation.md) |
 
 Python 3.10+, standard library only, offline. The model is `agentkit.MockLLM`, so output is deterministic.
 
@@ -35,6 +35,6 @@ result: ok=True attempts=3 reply='Refunded $45 to your card. Sorry for the troub
 result: ok=False attempts=3 used_fallback=True tags=['needs-human']
 ```
 
-> **Canonical module.** Built early for the support-triage capstone, which imports it. Its chapter is written in its assigned part.
+> **Reused, not copied:** the support-triage capstone imports this module.
 
 Verified by `python3 code/verify.py guardrailed_generation`.

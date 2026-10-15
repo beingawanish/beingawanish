@@ -35,4 +35,6 @@ Routing
 classifier calls: 3 of 5 tickets
 ```
 
+> **Reused, not copied:** the support-triage capstone imports this module.
+
 Verified by `python3 code/verify.py routing`.

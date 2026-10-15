@@ -35,4 +35,6 @@ Parallelization
 [fan-in] verdict=PHISHING agreement=1.00 from 2 usable votes
 ```
 
+> **Reused, not copied:** the support-triage capstone imports this module.
+
 Verified by `python3 code/verify.py parallelization`.

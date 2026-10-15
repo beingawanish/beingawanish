@@ -1,0 +1,4 @@
+ReAct — exercise solution
+=========================
+[tool-using run] answer='Lisbon — currently 21°C and sunny.' grounded=True
+[from-memory run] answer='Berlin — 18°C and cloudy.' grounded=False unsupported=['Berlin', '18']

@@ -7,7 +7,7 @@ Pause risky actions at a policy checkpoint, persist state, resume exactly once.
 | Implementation | [`hitl.py`](hitl.py) |
 | Demo | [`main.py`](main.py) |
 | Exercise solution | — (with its chapter) |
-| Chapter | — (written in its assigned part) |
+| Chapter | [`book/part-3-multi-agent/17-human-in-the-loop.md`](../../../book/part-3-multi-agent/17-human-in-the-loop.md) |
 
 Python 3.10+, standard library only, offline. The model is `agentkit.MockLLM`, so output is deterministic.
 
@@ -38,6 +38,6 @@ Human-in-the-loop
 ledger: refund(amount=20, customer=sam) | refund(amount=100, customer=lee)
 ```
 
-> **Canonical module.** Built early for the support-triage capstone, which imports it. Its chapter is written in its assigned part.
+> **Reused, not copied:** the support-triage capstone imports this module.
 
 Verified by `python3 code/verify.py human_in_the_loop`.

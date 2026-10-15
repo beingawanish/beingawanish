@@ -1,0 +1,5 @@
+Reflection — exercise solution
+==============================
+[without lessons] tests pass=False
+[stored] Lesson: month-length code must handle February in leap years.
+[with lessons] tests pass=True

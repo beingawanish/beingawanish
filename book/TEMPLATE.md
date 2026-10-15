@@ -1,4 +1,4 @@
-# Chapter template (pilot draft — not locked until approved at Gate 2)
+# Chapter template — LOCKED (approved at Gate 2)
 
 Every pattern chapter uses these sections, in this order, with these exact headings.
 Section 3 (design concept & theory) and section 6 (trade-off analysis & usage guidance) were added at your request during the pilot.

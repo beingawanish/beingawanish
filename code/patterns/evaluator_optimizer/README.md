@@ -39,4 +39,6 @@ result: passed=False rounds=2 stop=stalled -> escalate to a human
 total model calls: 10
 ```
 
+> **Reused, not copied:** the deep-research capstone imports this module.
+
 Verified by `python3 code/verify.py evaluator_optimizer`.

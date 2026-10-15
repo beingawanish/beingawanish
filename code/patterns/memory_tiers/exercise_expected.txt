@@ -1,0 +1,5 @@
+Memory tiers — exercise solution
+================================
+[after forget] semantic has allergy=False; episodic leaks=0
+[replayed extraction] blocked (user asked to forget)
+[explicit new request] added

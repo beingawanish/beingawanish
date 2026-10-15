@@ -1,6 +1,6 @@
 # Agentic Design Patterns — Scope Sheet (Gate 1: Inventory Lock)
 
-Status: **DRAFT — awaiting approval.** No chapters or code are written until this sheet is approved.
+Status: **APPROVED (Gate 1).** Slugs, Python 3.10+, and the feature branch were confirmed.
 Pattern list is exactly as specified (21 patterns, 4 parts). No additions, cuts, or renames are proposed.
 
 ## How to read the boundaries
