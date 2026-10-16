@@ -34,3 +34,11 @@ For each chapter: write the JSON (in chunks if large, merging into the same file
 lost fact, never by dropping the block's rewrite silently. Don't edit any other file. Don't run git.
 
 Report back: per chapter, blocks rewritten / total, and check result.
+
+## Lessons from earlier runs
+
+- Work only in your own scratch subfolder (named in your assignment). Never write shared files such as
+  `scratchpad/merge.py`; parallel agents have overwritten each other's helpers before.
+- The bold check is case-sensitive: don't capitalise a bold term at the start of a list item; reword instead.
+- Numbered markers like "(1)" or "Step 3" count as numbers. Keep them in the text when you make a list.
+- Keep closing punctuation outside `<b>…</b>` as in the original.
