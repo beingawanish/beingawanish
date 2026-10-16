@@ -235,6 +235,11 @@ TEXT_EDITS: list[tuple[str, str, int]] = [
         '<h2 id="the-checklist-revisited">The checklist, revisited</h2>',
         1,
     ),
+    (
+        "These six problems were almost always the second case.",
+        "The problems in this guide were almost always the second case.",
+        1,
+    ),
     # ---- Outro: where to go next ------------------------------------------------------
     (
         "<p>Two problems from your original list did not make this guide: <strong>ride sharing</strong> and the <strong>calendar/meeting scheduler</strong>. They are your next two type-alongs, and they are chosen deliberately — each one is a combination of moves you already own.</p>",
