@@ -3,7 +3,7 @@
 <p>Chapter 3 built one intersection. This chapter builds the city around it. There are many intersections now, joined by roads, each with its own controller. A central traffic management centre pushes timing plans out and receives telemetry back. Signals along a main road are coordinated so that a car at the right speed meets green after green. Ambulances get green lights ahead of them. Incidents close lanes. And when the radio link to a controller dies, which happens every day in a real city, that controller has to keep its junction safe on its own.</p>
 <p>The Chapter 3 state machine is still the core. What changes is everything that talks to it.</p>
 <h2 id="ch07-1-the-problem">1. The problem</h2>
-<p>A city runs a network of signalised intersections. Each one has two crossing movements, north-south (NS) and east-west (EW), and a controller that cycles green, yellow and all-red between them. How long each green lasts comes from a timing plan, and there are three kinds: a fixed-time plan, an adaptive plan that reads vehicle-count sensors, and a time-of-day plan that switches between the two by the clock.</p>
+<p>A city runs a network of signalised intersections. Each one has two crossing movements, north-south (NS) and east-west (EW), and a controller that cycles green, yellow and all-red between them. How long each green lasts comes from a timing plan. There are three kinds: fixed-time, adaptive (it reads vehicle-count sensors), and time-of-day, which switches between plans by the clock.</p>
 <p>A central Traffic Management Center (TMC) owns the city view. It pushes plans to controllers, coordinates a corridor into a green wave, preempts signals along an emergency vehicle's route, and records lane closures from incidents. Controllers send their phase changes and mode changes back as telemetry. If a controller stops hearing from the centre, it falls back to a safe local fixed-time plan. If its own hardware reports a fault, it drops to flashing red, an all-way stop, until a technician resets it.</p>
 <p>Everything runs on a simulated clock that moves one second at a time. Same inputs, same outputs, every run.</p>
 <h2 id="ch07-2-requirements">2. Requirements</h2>
@@ -40,11 +40,6 @@
 </ul>
 <h2 id="ch07-3-from-nouns-to-classes">3. From nouns to classes</h2>
 <table>
-<colgroup>
-<col style="width: 33%" />
-<col style="width: 33%" />
-<col style="width: 33%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>Noun in the problem</th>
@@ -128,10 +123,122 @@
 <h2 id="ch07-4-class-diagram">4. Class diagram</h2>
 <div style="overflow-x:auto">
 <svg role="img" aria-labelledby="ch07-title ch07-desc" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 720" style="min-width:960px;max-width:100%;height:auto;background:#faf7f0">
-<title id="ch07-title">
-Traffic management class diagram
-</title>
-<desc id="ch07-desc">TrafficSimulation steps the TrafficManagementCenter and every IntersectionController. The centre sends commands to controllers and routes over the RoadNetwork. Each controller asks a TimingStrategy for its green split, reads ApproachQueues, and publishes telemetry through an Uplink to the EventBus, which notifies the centre. GreenWaveDesigner reads the RoadNetwork and builds CoordinatedPlans. FixedTimePlan, AdaptivePlan, TimeOfDayPlan and CoordinatedPlan implement TimingStrategy.</desc> <defs> <marker id="ch07-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#6b7280"/></marker> <marker id="ch07-tri" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" orient="auto-start-reverse"><path d="M1,1 L11,6 L1,11 z" fill="#faf7f0" stroke="#6b7280" stroke-width="1.2"/></marker> </defs> <rect x="0" y="0" width="960" height="720" fill="#faf7f0"/> <g stroke="#6b7280" stroke-width="1.5" fill="none"> <line x1="225" y1="70" x2="370" y2="70" marker-end="url(#ch07-arr)"/> <path d="M225,120 H312 Q320,120 320,128 L320,292 Q320,300 328,300 L370,300" marker-end="url(#ch07-arr)"/> <line x1="480" y1="154" x2="480" y2="230" marker-end="url(#ch07-arr)"/> <line x1="590" y1="84" x2="735" y2="84" marker-end="url(#ch07-arr)"/> <line x1="835" y1="230" x2="835" y2="144" marker-end="url(#ch07-arr)"/> <line x1="745" y1="330" x2="745" y2="600" marker-end="url(#ch07-arr)"/> <path d="M370,350 H312 Q304,350 304,358 L304,482 Q304,490 296,490 L225,490" marker-end="url(#ch07-arr)"/> <line x1="125" y1="440" x2="125" y2="330" marker-end="url(#ch07-arr)"/> <path d="M175,230 L175,176 Q175,168 183,168 L308,168 A12,12 0 0 1 332,168 L392,168 Q400,168 400,160 L400,154" marker-end="url(#ch07-arr)"/> <line x1="480" y1="380" x2="480" y2="450" marker-end="url(#ch07-arr)"/> <path d="M590,340 H650 Q658,340 658,348 L658,482 Q658,490 666,490 L733,490 A12,12 0 0 1 757,490 L760,490" marker-end="url(#ch07-arr)"/> <path d="M292,600 L292,573 Q292,565 300,565 L704,565 Q712,565 712,573 L712,600"/> <line x1="432" y1="565" x2="432" y2="600"/> <line x1="572" y1="565" x2="572" y2="600"/> <line x1="480" y1="565" x2="480" y2="530" marker-end="url(#ch07-tri)"/> </g> <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563"> <rect x="272" y="52" width="50" height="17" fill="#faf7f0"/><text x="297" y="65" text-anchor="middle">STEPS</text> <rect x="296" y="196" width="48" height="17" fill="#faf7f0"/><text x="320" y="209" text-anchor="middle">STEPS</text> <rect x="446" y="183" width="68" height="17" fill="#faf7f0"/><text x="480" y="196" text-anchor="middle">COMMANDS</text> <rect x="637" y="66" width="50" height="17" fill="#faf7f0"/><text x="662" y="79" text-anchor="middle">ROUTES</text> <rect x="811" y="178" width="48" height="17" fill="#faf7f0"/><text x="835" y="191" text-anchor="middle">READS</text> <rect x="718" y="374" width="54" height="17" fill="#faf7f0"/><text x="745" y="387" text-anchor="middle">BUILDS</text> <rect x="272" y="406" width="64" height="17" fill="#faf7f0"/><text x="304" y="419" text-anchor="middle">PUBLISHES</text> <rect x="95" y="377" width="60" height="17" fill="#faf7f0"/><text x="125" y="390" text-anchor="middle">FORWARDS</text> <rect x="224" y="150" width="60" height="17" fill="#faf7f0"/><text x="254" y="163" text-anchor="middle">NOTIFIES</text> <rect x="456" y="406" width="48" height="17" fill="#faf7f0"/><text x="480" y="419" text-anchor="middle">ASKS</text> <rect x="632" y="406" width="52" height="17" fill="#faf7f0"/><text x="658" y="419" text-anchor="middle">COUNTS</text> </g> <g> <rect x="25" y="40" width="200" height="100" rx="6" fill="#ffffff" stroke="#2d3142"/> <text x="125" y="60" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«world loop»</text> <text x="125" y="78" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">TrafficSimulation</text> <line x1="37" y1="86" x2="213" y2="86" stroke="#d1d5db"/> <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563"> <text x="37" y="104">run(seconds)</text><text x="37" y="119">add_arrivals(id, axis, n)</text> </g> <rect x="370" y="24" width="220" height="130" rx="6" fill="#ffffff" stroke="#bf4520" stroke-width="2"/> <text x="480" y="44" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«centre»</text> <text x="480" y="62" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">TrafficManagementCenter</text> <line x1="382" y1="70" x2="578" y2="70" stroke="#d1d5db"/> <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563"> <text x="382" y="88">set_plan(id, plan)</text><text x="382" y="103">dispatch_emergency(...)</text><text x="382" y="118">report_incident(link, n)</text><text x="382" y="133">on_event(event)</text> </g> <rect x="735" y="24" width="200" height="120" rx="6" fill="#ffffff" stroke="#2d3142"/> <text x="835" y="44" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«graph»</text> <text x="835" y="62" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">RoadNetwork</text> <line x1="747" y1="70" x2="923" y2="70" stroke="#d1d5db"/> <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563"> <text x="747" y="88">shortest_route(a, b)</text><text x="747" y="103">set_lanes_closed(link, n)</text><text x="747" y="118">Link: length, approach</text> </g> <rect x="25" y="230" width="200" height="100" rx="6" fill="#ffffff" stroke="#2d3142"/> <text x="125" y="250" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«observer»</text> <text x="125" y="268" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">EventBus</text> <line x1="37" y1="276" x2="213" y2="276" stroke="#d1d5db"/> <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563"> <text x="37" y="294">subscribe(listener)</text><text x="37" y="309">send(event)</text> </g> <rect x="370" y="230" width="220" height="150" rx="6" fill="#ffffff" stroke="#bf4520" stroke-width="2"/> <text x="480" y="250" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«state machine»</text> <text x="480" y="268" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">IntersectionController</text> <line x1="382" y1="276" x2="578" y2="276" stroke="#d1d5db"/> <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563"> <text x="382" y="294">step()</text><text x="382" y="309">heartbeat() / apply_plan(plan)</text><text x="382" y="324">preempt(axis, vehicle)</text><text x="382" y="339">report_fault(reason)</text><text x="382" y="354">TRANSITIONS table</text> </g> <rect x="735" y="230" width="200" height="100" rx="6" fill="#ffffff" stroke="#2d3142"/> <text x="835" y="254" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">GreenWaveDesigner</text> <line x1="747" y1="262" x2="923" y2="262" stroke="#d1d5db"/> <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563"> <text x="747" y="280">design(links, speed, ...)</text><text x="747" y="295">offset = travel time</text><text x="747" y="310"> mod cycle length</text> </g> <rect x="25" y="440" width="200" height="100" rx="6" fill="#ffffff" stroke="#2d3142"/> <text x="125" y="460" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«store-and-forward»</text> <text x="125" y="478" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">Uplink</text> <line x1="37" y1="486" x2="213" y2="486" stroke="#d1d5db"/> <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563"> <text x="37" y="504">send(event)</text><text x="37" y="519">bounded buffer</text><text x="37" y="534">CommsNetwork.is_up(id)</text> </g> <rect x="370" y="450" width="220" height="80" rx="6" fill="#ffffff" stroke="#2d3142"/> <text x="480" y="470" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«strategy»</text> <text x="480" y="488" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">TimingStrategy</text> <line x1="382" y1="496" x2="578" y2="496" stroke="#d1d5db"/> <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563"> <text x="382" y="514">split(ctx) -&gt; GreenSplit</text> </g> <rect x="760" y="440" width="175" height="100" rx="6" fill="#ffffff" stroke="#2d3142"/> <text x="847" y="460" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«sensor»</text> <text x="847" y="478" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">ApproachQueues</text> <line x1="772" y1="486" x2="923" y2="486" stroke="#d1d5db"/> <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563"> <text x="772" y="504">arrive(axis, n)</text><text x="772" y="519">discharge(axis)</text><text x="772" y="534">count(axis)</text> </g> <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600" fill="#2d3142" text-anchor="middle"> <rect x="230" y="600" width="125" height="44" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/><text x="292" y="626">FixedTimePlan</text> <rect x="370" y="600" width="125" height="44" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/><text x="432" y="626">AdaptivePlan</text> <rect x="510" y="600" width="125" height="44" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/><text x="572" y="626">TimeOfDayPlan</text> <rect x="650" y="600" width="125" height="44" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/><text x="712" y="626">CoordinatedPlan</text> </g> </g> <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="#6b7280"> <line x1="40" y1="690" x2="84" y2="690" stroke="#6b7280" stroke-width="1.5" marker-end="url(#ch07-arr)"/> <text x="92" y="694">labeled association</text> <line x1="220" y1="690" x2="264" y2="690" stroke="#6b7280" stroke-width="1.5" marker-end="url(#ch07-tri)"/> <text x="272" y="694">implements</text> <rect x="360" y="682" width="18" height="14" fill="#ffffff" stroke="#bf4520" stroke-width="2"/> <text x="386" y="694">focal classes</text> <text x="490" y="694">Clock and config dataclasses are injected everywhere (not drawn)</text> </g>
+<title id="ch07-title">Traffic management class diagram</title>
+<desc id="ch07-desc">TrafficSimulation steps the TrafficManagementCenter and every IntersectionController. The centre sends commands to controllers and routes over the RoadNetwork. Each controller asks a TimingStrategy for its green split, reads ApproachQueues, and publishes telemetry through an Uplink to the EventBus, which notifies the centre. GreenWaveDesigner reads the RoadNetwork and builds CoordinatedPlans. FixedTimePlan, AdaptivePlan, TimeOfDayPlan and CoordinatedPlan implement TimingStrategy.</desc>
+<defs>
+<marker id="ch07-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#6b7280"/></marker>
+<marker id="ch07-tri" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" orient="auto-start-reverse"><path d="M1,1 L11,6 L1,11 z" fill="#faf7f0" stroke="#6b7280" stroke-width="1.2"/></marker>
+</defs>
+<rect x="0" y="0" width="960" height="720" fill="#faf7f0"/>
+<g stroke="#6b7280" stroke-width="1.5" fill="none">
+<line x1="225" y1="70" x2="370" y2="70" marker-end="url(#ch07-arr)"/>
+<path d="M225,120 H312 Q320,120 320,128 L320,292 Q320,300 328,300 L370,300" marker-end="url(#ch07-arr)"/>
+<line x1="480" y1="154" x2="480" y2="230" marker-end="url(#ch07-arr)"/>
+<line x1="590" y1="84" x2="735" y2="84" marker-end="url(#ch07-arr)"/>
+<line x1="835" y1="230" x2="835" y2="144" marker-end="url(#ch07-arr)"/>
+<line x1="745" y1="330" x2="745" y2="600" marker-end="url(#ch07-arr)"/>
+<path d="M370,350 H312 Q304,350 304,358 L304,482 Q304,490 296,490 L225,490" marker-end="url(#ch07-arr)"/>
+<line x1="125" y1="440" x2="125" y2="330" marker-end="url(#ch07-arr)"/>
+<path d="M175,230 L175,176 Q175,168 183,168 L308,168 A12,12 0 0 1 332,168 L392,168 Q400,168 400,160 L400,154" marker-end="url(#ch07-arr)"/>
+<line x1="480" y1="380" x2="480" y2="450" marker-end="url(#ch07-arr)"/>
+<path d="M590,340 H650 Q658,340 658,348 L658,482 Q658,490 666,490 L733,490 A12,12 0 0 1 757,490 L760,490" marker-end="url(#ch07-arr)"/>
+<path d="M292,600 L292,573 Q292,565 300,565 L704,565 Q712,565 712,573 L712,600"/>
+<line x1="432" y1="565" x2="432" y2="600"/>
+<line x1="572" y1="565" x2="572" y2="600"/>
+<line x1="480" y1="565" x2="480" y2="530" marker-end="url(#ch07-tri)"/>
+</g>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563">
+<rect x="272" y="52" width="50" height="17" fill="#faf7f0"/><text x="297" y="65" text-anchor="middle">STEPS</text>
+<rect x="296" y="196" width="48" height="17" fill="#faf7f0"/><text x="320" y="209" text-anchor="middle">STEPS</text>
+<rect x="446" y="183" width="68" height="17" fill="#faf7f0"/><text x="480" y="196" text-anchor="middle">COMMANDS</text>
+<rect x="637" y="66" width="50" height="17" fill="#faf7f0"/><text x="662" y="79" text-anchor="middle">ROUTES</text>
+<rect x="811" y="178" width="48" height="17" fill="#faf7f0"/><text x="835" y="191" text-anchor="middle">READS</text>
+<rect x="718" y="374" width="54" height="17" fill="#faf7f0"/><text x="745" y="387" text-anchor="middle">BUILDS</text>
+<rect x="272" y="406" width="64" height="17" fill="#faf7f0"/><text x="304" y="419" text-anchor="middle">PUBLISHES</text>
+<rect x="95" y="377" width="60" height="17" fill="#faf7f0"/><text x="125" y="390" text-anchor="middle">FORWARDS</text>
+<rect x="224" y="150" width="60" height="17" fill="#faf7f0"/><text x="254" y="163" text-anchor="middle">NOTIFIES</text>
+<rect x="456" y="406" width="48" height="17" fill="#faf7f0"/><text x="480" y="419" text-anchor="middle">ASKS</text>
+<rect x="632" y="406" width="52" height="17" fill="#faf7f0"/><text x="658" y="419" text-anchor="middle">COUNTS</text>
+</g>
+<g>
+<rect x="25" y="40" width="200" height="100" rx="6" fill="#ffffff" stroke="#2d3142"/>
+<text x="125" y="60" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«world loop»</text>
+<text x="125" y="78" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">TrafficSimulation</text>
+<line x1="37" y1="86" x2="213" y2="86" stroke="#d1d5db"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563">
+<text x="37" y="104">run(seconds)</text><text x="37" y="119">add_arrivals(id, axis, n)</text>
+</g>
+<rect x="370" y="24" width="220" height="130" rx="6" fill="#ffffff" stroke="#bf4520" stroke-width="2"/>
+<text x="480" y="44" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«centre»</text>
+<text x="480" y="62" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">TrafficManagementCenter</text>
+<line x1="382" y1="70" x2="578" y2="70" stroke="#d1d5db"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563">
+<text x="382" y="88">set_plan(id, plan)</text><text x="382" y="103">dispatch_emergency(...)</text><text x="382" y="118">report_incident(link, n)</text><text x="382" y="133">on_event(event)</text>
+</g>
+<rect x="735" y="24" width="200" height="120" rx="6" fill="#ffffff" stroke="#2d3142"/>
+<text x="835" y="44" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«graph»</text>
+<text x="835" y="62" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">RoadNetwork</text>
+<line x1="747" y1="70" x2="923" y2="70" stroke="#d1d5db"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563">
+<text x="747" y="88">shortest_route(a, b)</text><text x="747" y="103">set_lanes_closed(link, n)</text><text x="747" y="118">Link: length, approach</text>
+</g>
+<rect x="25" y="230" width="200" height="100" rx="6" fill="#ffffff" stroke="#2d3142"/>
+<text x="125" y="250" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«observer»</text>
+<text x="125" y="268" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">EventBus</text>
+<line x1="37" y1="276" x2="213" y2="276" stroke="#d1d5db"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563">
+<text x="37" y="294">subscribe(listener)</text><text x="37" y="309">send(event)</text>
+</g>
+<rect x="370" y="230" width="220" height="150" rx="6" fill="#ffffff" stroke="#bf4520" stroke-width="2"/>
+<text x="480" y="250" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«state machine»</text>
+<text x="480" y="268" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">IntersectionController</text>
+<line x1="382" y1="276" x2="578" y2="276" stroke="#d1d5db"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563">
+<text x="382" y="294">step()</text><text x="382" y="309">heartbeat() / apply_plan(plan)</text><text x="382" y="324">preempt(axis, vehicle)</text><text x="382" y="339">report_fault(reason)</text><text x="382" y="354">TRANSITIONS table</text>
+</g>
+<rect x="735" y="230" width="200" height="100" rx="6" fill="#ffffff" stroke="#2d3142"/>
+<text x="835" y="254" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">GreenWaveDesigner</text>
+<line x1="747" y1="262" x2="923" y2="262" stroke="#d1d5db"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563">
+<text x="747" y="280">design(links, speed, ...)</text><text x="747" y="295">offset = travel time</text><text x="747" y="310">  mod cycle length</text>
+</g>
+<rect x="25" y="440" width="200" height="100" rx="6" fill="#ffffff" stroke="#2d3142"/>
+<text x="125" y="460" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«store-and-forward»</text>
+<text x="125" y="478" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">Uplink</text>
+<line x1="37" y1="486" x2="213" y2="486" stroke="#d1d5db"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563">
+<text x="37" y="504">send(event)</text><text x="37" y="519">bounded buffer</text><text x="37" y="534">CommsNetwork.is_up(id)</text>
+</g>
+<rect x="370" y="450" width="220" height="80" rx="6" fill="#ffffff" stroke="#2d3142"/>
+<text x="480" y="470" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«strategy»</text>
+<text x="480" y="488" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">TimingStrategy</text>
+<line x1="382" y1="496" x2="578" y2="496" stroke="#d1d5db"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563">
+<text x="382" y="514">split(ctx) -&gt; GreenSplit</text>
+</g>
+<rect x="760" y="440" width="175" height="100" rx="6" fill="#ffffff" stroke="#2d3142"/>
+<text x="847" y="460" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6b7280">«sensor»</text>
+<text x="847" y="478" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="600" fill="#2d3142">ApproachQueues</text>
+<line x1="772" y1="486" x2="923" y2="486" stroke="#d1d5db"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#4b5563">
+<text x="772" y="504">arrive(axis, n)</text><text x="772" y="519">discharge(axis)</text><text x="772" y="534">count(axis)</text>
+</g>
+<g font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600" fill="#2d3142" text-anchor="middle">
+<rect x="230" y="600" width="125" height="44" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/><text x="292" y="626">FixedTimePlan</text>
+<rect x="370" y="600" width="125" height="44" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/><text x="432" y="626">AdaptivePlan</text>
+<rect x="510" y="600" width="125" height="44" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/><text x="572" y="626">TimeOfDayPlan</text>
+<rect x="650" y="600" width="125" height="44" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/><text x="712" y="626">CoordinatedPlan</text>
+</g>
+</g>
+<g font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="#6b7280">
+<line x1="40" y1="690" x2="84" y2="690" stroke="#6b7280" stroke-width="1.5" marker-end="url(#ch07-arr)"/>
+<text x="92" y="694">labeled association</text>
+<line x1="220" y1="690" x2="264" y2="690" stroke="#6b7280" stroke-width="1.5" marker-end="url(#ch07-tri)"/>
+<text x="272" y="694">implements</text>
+<rect x="360" y="682" width="18" height="14" fill="#ffffff" stroke="#bf4520" stroke-width="2"/>
+<text x="386" y="694">focal classes</text>
+<text x="490" y="694">Clock and config dataclasses are injected everywhere (not drawn)</text>
+</g>
 </svg>
 </div>
 <p>Two classes carry the design, and the diagram marks both. The controller owns safety at one junction. The centre owns the city view. Everything else is a seam between them: plans flow down through a strategy, telemetry flows up through an uplink and a bus.</p>
@@ -2624,12 +2731,6 @@ OK</code></pre>
 <p>51 tests, all green: 4 config, 9 timing-strategy, 6 controller-cycle, 5 failsafe, 6 preemption, 6 queue-and-network, 4 green-wave, 9 centre, 1 observer, 1 concurrency. The suite simulates about three quarters of an hour of city time and still finishes in under a tenth of a second. The checkpoint and demo output in Section 6 is also real, from the same interpreter, and identical on every run.</p>
 <h2 id="ch07-8-enterprise-checklist-mapped-to-the-code">8. Enterprise checklist, mapped to the code</h2>
 <table>
-<colgroup>
-<col style="width: 25%" />
-<col style="width: 25%" />
-<col style="width: 25%" />
-<col style="width: 25%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>#</th>
@@ -2716,7 +2817,7 @@ OK</code></pre>
 <p><strong>Honest limits.</strong> The comms model is binary: up or down. Real links lose some packets and delay others. The queue model is one lane-group per axis with a constant saturation flow. Coordination only runs on the NS axis of a corridor, and two crossing corridors would need a shared cycle length. Locks cover threads in one process; a real centre is several processes, and the desired-plan map would live in a database.</p>
 <h2 id="ch07-9-common-interview-follow-ups">9. Common interview follow-ups</h2>
 <p><strong>"Now add transit signal priority for buses."</strong> Priority is a softer cousin of preemption. A late bus may get a few extra seconds of green or an early green, but it never cuts a cross street short. The design change is a new request type, say <code>PriorityRequest(axis, max_extension)</code>, and a controller method that adjusts <code>_duration</code> of the current or next green within a cap from config. Preemption still outranks it. The transition table does not change at all, because priority changes durations, not phases.</p>
-<p><strong>"Now an incident happens in the middle of an ambulance run."</strong> Today a run's legs are fixed at dispatch. The change is a reroute step in <code>report_incident()</code>: for each active run whose remaining legs use the closed link, recompute the route from the next pending intersection, release any held legs that are no longer on it, and splice in the new legs with fresh ETAs. The controller needs nothing new. That is the point of keeping routing in the centre and safety in the controller.</p>
+<p><strong>"Now an incident happens in the middle of an ambulance run."</strong> Today a run's legs are fixed at dispatch. The change is a reroute step in <code>report_incident()</code>. Find each active run whose remaining legs use the closed link. Recompute its route from the next pending intersection, release any held legs that are no longer on it, and splice in the new legs with fresh ETAs. The controller needs nothing new. That is the point of keeping routing in the centre and safety in the controller.</p>
 <p><strong>"Now scale to 10,000 intersections and three centre nodes."</strong> Partition intersections by region, one partition per node, with a message broker carrying heartbeats and telemetry. The desired-plan map moves into a database, and each plan gets a version number so <code>apply_plan()</code> becomes idempotent (ignore a version you already have). Controllers don't change. They already tolerate a silent centre, which is exactly what a node failover looks like from the roadside.</p>
 <p><strong>"Now broadcast signal timing to connected cars (SPaT)."</strong> Write a new <code>TelemetryListener</code> that turns <code>PhaseChanged</code> and <code>CycleStarted</code> events into "time to next change" messages. The controller, the centre and the bus are untouched. This is the Observer seam paying for itself.</p>
 <p><strong>"What if the centre is compromised and pushes a plan with one-second greens?"</strong> The controller clamps it to <code>min_green</code> and logs a warning; yellow and all-red were never the plan's to set. That bounds the damage to "slow". In a production design you would add signed plans and a local safety envelope per intersection (maximum cycle length, minimum pedestrian time), checked before <code>apply_plan()</code> stores anything.</p>
