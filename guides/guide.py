@@ -39,7 +39,7 @@ REWRITES = GUIDE / "rewrites"
 WORK = GUIDE / "work"
 OUT = ROOT / "dist" / SOURCE.name.replace(".original", "")
 
-H1 = re.compile(r'^<h1 id="(\d\d)--')
+H1 = re.compile(r'^<h1 id="(\d\d[a-z]?)--')
 BLOCK = re.compile(r"^(<(p|li)(?: class=\"[^\"]*\")?>)(.*)(</\2>)\s*$")
 PROTECT_OPEN = re.compile(r"<(pre|svg|table|code class=\"sourceCode)")
 PROTECT_CLOSE = {"pre": "</pre>", "svg": "</svg>", "table": "</table>", "code class=\"sourceCode": "</code>"}
@@ -183,7 +183,7 @@ def cmd_build() -> None:
     doc = re.sub(r"<ol>(\n<li>(?:(?!</ol>).)*?</ol>\n<aside class=\"dg-callout dg-callout-info\">\n"
                  r"<p class=\"dg-callout-title\">Answer: )", r'<ol class="options">\1', doc, flags=re.S)
     # Hide answers until the reader asks for them.
-    doc = re.sub(r'<aside class="dg-callout dg-callout-info">\n<p class="dg-callout-title">(Answer: [^<]+)</p>'
+    doc = re.sub(r'<aside class="dg-callout dg-callout-info">\n<p class="dg-callout-title">(Answer:(?:(?!</p>).)*)</p>'
                  r'(.*?)</aside>',
                  lambda m: (f'<details class="answer"><summary>Show answer</summary>'
                             f'<p class="dg-callout-title">{m.group(1)}</p>{m.group(2)}</details>'),
