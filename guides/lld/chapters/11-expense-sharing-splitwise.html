@@ -16,7 +16,7 @@
 <li><em>Is "simplify debts" a view or a rewrite of history?</em> A view. The raw pairwise history stays; the simplified plan is a suggestion.</li>
 <li><em>Scale?</em> Groups of tens of people, not thousands. Many groups in parallel.</li>
 </ul>
-<p><strong>The 2026 angle.</strong> Interviewers in 2026 still grade the classic rubric, but three things now get probed hard on this problem. First, money correctness: integer minor units or <code>Decimal</code>, a written rounding rule, and an invariant you can test. Second, honesty about complexity: candidates who claim their greedy algorithm "minimises transactions" lose points; candidates who say "greedy, at most n − 1 payments, optimal is NP-hard, here is a counterexample" gain them. Third, operational realism: audit trails, idempotent payments from flaky mobile clients, and what happens when two people tap "settle up" at the same moment. Many rounds now let you use an AI assistant, which raises the bar on those judgment calls. Anyone can generate a <code>Splitwise</code> class; the interview is about whether you can defend its rounding and its locks.</p>
+<p><strong>The 2026 angle.</strong> Interviewers in 2026 still grade the classic rubric, but three things now get probed hard on this problem. First, money correctness: integer minor units or <code>Decimal</code>, a written rounding rule, and an invariant you can test. Second, honesty about complexity. Claim your greedy algorithm "minimises transactions" and you lose points. Say "greedy, at most n − 1 payments, optimal is NP-hard, here is a counterexample" and you gain them. Third, operational realism: audit trails, idempotent payments from flaky mobile clients, and what happens when two people tap "settle up" at the same moment. Many rounds now let you use an AI assistant, which raises the bar on those judgment calls. Anyone can generate a <code>Splitwise</code> class; the interview is about whether you can defend its rounding and its locks.</p>
 <p><strong>Functional</strong></p>
 <ul>
 <li>Register users; create groups; add members to a group.</li>
@@ -37,11 +37,6 @@
 </ul>
 <h2 id="ch11-3-from-nouns-to-classes">3. From nouns to classes</h2>
 <table>
-<colgroup>
-<col style="width: 33%" />
-<col style="width: 33%" />
-<col style="width: 33%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>Noun in the problem</th>
@@ -2093,18 +2088,12 @@ test_shares_must_be_positive_ints (test_splitwise.SplitStrategyTests.test_shares
 test_shares_split (test_splitwise.SplitStrategyTests.test_shares_split) ... ok
 
 ----------------------------------------------------------------------
-Ran 38 tests in 0.053s
+Ran 38 tests in 0.050s
 
 OK</code></pre>
 <p>38 tests, all green: 7 money, 4 allocation, 9 split, 3 ledger, 4 simplifier, 9 service, 2 concurrency. The demo output in Step 13 and every checkpoint above are real, from the same interpreter.</p>
 <h2 id="ch11-8-enterprise-checklist-mapped-to-the-code">8. Enterprise checklist, mapped to the code</h2>
 <table>
-<colgroup>
-<col style="width: 25%" />
-<col style="width: 25%" />
-<col style="width: 25%" />
-<col style="width: 25%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>#</th>
