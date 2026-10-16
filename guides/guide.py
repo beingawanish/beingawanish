@@ -47,11 +47,14 @@ PROTECT_CLOSE = {"pre": "</pre>", "svg": "</svg>", "table": "</table>", "code cl
 
 def load() -> list[str]:
     text = SOURCE.read_text()
-    fixes = GUIDE / "prose_fixes.py"  # optional sentence-level edits for guides not rewritten block by block
-    if fixes.exists():
-        ns: dict = {}
-        exec(compile(fixes.read_text(), str(fixes), "exec"), ns)
-        text = ns["apply"](text)
+    # Optional fix layers, applied in order: sentence-level prose edits for guides not rewritten
+    # block by block, then code-block fixes (found by running the guide's code).
+    for name in ("prose_fixes.py", "code_fixes.py"):
+        fixes = GUIDE / name
+        if fixes.exists():
+            ns: dict = {}
+            exec(compile(fixes.read_text(), str(fixes), "exec"), ns)
+            text = ns["apply"](text)
     return text.split("\n")
 
 
