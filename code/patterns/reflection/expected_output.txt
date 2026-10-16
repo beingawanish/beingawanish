@@ -1,0 +1,13 @@
+Reflection
+==========
+-- Write Python is_leap(y) for the Gregorian calendar.
+[draft] def is_leap(y): …
+[critique 1] Missed the Gregorian century rule: 1900 is not a leap year, 2000 is.
+[revision 1] def is_leap(y): …
+[critique 2] NO ISSUES
+measured: first draft 3/4 tests, final 4/4 tests; revisions=1
+-- Write Python days_in_month(m, y).
+[draft] def days_in_month(m, y): …
+[critique 1] NO ISSUES
+measured: first draft 3/4 tests, final 3/4 tests; revisions=0
+model calls: 6 (same model throughout)

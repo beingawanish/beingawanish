@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 262" role="img" aria-labelledby="react-t react-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="react-t">ReAct structure</title>
+  <desc id="react-d">A question enters a loop: the model writes a Thought and an Action; code runs the tool and appends an Observation to the growing trace; the loop ends at a Final Answer or a step/repeat guard.</desc>
+  <defs>
+    <marker id="react-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="262" fill="#FBF5EA"/>
+  <rect x="16" y="96" width="88" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="60.0" y="127.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Question</text>
+  <path d="M104,122 L128,122" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#react-ah)"/>
+  <rect x="130" y="90" width="154" height="64" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="207.0" y="119.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">Thought + Action</text>
+  <text x="207.0" y="135.0" text-anchor="middle" font-size="11" fill="#7A6A5E">model reads whole trace</text>
+  <path d="M284,122 L344,122" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#react-ah)"/>
+  <text x="314" y="112" text-anchor="middle" font-size="10" fill="#7A6A5E">tool[input]</text>
+  <rect x="346" y="96" width="120" height="52" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="406.0" y="119.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">run tool</text>
+  <text x="406.0" y="135.0" text-anchor="middle" font-size="11" fill="#7A6A5E">validate, execute</text>
+  <path d="M466,122 L494,122" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#react-ah)"/>
+  <rect x="496" y="96" width="120" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="556.0" y="119.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Observation</text>
+  <text x="556.0" y="135.0" text-anchor="middle" font-size="11" fill="#7A6A5E">appended to trace</text>
+  <path d="M556,148 L556,200 L207,200 L207,156" fill="none" stroke="#B5562E" stroke-width="1.5" marker-end="url(#react-ah)"/>
+  <text x="380" y="194" text-anchor="middle" font-size="10" fill="#B5562E">next step sees every prior observation</text>
+  <path d="M207,90 L207,46 L690,46 L690,94" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#react-ah)"/>
+  <text x="450" y="40" text-anchor="middle" font-size="10" fill="#6B7F5E">Final Answer</text>
+  <rect x="636" y="96" width="108" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="690.0" y="127.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Answer</text>
+  <path d="M600,148 L600,194" fill="none" stroke="#B5562E" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#react-ah)"/>
+  <rect x="586" y="196" width="158" height="44" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="665.0" y="215.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">stop: max steps</text>
+  <text x="665.0" y="231.0" text-anchor="middle" font-size="11" fill="#7A6A5E">or repeated action</text>
+  <text x="16" y="252" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = deterministic code · Dashed = data / failure path</text>
+</svg>

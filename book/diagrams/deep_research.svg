@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 360" role="img" aria-labelledby="deep_research-t deep_research-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="deep_research-t">Deep-research capstone architecture</title>
+  <desc id="deep_research-d">A planner decomposes the question into sub-questions. For each, the agent first checks long-term memory; on a miss it runs agentic RAG and stores the cited finding. An unanswerable sub-question triggers a re-plan. The writer drafts, critiques its own draft, then a separate evaluator drives rubric revisions.</desc>
+  <defs>
+    <marker id="deep_research-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="360" fill="#FBF5EA"/>
+  <rect x="16" y="70" width="90" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="61.0" y="101.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Question</text>
+  <path d="M106,96 L130,96" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#deep_research-ah)"/>
+  <text x="196" y="40" text-anchor="middle" font-size="11" fill="#6B7F5E" font-weight="700">#7 PLAN-AND-EXECUTE</text>
+  <rect x="132" y="64" width="128" height="64" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="196.0" y="93.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">planner</text>
+  <text x="196.0" y="109.0" text-anchor="middle" font-size="11" fill="#7A6A5E">sub-questions</text>
+  <path d="M260,96 L290,96" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#deep_research-ah)"/>
+  <polygon points="318,68 346,96 318,124 290,96" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="318" y="100" text-anchor="middle" font-size="10" fill="#3B2F2A">memory?</text>
+  <text x="318" y="40" text-anchor="middle" font-size="11" fill="#6B7F5E" font-weight="700">#19 MEMORY</text>
+  <path d="M344,96 L470,96" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#deep_research-ah)"/>
+  <text x="406" y="88" text-anchor="middle" font-size="10" fill="#6B7F5E">hit: reuse finding</text>
+  <path d="M318,122 L318,160" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#deep_research-ah)"/>
+  <text x="336" y="146" text-anchor="middle" font-size="10" fill="#7A6A5E">miss</text>
+  <text x="318" y="232" text-anchor="middle" font-size="11" fill="#6B7F5E" font-weight="700">#10 AGENTIC RAG</text>
+  <rect x="250" y="162" width="136" height="56" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="318.0" y="187.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">query · grade</text>
+  <text x="318.0" y="203.0" text-anchor="middle" font-size="11" fill="#7A6A5E">retrieve · cite</text>
+  <path d="M386,190 L470,190 L470,124" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#deep_research-ah)"/>
+  <text x="430" y="182" text-anchor="middle" font-size="10" fill="#6B7F5E">store finding</text>
+  <rect x="472" y="70" width="110" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="527.0" y="93.0" text-anchor="middle" font-size="13" fill="#3B2F2A">findings</text>
+  <text x="527.0" y="109.0" text-anchor="middle" font-size="11" fill="#7A6A5E">topic → cited text</text>
+  <path d="M250,190 L196,190 L196,130" fill="none" stroke="#B5562E" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#deep_research-ah)"/>
+  <text x="16" y="160" text-anchor="start" font-size="10" fill="#B5562E">abstain → re-plan</text>
+  <path d="M582,96 L608,96" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#deep_research-ah)"/>
+  <text x="676" y="40" text-anchor="middle" font-size="11" fill="#6B7F5E" font-weight="700">#8 REFLECTION</text>
+  <rect x="610" y="64" width="134" height="64" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="677.0" y="93.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">writer</text>
+  <text x="677.0" y="109.0" text-anchor="middle" font-size="11" fill="#7A6A5E">draft → self-critique</text>
+  <path d="M677,128 L677,168" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#deep_research-ah)"/>
+  <text x="600" y="202" text-anchor="end" font-size="11" fill="#6B7F5E" font-weight="700">#5 EVAL–OPTIMIZER</text>
+  <rect x="610" y="170" width="134" height="56" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="677.0" y="195.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">evaluator</text>
+  <text x="677.0" y="211.0" text-anchor="middle" font-size="11" fill="#7A6A5E">rubric · feedback</text>
+  <path d="M677,226 L677,262" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#deep_research-ah)"/>
+  <rect x="610" y="264" width="134" height="46" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="677.0" y="292.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Cited report</text>
+  <text x="380" y="290" text-anchor="middle" font-size="11" fill="#7A6A5E">code checks: every number cited · every cited id exists · all topics covered</text>
+  <text x="16" y="350" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = deterministic code · Dashed = data / failure path</text>
+</svg>

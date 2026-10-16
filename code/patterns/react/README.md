@@ -1,0 +1,51 @@
+# Pattern 6 — ReAct
+
+Interleave Thought → Action → Observation so every step is grounded in what was observed.
+
+| | |
+|---|---|
+| Implementation | [`react.py`](react.py) |
+| Demo | [`main.py`](main.py) |
+| Exercise solution | [`exercise_solution.py`](exercise_solution.py) |
+| Chapter | [`book/part-2-single-agent/06-react.md`](../../../book/part-2-single-agent/06-react.md) |
+
+Python 3.10+, standard library only, offline. The model is `agentkit.MockLLM`, so output is deterministic.
+
+## Run
+
+```
+python3 code/patterns/react/main.py
+```
+
+## Expected output
+
+```text
+ReAct
+=====
+-- Q1: What's the weather at the HQ of the company that makes the Orbit X1?
+[thought 1] First find who makes the Orbit X1 headset.
+[action 1] search[Orbit X1 headset maker]
+[observe 1] No results.
+[thought 2] The phrase was too specific; search the product name alone.
+[action 2] search[Orbit X1]
+[observe 2] Orbit X1 is a VR headset made by Lumen Labs.
+[thought 3] The maker is Lumen Labs; find where it is headquartered.
+[action 3] search[Lumen Labs]
+[observe 3] Lumen Labs is headquartered in Lisbon, Portugal.
+[thought 4] The HQ is Lisbon; now get the weather there.
+[action 4] weather[Lisbon]
+[observe 4] Lisbon: 21°C, sunny
+[thought 5] I have the city and its weather.
+[final] Lisbon — currently 21°C and sunny.
+result: answered in 5 steps
+-- Q2: What is the Lumen Labs CEO's shoe size?
+[thought 1] I should search for the CEO's shoe size.
+[action 1] search[Lumen Labs CEO shoe size]
+[observe 1] No results.
+[thought 2] I should search for the CEO's shoe size.
+[stop] repeated action search[Lumen Labs CEO shoe size] — not making progress
+result: repeated_action after 2 steps, answer=None
+model calls: 7
+```
+
+Verified by `python3 code/verify.py react`.

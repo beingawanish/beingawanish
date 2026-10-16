@@ -1,0 +1,15 @@
+Orchestrator-workers — exercise solution
+========================================
+-- without retry
+[plan] 3 subtask(s): login, session, docs
+[worker:login] Adds rate limiting: 5 failed attempts per 15 minutes.
+[worker:session] [worker failed: TimeoutError: worker call timed out]
+[worker:docs] Docs say 8 hours — consistent with the code.
+[synthesize] Security hardening: login is rate-limited (5 tries / 15 min) and sessions now last 8h instead of 24h. Docs updated and consistent.
+-- with RetryingLLM
+[plan] 3 subtask(s): login, session, docs
+[worker:login] Adds rate limiting: 5 failed attempts per 15 minutes.
+[worker:session] Session lifetime reduced from 24h to 8h.
+[worker:docs] Docs say 8 hours — consistent with the code.
+[synthesize] Security hardening: login is rate-limited (5 tries / 15 min) and sessions now last 8h instead of 24h. Docs updated and consistent.
+retries used: 1

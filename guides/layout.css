@@ -1,0 +1,84 @@
+/* ==== Readability layer (appended after the original styles; overrides them) ====
+   Goals: visible hierarchy, a comfortable line length, navigation that is always there,
+   answers you have to choose to reveal, and options lettered the way the answers cite them. */
+:root{ --measure: 44rem; --side: 300px; }
+body{ font-size:17.5px; line-height:1.72; background-image:none; background-color:#f6f1ea; }
+.sitebar{ display:none; }
+.page{ max-width:none; margin:0; padding:0; display:grid; grid-template-columns:var(--side) minmax(0,1fr); }
+.doc{ border:none; border-radius:0; box-shadow:none; background:#fdfbf7; padding:48px clamp(20px,5vw,72px) 120px; min-width:0; }
+.doc > *{ max-width:var(--measure); }
+.doc > figure, .doc > table, .doc > .sourceCode, .doc > pre, .doc > div{ max-width:calc(var(--measure) + 12rem); }
+#title-block-header{ max-width:var(--measure); padding:24px 0 8px; }
+#title-block-header .title{ font-size:clamp(30px,4vw,42px); font-style:normal; line-height:1.12; margin:0 0 6px; }
+#TOC{ display:none; }
+
+/* Hierarchy you can see while scrolling */
+h1{ font-size:clamp(28px,3.4vw,36px); font-style:normal; font-weight:800; line-height:1.15;
+    margin:96px 0 22px; padding-top:28px; border-top:3px double #d9cdbb; }
+h1::before{ content:attr(data-num); display:block; font:700 13px/1 var(--mono); letter-spacing:.14em;
+            color:#9a4a2f; margin-bottom:12px; }
+h2{ font-size:24px; font-weight:750; margin:56px 0 14px; padding-bottom:8px; border-bottom:1px solid #e3d8c8; }
+h3{ font-size:19.5px; font-weight:700; margin:34px 0 10px; }
+h4{ font-size:17px; margin:24px 0 8px; }
+h2 .secnum{ font:600 14px var(--mono); color:#9a4a2f; margin-right:10px; vertical-align:2px; }
+p{ margin:0 0 1.05em; }
+li{ margin:6px 0; }
+.doc table{ font-size:15px; }
+code{ font-size:.84em; }
+.dg-callout{ font-size:16.5px; }
+.dg-callout-title{ font-family:var(--sans); font-weight:700; }
+
+/* Answer options are cited as A-D, so letter them A-D */
+ol.options{ list-style:upper-alpha; padding-left:2.2em; }
+ol.options li{ padding-left:4px; }
+ol.options li::marker{ font-weight:700; }
+
+/* Answers stay hidden until you have committed to one */
+details.answer{ margin:14px 0 30px; border:1px solid #c9d8e6; border-left:4px solid #2f6ea6; border-radius:8px;
+                background:#f1f6fb; max-width:var(--measure); }
+details.answer > summary{ cursor:pointer; padding:10px 16px; font:600 15px var(--sans); color:#2f6ea6; list-style:none; }
+details.answer > summary::-webkit-details-marker{ display:none; }
+details.answer > summary::before{ content:"▸ "; }
+details.answer[open] > summary::before{ content:"▾ "; }
+details.answer > :not(summary){ margin-left:16px; margin-right:16px; }
+details.answer > p:last-child{ margin-bottom:14px; }
+
+/* Side navigation */
+.side{ position:sticky; top:0; height:100vh; overflow:auto; background:#f3ece2; border-right:1px solid #e3d8c8;
+       padding:22px 14px 40px 20px; font:14px/1.45 var(--sans); }
+.side .brand-s{ font:800 16px/1.25 var(--serif); color:#2b2118; margin:0 0 4px; }
+.side .sub{ color:#7a6a5e; font-size:12.5px; margin:0 0 16px; }
+.side ol{ list-style:none; margin:0; padding:0; }
+.side a{ display:block; padding:4px 8px; border-radius:6px; color:#3b2f2a; text-decoration:none; }
+.side a:hover{ background:#eadfce; text-decoration:none; }
+.side .ch > a{ font-weight:600; }
+.side .ch > a .n{ display:inline-block; width:2.1em; color:#9a4a2f; font:600 12px var(--mono); }
+.side .secs{ display:none; margin:2px 0 8px 2.3em; border-left:2px solid #e0d2bf; }
+.side .ch.open .secs{ display:block; }
+.side .secs a{ font-size:13px; color:#5a4a3e; padding:3px 8px; }
+.side a.active{ background:#e6d3bd; color:#2b2118; }
+.progress{ position:fixed; top:0; left:0; height:3px; background:#9a4a2f; z-index:30; width:0; }
+.menu-btn{ display:none; }
+.chapnav{ display:flex; justify-content:space-between; gap:12px; margin:48px 0 0; font:14px var(--sans); }
+.chapnav a{ border:1px solid #e3d8c8; border-radius:10px; padding:10px 14px; background:#fff; color:#3b2f2a; max-width:48%; }
+.chapnav a small{ display:block; color:#7a6a5e; font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+
+@media (max-width:980px){
+  .page{ display:block; }
+  .side{ position:fixed; inset:0 18% 0 0; z-index:40; transform:translateX(-102%); transition:transform .2s; visibility:hidden; }
+  .side.open{ transform:none; visibility:visible; box-shadow:0 0 40px rgba(0,0,0,.25); }
+  .menu-btn{ display:inline-block; position:sticky; top:8px; z-index:35; margin:8px 12px 0; padding:8px 12px;
+             font:14px var(--sans); background:#fff; border:1px solid #e3d8c8; border-radius:8px; }
+  .doc{ padding:12px 16px 80px; }
+  body{ font-size:16.5px; }
+}
+@media print{
+  .side, .menu-btn, .progress, .chapnav{ display:none !important; }
+  .page{ display:block; }
+  details.answer > summary{ display:none; }
+  h1{ break-before:page; margin-top:0; }
+}
+.dg-langbar{ flex-wrap:wrap; max-width:100%; }
+@media (max-width:980px){ .doc table{ display:block; overflow-x:auto; max-width:100%; } .doc pre, .doc .sourceCode{ max-width:100%; } }
+@media (max-width:980px){ .doc{ overflow-x:hidden; } .doc pre{ overflow-x:auto; } }
+.doc{ min-width:0; } .doc table{ display:block; overflow-x:auto; max-width:100%; }

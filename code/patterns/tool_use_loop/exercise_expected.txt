@@ -1,0 +1,8 @@
+Tool-use loop — exercise solution
+=================================
+[call 1] create_event({"title": "Standup", "date": "2026-10-19"})
+[result 1] {"created": true, "title": "Standup", "date": "2026-10-19"}
+[call 2] create_event({"title": "Standup", "date": "2026-10-19"})
+[result 2] {"duplicate_ignored": true, "previous_result": {"created": true, "title": "Standup", "date": "2026-10-19"}}
+[final] Your standup is booked for 2026-10-19.
+events actually created: 1

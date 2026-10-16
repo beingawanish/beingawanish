@@ -1,0 +1,18 @@
+Supervisor
+==========
+-- Write a one-sentence pricing brief
+[supervisor → researcher] Collect competitor list prices
+[researcher] Monthly list prices: Acme (us) $49, Beta $59, Gamma $45
+[supervisor → writer] Draft one sentence positioning our price
+[writer] Acme sits between Beta and Gamma on price.
+[supervisor → analyst] Compute our price difference vs each competitor in %
+[analyst] Acme vs competitors: -17% vs Beta, +9% vs Gamma
+[supervisor → writer] Redraft using the percentage comparison
+[writer] Acme is priced mid-market: 17% below Beta and 9% above Gamma.
+[supervisor] FINISH: Acme is priced mid-market: 17% below Beta and 9% above Gamma.
+result: finished after 4 worker turns, 5 supervisor calls
+-- Same task, a supervisor that repeats itself
+[supervisor → researcher] Collect competitor list prices
+[researcher] Monthly list prices: Acme (us) $49, Beta $59, Gamma $45
+[supervisor] STOP — loop: researcher already did 'Collect competitor list prices'
+result: ok=False, loop: researcher already did 'Collect competitor list prices'

@@ -1,0 +1,9 @@
+Sequential handoffs — exercise solution
+=======================================
+-- without correction
+[escalate] technical tried to hand off to 'refunds' (not allowed)
+escalated=True, owner=technical
+-- with correction
+[technical ⇒ billing] refund request | summary: Wants refund for outage.
+[billing] Per our SLA I've applied a one-day service credit to your next invoice.
+escalated=False, owner=billing

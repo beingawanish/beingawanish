@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" role="img" aria-labelledby="memory_tiers-t memory_tiers-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="memory_tiers-t">Memory tiers structure</title>
+  <desc id="memory_tiers-d">Each user turn enters bounded working memory. An extractor model proposes memory candidates. A code write policy sends stable, confident facts to semantic memory, transient facts to episodic memory, and drops the rest. Long-term tiers persist to disk; recall is by tag.</desc>
+  <defs>
+    <marker id="memory_tiers-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="300" fill="#FBF5EA"/>
+  <rect x="16" y="110" width="84" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="58.0" y="141.0" text-anchor="middle" font-size="13" fill="#3B2F2A">User turn</text>
+  <path d="M100,136 L128,136" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#memory_tiers-ah)"/>
+  <rect x="130" y="30" width="150" height="52" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="205.0" y="53.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">working memory</text>
+  <text x="205.0" y="69.0" text-anchor="middle" font-size="11" fill="#7A6A5E">last N turns, verbatim</text>
+  <path d="M115,136 L115,56 L128,56" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#memory_tiers-ah)"/>
+  <rect x="130" y="110" width="150" height="52" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="205.0" y="133.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">extract</text>
+  <text x="205.0" y="149.0" text-anchor="middle" font-size="11" fill="#7A6A5E">candidate facts</text>
+  <path d="M280,136 L318,136" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#memory_tiers-ah)"/>
+  <polygon points="350,104 382,136 350,168 318,136" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="350" y="140" text-anchor="middle" font-size="10" fill="#3B2F2A">policy</text>
+  <text x="350" y="190" text-anchor="middle" font-size="10" fill="#7A6A5E">code decides</text>
+  <path d="M382,136 L420,136 L420,60 L468,60" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#memory_tiers-ah)"/>
+  <text x="430" y="52" text-anchor="start" font-size="10" fill="#6B7F5E">stable</text>
+  <rect x="470" y="34" width="170" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="555.0" y="57.0" text-anchor="middle" font-size="12" fill="#3B2F2A">semantic memory</text>
+  <text x="555.0" y="73.0" text-anchor="middle" font-size="11" fill="#7A6A5E">facts + history + source</text>
+  <path d="M420,136 L468,136" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#memory_tiers-ah)"/>
+  <text x="444" y="128" text-anchor="middle" font-size="10" fill="#7A6A5E">transient</text>
+  <rect x="470" y="110" width="170" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="555.0" y="133.0" text-anchor="middle" font-size="12" fill="#3B2F2A">episodic memory</text>
+  <text x="555.0" y="149.0" text-anchor="middle" font-size="11" fill="#7A6A5E">session notes</text>
+  <path d="M350,168 L350,222 L468,222" fill="none" stroke="#B5562E" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#memory_tiers-ah)"/>
+  <text x="360" y="238" text-anchor="start" font-size="10" fill="#B5562E">low confidence</text>
+  <rect x="470" y="200" width="170" height="44" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="555.0" y="227.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">dropped</text>
+  <rect x="660" y="34" width="84" height="128" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="702.0" y="95.0" text-anchor="middle" font-size="13" fill="#3B2F2A">JSON</text>
+  <text x="702.0" y="111.0" text-anchor="middle" font-size="11" fill="#7A6A5E">on disk</text>
+  <path d="M640,60 L658,60" fill="none" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <path d="M640,136 L658,136" fill="none" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="555" y="274" text-anchor="middle" font-size="10" fill="#7A6A5E">recall by tag · newer value supersedes, history kept</text>
+  <text x="16" y="290" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = deterministic code · Dashed = data / failure path</text>
+</svg>

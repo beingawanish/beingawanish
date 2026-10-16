@@ -1,0 +1,5 @@
+Eval harness — exercise solution
+================================
+[v1] FAIL: route_correct 0.70 < 0.85
+[v2] FAIL: route_correct@critical 0.67 < 1.00
+[v3] PASS

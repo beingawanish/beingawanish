@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 320" role="img" aria-labelledby="hierarchical_teams-t hierarchical_teams-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="hierarchical_teams-t">Hierarchical teams structure</title>
+  <desc id="hierarchical_teams-d">A top-level lead delegates to team leads. Each team lead supervises its own workers with private state. Only a short summary flows back up, so the top lead&#x27;s context stays small.</desc>
+  <defs>
+    <marker id="hierarchical_teams-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="320" fill="#FBF5EA"/>
+  <rect x="300" y="20" width="160" height="52" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="380.0" y="43.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">launch lead</text>
+  <text x="380.0" y="59.0" text-anchor="middle" font-size="11" fill="#7A6A5E">sees summaries only</text>
+  <path d="M340,72 L180,118" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#hierarchical_teams-ah)"/>
+  <path d="M420,72 L580,118" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#hierarchical_teams-ah)"/>
+  <text x="160" y="94" text-anchor="middle" font-size="10" fill="#7A6A5E">instruction ↓  summary ↑</text>
+  <text x="610" y="94" text-anchor="middle" font-size="10" fill="#7A6A5E">instruction ↓  summary ↑</text>
+  <rect x="100" y="120" width="160" height="52" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="180.0" y="143.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">research lead</text>
+  <text x="180.0" y="159.0" text-anchor="middle" font-size="11" fill="#7A6A5E">own loop + state</text>
+  <rect x="500" y="120" width="160" height="52" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="580.0" y="143.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">content lead</text>
+  <text x="580.0" y="159.0" text-anchor="middle" font-size="11" fill="#7A6A5E">own loop + state</text>
+  <rect x="40" y="220" width="130" height="44" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="105.0" y="247.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">researcher</text>
+  <rect x="190" y="220" width="130" height="44" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="255.0" y="247.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">analyst</text>
+  <path d="M180,172 L105,218" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#hierarchical_teams-ah)"/>
+  <path d="M180,172 L255,218" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#hierarchical_teams-ah)"/>
+  <rect x="440" y="220" width="130" height="44" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="505.0" y="247.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">writer</text>
+  <rect x="590" y="220" width="130" height="44" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="655.0" y="247.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">editor</text>
+  <path d="M580,172 L505,218" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#hierarchical_teams-ah)"/>
+  <path d="M580,172 L655,218" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#hierarchical_teams-ah)"/>
+  <text x="380" y="290" text-anchor="middle" font-size="11" fill="#7A6A5E">team-internal detail and state never leave the team</text>
+  <text x="16" y="310" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = deterministic code · Dashed = data / failure path</text>
+</svg>

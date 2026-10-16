@@ -1,0 +1,4 @@
+Supervisor — exercise solution
+==============================
+[full history] ok=True turns=4 supervisor prompt tokens=1446
+[clipped history] ok=True turns=4 supervisor prompt tokens=523

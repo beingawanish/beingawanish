@@ -1,0 +1,7 @@
+Evaluator-optimizer — exercise solution
+=======================================
+[round 1 draft] Hi Sam, I am so incredibly sorry to hear that your order #4471 arrived six whole days later than we promised. I completely understand how frustrating it must have been to wait, especially after you had planned around the original delivery date. That's on us, and we take it seriously. I've refunded your $9.99 shipping fee today, and our whole team is reviewing what went wrong so it never happens again.
+[round 1 eval] FAIL: Cut to under 60 words (now 71)
+[round 2 draft] Hi Sam, I'm sorry order #4471 arrived 6 days late. That's on us. I've refunded your $9.99 shipping fee today.
+[round 2 eval] PASS
+passed=True rounds=2; evaluator calls=1, saved by pre-check=1

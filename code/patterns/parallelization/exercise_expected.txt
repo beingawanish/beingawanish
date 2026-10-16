@@ -1,0 +1,4 @@
+Parallelization — exercise solution
+===================================
+[2 usable of 3] verdict=None — no quorum (2/3 usable, need 3)
+[3 usable of 3] verdict=PHISHING — agreement 0.67 of 3 cast

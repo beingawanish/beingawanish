@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" role="img" aria-labelledby="ow-t ow-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="ow-t">Orchestrator–workers structure</title>
+  <desc id="ow-d">An orchestrator model writes a plan of subtasks at runtime. Code validates the plan, then workers run each subtask concurrently. The orchestrator synthesises the worker outputs into one result in a single pass.</desc>
+  <defs>
+    <marker id="ow-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="300" fill="#FBF5EA"/>
+
+  <rect x="16" y="118" width="80" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="56" y="149" text-anchor="middle" font-size="13" fill="#3B2F2A">Task</text>
+  <line x1="96" y1="144" x2="118" y2="144" stroke="#5A4636" stroke-width="1.5" marker-end="url(#ow-ah)"/>
+
+  <rect x="120" y="118" width="120" height="52" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="180" y="140" text-anchor="middle" font-size="13" font-weight="600" fill="#3B2F2A">orchestrator</text>
+  <text x="180" y="157" text-anchor="middle" font-size="11" fill="#7A6A5E">plan: N subtasks</text>
+  <line x1="240" y1="144" x2="262" y2="144" stroke="#5A4636" stroke-width="1.5" marker-end="url(#ow-ah)"/>
+
+  <polygon points="288,118 314,144 288,170 262,144" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="288" y="148" text-anchor="middle" font-size="10" fill="#3B2F2A">valid?</text>
+  <text x="280" y="190" text-anchor="end" font-size="10" fill="#7A6A5E">≤ max subtasks,</text>
+  <text x="280" y="203" text-anchor="end" font-size="10" fill="#7A6A5E">known sources</text>
+  <path d="M288,170 V 250 H 238" fill="none" stroke="#B5562E" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ow-ah)"/>
+  <rect x="120" y="230" width="116" height="40" rx="8" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="178" y="254" text-anchor="middle" font-size="12" fill="#3B2F2A">reject plan</text>
+
+  <!-- workers -->
+  <line x1="314" y1="144" x2="340" y2="144" stroke="#5A4636" stroke-width="1.5"/>
+  <path d="M340,144 V 48 H 372" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#ow-ah)"/>
+  <path d="M340,144 V 112 H 372" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#ow-ah)"/>
+  <path d="M340,144 V 176 H 372" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#ow-ah)"/>
+  <path d="M340,144 V 240 H 372" fill="none" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ow-ah)"/>
+  <g font-size="12" fill="#3B2F2A">
+    <rect x="374" y="28" width="150" height="40" rx="8" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+    <text x="449" y="52" text-anchor="middle">worker: login.py</text>
+    <rect x="374" y="92" width="150" height="40" rx="8" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+    <text x="449" y="116" text-anchor="middle">worker: session.py</text>
+    <rect x="374" y="156" width="150" height="40" rx="8" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+    <text x="449" y="180" text-anchor="middle">worker: security.md</text>
+    <rect x="374" y="220" width="150" height="40" rx="8" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <text x="449" y="244" text-anchor="middle" fill="#7A6A5E">… N chosen at runtime</text>
+  </g>
+  <text x="356" y="20" font-size="10" fill="#7A6A5E">concurrent (reuses fan_out)</text>
+
+  <!-- synth -->
+  <path d="M524,48 H 556 V 144" fill="none" stroke="#5A4636" stroke-width="1.5"/>
+  <path d="M524,112 H 556" fill="none" stroke="#5A4636" stroke-width="1.5"/>
+  <path d="M524,176 H 556" fill="none" stroke="#5A4636" stroke-width="1.5"/>
+  <path d="M524,240 H 556 V 144" fill="none" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <line x1="556" y1="144" x2="582" y2="144" stroke="#5A4636" stroke-width="1.5" marker-end="url(#ow-ah)"/>
+  <rect x="584" y="118" width="160" height="52" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="664" y="140" text-anchor="middle" font-size="13" font-weight="600" fill="#3B2F2A">orchestrator</text>
+  <text x="664" y="157" text-anchor="middle" font-size="11" fill="#7A6A5E">synthesise → result</text>
+  <text x="664" y="196" text-anchor="middle" font-size="11" fill="#7A6A5E">single pass: no re-planning</text>
+
+  <text x="16" y="290" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = deterministic code · Dashed = data / failure path</text>
+</svg>

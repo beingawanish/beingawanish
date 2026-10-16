@@ -1,0 +1,39 @@
+# Pattern 15 — Debate / peer critique
+
+Peer agents argue over rounds; a judge resolves; early agreement stops the debate.
+
+| | |
+|---|---|
+| Implementation | [`debate.py`](debate.py) |
+| Demo | [`main.py`](main.py) |
+| Exercise solution | [`exercise_solution.py`](exercise_solution.py) |
+| Chapter | [`book/part-3-multi-agent/15-debate.md`](../../../book/part-3-multi-agent/15-debate.md) |
+
+Python 3.10+, standard library only, offline. The model is `agentkit.MockLLM`, so output is deterministic.
+
+## Run
+
+```
+python3 code/patterns/debate/main.py
+```
+
+## Expected output
+
+```text
+Debate
+======
+-- Should we split billing out of the monolith this quarter?
+[r1 pro] Yes: billing deploys are blocked by unrelated monolith releases twice a month.
+[r1 con] No: no team owns billing today, so a new service would be orphaned.
+[r2 pro] Ownership is solvable by assigning two engineers; deploy coupling costs us a blocked release every sprint.
+[r2 con] Billing shares 14 tables with orders; splitting now means distributed transactions before we have an API boundary.
+[judge] Not this quarter: first put billing behind an internal API inside the monolith, then split. — Con's shared-tables point (r2) makes a split now risky; Pro's deploy-blocking cost (r1) is real, so the API boundary should start now to enable the split next quarter.
+result: consensus=False, rounds=2
+-- Should we add an index on orders.customer_id (queries scan 4M rows)?
+[r1 pro] Yes: every lookup scans 4M rows; the index is cheap to add online.
+[r1 con] Yes from me too: the write overhead is negligible next to the read savings.
+[consensus] all debaters agree after round 1 — no judge needed
+result: consensus=True, rounds=1; judge calls in total: 1
+```
+
+Verified by `python3 code/verify.py debate`.

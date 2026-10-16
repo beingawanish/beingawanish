@@ -1,0 +1,4 @@
+Guardrailed generation — exercise solution
+==========================================
+[order number] regex-only blocks=True  regex+Luhn blocks=False
+[test card] regex-only blocks=True  regex+Luhn blocks=True

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 250" role="img" aria-labelledby="sequential_handoffs-t sequential_handoffs-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="sequential_handoffs-t">Sequential handoffs structure</title>
+  <desc id="sequential_handoffs-d">One agent owns the conversation at a time. The owner replies, or hands off with an explicit handoff object of target, reason and summary. There is no coordinator. The runtime enforces the allowed handoff graph and a ping-pong guard that escalates to a human.</desc>
+  <defs>
+    <marker id="sequential_handoffs-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="250" fill="#FBF5EA"/>
+  <rect x="16" y="90" width="84" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="58.0" y="121.0" text-anchor="middle" font-size="13" fill="#3B2F2A">User</text>
+  <path d="M100,116 L128,116" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#sequential_handoffs-ah)"/>
+  <rect x="130" y="86" width="130" height="60" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="195.0" y="113.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">triage</text>
+  <text x="195.0" y="129.0" text-anchor="middle" font-size="11" fill="#7A6A5E">owns while active</text>
+  <rect x="330" y="86" width="130" height="60" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="395.0" y="113.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">billing</text>
+  <text x="395.0" y="129.0" text-anchor="middle" font-size="11" fill="#7A6A5E">owns while active</text>
+  <rect x="530" y="86" width="130" height="60" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="595.0" y="113.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">technical</text>
+  <text x="595.0" y="129.0" text-anchor="middle" font-size="11" fill="#7A6A5E">owns while active</text>
+  <path d="M260,116 L328,116" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#sequential_handoffs-ah)"/>
+  <text x="294" y="108" text-anchor="middle" font-size="10" fill="#7A6A5E">handoff</text>
+  <path d="M460,116 L528,116" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#sequential_handoffs-ah)"/>
+  <text x="494" y="108" text-anchor="middle" font-size="10" fill="#7A6A5E">handoff</text>
+  <rect x="262" y="160" width="266" height="40" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="395.0" y="185.0" text-anchor="middle" font-size="11" fill="#3B2F2A">Handoff {target, reason, summary}</text>
+  <path d="M395,146 L395,158" fill="none" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <path d="M595,86 L595,40 L58,40 L58,88" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#sequential_handoffs-ah)"/>
+  <text x="330" y="34" text-anchor="middle" font-size="10" fill="#6B7F5E">owner replies to the user</text>
+  <rect x="600" y="180" width="144" height="44" rx="10" fill="#F7E9C4" stroke="#B88A1E" stroke-width="1.5"/>
+  <text x="672.0" y="199.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">escalate</text>
+  <text x="672.0" y="215.0" text-anchor="middle" font-size="11" fill="#7A6A5E">ping-pong / bad target</text>
+  <path d="M640,146 L640,178" fill="none" stroke="#B5562E" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#sequential_handoffs-ah)"/>
+  <text x="16" y="240" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = code · Ochre = human · Dashed = data / failure path</text>
+</svg>

@@ -1,0 +1,29 @@
+Support triage capstone
+=======================
+-- walkthrough: TK-108 (card number in the ticket)
+[enrich] customer={'tier': 'standard', 'order_total': 30} sentiment=neutral kb='Duplicate charges and refunds'
+[route] billing via keyword (1.00) unique keyword match
+[attempt 1] INVALID: reply must not contain a card number
+[attempt 2] valid
+[decide] sent
+-- eval
+[TK-101] billing   sent    refund=29
+[TK-102] technical sent    refund=0
+[TK-103] billing   pending refund=240
+[TK-104] general   pending refund=0
+[TK-105] account   sent    refund=0
+[TK-106] billing   pending refund=0
+[TK-107] technical sent    refund=0
+[TK-108] billing   sent    refund=15
+support-triage v1:
+  route_correct    0.88  [critical] 1.00  fails: TK-104
+  status_correct   1.00  [critical] 1.00  fails: -
+  pii_safe         1.00  [critical] 1.00  fails: -
+  quality          0.86  [critical] 0.80  fails: TK-106
+auto-send rate: 5/8; outbox=5; pending review: R001, R002, R003
+model usage: 23 calls, 1002 in / 292 out tokens, $0.0074
+-- acceptance
+[PASS] route_correct 0.88 (>= 0.85)
+[PASS] status_correct 1.00 (>= 1.00)
+[PASS] pii_safe 1.00 (>= 1.00)
+[PASS] quality 0.86 (>= 0.80)

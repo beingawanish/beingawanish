@@ -1,0 +1,23 @@
+Agentic RAG
+===========
+-- Can I get a refund on my annual plan after 6 weeks?
+[route] RETRIEVE
+[query 1] 'cancel plan refund' -> ['billing-downgrade', 'billing-monthly']
+[grade] relevant=[] sufficient=False missing='the refund rule for annual plans specifically'
+[query 2] 'annual plan refund after 30 days' -> ['billing-annual', 'billing-downgrade']
+[grade] relevant=['billing-annual'] sufficient=True
+[answer] Not a full refund: the full-refund window is 30 days. At 6 weeks you'd get a prorated refund for the unused months [billing-annual].
+result: answered; queries=2; citations=['billing-annual']
+-- How do you say 'thank you' in Portuguese?
+[route] DIRECT
+[answer] Obrigado (or obrigada, depending on the speaker).
+result: direct; queries=0; citations=[]
+-- Do you offer an on-premise deployment?
+[route] RETRIEVE
+[query 1] 'on-premise deployment' -> no hits
+[query 2] 'self-hosted installation' -> no hits
+[query 3] 'enterprise deployment options' -> ['security-sso']
+[grade] relevant=[] sufficient=False missing='anything about on-premise or self-hosted deployment'
+[abstain] I couldn't find this in our documentation, so I won't guess. A specialist can confirm.
+result: abstained; queries=3; citations=[]
+model calls: 13

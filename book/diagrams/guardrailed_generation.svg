@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 280" role="img" aria-labelledby="guardrailed_generation-t guardrailed_generation-d" font-family="'Source Sans 3','Helvetica Neue',Arial,sans-serif">
+  <title id="guardrailed_generation-t">Guardrailed generation structure</title>
+  <desc id="guardrailed_generation-d">A model generates structured output. Deterministic validators check schema, policy and safety rules. Failures are sent back as targeted repair instructions up to a repair budget, after which a safe fallback is returned and flagged.</desc>
+  <defs>
+    <marker id="guardrailed_generation-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5A4636"/></marker>
+  </defs>
+  <rect width="760" height="280" fill="#FBF5EA"/>
+  <rect x="16" y="96" width="84" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="58.0" y="127.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Request</text>
+  <path d="M100,122 L126,122" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#guardrailed_generation-ah)"/>
+  <rect x="128" y="90" width="140" height="64" rx="10" fill="#F6E3D3" stroke="#B5562E" stroke-width="1.5"/>
+  <text x="198.0" y="119.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">generate</text>
+  <text x="198.0" y="135.0" text-anchor="middle" font-size="11" fill="#7A6A5E">JSON output</text>
+  <path d="M268,122 L300,122" fill="none" stroke="#5A4636" stroke-width="1.5" marker-end="url(#guardrailed_generation-ah)"/>
+  <rect x="302" y="74" width="176" height="96" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="390.0" y="127.0" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600"></text>
+  <text x="390" y="98" text-anchor="middle" font-size="13" fill="#3B2F2A" font-weight="600">validators</text>
+  <text x="390" y="118" text-anchor="middle" font-size="11" fill="#7A6A5E">schema · types</text>
+  <text x="390" y="134" text-anchor="middle" font-size="11" fill="#7A6A5E">policy limits</text>
+  <text x="390" y="150" text-anchor="middle" font-size="11" fill="#7A6A5E">PII · length</text>
+  <path d="M478,122 L618,122" fill="none" stroke="#6B7F5E" stroke-width="1.5" marker-end="url(#guardrailed_generation-ah)"/>
+  <text x="548" y="114" text-anchor="middle" font-size="10" fill="#6B7F5E">all pass</text>
+  <rect x="620" y="96" width="124" height="52" rx="10" fill="#FFFDF8" stroke="#8C7B70" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="682.0" y="127.0" text-anchor="middle" font-size="13" fill="#3B2F2A">Valid output</text>
+  <path d="M390,170 L390,214 L198,214 L198,156" fill="none" stroke="#B5562E" stroke-width="1.5" marker-end="url(#guardrailed_generation-ah)"/>
+  <text x="294" y="208" text-anchor="middle" font-size="10" fill="#B5562E">repair: your output + exact errors</text>
+  <text x="198" y="236" text-anchor="middle" font-size="10" fill="#7A6A5E">≤ max repairs</text>
+  <path d="M478,150 L560,150 L560,211 L618,211" fill="none" stroke="#B5562E" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#guardrailed_generation-ah)"/>
+  <text x="566" y="182" text-anchor="start" font-size="10" fill="#B5562E">budget spent</text>
+  <rect x="620" y="188" width="124" height="46" rx="10" fill="#E7EDE1" stroke="#6B7F5E" stroke-width="1.5"/>
+  <text x="682.0" y="208.0" text-anchor="middle" font-size="12" fill="#3B2F2A" font-weight="600">safe fallback</text>
+  <text x="682.0" y="224.0" text-anchor="middle" font-size="11" fill="#7A6A5E">flagged</text>
+  <text x="16" y="270" text-anchor="start" font-size="11" fill="#7A6A5E">Terracotta = model call · Sage = deterministic code · Dashed = data / failure path</text>
+</svg>

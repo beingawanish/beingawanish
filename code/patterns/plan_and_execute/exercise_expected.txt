@@ -1,0 +1,10 @@
+Plan-and-execute — exercise solution
+====================================
+[plan v1] s1:search_venues → s2:check_availability → s3:get_quote → s4:draft_invite
+[exec s1] ok  ['Casa Azul', 'Quinta Verde']
+[exec s2] FAIL booked (Casa Azul unavailable)
+[local repair] s2r:check_availability → s3r:get_quote → s4r:draft_invite
+[exec s2r] ok  free
+[exec s3r] ok  EUR 1800
+[exec s4r] ok  Invite: offsite at Quinta Verde on 14 Nov
+result: completed; replans=0; planner calls=1 (was 2)
