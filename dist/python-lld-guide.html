@@ -308,7 +308,8 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li><a href="#python-lld-type-along-guide" id="toc-python-lld-type-along-guide">Python LLD Type-Along Guide</a></li>
 <li><a href="#chapter-0-before-you-type-a-line" id="toc-chapter-0-before-you-type-a-line">Chapter 0: Before You Type a Line</a> <ul> <li><a href="#what-this-guide-is" id="toc-what-this-guide-is">What this guide is</a></li>
 <li><a href="#how-to-use-a-type-along-guide" id="toc-how-to-use-a-type-along-guide">How to use a type-along guide</a></li>
-<li><a href="#the-six-problems" id="toc-the-six-problems">The six problems</a></li>
+<li><a href="#the-fifteen-problems" id="toc-the-fifteen-problems">The fifteen problems</a></li>
+<li><a href="#reading-paths" id="toc-reading-paths">Reading paths</a></li>
 <li><a href="#how-lld-interviews-are-scored" id="toc-how-lld-interviews-are-scored">How LLD interviews are scored</a></li>
 <li><a href="#the-enterprise-checklist" id="toc-the-enterprise-checklist">The enterprise checklist</a></li>
 <li><a href="#how-each-problem-chapter-is-structured" id="toc-how-each-problem-chapter-is-structured">How each problem chapter is structured</a></li>
@@ -537,8 +538,9 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li><a href="#ch15-10-stretch-tasks" id="toc-ch15-10-stretch-tasks">10. Stretch tasks</a></li>
 </ul></li>
 <li><a href="#chapter-16-what-repeats" id="toc-chapter-16-what-repeats">Chapter 16: What Repeats</a> <ul> <li><a href="#the-pattern-map" id="toc-the-pattern-map">The pattern map</a></li>
+<li><a href="#pattern-by-chapter" id="toc-pattern-by-chapter">Pattern × chapter</a></li>
 <li><a href="#the-design-moves-that-repeat" id="toc-the-design-moves-that-repeat">The design moves that repeat</a></li>
-<li><a href="#fifteen-questions-to-test-the-understanding" id="toc-fifteen-questions-to-test-the-understanding">Fifteen questions to test the understanding</a></li>
+<li><a href="#twenty-three-questions-to-test-the-understanding" id="toc-twenty-three-questions-to-test-the-understanding">Twenty-three questions to test the understanding</a></li>
 <li><a href="#the-checklist-revisited" id="toc-the-checklist-revisited">The checklist, revisited</a></li>
 <li><a href="#where-to-go-next" id="toc-where-to-go-next">Where to go next</a></li>
 </ul></li>
@@ -546,26 +548,57 @@ details.answer > p:last-child{ margin-bottom:14px; }
 </nav>
 <p><a id="top"></a></p>
 <h1 id="python-lld-type-along-guide">Python LLD Type-Along Guide</h1>
-<p><em>Six low-level design problems, typed end to end — the enterprise-grade follow-up to the Python Study Guide. Written against Python 3.13, standard library only.</em></p>
+<p><em>Fifteen low-level design problems, typed end to end — the enterprise-grade follow-up to the Python Study Guide. Written against Python 3.13, standard library only.</em></p>
 <h1 id="chapter-0-before-you-type-a-line">Chapter 0: Before You Type a Line</h1>
 <h2 id="what-this-guide-is">What this guide is</h2>
-<p>Six problems. One method: you type every line.</p>
+<p>Fifteen problems. One method: you type every line.</p>
 <p>This is the type-along companion to the Python Study Guide. That guide taught you the language — functions, classes, dataclasses, typing, exceptions, testing, the material of its chapters 1 through 8. This guide teaches you what to build with it.</p>
-<p>Each of the six chapters takes one low-level design problem — parking lot, elevator system, traffic light, library management, vending machine, car rental — and walks you through a complete, working, tested solution. Nothing is pasted. You type it all.</p>
+<p>Each of the fifteen problem chapters takes one low-level design problem and walks you through a complete, working, tested solution. The first six are the classics: parking lot, elevator system, traffic light, library management, vending machine, car rental. The next nine are the problems 2026 interviews reach for: traffic management, rate limiter, LRU cache with TTL, movie ticket booking, expense sharing, ride-sharing, food delivery, an LLM gateway and an agent tool-calling framework. Car rental also gets a Version 2, where the interviewer's follow-ups are built as real code instead of answered in words. Nothing is pasted. You type it all.</p>
 <p>That is the whole method, and it works for one reason: it is how you learned Java. You did not learn Java by reading about it. You typed it for years, until the patterns lived in your hands. Python gets the same treatment here. By the sixth problem, the moves — the injected clock, the boundary validation, the explicit state table — should feel as automatic as a Java constructor chain.</p>
 <p>The Study Guide's chapters 1 through 8 are the entire toolkit this guide needs. Functions and classes are the skeleton of every design. Dataclasses carry the domain objects and the config. Typing makes the API surface honest — every signature says what it takes and what it returns. Exceptions become the custom hierarchies. Testing becomes the checkpoints. If any of those feel rusty, revisit the chapter before you start typing. This guide builds on them without re-teaching them.</p>
 <p>One more thing this guide assumes: you are preparing for senior backend interviews. Every chapter is shaped the way interviewers actually grade LLD rounds. You will see how in the section on scoring below.</p>
 <h2 id="how-to-use-a-type-along-guide">How to use a type-along guide</h2>
 <p><strong>Type every line yourself.</strong> Do not copy-paste.</p>
-<p>Copy-paste lets your eyes skim. Typing forces you to parse each construct — the colon after the method signature, the <code>self</code> you almost forgot, the import at the top of the file. Your fingers catch what your eyes skip. That is not a metaphor. When you retype <code>def __post_init__(self) -&gt; None:</code> ten times across six chapters, your hands know it before your head does, and in an interview your hands are what the interviewer is watching.</p>
+<p>Copy-paste lets your eyes skim. Typing forces you to parse each construct — the colon after the method signature, the <code>self</code> you almost forgot, the import at the top of the file. Your fingers catch what your eyes skip. That is not a metaphor. When you retype <code>def __post_init__(self) -&gt; None:</code> ten times across fifteen chapters, your hands know it before your head does, and in an interview your hands are what the interviewer is watching.</p>
 <p><strong>Run the checkpoint at each step.</strong> Every chapter carries two or three checkpoints: small, runnable milestones with a precise expected result. When a checkpoint passes, the ground under you is solid and you can build on it. When it fails, you know exactly where to look instead of debugging a whole system at once. Never skip a checkpoint. A skipped checkpoint is a bug you will meet again, worse, at the next one.</p>
 <p><strong>When you get stuck — and you will — compare, find the difference, and retype the fix.</strong> Do not paste it. Open the reference, find where your code diverges, understand the divergence, close the reference, and type the fix yourself. The point is not the green test run. The point is the second pass through the same construct. The first pass taught you nothing because you were following; the second pass is where the learning happens.</p>
 <p><strong>Keep a mistakes note.</strong> One file, one line per mistake: what went wrong, what the fix was. A forgotten <code>field(default_factory=...)</code> here, a lock acquired in the wrong order there. Your own bug list beats any textbook, because every entry in it is something you actually did. Read it before interviews. It is the shortest path to not repeating yourself under pressure.</p>
 <p><strong>One problem per sitting.</strong> A sitting is the type-along plus the stretch tasks at the end of the chapter. If a sitting runs long, stop at a checkpoint — the chapters are built so the checkpoints are safe stopping points. Come back fresh. Typing tired teaches typos, not design.</p>
-<h2 id="the-six-problems">The six problems</h2>
+<h2 id="the-fifteen-problems">The fifteen problems</h2>
 <p>A word on what each one is really about, beneath the domain dressing.</p>
 <p><strong>Parking lot</strong> is allocation under constraints: who fits where, who pays what, and what happens when the lot is full. <strong>Elevator system</strong> is concurrency: many requests, many cabs, one dispatcher, and the queue in between. <strong>Traffic light</strong> is state machines with real-world consequences: phases, transitions, and the clearance that keeps people safe. <strong>Library management</strong> is repositories and reservations: catalogs, copies, holds, and the notifications that close the loop. <strong>Vending machine</strong> is state plus money: collect, validate, dispense, return change, and never lose a coin. <strong>Car rental</strong> is intervals and pricing: who has which car when, and what the time was worth.</p>
+<p>Then come nine more, in five families.</p>
+<p><strong>Classic infrastructure.</strong> <strong>Rate limiter</strong> is really about atomic read-modify-write. Five algorithms answer the same question, "may this pass?", and the hard part is making sure two threads can't both read 9 of 10 and both let a request through. <strong>LRU cache with TTL</strong> is two data structures doing one job: a dict for finding, a linked list for ordering. Add time that makes entries go stale, and a stampede to stop when a hot key expires.</p>
+<p><strong>Booking and money.</strong> <strong>Movie ticket booking</strong> is a race with exactly one winner. Two people click seat B2 at the same instant, one of them gets a ten-minute hold, and the payment that follows must move money exactly once. <strong>Expense sharing (Splitwise)</strong> is a ledger that must never lose a cent: integer money, one written-down rounding rule, and an honest answer to "minimise the number of payments", which turns out to be NP-hard.</p>
+<p><strong>Marketplaces.</strong> <strong>Ride-sharing</strong> is the elevator dispatcher with money attached, plus one hard guarantee: a driver is never handed two riders at once. <strong>Food delivery</strong> is a long order lifecycle with three parties in it (customer, restaurant, delivery partner), a bill built step by step, and an order that must be safe to place twice.</p>
+<p><strong>City systems.</strong> <strong>Traffic management</strong> is Chapter 3 grown up. Many intersections, a control centre pushing timing plans and green waves, and controllers that stay safe when the centre goes quiet or pushes a bad plan.</p>
+<p><strong>AI-era systems.</strong> <strong>LLM gateway</strong> is a thin orchestrator over small, single-purpose classes: routing, retries, a circuit breaker, fallback across providers, per-team quotas, and a ledger that bills every token. <strong>Agent tool-calling framework</strong> is the loop between a model and the functions it may call — and everything that loop does wrong by default. It runs forever. It crashes on the first tool error. It sends an email twice. It obeys a web page.</p>
+<p>And <strong>Car rental, Version 2</strong> is the follow-up round made real. The interviewer moves the goalposts five times: dynamic pricing, an electric fleet, a vehicle lifecycle, branches with one-way trips, payments with a deposit. Every change lands in a new package, and not one line of version 1 is edited.</p>
 <p>Different stories, same moves. By the third chapter you will start predicting the design before you read it. That feeling is the whole point.</p>
+<p><strong>What 2026 interviews add.</strong> The classics still open plenty of rounds. What has changed is the follow-up questions, and the nine newer chapters exist to rehearse them. Four themes come up again and again:</p>
+<ul>
+<li><strong>Concurrency correctness.</strong> Not "did you add a lock" but "show me the check-then-act, and prove two threads can't both win." With free-threaded Python 3.13 builds around, "the GIL protects me" no longer counts as an answer.</li>
+<li><strong>Idempotency.</strong> The client will retry. The gateway will time out after it took the money. The same request must not act twice.</li>
+<li><strong>Money.</strong> Integer minor units, a rounding rule you can state, refunds that depend on who cancelled and when.</li>
+<li><strong>AI-era systems.</strong> Interviewers now ask for the gateway in front of a model and the runtime around an agent. They grade them with the same rubric as a parking lot.</li>
+</ul>
+<h2 id="reading-paths">Reading paths</h2>
+<p>Reading straight through works, and it is the best path if you have the time. The chapters are in a sensible order, and a few later ones lean on earlier ones: Chapter 7 grows Chapter 3's transition table, and Chapter 13 borrows Chapter 12's surge policy. At one sitting a day, the whole guide is sixteen sittings, plus the outro.</p>
+<p>If the interview is two weeks away, take this path instead. It keeps one sitting a day and skips the two chapters whose moves you will meet elsewhere: Chapter 4 (repositories and notifications come back in Chapters 10 to 13) and Chapter 7 (it extends Chapter 3, which you will have typed). Read Chapter 16 on the last evening.</p>
+<table>
+<thead>
+<tr><th>Days</th><th>Sittings</th><th>What you are practising</th></tr>
+</thead>
+<tbody>
+<tr><td>1–3</td><td>Chapters 1, 2, 3</td><td>Allocation, dispatch, the transition table</td></tr>
+<tr><td>4–6</td><td>Chapter 5, Chapter 6, Chapter 6 Version 2</td><td>State plus money, intervals, follow-ups as code</td></tr>
+<tr><td>7–8</td><td>Chapters 8, 9</td><td>Atomic updates, eviction, expiry</td></tr>
+<tr><td>9–10</td><td>Chapters 10, 11</td><td>One-winner races, idempotent payments, exact money</td></tr>
+<tr><td>11–12</td><td>Chapters 12, 13</td><td>Compare-and-set claims, long lifecycles</td></tr>
+<tr><td>13–14</td><td>Chapters 14, 15</td><td>Retries, breakers, quotas, the agent loop</td></tr>
+</tbody>
+</table>
+<p>Shorter still, if you know what the role is about. A backend infrastructure round: Chapters 1, 6, 8, 9, 14. A product company with bookings and payments: Chapters 6 (with Version 2), 10, 11, 12, 13. An AI platform team: Chapters 8, 9, 14, 15, since the rate limiter and the cache are the gateway's own parts.</p>
 <h2 id="how-lld-interviews-are-scored">How LLD interviews are scored</h2>
 <p>Interviewers rarely say this out loud, but an LLD round is graded on five things. They map directly onto this guide's chapter structure, so you are practicing the scoring rubric every time you type.</p>
 <p><strong>Requirements elicitation.</strong> The interview starts before you design. A strong candidate asks clarifying questions: how many floors, which vehicle types, how is pricing charged, what happens when the lot is full. This is not stalling. Production systems fail on assumed requirements, and the interviewer is checking whether you think like someone who has been burned by that. Each chapter opens with the questions to ask and the answers the interviewer would give, so you practice the asking.</p>
@@ -588,7 +621,7 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <p><strong>Repository pattern for persistence — in-memory, swappable.</strong> Business code talks to a repository interface. The implementation behind it is in-memory today and a database tomorrow, and the callers never change.</p>
 <p><strong>unittest stdlib tests with edge cases.</strong> The stdlib test runner works anywhere Python runs, with zero installs. Edge cases are where interview bugs live: the full lot, the empty queue, the expired ticket, the midnight boundary.</p>
 <h2 id="how-each-problem-chapter-is-structured">How each problem chapter is structured</h2>
-<p>Every chapter follows the same ten-part arc. Once you have done one, you know the shape of the other five, and you can pace yourself against it.</p>
+<p>Every chapter follows the same ten-part arc. Once you have done one, you know the shape of the other fourteen, and you can pace yourself against it. Chapter 6 has one extra section at the end, Version 2, where its follow-ups get built as code.</p>
 <ol type="1">
 <li><strong>The problem.</strong> What you are building, in plain words, with the scope pinned down. No code yet.</li>
 <li><strong>Requirements.</strong> Functional and non-functional, written the way a strong candidate elicits them — practice asking these before you read the answers.</li>
@@ -604,12 +637,14 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <p>Read steps 1 through 5 before you start typing. Then type steps 6 through 8. Then attempt 9 before looking at any hints. Then read 10 and notice how much of it you already knew.</p>
 <h2 id="setup">Setup</h2>
 <p><strong>Python 3.13</strong>, the same version as the Study Guide. Everything here uses the standard library only — no pip installs, ever. If a chapter ever needed a third-party package, that would be a bug in the chapter.</p>
-<p>Each problem lives in its own directory under <code>code/</code>, with its tests beside it under <code>tests/</code>. Run the suite for the problem you are working on from the repository root:</p>
+<p>Each problem lives in its own package under <code>code/</code>, and all the tests live together under <code>tests/</code>. Run the suite from the guide root, the folder that holds both <code>code/</code> and <code>tests/</code>:</p>
 <div class="sourceCode" id="cb1"><pre
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-m</span> unittest discover <span class="at">-s</span> tests <span class="at">-v</span></span></code></pre></div>
 <p>The <code>-v</code> flag matters while you are learning: it names each test as it runs, so a failure tells you exactly which behavior broke.</p>
-<p>Check your version first: <code>python3 --version</code> should report 3.13.x. Every problem mirrors the same directory layout — source under <code>code/&lt;problem&gt;/</code>, tests under <code>tests/</code> — so once you learn one, you know all six. A problem is done when its full suite is green and you have attempted the stretch tasks with the reference closed.</p>
-<p>Suggested pace: one problem per sitting — the type-along first, the stretch tasks after. Six problems, six sittings, and at the end a set of moves your hands know. The outro chapter then shows you how those moves connect across problems and hands you fifteen interview questions to test the understanding behind them.</p>
+<p>To run one problem's tests on their own, add <code>-t .</code> and a file pattern: <code>python3 -m unittest discover -s tests -t . -p 'test_rate_limiter*.py' -v</code>. The <code>-t .</code> makes discovery import <code>tests</code> as a package, so <code>tests/__init__.py</code> runs, and that file puts <code>code/</code> on <code>sys.path</code>. You never set <code>PYTHONPATH</code> yourself.</p>
+<p>Demos are the one exception to "run it from the guide root." A package with a <code>__main__.py</code> runs as <code>python3 -m &lt;package&gt;</code> from inside <code>code/</code>: <code>cd code</code>, then <code>python3 -m rate_limiter</code>. Chapters 12 and 15 use a plain script instead, <code>python3 ride_demo.py</code> and <code>python3 agent_demo.py</code>, from the same folder. Some chapters suggest a flat project of your own, with the package and <code>tests/</code> side by side. In that layout, run everything from that one folder.</p>
+<p>Check your version first: <code>python3 --version</code> should report 3.13.x. Every problem mirrors the same directory layout — source under <code>code/&lt;problem&gt;/</code>, tests under <code>tests/</code> — so once you learn one, you know them all. A problem is done when its full suite is green and you have attempted the stretch tasks with the reference closed.</p>
+<p>Suggested pace: one problem per sitting — the type-along first, the stretch tasks after. Fifteen problems and one Version 2 make sixteen sittings, and at the end a set of moves your hands know. The reading paths above show how to cut that to two weeks. The outro, Chapter 16, then shows you how those moves connect across problems and hands you twenty-three interview questions to test the understanding behind them.</p>
 <p>Type the first line whenever you are ready.</p>
 <h1 id="chapter-1-parking-lot">Chapter 1: Parking Lot</h1>
 <p>Type along with this chapter. You will build a working multi-floor parking lot: entry panel, exit panel, tickets, hourly pricing, and a free-spot display. Every file is complete and runnable. Type each one, run the checkpoint, and move on.</p>
@@ -31217,9 +31252,10 @@ OK</code></pre>
 <li><strong>Subagents as tools.</strong> Write <code>AgentTool(Tool)</code>, which wraps a whole <code>Agent</code> and runs it on its <code>task</code> argument. Decide what its permission default should be, and what a child's step budget should be relative to its parent's. Argue both in a paragraph.</li>
 </ol>
 <h1 id="chapter-16-what-repeats">Chapter 16: What Repeats</h1>
-<p>You have typed six complete systems. Step back from the keyboard for a minute and look at what your hands just learned.</p>
-<p>It was never really six different problems. The same five patterns kept showing up in different clothes. The same six design moves solved the hard part every time. This chapter names them out loud, because in an interview you will not be asked about parking lots. You will be asked about a problem you have never seen — and the thing that saves you is recognizing it as a pattern you have already typed.</p>
+<p>You have typed fifteen complete systems, and a second version of one of them. Step back from the keyboard for a minute and look at what your hands just learned.</p>
+<p>It was never really fifteen different problems. A short list of patterns kept showing up in different clothes. The same ten design moves solved the hard part, chapter after chapter. This chapter names them out loud, because in an interview you will not be asked about parking lots. You will be asked about a problem you have never seen — and the thing that saves you is recognizing it as a pattern you have already typed.</p>
 <h2 id="the-pattern-map">The pattern map</h2>
+<p>Start with the first six chapters. That is where the vocabulary was learned: five classic patterns, each with one job.</p>
 <table>
 <thead>
 <tr>
@@ -31266,18 +31302,18 @@ answer comes from memory today or a database tomorrow.</td>
 </tr>
 </tbody>
 </table>
-<p>Five patterns, six problems. Here is the shape of it. Each hub is a pattern, each edge is labeled with the job the pattern does, and the center is the ground they all share:</p>
+<p>Five patterns, and the first six problems. Here is the shape of it. Each hub is a pattern, each edge is labeled with the job the pattern does, and the center is the ground they all share:</p>
 <div style="overflow-x:auto">
 <svg viewBox="0 0 1200 680" style="min-width:1200px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="pattern-map-title pattern-map-desc" xmlns="http://www.w3.org/2000/svg">
-<title id="pattern-map-title">The cross-problem pattern map</title>
-<desc id="pattern-map-desc">Five design patterns connect to the six LLD type-along problems; each labeled edge names the job the pattern does.</desc>
+<title id="pattern-map-title">The cross-problem pattern map for Chapters 1 to 6</title>
+<desc id="pattern-map-desc">Five design patterns connect to the six classic problems of Chapters 1 to 6; each labeled edge names the job the pattern does. The Pattern × chapter table after the map covers all fifteen problems.</desc>
 <defs>
 <marker id="pmap-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
 <path d="M 0 1 L 9 5 L 0 9 z" fill="#4f5d75"/>
 </marker>
 </defs>
 <rect x="0" y="0" width="1200" height="680" fill="#f5f5f5"/>
-<text x="600" y="40" text-anchor="middle" font-family="'Instrument Serif', Georgia, 'Times New Roman', serif" font-size="30" fill="#2d3142">Five patterns, six problems</text>
+<text x="600" y="40" text-anchor="middle" font-family="'Instrument Serif', Georgia, 'Times New Roman', serif" font-size="30" fill="#2d3142">Five patterns, the first six problems</text>
 <g stroke="#4f5d75" stroke-width="1.5" fill="none">
 <path d="M 600 168 V 256" marker-end="url(#pmap-arrow)"/>
 <path d="M 308 344 H 440" marker-end="url(#pmap-arrow)"/>
@@ -31299,7 +31335,7 @@ answer comes from memory today or a database tomorrow.</td>
 </g>
 <g>
 <rect x="440" y="256" width="320" height="192" rx="8" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.5"/>
-<text x="600" y="284" text-anchor="middle" font-family="'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" font-weight="500" letter-spacing="0.12em" fill="#2d3142">SIX TYPE-ALONG PROBLEMS</text>
+<text x="600" y="284" text-anchor="middle" font-family="'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" font-weight="500" letter-spacing="0.12em" fill="#2d3142">THE CLASSICS · CHAPTERS 1–6</text>
 <g font-family="'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9" fill="#2d3142">
 <rect x="456" y="302" width="136" height="32" rx="6" fill="#ffffff" stroke="#2d3142" stroke-opacity="0.3"/>
 <text x="524" y="323" text-anchor="middle">PARKING LOT</text>
@@ -31346,25 +31382,60 @@ answer comes from memory today or a database tomorrow.</td>
 <rect x="84" y="622" width="44" height="26" rx="4" fill="#ffffff" stroke="#2d3142"/>
 <text x="140" y="640">pattern hub — one reusable idea</text>
 <rect x="430" y="622" width="44" height="26" rx="4" fill="rgba(191,69,32,0.08)" stroke="#bf4520"/>
-<text x="486" y="640">the six type-along problems</text>
+<text x="486" y="640">the classics, Chapters 1–6</text>
 <line x1="800" y1="635" x2="870" y2="635" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#pmap-arrow)"/>
 <text x="882" y="640">edge label — the job the pattern does</text>
 </g>
 </svg>
 </div>
 
-<p>Read it this way: no pattern belongs to any single problem. Strategy is not "the pricing thing from the parking lot." It is the move you reach for whenever an algorithm varies independently of its user — and it showed up four times in six chapters. When the interviewer hands you a seventh problem, your first question is not "what do I build." It is "which of these five is this."</p>
-<p>If you only carry two patterns into an interview, make them Strategy and State. Strategy showed up four times because "the rule might change" is the most common sentence in a requirements doc — pricing, dispatch, fines, all the same shape. State showed up three times because anything with a lifecycle — a machine, a light, a cab — is a state machine whether you name it or not. The other three are support beams: Observer keeps producers and consumers strangers, Factory keeps construction rules in one room, Repository keeps storage a deployment decision. Five is a small enough set to hold in your head during a live design. That is the real reason the map matters.</p>
+<p>Read it this way: no pattern belongs to any single problem. Strategy is not "the pricing thing from the parking lot." It is the move you reach for whenever an algorithm varies independently of its user — and it showed up four times in the first six chapters. When the interviewer hands you a problem you have never seen, your first question is not "what do I build." It is "which of these is this."</p>
+<p>If you only carry two patterns into an interview, make them Strategy and State. In the classics, Strategy showed up four times because "the rule might change" is the most common sentence in a requirements doc — pricing, dispatch, fines, all the same shape. State showed up three times because anything with a lifecycle — a machine, a light, a cab — is a state machine whether you name it or not. The other three are support beams: Observer keeps producers and consumers strangers, Factory keeps construction rules in one room, Repository keeps storage a deployment decision. Five is a small enough set to hold in your head during a live design. That is the real reason the map matters.</p>
+<h2 id="pattern-by-chapter">Pattern × chapter</h2>
+<p>Then came nine more problems, and the real question was whether the five would hold. They did. Strategy turned up in all nine, and in Version 2 as well. State machines came back in four of them and in Version 2, plus once in disguise: the LLM gateway's circuit breaker is a three-state machine (closed, open, half-open). Repository carried the storage in six of the nine, and Observer the notifications in four.</p>
+<p>A few new names joined the list. <strong>Chain of Responsibility</strong> arrived three times: food delivery's discount rules, the gateway's guardrails, the agent's hooks. Each is a run of handlers that decide for themselves whether to act, and none of them knows about the others. <strong>Circuit breaker</strong> arrived with the gateway. It answers "should I even try this provider?", which is a different question from the retrier's "should I wait and try again?", so it is a different class.</p>
+<p>The last four columns are design moves rather than patterns, but they belong on the same map. The next section covers them.</p>
+<div style="overflow-x:auto">
+<table>
+<thead>
+<tr><th>Chapter</th><th>Strategy</th><th>State machine</th><th>Observer</th><th>Chain of Resp.</th><th>Repository</th><th>Circuit breaker</th><th>Idempotency key</th><th>Compare-and-set claim</th><th>Per-key lock</th><th>Injected clock</th></tr>
+</thead>
+<tbody>
+<tr><td>1 Parking lot</td><td>●</td><td></td><td></td><td></td><td>●</td><td></td><td></td><td></td><td></td><td>●</td></tr>
+<tr><td>2 Elevator</td><td>●</td><td>●</td><td>●</td><td></td><td>●</td><td></td><td></td><td></td><td></td><td>●</td></tr>
+<tr><td>3 Traffic light</td><td></td><td>●</td><td>●</td><td></td><td></td><td></td><td></td><td></td><td></td><td>●</td></tr>
+<tr><td>4 Library</td><td>●</td><td></td><td>●</td><td></td><td>●</td><td></td><td></td><td></td><td></td><td>●</td></tr>
+<tr><td>5 Vending machine</td><td></td><td>●</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td>6 Car rental</td><td>●</td><td></td><td></td><td></td><td>●</td><td></td><td></td><td></td><td></td><td>●</td></tr>
+<tr><td>6 Version 2</td><td>●</td><td>●</td><td></td><td></td><td>●</td><td></td><td>●</td><td></td><td></td><td>●</td></tr>
+<tr><td>7 Traffic management</td><td>●</td><td>●</td><td>●</td><td></td><td></td><td></td><td></td><td></td><td></td><td>●</td></tr>
+<tr><td>8 Rate limiter</td><td>●</td><td></td><td></td><td></td><td>●</td><td></td><td></td><td></td><td></td><td>●</td></tr>
+<tr><td>9 LRU cache with TTL</td><td>●</td><td></td><td>●</td><td></td><td></td><td></td><td></td><td></td><td></td><td>●</td></tr>
+<tr><td>10 Movie ticket booking</td><td>●</td><td>●</td><td></td><td></td><td>●</td><td></td><td>●</td><td>●</td><td>●</td><td>●</td></tr>
+<tr><td>11 Expense sharing</td><td>●</td><td></td><td></td><td></td><td>●</td><td></td><td></td><td></td><td>●</td><td>●</td></tr>
+<tr><td>12 Ride-sharing</td><td>●</td><td>●</td><td>●</td><td></td><td>●</td><td></td><td></td><td>●</td><td></td><td>●</td></tr>
+<tr><td>13 Food delivery</td><td>●</td><td>●</td><td>●</td><td>●</td><td>●</td><td></td><td>●</td><td>●</td><td></td><td>●</td></tr>
+<tr><td>14 LLM gateway</td><td>●</td><td>●</td><td></td><td>●</td><td></td><td>●</td><td></td><td></td><td></td><td>●</td></tr>
+<tr><td>15 Agent tool-calling</td><td>●</td><td></td><td></td><td>●</td><td>●</td><td></td><td>●</td><td></td><td>●</td><td>●</td></tr>
+</tbody>
+</table>
+</div>
+<p>Read the table by columns, not rows. Strategy's column is solid apart from the two pure state machines, because "the rule might change" never stopped being the most common sentence in a requirements doc. The clock column is solid apart from the vending machine, which never asks what time it is. The right-hand columns are empty in Chapters 1 to 6 and fill up from Version 2 on, exactly where retries, money and marketplaces arrive. That is the 2026 shift, in one picture.</p>
 <h2 id="the-design-moves-that-repeat">The design moves that repeat</h2>
-<p>Patterns are the vocabulary. These six moves are the grammar — the small decisions that showed up in every chapter, in almost the same form, because they solve problems that every LLD problem has.</p>
+<p>Patterns are the vocabulary. These moves are the grammar — the small decisions that showed up chapter after chapter, in almost the same form, because they solve problems that every LLD problem has. The classics taught the first six. The newer chapters added four more.</p>
 <p><strong>Inject the clock.</strong> Every chapter that touched time took it as a constructor argument instead of calling <code>date.today()</code> or <code>datetime.now()</code> inside the logic. The reason is testability, but the deeper reason is honesty: time is an input, and inputs belong in the signature where everyone can see them. Production passes the real clock; tests pass a fixed one; the logic never knows the difference. Once you have done this three times, a hardcoded <code>now()</code> inside business logic starts to look like a global variable — because that is what it is.</p>
 <p><strong>Validate at the boundary.</strong> Public methods guard; private helpers trust. Every chapter put its input checks at the outermost layer — negative minutes rejected, unknown ids rejected, empty strings rejected — and then wrote the inner logic as if the inputs were already clean. An error caught at the door carries full context: which argument, which call. The same error discovered three layers down has already half-mutated the state, and the stack trace reads like a riddle. Boundaries validate so internals can stay readable.</p>
 <p><strong>Half-open intervals for bookings.</strong> Whenever two things could not overlap in time — rental reservations, and anywhere else a resource is held for a span — the chapters used <code>[start, end)</code>: inclusive start, exclusive end. Back-to-back bookings then never collide, and the overlap test is a single clean comparison instead of a nest of endpoint special cases. Every special case you avoid is a double-booking bug that never gets written.</p>
 <p><strong>Smallest-fit allocation.</strong> The parking lot gives each vehicle the smallest spot it fits in: motorcycle to compact, car to regular, truck to large. First-free would park the motorcycle in the large spot and leave the truck circling. It is greedy best-fit — preserve the scarce resource for the demand that actually needs it. The same instinct transfers anywhere capacity comes in tiers: thread pools, connection pools, warehouse bins.</p>
 <p><strong>Explicit transition tables.</strong> The vending machine, the traffic light, and the elevator cab all keep their states and legal transitions as data — a table you can read — instead of nested <code>if</code> statements scattered through methods. An impossible transition then fails loudly at the table instead of silently doing nothing inside a branch you forgot. When the interviewer asks "what happens if X arrives while in state Y," you point at one row instead of tracing five methods.</p>
 <p><strong>Locks around shared queues, documented.</strong> The elevator's request queue, the parking lot's spot map — anywhere two threads could touch the same mutable state, the chapters guarded it with one lock, kept the locked section short, and wrote down exactly what the lock protects at the declaration site. The documentation is part of the move: a lock whose scope lives only in the author's head is a deadlock waiting for the next person who touches the code.</p>
-<h2 id="fifteen-questions-to-test-the-understanding">Fifteen questions to test the understanding</h2>
-<p>Short answers. If you can answer these out loud, without the book open, the six chapters did their job. If one stalls you, go back to its chapter — the answer is in your fingers already.</p>
+<p><strong>Make retries safe with idempotency keys.</strong> Networks fail in the worst possible place: after the work happened, before the answer arrived. The caller can't tell which, so it retries. Version 2's payments, the movie booking's charges, food delivery's place-order and the agent's side-effecting tools all handle this the same way. Each request carries a key. The first result is stored under it, and a repeat gets the stored result back instead of acting twice. The agent chapter adds one sharp detail: build the key from what the call does (run id, tool name, canonical input), not from an id the model mints fresh on every retry.</p>
+<p><strong>Claim with compare-and-set.</strong> "Is it free? Then it's mine" is two steps, and another thread can always slip between them. Ride-sharing's <code>DriverRepository.claim(driver_id, expected, new)</code> flips a driver's status only if it still holds the expected value. Food delivery's partner reservation works the same way. So does the movie booking's confirm, which commits only if the booking is still <code>HELD</code>. The nice part is that the in-memory version and the database version have the same shape: an <code>UPDATE … WHERE status = 'AVAILABLE'</code>, then a check of the row count.</p>
+<p><strong>Lock per key, not per system.</strong> One lock for everything is correct and simple, and Chapter 1 defends it. But a rush on one show shouldn't slow every other show. Movie booking hands out one lock per show, Splitwise one per group, and the agent's idempotency store one per key. Each lock still guards a whole check-then-act. There are just more of them, so strangers stop queuing behind each other.</p>
+<p><strong>Keep slow work outside the lock.</strong> A lock held across a payment call makes every other user wait for one person's card. The movie booking splits its confirm into three phases for exactly this reason: check under the lock, charge with no lock held, then re-take the lock and commit. The rate limiter logs only after releasing its lock, and the cache never calls a listener while holding its own. The rule is short. Inside the lock, touch memory and nothing else.</p>
+<p>And the oldest move kept growing. The injected clock in the LLM gateway does more than tell the time. Its <code>FakeClock.sleep</code> advances time instead of blocking, so a test that walks through retries and a 30-second circuit cooldown still runs in milliseconds.</p>
+<h2 id="twenty-three-questions-to-test-the-understanding">Twenty-three questions to test the understanding</h2>
+<p>Short answers. If you can answer these out loud, without the book open, the fifteen chapters did their job. If one stalls you, go back to its chapter — the answer is in your fingers already.</p>
 <p><strong>1. Why inject a clock instead of calling <code>date.today()</code> directly?</strong></p>
 <p>A hardcoded call to the real clock makes time untestable. An injected clock turns time into an ordinary input: tests pass a fixed clock and get deterministic results, production passes the system clock and gets real behavior. The logic never knows which one it got. Time stops being hidden global state and becomes a visible parameter.</p>
 <p><strong>2. When does composition beat inheritance in these designs?</strong></p>
@@ -31395,18 +31466,34 @@ answer comes from memory today or a database tomorrow.</td>
 <p>Context. An error caught at a public method's door knows which argument was wrong and which call made it. The same error discovered three layers down has already partially mutated state, and by the time you find it you are debugging the corruption, not the cause. Boundaries validate so that internals can trust — and trusted internals stay readable, because they are not cluttered with defensive checks.</p>
 <p><strong>15. What is smallest-fit allocation, and why not just take the first free spot?</strong></p>
 <p>Smallest-fit gives each vehicle the smallest spot it fits in. First-free would park the motorcycle in the large spot and leave the truck circling the lot. It is greedy best-fit: preserve the scarce resource for the demand that needs it. The rule is three lines, the payoff is utilization, and the same instinct applies wherever capacity comes in tiers.</p>
+<p><strong>16. Why does a traffic controller clamp a timing plan instead of trusting it?</strong></p>
+<p>Because safety lives in the controller, never in the plan. A plan only says how many green seconds each axis gets. Yellow and all-red come from the controller's own safety timings, and any green below the minimum gets clamped. So a buggy plan, or one pushed by a compromised centre, can make traffic slow. It cannot make it unsafe. That is also why every timing strategy is safe to plug in.</p>
+<p><strong>17. How does a rate limiter stay correct when two requests for the same key arrive at once?</strong></p>
+<p>The whole read-modify-write runs as one atomic unit inside the store. <code>StateStore.update</code> reads the state, runs the algorithm's step, writes the result and sets the expiry together: a lock in memory, a Lua script in Redis. The algorithm itself is a pure function with no clock and no lock, so the same step can run in either place. Split the read from the write and you get the classic race: two threads both see 9 of 10, both write 10, and 11 requests pass.</p>
+<p><strong>18. Why does an LRU cache need both a dict and a doubly linked list?</strong></p>
+<p>The dict finds a key in O(1) but knows nothing about age. The list knows the order, but finding a key in it is O(n). Together, a hit is "find the node through the dict, unlink it, push it to the front", and eviction is "take the node at the back." It has to be doubly linked, because unlinking from the middle needs the predecessor. Then admit the shortcut: <code>OrderedDict</code> is exactly this pair, written in C.</p>
+<p><strong>19. Why not hold the show's lock while the payment gateway charges the card?</strong></p>
+<p>A gateway call can take seconds, and under the lock every other user of that show waits. So confirm runs in three phases: check the hold under the lock, charge with no lock held, then re-take the lock and commit only if the booking is still <code>HELD</code>. The price is one extra case. The hold can expire while the money moves, and then the service refunds automatically. That case has its own test.</p>
+<p><strong>20. Why store money as integer minor units, and who gets the leftover cent?</strong></p>
+<p>Floats drift, and a ledger is updated thousands of times. Integers make every addition exact, and rounding happens once, inside one function, under one rule. The rule is largest remainder: everyone gets the floor of their share, and the leftover cents go to the largest fractional remainders, ties to whoever is listed first. So $100 split three ways is $33.34, $33.33, $33.33, and two servers computing the same split always agree.</p>
+<p><strong>21. How does ride-sharing guarantee a driver never gets two riders?</strong></p>
+<p>A compare-and-set claim. Dispatch ranks a snapshot of drivers, then claims the winner: the repository flips the driver from <code>AVAILABLE</code> to <code>OFFERED</code> only if the status is still <code>AVAILABLE</code>. If the claim fails, dispatch tries the next driver. An offered driver is invisible to every other dispatch. In a database the same move is an <code>UPDATE … WHERE status = 'AVAILABLE'</code> with a row-count check.</p>
+<p><strong>22. In the LLM gateway, why does every error carry a retryable flag?</strong></p>
+<p>Because three components key off it. The retrier retries only retryable errors, the breaker counts only retryable errors, and the fallback loop moves to the next model only after one. A 400 means the request itself is wrong. Retrying it, or sending it to another provider, just burns money and time to get the same answer. Retry inside a model, fall back across models.</p>
+<p><strong>23. Why does the agent framework turn tool failures into results instead of raising?</strong></p>
+<p>A model can fix its own mistakes, but only if it sees them. An unknown tool, a bad argument, a denied permission or a crashing tool all become a <code>tool_result</code> with <code>is_error: true</code> and a message that names the problem, and the loop keeps going. Only faults the model cannot fix raise: the model call itself, a broken message protocol, bad config. Same idea as answer 11, turned around. Exceptions are for faults; an error the caller can act on is data.</p>
 <h2 id="the-checklist-revisited">The checklist, revisited</h2>
 <p>Chapter 0 gave you twelve items. Here is where each one earned its keep.</p>
 <p>Single Responsibility and Open/Closed did their heaviest work in the domain-model sections and the stretch tasks — every goalpost move the interviewer threw was absorbed by a new class. Liskov stayed quiet, which is the point: when the abstractions are honest, substitutability never becomes a discussion. Dependency inversion showed up as constructor injection in every chapter, and the test suites are the proof it worked. The exception hierarchies got their workout in the tricky-parts sections, where each failure mode needed its own type. Logging versus print was a standing decision you stopped noticing by chapter three — that is what a convention becoming a habit looks like. Boundary validation and config dataclasses were the first code typed in every checkpoint 1. Composition over inheritance was the Strategy pattern wearing its checklist name. The documented locks were the concurrency sections. The Repository was the persistence seam. And the unittest suites were the checkpoints themselves.</p>
 <p>Read that list again and notice something: the checklist is not twelve separate rules. It is one habit — put every decision where it can be seen, and make every seam explicit — applied twelve times.</p>
 <h2 id="where-to-go-next">Where to go next</h2>
-<p>Two problems from your original list did not make this guide: <strong>ride sharing</strong> and the <strong>calendar/meeting scheduler</strong>. They are your next two type-alongs, and they are chosen deliberately — each one is a combination of moves you already own.</p>
-<p>Ride sharing is elevator dispatch with money attached. Match riders to drivers — the dispatcher, now with positions on a map instead of a shaft. Price the trip — Strategy again, with a surge multiplier. Notify both sides — Observer. Nothing in it is new. That is the point — you will feel the patterns transfer instead of reading about transfer.</p>
+<p>One problem from your original list still has not made this guide: the <strong>calendar/meeting scheduler</strong>. It is your next type-along, and it is chosen deliberately — it is a combination of moves you already own.</p>
+<p>Ride sharing was on that list too, and it became Chapter 12. Think back to typing it. The dispatcher came from the elevator, now with positions on a map instead of a shaft. The surge pricing was Strategy again. The notifications were Observer. The one genuinely new idea was the compare-and-set claim. That is what transfer feels like from the inside.</p>
 <p>The meeting scheduler pushes the booking move further: half-open intervals, conflict detection across many rooms and attendees, recurring meetings, and the find-a-free-slot search. It is the car-rental reservation logic grown up, with the interval arithmetic doing heavier lifting.</p>
-<p>After those two, the road forks upward to system design — the HLD track. The relationship is simpler than it looks: LLD is design <em>inside</em> one service, HLD is how services talk to each other <em>across</em> a network. The moves transfer directly. A repository becomes a database. Constructor injection becomes service wiring. Boundary validation becomes API contracts. Locks around shared state become the distributed coordination problems — leader election, distributed locks, idempotency — that the HLD track is built around. Harder versions of the same ideas, at a scale where the network can fail.</p>
+<p>After that, the road forks upward to system design — the HLD track. The relationship is simpler than it looks: LLD is design <em>inside</em> one service, HLD is how services talk to each other <em>across</em> a network. The moves transfer directly. A repository becomes a database. Constructor injection becomes service wiring. Boundary validation becomes API contracts. Locks around shared state become the distributed coordination problems — leader election, distributed locks, idempotency — that the HLD track is built around. Harder versions of the same ideas, at a scale where the network can fail. You have already had a preview. From Chapter 8 on, nearly every follow-up section asks what changes with several servers behind a load balancer, and the answer is usually the same move, rewritten: a Lua script, a conditional <code>UPDATE</code>, a unique constraint.</p>
 <p>The interview shape stays the same up there, too. Elicitation still comes first — only now the questions are about scale, latency budgets, and failure modes. Domain modeling becomes service boundaries: which nouns deserve their own service, and what crosses the wire between them. Extensibility is the same goalpost move — "now add a second region" — answered with new components, not surgery. Trade-off discussion gets louder, because at scale every choice has a price tag. And "working code" becomes "a design you could defend in a review." The rubric from Chapter 0 does not change. Only the blast radius does.</p>
 <p>And the enterprise checklist from Chapter 0 does not retire. It follows you up the stack. Single responsibility, explicit boundaries, seams placed before they are needed — those are not LLD rules. They are engineering rules. You just learned them with your hands.</p>
-<p>One practical suggestion for the fifteen questions above: do not read them once and move on. Answer three of them out loud before each interview you take, picked at random. The ones that come out smooth are done. The ones that stall go back into your mistakes note with the chapter name attached. Understanding that cannot be retrieved under pressure is not understanding yet — it is familiarity, and interviews test the first, not the second.</p>
+<p>One practical suggestion for the twenty-three questions above: do not read them once and move on. Answer three of them out loud before each interview you take, picked at random. The ones that come out smooth are done. The ones that stall go back into your mistakes note with the chapter name attached. Understanding that cannot be retrieved under pressure is not understanding yet — it is familiarity, and interviews test the first, not the second.</p>
 <p>You started this guide typing someone else's design. You are finishing it with a set of moves you can apply to problems that do not exist yet. That is the entire arc of interview preparation: from following, to predicting, to designing. The next time an interviewer says "design a…", let your hands start before your doubts do. They know the way now.</p>
 </article></div>
 <script>
