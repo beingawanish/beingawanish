@@ -39,7 +39,7 @@ REWRITES = GUIDE / "rewrites"
 WORK = GUIDE / "work"
 OUT = ROOT / "dist" / SOURCE.name.replace(".original", "")
 
-H1 = re.compile(r'^<h1 id="(\d\d[a-z]?)--')
+H1 = re.compile(r'^<h1 id="(?:chapter-)?(\d+[a-z]?)-')
 BLOCK = re.compile(r"^(<(p|li)(?: class=\"[^\"]*\")?>)(.*)(</\2>)\s*$")
 PROTECT_OPEN = re.compile(r"<(pre|svg|table|code class=\"sourceCode)")
 PROTECT_CLOSE = {"pre": "</pre>", "svg": "</svg>", "table": "</table>", "code class=\"sourceCode": "</code>"}
@@ -59,7 +59,7 @@ def load() -> list[str]:
 
 
 def chapters(lines: list[str]) -> dict[str, tuple[int, int]]:
-    starts = [(i, H1.match(l).group(1)) for i, l in enumerate(lines) if H1.match(l)]
+    starts = [(i, H1.match(l).group(1).zfill(2)) for i, l in enumerate(lines) if H1.match(l)]
     spans = {}
     for k, (i, num) in enumerate(starts):
         end = starts[k + 1][0] if k + 1 < len(starts) else len(lines)
