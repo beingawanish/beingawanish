@@ -2,6 +2,7 @@
 
 Each in-memory repository has its own lock guarding its own dict.
 """
+
 import threading
 from abc import ABC, abstractmethod
 

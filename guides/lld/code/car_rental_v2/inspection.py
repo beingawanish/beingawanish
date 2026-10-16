@@ -1,22 +1,16 @@
-"""Post-return inspection: damage charges and return rules.
+"""Post-return inspection: what is new damage, and what does it cost?
 
 DamageInspector keeps a ledger of the damage each car already carries, so a
 customer pays only for what is new. assess() is pure: it prices the report
 and changes nothing. record() commits the new damage once the money side has
 succeeded. That split is what makes a retried inspection safe.
-
-ReturnRule is the seam for "charge something at return". LowChargeRule is the
-EV rule; a fuel rule for petrol cars would be one more subclass.
 """
 import threading
-from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from car_rental import Vehicle
-
-from .config import EvConfig, InspectionConfig
-from .models import Damage, ElectricVehicle, InspectionReport, PriceLine
+from .config import InspectionConfig
+from .models import Damage, InspectionReport, PriceLine
 
 
 @dataclass(frozen=True)
@@ -58,30 +52,3 @@ class DamageInspector:
             known = self._known.get(vehicle_id, set())
             self._known[vehicle_id] = {d for d in known
                                        if d.kind not in self._config.needs_repair}
-
-
-class ReturnRule(ABC):
-    @abstractmethod
-    def charges(self, vehicle: Vehicle, report: InspectionReport) -> list[PriceLine]:
-        ...
-
-
-class LowChargeRule(ReturnRule):
-    """EVs only: below the return threshold, pay per missing percentage point."""
-
-    def __init__(self, config: EvConfig):
-        self._config = config
-
-    def charges(self, vehicle: Vehicle, report: InspectionReport) -> list[PriceLine]:
-        if not isinstance(vehicle, ElectricVehicle):
-            return []
-        if report.charge_pct is None:
-            raise ValueError(f"{vehicle.vehicle_id} is electric: report needs charge_pct")
-        if not 0 <= report.charge_pct <= 100:
-            raise ValueError("charge_pct must be within 0..100")
-        shortfall = self._config.min_return_charge_pct - report.charge_pct
-        if shortfall <= 0:
-            return []
-        fee = round(shortfall * self._config.recharge_fee_per_pct, 2)
-        return [PriceLine(f"recharge ({report.charge_pct}% < "
-                          f"{self._config.min_return_charge_pct}%)", fee)]

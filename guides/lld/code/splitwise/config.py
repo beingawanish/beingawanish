@@ -1,4 +1,5 @@
 """Configuration: every limit and the supported currencies, in one frozen dataclass."""
+
 from dataclasses import dataclass
 
 from .errors import ConfigError

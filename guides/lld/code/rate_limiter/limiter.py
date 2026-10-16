@@ -33,9 +33,10 @@ class RateLimiter:
         clock: Clock | None = None,
         algorithms: Mapping[str, RateLimitAlgorithm] | None = None,
     ) -> None:
-        self._config = config or RateLimiterConfig()
-        self._store = store or InMemoryStore()
-        self._clock = clock or MonotonicClock()
+        # `is None`, not `or`: an empty store defines __len__ == 0, so it is falsy.
+        self._config = config if config is not None else RateLimiterConfig()
+        self._store = store if store is not None else InMemoryStore()
+        self._clock = clock if clock is not None else MonotonicClock()
         self._algorithms = dict(algorithms) if algorithms is not None else default_algorithms()
         self._rules = RuleBook(self._config)
         for rule in self._rules.rules():  # fail at startup, not on the first request

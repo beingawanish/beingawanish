@@ -2,6 +2,7 @@
 
 All frozen. A change produces a new record; nothing is edited in place.
 """
+
 from dataclasses import dataclass
 from datetime import datetime
 

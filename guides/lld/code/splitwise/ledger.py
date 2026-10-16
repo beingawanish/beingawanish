@@ -6,6 +6,7 @@ B-owes-A are the same row with opposite signs; they cancel automatically.
 Not thread-safe on its own. ExpenseService holds the group's lock around
 every call, because its check-then-act steps span several ledger calls.
 """
+
 from collections import defaultdict
 
 from .errors import LedgerInvariantError

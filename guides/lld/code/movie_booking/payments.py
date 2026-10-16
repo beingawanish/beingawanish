@@ -53,7 +53,7 @@ class FakePaymentGateway(PaymentGateway):
         decline_users: Iterable[str] = (),
         after_charge: Callable[[], None] | None = None,
     ) -> None:
-        self._decline_users = frozenset(decline_users)
+        self.decline_users: set[str] = set(decline_users)  # tests may edit
         self.after_charge = after_charge
         self._charges: dict[str, PaymentReceipt] = {}
         self._refunds: dict[str, RefundReceipt] = {}
@@ -70,7 +70,7 @@ class FakePaymentGateway(PaymentGateway):
                     )
                 log.info("charge replayed for key %s", idempotency_key)
                 return seen
-            if user_id in self._decline_users:
+            if user_id in self.decline_users:
                 raise PaymentDeclinedError(f"card declined for {user_id}")
             receipt = PaymentReceipt(f"pay-{next(self._ids)}", idempotency_key, amount)
             self._charges[idempotency_key] = receipt

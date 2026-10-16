@@ -1,4 +1,5 @@
 """Injectable time and ids, so tests and demos are deterministic."""
+
 import itertools
 import threading
 import uuid

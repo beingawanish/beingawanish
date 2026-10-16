@@ -2,9 +2,12 @@
 
 Concurrency: one lock per group. Every read or write of a group's ledger,
 membership, or expenses happens under that group's lock, so check-then-act
-steps (is this payment an overpayment? then record it) are atomic. Different
-groups never contend. _locks_guard only protects the lock and ledger maps.
+steps (is this payment an overpayment? then record it) are atomic. The audit
+entry is written under the same lock, so the trail's order matches the order
+the ledger changed. Different groups never contend. _locks_guard only
+protects the lock and ledger maps.
 """
+
 import logging
 import threading
 from collections.abc import Iterable
@@ -83,7 +86,10 @@ class ExpenseService:
             self._ledgers[group.group_id] = BalanceLedger()
         self._groups.add(group)
         self._audit.append(
-            self._clock.now(), created_by, AuditAction.GROUP_CREATED, group.group_id,
+            self._clock.now(),
+            created_by,
+            AuditAction.GROUP_CREATED,
+            group.group_id,
             f"{name!r} with {', '.join(sorted(member_ids))}",
         )
         log.info("created group %s", group.group_id)
@@ -97,7 +103,9 @@ class ExpenseService:
             self._require_members(group, [actor])
             updated = group.with_member(user_id)
             self._groups.update(updated)
-        self._audit.append(self._clock.now(), actor, AuditAction.MEMBER_ADDED, group_id, user_id)
+            self._audit.append(
+                self._clock.now(), actor, AuditAction.MEMBER_ADDED, group_id, user_id
+            )
         return updated
 
     # ----- expenses ---------------------------------------------------------
@@ -108,23 +116,34 @@ class ExpenseService:
         self._check_description(description)
         self._check_currency(total.currency)
         if len(split.participants) > self._config.max_participants:
-            raise InvalidSplitError(f"at most {self._config.max_participants} participants per expense")
+            raise InvalidSplitError(
+                f"at most {self._config.max_participants} participants per expense"
+            )
         shares = split.split(total)  # validates: parts sum to total
         lock, ledger = self._group_state(group_id)
         with lock:
             group = self._groups.get(group_id)
             self._require_members(group, [payer_id, *split.participants])
             expense = Expense(
-                self._ids.next_id("exp"), group_id, description.strip(), payer_id, total,
-                tuple(shares.items()), split.kind, self._clock.now(),
+                self._ids.next_id("exp"),
+                group_id,
+                description.strip(),
+                payer_id,
+                total,
+                tuple(shares.items()),
+                split.kind,
+                self._clock.now(),
             )
             self._expenses.add(expense)
             for user_id, share in shares.items():
                 ledger.record_debt(user_id, payer_id, share)
-        self._audit.append(
-            expense.created_at, payer_id, AuditAction.EXPENSE_ADDED, expense.expense_id,
-            f"{description.strip()!r} {total} {split.kind} split in {group_id}",
-        )
+            self._audit.append(
+                expense.created_at,
+                payer_id,
+                AuditAction.EXPENSE_ADDED,
+                expense.expense_id,
+                f"{description.strip()!r} {total} {split.kind} split in {group_id}",
+            )
         log.info("expense %s: %s paid %s in %s", expense.expense_id, payer_id, total, group_id)
         return expense
 
@@ -140,14 +159,24 @@ class ExpenseService:
             for user_id, share in expense.shares:
                 ledger.record_debt(expense.payer_id, user_id, share)  # the mirror image
             deleted = Expense(
-                expense.expense_id, expense.group_id, expense.description, expense.payer_id,
-                expense.total, expense.shares, expense.split_kind, expense.created_at, deleted=True,
+                expense.expense_id,
+                expense.group_id,
+                expense.description,
+                expense.payer_id,
+                expense.total,
+                expense.shares,
+                expense.split_kind,
+                expense.created_at,
+                deleted=True,
             )
             self._expenses.update(deleted)
-        self._audit.append(
-            self._clock.now(), actor, AuditAction.EXPENSE_DELETED, expense_id,
-            f"reversed {expense.total} paid by {expense.payer_id}",
-        )
+            self._audit.append(
+                self._clock.now(),
+                actor,
+                AuditAction.EXPENSE_DELETED,
+                expense_id,
+                f"reversed {expense.total} paid by {expense.payer_id}",
+            )
         log.info("expense %s deleted by %s", expense_id, actor)
         return deleted
 
@@ -178,11 +207,16 @@ class ExpenseService:
             )
             self._expenses.add_settlement(settlement)
             ledger.record_debt(payee_id, payer_id, amount)  # payee now owes payer back
-        self._audit.append(
-            settlement.created_at, payer_id, AuditAction.SETTLEMENT_RECORDED,
-            settlement.settlement_id, f"{payer_id} paid {payee_id} {amount} in {group_id}",
+            self._audit.append(
+                settlement.created_at,
+                payer_id,
+                AuditAction.SETTLEMENT_RECORDED,
+                settlement.settlement_id,
+                f"{payer_id} paid {payee_id} {amount} in {group_id}",
+            )
+        log.info(
+            "settlement %s: %s paid %s %s", settlement.settlement_id, payer_id, payee_id, amount
         )
-        log.info("settlement %s: %s paid %s %s", settlement.settlement_id, payer_id, payee_id, amount)
         return settlement
 
     # ----- reading balances -------------------------------------------------
@@ -232,4 +266,6 @@ class ExpenseService:
         if not description or not description.strip():
             raise InvalidInputError("description must not be blank")
         if len(description.strip()) > self._config.max_description_length:
-            raise InvalidInputError(f"description longer than {self._config.max_description_length} chars")
+            raise InvalidInputError(
+                f"description longer than {self._config.max_description_length} chars"
+            )

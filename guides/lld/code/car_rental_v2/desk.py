@@ -27,7 +27,8 @@ from car_rental import (
 from .branches import BranchNetwork, TripRepository
 from .config import V2Config
 from .errors import RentalStageError, TripNotFoundError, VehicleNotReadyError
-from .inspection import DamageInspector, ReturnRule
+from .ev import ReturnRule
+from .inspection import DamageInspector
 from .lifecycle import VehicleLifecycle
 from .models import (
     Damage,

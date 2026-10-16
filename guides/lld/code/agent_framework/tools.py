@@ -18,6 +18,8 @@ from agent_framework.schema import JsonSchema, schema_from_function
 
 log = logging.getLogger(__name__)
 
+Fn = Callable[..., Any]
+
 # Same shape the Claude API accepts for tool names.
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
@@ -44,7 +46,7 @@ class Tool(ABC):
 class FunctionTool(Tool):
     """A Tool backed by a plain typed function."""
 
-    def __init__(self, fn: Callable[..., Any], name: str, description: str,
+    def __init__(self, fn: Fn, name: str, description: str,
                  side_effects: bool, parallel_safe: bool) -> None:
         self._fn = fn
         self.name = name
@@ -82,13 +84,13 @@ class ToolRegistry:
 
     def tool(self, name: str | None = None, description: str | None = None, *,
              side_effects: bool = False,
-             parallel_safe: bool | None = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+             parallel_safe: bool | None = None) -> Callable[[Fn], Fn]:
         """Decorator. The function stays callable as-is; a FunctionTool is registered.
 
         Description defaults to the docstring. Side-effecting tools default to
         parallel_safe=False, so their order in a batch is preserved.
         """
-        def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        def decorate(fn: Fn) -> Fn:
             desc = description or inspect.getdoc(fn) or ""
             safe = (not side_effects) if parallel_safe is None else parallel_safe
             self.register(FunctionTool(fn, name or fn.__name__, desc, side_effects, safe))

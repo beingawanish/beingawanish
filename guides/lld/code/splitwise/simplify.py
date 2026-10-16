@@ -6,6 +6,7 @@ problem. GreedySimplifier is the practical answer: at most n - 1 payments,
 O(n log n), and nobody pays more than they owe or receives more than they are
 owed. It is not always minimal; the tests pin a case where it is not.
 """
+
 import heapq
 from abc import ABC, abstractmethod
 from collections.abc import Mapping

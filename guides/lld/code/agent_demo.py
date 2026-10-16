@@ -5,6 +5,7 @@ duplicate side effect, a policy denial, then the final answer.
 """
 import json
 import logging
+import sys
 from typing import Annotated, Literal
 
 from agent_framework import (AgentConfig, FakeClock, Permission, PermissionPolicy,
@@ -45,7 +46,8 @@ def delete_account(user_id: str) -> str:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(stream=sys.stdout, level=logging.WARNING,
+                        format="%(levelname)s %(name)s: %(message)s")
     model = ScriptedModel([
         call(ToolUseBlock("toolu_01", "get_weather", {"city": "Paris"}),
              ToolUseBlock("toolu_02", "get_weather", {"city": "Tokyo"}),
@@ -76,7 +78,7 @@ def main() -> None:
             if isinstance(block, ToolResultBlock):
                 header, body = block.content.splitlines()[:2]
                 mark = " FLAGGED" if "flagged=" in header else ""
-                print(f"{block.tool_use_id} error={block.is_error!s:5} {body[:60]}{mark}")
+                print(f"{block.tool_use_id} error={block.is_error!s:5} {body[:76]}{mark}")
     print("emails actually sent:", len(outbox))
     print(f"status={result.status.value} steps={result.steps} tokens={result.usage.total}")
     print("final:", result.final_text)

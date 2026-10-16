@@ -1,4 +1,5 @@
 """Append-only audit trail. Every change to money gets one entry, forever."""
+
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -25,14 +26,17 @@ class AuditEntry:
     detail: str
 
     def __str__(self) -> str:
-        return f"#{self.seq} {self.at:%H:%M} {self.actor} {self.action.value} {self.subject_id}: {self.detail}"
+        what = f"{self.action.value} {self.subject_id}"
+        return f"#{self.seq} {self.at:%H:%M} {self.actor} {what}: {self.detail}"
 
 
 class AuditLog(ABC):
     """Append and read. There is deliberately no update and no delete."""
 
     @abstractmethod
-    def append(self, at: datetime, actor: str, action: AuditAction, subject_id: str, detail: str) -> AuditEntry: ...
+    def append(
+        self, at: datetime, actor: str, action: AuditAction, subject_id: str, detail: str
+    ) -> AuditEntry: ...
 
     @abstractmethod
     def entries(self, subject_id: str | None = None) -> tuple[AuditEntry, ...]: ...
@@ -45,7 +49,9 @@ class InMemoryAuditLog(AuditLog):
         self._lock = threading.Lock()
         self._entries: list[AuditEntry] = []
 
-    def append(self, at: datetime, actor: str, action: AuditAction, subject_id: str, detail: str) -> AuditEntry:
+    def append(
+        self, at: datetime, actor: str, action: AuditAction, subject_id: str, detail: str
+    ) -> AuditEntry:
         with self._lock:
             entry = AuditEntry(len(self._entries) + 1, at, actor, action, subject_id, detail)
             self._entries.append(entry)
@@ -53,4 +59,6 @@ class InMemoryAuditLog(AuditLog):
 
     def entries(self, subject_id: str | None = None) -> tuple[AuditEntry, ...]:
         with self._lock:
-            return tuple(e for e in self._entries if subject_id is None or e.subject_id == subject_id)
+            return tuple(
+                e for e in self._entries if subject_id is None or e.subject_id == subject_id
+            )

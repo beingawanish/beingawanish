@@ -1,4 +1,5 @@
 """Expense sharing (Splitwise-style): exact money, pluggable splits, simplified debts."""
+
 from .audit import AuditAction, AuditEntry, AuditLog, InMemoryAuditLog
 from .clock import Clock, FixedClock, IdGenerator, SequentialIds, SystemClock, UuidIds
 from .config import SplitwiseConfig

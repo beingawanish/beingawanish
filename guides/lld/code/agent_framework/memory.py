@@ -77,6 +77,7 @@ class ConversationMemory:
             used += cost
         dropped = len(rest) - sum(len(u) for u in kept)
         if dropped:
-            note = TextBlock(f"[{dropped} earlier messages were truncated to fit the context budget]")
+            note = TextBlock(f"\n[{dropped} earlier messages were truncated "
+                             "to fit the context budget]")
             task = Message(task.role, task.content + (note,))
         return [task] + [m for unit in kept for m in unit]

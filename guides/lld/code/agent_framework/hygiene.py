@@ -24,7 +24,7 @@ SAFETY_PREAMBLE = (
 )
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_WRAPPER_TAG = re.compile(r"</?\s*tool_output", re.IGNORECASE)
+_WRAPPER_TAG = re.compile(r"</?\s*tool_output[^>]*>?", re.IGNORECASE)
 _SUSPICIOUS = re.compile(
     r"ignore (all |any )?(previous|prior|above) instructions"
     r"|disregard (the )?(system|previous) prompt"

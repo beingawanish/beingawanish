@@ -362,7 +362,8 @@ class AgentLoopTests(unittest.TestCase):
         script = [call(use("t1", "add", a=1, b=1), usage=big), say("never")]
         agent, model, _ = self.build(script, config=AgentConfig(max_total_tokens=500))
         result = agent.run("go")
-        self.assertEqual((result.status, result.usage.total), (RunStatus.TOKEN_BUDGET_EXHAUSTED, 600))
+        self.assertEqual(result.status, RunStatus.TOKEN_BUDGET_EXHAUSTED)
+        self.assertEqual(result.usage.total, 600)
         self.assertEqual(len(model.requests), 1)
 
     def test_truncated_tool_use_is_never_executed(self) -> None:

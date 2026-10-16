@@ -1,4 +1,5 @@
 """Tests for expense sharing. Time and ids are fixed, so every run is identical."""
+
 import random
 import threading
 import unittest
@@ -91,7 +92,7 @@ class AllocateTests(unittest.TestCase):
         self.assertEqual(allocate(100, [Fraction(1)] * 3), [34, 33, 33])
 
     def test_largest_remainder_wins_before_position(self):
-        # exact shares 0.5, 0.75, 1.75 -> floors 0, 0, 1, one unit left for the 0.75
+        # exact shares 0.5, 0.75, 1.75 -> floors 0, 0, 1; the 2 leftover units go to the two 0.75s
         self.assertEqual(allocate(3, [Fraction(2), Fraction(3), Fraction(7)]), [0, 1, 2])
 
     def test_parts_always_sum_to_total(self):
@@ -115,7 +116,9 @@ class SplitStrategyTests(unittest.TestCase):
 
     def test_exact_split_must_sum_to_total(self):
         split = ExactSplit({"a": usd("60.00"), "b": usd("30.00")})
-        with self.assertRaisesRegex(InvalidSplitError, "sum to USD 90.00 but the total is USD 100.00"):
+        with self.assertRaisesRegex(
+            InvalidSplitError, "sum to USD 90.00 but the total is USD 100.00"
+        ):
             split.split(usd("100.00"))
         self.assertEqual(split.split(usd("90.00"))["a"], usd("60.00"))
 
@@ -183,9 +186,14 @@ class SimplifierTests(unittest.TestCase):
     def test_greedy_matches_largest_creditor_with_largest_debtor(self):
         net = {"a": usd("-91.84"), "b": usd("144.67"), "c": usd("-17.83"), "d": usd("-35.00")}
         plan = GreedySimplifier().simplify(net)
-        self.assertEqual([str(p) for p in plan], [
-            "a -> b: USD 91.84", "d -> b: USD 35.00", "c -> b: USD 17.83",
-        ])
+        self.assertEqual(
+            [str(p) for p in plan],
+            [
+                "a -> b: USD 91.84",
+                "d -> b: USD 35.00",
+                "c -> b: USD 17.83",
+            ],
+        )
 
     def test_plan_zeroes_every_balance_in_at_most_n_minus_1_payments(self):
         rng = random.Random(7)
@@ -217,8 +225,10 @@ class ServiceTests(unittest.TestCase):
 
     def test_expense_updates_pairwise_and_net(self):
         self.svc.add_expense(self.group, "a", usd("90.00"), EqualSplit(["a", "b", "c"]), "dinner")
-        self.assertEqual([str(d) for d in self.svc.debts(self.group, USD)],
-                         ["b -> a: USD 30.00", "c -> a: USD 30.00"])
+        self.assertEqual(
+            [str(d) for d in self.svc.debts(self.group, USD)],
+            ["b -> a: USD 30.00", "c -> a: USD 30.00"],
+        )
         self.assertEqual(self.svc.net_balances(self.group, USD)["a"], usd("60.00"))
 
     def test_outsiders_rejected(self):
@@ -273,7 +283,9 @@ class ServiceTests(unittest.TestCase):
             self.svc.settle_up(self.group, "a", "a", usd("1.00"))
 
     def test_delete_reverses_balances_and_keeps_the_record(self):
-        expense = self.svc.add_expense(self.group, "a", usd("90.00"), EqualSplit(["a", "b", "c"]), "dinner")
+        expense = self.svc.add_expense(
+            self.group, "a", usd("90.00"), EqualSplit(["a", "b", "c"]), "dinner"
+        )
         deleted = self.svc.delete_expense(expense.expense_id, actor="b")
         self.assertTrue(deleted.deleted)
         self.assertEqual(self.svc.net_balances(self.group, USD), {})
@@ -281,13 +293,20 @@ class ServiceTests(unittest.TestCase):
             self.svc.delete_expense(expense.expense_id, actor="b")
 
     def test_audit_trail_records_every_money_change(self):
-        expense = self.svc.add_expense(self.group, "a", usd("90.00"), EqualSplit(["a", "b", "c"]), "dinner")
+        expense = self.svc.add_expense(
+            self.group, "a", usd("90.00"), EqualSplit(["a", "b", "c"]), "dinner"
+        )
         self.svc.settle_up(self.group, "b", "a", usd("30.00"))
         self.svc.delete_expense(expense.expense_id, actor="c")
         actions = [e.action for e in self.svc.audit_trail()]
-        self.assertEqual(actions[-3:], [
-            AuditAction.EXPENSE_ADDED, AuditAction.SETTLEMENT_RECORDED, AuditAction.EXPENSE_DELETED,
-        ])
+        self.assertEqual(
+            actions[-3:],
+            [
+                AuditAction.EXPENSE_ADDED,
+                AuditAction.SETTLEMENT_RECORDED,
+                AuditAction.EXPENSE_DELETED,
+            ],
+        )
         seqs = [e.seq for e in self.svc.audit_trail()]
         self.assertEqual(seqs, list(range(1, len(seqs) + 1)))
         self.assertEqual([e.actor for e in self.svc.audit_trail(expense.expense_id)], ["a", "c"])
@@ -312,8 +331,10 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(sum(m.minor for m in net.values()), 0)
         # 400 expenses of $10. Each payer paid $1000. a absorbs the odd cent every time:
         # a owes 400 x 3.34 = 1336, b and c owe 400 x 3.33 = 1332 each, d owes nothing.
-        self.assertEqual(net, {"a": usd("-336.00"), "b": usd("-332.00"),
-                               "c": usd("-332.00"), "d": usd("1000.00")})
+        self.assertEqual(
+            net,
+            {"a": usd("-336.00"), "b": usd("-332.00"), "c": usd("-332.00"), "d": usd("1000.00")},
+        )
 
     def test_racing_settlements_only_one_wins(self):
         svc, group = make_service()

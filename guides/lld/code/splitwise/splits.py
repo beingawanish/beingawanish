@@ -5,6 +5,7 @@ checks the invariant every split must keep. The parts sum to the total,
 exactly, in the total's currency. A new split kind is a new subclass; the
 invariant check comes free.
 """
+
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from decimal import Decimal, InvalidOperation
@@ -37,12 +38,17 @@ class SplitStrategy(ABC):
         parts = self._parts(total)
         for user_id, part in parts.items():
             if part.currency != total.currency:
-                raise InvalidSplitError(f"{user_id}'s share is in {part.currency.code}, total is in {total.currency.code}")
+                raise InvalidSplitError(
+                    f"{user_id}'s share is in {part.currency.code}, "
+                    f"the total is in {total.currency.code}"
+                )
             if part.minor < 0:
                 raise InvalidSplitError(f"{user_id}'s share is negative: {part}")
         owed = sum(p.minor for p in parts.values())
         if owed != total.minor:
-            raise InvalidSplitError(f"shares sum to {Money(owed, total.currency)} but the total is {total}")
+            raise InvalidSplitError(
+                f"shares sum to {Money(owed, total.currency)} but the total is {total}"
+            )
         return parts
 
 
@@ -68,7 +74,9 @@ class EqualSplit(SplitStrategy):
 
     def _parts(self, total: Money) -> dict[str, Money]:
         minors = allocate(total.minor, [Fraction(1)] * len(self._participants))
-        return {u: Money(m, total.currency) for u, m in zip(self._participants, minors)}
+        return {
+            u: Money(m, total.currency) for u, m in zip(self._participants, minors, strict=True)
+        }
 
 
 class ExactSplit(SplitStrategy):
@@ -115,7 +123,9 @@ class PercentSplit(SplitStrategy):
 
     def _parts(self, total: Money) -> dict[str, Money]:
         minors = allocate(total.minor, self._weights)
-        return {u: Money(m, total.currency) for u, m in zip(self._participants, minors)}
+        return {
+            u: Money(m, total.currency) for u, m in zip(self._participants, minors, strict=True)
+        }
 
 
 class SharesSplit(SplitStrategy):
@@ -136,4 +146,6 @@ class SharesSplit(SplitStrategy):
 
     def _parts(self, total: Money) -> dict[str, Money]:
         minors = allocate(total.minor, self._weights)
-        return {u: Money(m, total.currency) for u, m in zip(self._participants, minors)}
+        return {
+            u: Money(m, total.currency) for u, m in zip(self._participants, minors, strict=True)
+        }

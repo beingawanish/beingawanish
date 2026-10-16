@@ -5,6 +5,7 @@ for exact precision, and is stored as an int count of minor units (cents for
 USD, yen for JPY). Splitting uses exact fractions and the largest-remainder
 rule, so the parts always add back to the total.
 """
+
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -24,7 +25,11 @@ class Currency:
     exponent: int
 
     def __post_init__(self) -> None:
-        if len(self.code) != CURRENCY_CODE_LENGTH or not self.code.isalpha() or not self.code.isupper():
+        if (
+            len(self.code) != CURRENCY_CODE_LENGTH
+            or not self.code.isalpha()
+            or not self.code.isupper()
+        ):
             raise InvalidAmountError(f"bad currency code {self.code!r}")
         if self.exponent < 0:
             raise InvalidAmountError(f"exponent must be >= 0, got {self.exponent}")
@@ -71,7 +76,9 @@ class Money:
 
     def _same_currency(self, other: "Money") -> None:
         if self.currency != other.currency:
-            raise CurrencyMismatchError(f"cannot combine {self.currency.code} with {other.currency.code}")
+            raise CurrencyMismatchError(
+                f"cannot combine {self.currency.code} with {other.currency.code}"
+            )
 
     def __add__(self, other: "Money") -> "Money":
         self._same_currency(other)

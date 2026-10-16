@@ -64,7 +64,7 @@ class InMemoryPaymentGateway(PaymentGateway):
                 return result
             result = action()
             self._results[key] = (request, result)
-            self.executed.append(f"{request[0]} {result}")
+            self.executed.append(f"{result}: " + " ".join(map(str, request)))
             return result
 
     def _new_id(self, prefix: str) -> str:
