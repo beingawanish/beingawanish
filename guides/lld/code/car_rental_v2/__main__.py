@@ -16,11 +16,13 @@ from . import (
     InMemoryPaymentGateway,
     InspectionReport,
     LoyaltyTier,
+    RentalDesk,
+    Trip,
     build_desk,
 )
 
 
-def show_quote(desk, trip) -> None:
+def show_quote(desk: RentalDesk, trip: Trip) -> None:
     for line in desk.quote(trip.reservation_id).lines:
         print(f"    {line.label:<34}{line.amount:>9.2f}")
     print(f"    {'locked total':<34}{trip.quoted_total:>9.2f}")

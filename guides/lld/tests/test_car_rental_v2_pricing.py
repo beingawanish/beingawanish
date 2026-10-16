@@ -96,7 +96,7 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(rule.adjust(context(3, LoyaltyTier.SILVER), 150.0).amount, -7.5)
         self.assertEqual(rule.adjust(context(3, LoyaltyTier.GOLD), 150.0).amount, -15.0)
 
-    def test_weekend_and_surge_rules_are_independent(self):
+    def test_rules_stay_silent_when_they_do_not_apply(self):
         self.assertIsNone(SurgeRule().adjust(context(3, utilisation=0.49), 150.0))
         self.assertIsNone(WeekendRule().adjust(context(4), 200.0))   # Mon..Thu
 
