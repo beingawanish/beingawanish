@@ -201,7 +201,8 @@ class IntersectionController:
         if mode is self._mode:
             return
         self._mode = mode
-        log.warning("%s: mode -> %s (%s)", self.intersection_id, mode.name, reason)
+        level = logging.INFO if mode is ControlMode.CENTRAL else logging.WARNING
+        log.log(level, "%s: mode -> %s (%s)", self.intersection_id, mode.name, reason)
         self._telemetry.send(ModeChanged(self.intersection_id, self._clock.now(), mode, reason))
 
     def _end_preemption(self) -> None:

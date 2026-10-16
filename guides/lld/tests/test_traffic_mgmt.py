@@ -15,7 +15,6 @@ from traffic_mgmt import (  # noqa: E402
     AdaptiveTuning,
     ApproachQueues,
     Axis,
-    CommunicationLostError,
     ControlMode,
     ControllerConfig,
     CoordinatedPlan,
@@ -186,10 +185,10 @@ class ControllerCycleTests(unittest.TestCase):
 
     def test_new_plan_waits_for_cycle_boundary(self):
         ctrl, clock, _, sink = make_controller()
+        run(ctrl, clock, 5)  # NS green under the local fallback, 20/20
         ctrl.heartbeat()
-        run(ctrl, clock, 5)  # NS green under fallback 20/20
         ctrl.apply_plan(FixedTimePlan(9, 9, "new"))
-        run(ctrl, clock, 10)
+        run(ctrl, clock, 10, heartbeat_every=5)
         self.assertIs(ctrl.phase, Phase.NS_GREEN)  # the old 20 s green continues
         run(ctrl, clock, 60, heartbeat_every=5)
         plans = [e.split.plan for e in sink.events() if isinstance(e, CycleStarted)]
@@ -453,12 +452,15 @@ class CentreTests(unittest.TestCase):
         self.city.tmc.report_incident("B-C", 2)
         self.assertEqual(self.city.tmc.dispatch_emergency("AMB", "A", "C", 15), ["D", "C"])
         self.city.tmc.report_incident("A-B", 1)
-        self.assertEqual(self.city.controllers["B"]._queues.capacity(Axis.NS), Fraction(1, 2))
+        self.assertEqual(self.city.queues["B"].capacity(Axis.NS), Fraction(1, 2))
 
-    def test_unreachable_command_raises_for_direct_callers(self):
+    def test_only_the_cut_controller_falls_back(self):
+        self.city.sim.run(10)
         self.city.comms.sever("A")
-        with self.assertRaises(CommunicationLostError):
-            self.city.tmc._send("A", lambda: None)
+        self.city.sim.run(30)
+        modes = {iid: c.mode for iid, c in self.city.controllers.items()}
+        self.assertEqual(modes, {"A": ControlMode.LOCAL_FALLBACK, "B": ControlMode.CENTRAL,
+                                 "C": ControlMode.CENTRAL, "D": ControlMode.CENTRAL})
 
 
 class ObserverTests(unittest.TestCase):

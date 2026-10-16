@@ -25,6 +25,7 @@ class City:
     tmc: TrafficManagementCenter
     controllers: dict[str, IntersectionController]
     uplinks: dict[str, Uplink]
+    queues: dict[str, ApproachQueues]
     sim: TrafficSimulation
 
 
@@ -49,4 +50,4 @@ def build_city(
         )
         tmc.register(controllers[iid])
     sim = TrafficSimulation(clock, tmc, controllers, queues)
-    return City(clock, network, comms, bus, tmc, controllers, uplinks, sim)
+    return City(clock, network, comms, bus, tmc, controllers, uplinks, queues, sim)
