@@ -218,7 +218,7 @@
 </div>
 <h2 id="ch11-5-key-design-decisions">5. Key design decisions</h2>
 <ol type="1">
-<li><strong>Money is an int of minor units, and floats are refused at the door.</strong> <code>0.1 + 0.2</code> is not <code>0.3</code> in binary floating point, and a ledger that drifts by a cent a week is a ledger nobody trusts. <code>Money.of("12.34", USD)</code> parses a string through <code>Decimal</code>, rejects anything with more decimal places than the currency allows, and stores <code>1234</code>. JPY has zero decimal places, so <code>"1.5"</code> yen is an error, not a silent round.</li>
+<li><strong>Money is an int of minor units, and floats are refused at the door.</strong> <code>0.1 + 0.2</code> is not <code>0.3</code> in binary floating point. A ledger that drifts by a cent a week is a ledger nobody trusts. <code>Money.of("12.34", USD)</code> parses a string through <code>Decimal</code>, rejects anything with more decimal places than the currency allows, and stores <code>1234</code>. JPY has zero decimal places, so <code>"1.5"</code> yen is an error, not a silent round.</li>
 <li><strong>One rounding rule, written down: largest remainder.</strong> Every ratio split (equal, percent, shares) goes through <code>allocate()</code>. Each person first gets the floor of their exact share. The few cents left over go to the people with the largest fractional remainders, and ties go to whoever is listed first. That's why the $100 dinner comes out $33.34 / $33.33 / $33.33, with the extra cent on the first name. Exact <code>Fraction</code> arithmetic means no intermediate rounding sneaks in.</li>
 <li><strong>The "sums to total" invariant lives in the base class.</strong> <code>SplitStrategy.split()</code> is a template method. Subclasses compute shares; the base checks currency, non-negativity and the sum. A fifth split kind gets the check for free, and a buggy one can't slip a lost cent past it.</li>
 <li><strong>The ledger stores pairs, not people.</strong> One signed int per (currency, low id, high id). "Bea owes Awanish $30" and "Awanish owes Bea $12" land on the same row and cancel to $18 automatically. Net positions are derived from the pairs, so they always sum to zero; the ledger raises <code>LedgerInvariantError</code> if they ever don't.</li>
@@ -2047,7 +2047,7 @@ audit trail for exp-1
 <span id="ch11-cb27-364"><a href="#ch11-cb27-364" aria-hidden="true" tabindex="-1"></a></span>
 <span id="ch11-cb27-365"><a href="#ch11-cb27-365" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
 <span id="ch11-cb27-366"><a href="#ch11-cb27-366" aria-hidden="true" tabindex="-1"></a>    unittest.main()</span></code></pre></div>
-<p><strong>What to notice.</strong> Two tests check properties rather than examples: <code>test_parts_always_sum_to_total</code> throws 500 random totals and weights at <code>allocate</code>, and the simplifier test checks 200 random ledgers for "every balance ends at zero, in at most n − 1 payments". The concurrency tests use a <code>Barrier</code> so all threads start together. The settle-up race asserts exactly one <code>ok</code> and one <code>rejected</code>, in either order.</p>
+<p><strong>What to notice.</strong> Two tests check properties rather than examples. <code>test_parts_always_sum_to_total</code> throws 500 random totals and weights at <code>allocate</code>. The simplifier test checks 200 random ledgers for "every balance ends at zero, in at most n − 1 payments". The concurrency tests use a <code>Barrier</code> so all threads start together. The settle-up race asserts exactly one <code>ok</code> and one <code>rejected</code>, in either order.</p>
 <p>Checkpoint — run the suite:</p>
 <pre><code>python3 -m unittest discover -s tests</code></pre>
 <h2 id="ch11-7-test-results">7. Test results</h2>
@@ -2093,7 +2093,7 @@ test_shares_must_be_positive_ints (test_splitwise.SplitStrategyTests.test_shares
 test_shares_split (test_splitwise.SplitStrategyTests.test_shares_split) ... ok
 
 ----------------------------------------------------------------------
-Ran 38 tests in 0.050s
+Ran 38 tests in 0.053s
 
 OK</code></pre>
 <p>38 tests, all green: 7 money, 4 allocation, 9 split, 3 ledger, 4 simplifier, 9 service, 2 concurrency. The demo output in Step 13 and every checkpoint above are real, from the same interpreter.</p>
