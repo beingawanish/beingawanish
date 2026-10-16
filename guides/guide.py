@@ -45,11 +45,16 @@ PROTECT_OPEN = re.compile(r"<(pre|svg|table|code class=\"sourceCode)")
 PROTECT_CLOSE = {"pre": "</pre>", "svg": "</svg>", "table": "</table>", "code class=\"sourceCode": "</code>"}
 
 
-def load() -> list[str]:
+def load(additions: bool = True) -> list[str]:
+    """The source with its fix layers applied. extract/check pass additions=False, so
+    rewrite ids stay keyed to the source blocks even where additions.py edits them."""
     text = SOURCE.read_text()
     # Optional fix layers, applied in order: sentence-level prose edits for guides not rewritten
-    # block by block, then code-block fixes (found by running the guide's code).
-    for name in ("prose_fixes.py", "code_fixes.py"):
+    # block by block, then code-block fixes (found by running the guide's code), then
+    # additions (new content, such as an inserted chapter), last.
+    for name in ("prose_fixes.py", "code_fixes.py", "additions.py"):
+        if name == "additions.py" and not additions:
+            continue
         fixes = GUIDE / name
         if fixes.exists():
             ns: dict = {}
@@ -134,7 +139,7 @@ def all_rewrites() -> dict[str, str]:
 # --- commands ----------------------------------------------------------------------------
 
 def cmd_extract(num: str) -> None:
-    lines = load()
+    lines = load(additions=False)
     s, e = chapters(lines)[num]
     WORK.mkdir(exist_ok=True)
     data = {block_id(inner): {"tag": open_tag[1:3].strip(">"), "html": inner}
@@ -146,7 +151,7 @@ def cmd_extract(num: str) -> None:
 
 
 def cmd_check(only: str | None = None) -> int:
-    lines = load()
+    lines = load(additions=False)
     originals = {block_id(inner): inner for num, (s, e) in chapters(lines).items()
                  for _, _, inner, _ in blocks(lines, s, e)}
     problems = 0
