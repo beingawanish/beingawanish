@@ -1,0 +1,445 @@
+<h2 id="d05-deep-dive">Deep dive: what the street-address picture hid</h2>
+<p>The street-address model gets you through the arithmetic. It hides two things that matter the moment you run real infrastructure.</p>
+<p>The first is the data structure. A router does not "check which street an address is on." It walks a tree of bits, keeps a finger on the most specific prefix it has passed, and stops when the bits run out. That walk is longest-prefix match, and it runs once per packet on every router, switch, kernel, and cloud hypervisor between you and the other end. Once you see the tree, a whole class of production surprises stops being surprising: the VPN that "steals" your traffic, the /32 that overrides a whole subnet, the Kubernetes service range that swallows an office.</p>
+<p>The second is that real address plans are not one /16 carved neatly into VLANs. They are dozens of VPCs, a few clusters with pod and service ranges, a corporate network, a partner's VPN, and Docker on every laptop. All of them share one 32-bit space, and nobody owns the whole map. The hard part of subnetting in 2026 is not computing a broadcast address. It is keeping those ranges from colliding, because a collision turns into a routing decision you never meant to make.</p>
+<p>The sections below go under Module 05's model: the trie and how kernels and ASICs implement it, what the tools print, the numbers that bound cloud and Kubernetes plans, how plans fail, and what IPv6 changes.</p>
+<h2 id="d05-trie">Deep dive: the real mental model — prefixes as a binary trie</h2>
+<p>Write every prefix as a string of bits. 10.0.0.0/8 is the 8-bit string <code>00001010</code>. 10.10.0.0/16 is that string followed by <code>00001010</code> again. 0.0.0.0/0, the default route, is the empty string. Now put all the strings in a binary tree: start at the root, go left on a 0 and right on a 1, and mark the node where each prefix ends. That tree is a <strong>binary trie</strong>, and it is the honest picture of a routing table.</p>
+<p>Lookup is a walk. Take the destination address, read its bits from the top, and follow them down the tree. Every time you pass a marked node, remember it — it is a prefix that contains the address. When the next bit has no child to follow, stop. The last marked node you passed is the answer. No sorting, no comparing prefix lengths, no "check all routes": the longest match is simply the deepest marked node on your path.</p>
+<p>That one picture explains the rules people memorise separately:</p>
+<ul>
+<li><strong>The default route always matches</strong> because it sits at the root, and every walk starts at the root.</li>
+<li><strong>A more specific route wins</strong> because it is deeper on the same path. You pass the /16 before you reach the /23, so the /23 is what you remember last.</li>
+<li><strong>Route order in the table is irrelevant.</strong> The trie has no order, only depth.</li>
+<li><strong>Equal prefixes are the same node.</strong> Two routes for exactly 10.10.0.0/16 land on one node. Something else must break the tie: a metric, an administrative distance, a policy. Longest-prefix match itself has nothing to say.</li>
+</ul>
+<p>A naive trie spends one node per bit, which is wasteful. The six-prefix table below needs 33 nodes, most of them single-child links. Real implementations compress those chains. A <strong>PATRICIA trie</strong> (path-compressed, also called a radix tree) stores a whole run of bits on one edge and only branches where two prefixes actually diverge. BSD and macOS route lookup uses a radix tree of this kind. Linux goes further for IPv4. Since the 2.6 era its tables have been an <strong>LC-trie</strong> (level-compressed, <code>fib_trie</code>). A dense node can index several bits at once and have 2^k children, so a typical lookup touches only a handful of nodes. Linux IPv6 routes live in a separate radix tree (<code>fib6</code>).</p>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 470" role="img" aria-labelledby="d05-trie-title d05-trie-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
+<title id="d05-trie-title">Longest-prefix match as a walk down a path-compressed binary trie</title>
+<desc id="d05-trie-desc">Six routes stored as a path-compressed trie. Edges carry runs of address bits. Looking up 10.10.1.200 follows the highlighted path from the default route through 10.0.0.0/8 and 10.10.0.0/16 to 10.10.0.0/23, remembering each prefix node it passes; the last one remembered is the answer. A second lookup, 10.20.0.1, leaves the path after the /8 and answers with the /8.</desc>
+<text x="24" y="38" font-family="Georgia,serif" font-size="22" fill="#2d3142">Longest-prefix match is a walk, not a comparison</text>
+<text x="24" y="62" font-family="system-ui,sans-serif" font-size="13" fill="#6b6f7e">follow the destination's bits down the trie · remember the last prefix node passed · stop when no edge matches</text>
+<g font-family="ui-monospace,Menlo,monospace" font-size="11">
+<!-- edges (plain) -->
+<line x1="390" y1="220" x2="580" y2="320" stroke="#6b6f7e" stroke-width="1.5"/>
+<line x1="580" y1="320" x2="740" y2="270" stroke="#6b6f7e" stroke-width="1.5"/>
+<line x1="580" y1="320" x2="740" y2="385" stroke="#6b6f7e" stroke-width="1.5"/>
+<!-- highlighted lookup path for 10.10.1.200 -->
+<line x1="70" y1="220" x2="230" y2="220" stroke="#bf4520" stroke-width="3"/>
+<line x1="230" y1="220" x2="390" y2="220" stroke="#bf4520" stroke-width="3"/>
+<line x1="390" y1="220" x2="600" y2="130" stroke="#bf4520" stroke-width="3"/>
+<!-- edge labels: bit runs -->
+<rect x="104" y="196" width="92" height="18" fill="#f5f5f5"/><text x="150" y="209" text-anchor="middle" fill="#bf4520">00001010</text>
+<rect x="264" y="196" width="92" height="18" fill="#f5f5f5"/><text x="310" y="209" text-anchor="middle" fill="#bf4520">00001010</text>
+<rect x="452" y="152" width="70" height="18" fill="#f5f5f5"/><text x="487" y="165" text-anchor="middle" fill="#bf4520">0000000</text>
+<rect x="430" y="280" width="92" height="18" fill="#f5f5f5"/><text x="476" y="293" text-anchor="middle" fill="#2d3142">0000001110</text>
+<rect x="648" y="278" width="22" height="18" fill="#f5f5f5"/><text x="659" y="291" text-anchor="middle" fill="#2d3142">0</text>
+<rect x="636" y="352" width="44" height="18" fill="#f5f5f5"/><text x="658" y="365" text-anchor="middle" fill="#2d3142">1001</text>
+<!-- nodes: prefix nodes filled, branch-only node hollow -->
+<circle cx="70" cy="220" r="11" fill="#bf4520"/>
+<circle cx="230" cy="220" r="11" fill="#bf4520"/>
+<circle cx="390" cy="220" r="11" fill="#bf4520"/>
+<circle cx="600" cy="130" r="11" fill="#bf4520"/>
+<circle cx="580" cy="320" r="8" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5"/>
+<circle cx="740" cy="270" r="11" fill="#2d3142"/>
+<circle cx="740" cy="385" r="11" fill="#2d3142"/>
+<!-- node labels -->
+<text x="70" y="252" text-anchor="middle" fill="#2d3142">0.0.0.0/0</text>
+<text x="70" y="268" text-anchor="middle" fill="#6b6f7e">igw</text>
+<text x="230" y="252" text-anchor="middle" fill="#2d3142">10.0.0.0/8</text>
+<text x="230" y="268" text-anchor="middle" fill="#6b6f7e">tgw</text>
+<text x="390" y="252" text-anchor="middle" fill="#2d3142">10.10.0.0/16</text>
+<text x="390" y="268" text-anchor="middle" fill="#6b6f7e">local</text>
+<text x="600" y="104" text-anchor="middle" fill="#2d3142">10.10.0.0/23</text>
+<text x="600" y="90" text-anchor="middle" fill="#bf4520" font-weight="600">answer: eng VLAN</text>
+<text x="566" y="338" text-anchor="end" fill="#6b6f7e">branch, no route</text>
+<text x="740" y="248" text-anchor="middle" fill="#2d3142">.3.128/27</text>
+<text x="740" y="414" text-anchor="middle" fill="#2d3142">.3.164/30</text>
+<!-- depth ruler -->
+<g fill="#6b6f7e" font-size="10">
+<text x="70" y="186" text-anchor="middle">depth 0</text>
+<text x="230" y="186" text-anchor="middle">depth 8</text>
+<text x="390" y="186" text-anchor="middle">depth 16</text>
+<text x="640" y="134" text-anchor="start">23</text>
+<text x="602" y="324" text-anchor="start">26</text>
+<text x="760" y="274" text-anchor="start">27</text>
+<text x="760" y="389" text-anchor="start">30</text>
+</g>
+</g>
+<!-- side note: the walk for 10.10.1.200 -->
+<g font-family="system-ui,sans-serif" font-size="12">
+<rect x="24" y="300" width="330" height="96" fill="#f5f5f5" stroke="#d8d4c8" rx="4"/>
+<text x="36" y="320" fill="#2d3142" font-weight="600">lookup 10.10.1.200</text>
+<text x="36" y="338" fill="#2d3142"><tspan font-family="ui-monospace,Menlo,monospace">00001010 00001010 0000000|1 11001000</tspan></text>
+<text x="36" y="356" fill="#6b6f7e">best so far: /0 → /8 → /16 → /23</text>
+<text x="36" y="374" fill="#6b6f7e">the /23 node has no children: stop.</text>
+<text x="36" y="390" fill="#6b6f7e">bits after the bar are never read.</text>
+</g>
+<g font-family="system-ui,sans-serif" font-size="12">
+<text x="24" y="432" fill="#2d3142">10.20.0.1 = <tspan font-family="ui-monospace,Menlo,monospace">00001010 0001…</tspan> breaks off the second edge after 11 matching bits, so the answer is the /8 already in hand.</text>
+<text x="24" y="454" fill="#6b6f7e">Filled dots end a route; the hollow dot is a branch point that path compression keeps. Edges carry runs of bits.</text>
+</g>
+</svg>
+
+<p>Hardware does the same job a different way. A switch or router ASIC holds routes in <strong>TCAM</strong> (ternary content-addressable memory). Each TCAM entry is a value plus a mask, and the chip compares the destination against every entry in parallel in one clock. Several entries can match. The chip returns the first match by physical position, so software keeps the entries sorted longest-prefix-first. That sort is where the work hides: inserting a /23 into a TCAM full of /24s and /16s may mean shuffling entries to open a slot. TCAM is fast, power-hungry and small, so modern ASICs mix it with algorithmic LPM in ordinary SRAM. Capacity varies widely by chip, and "how many routes fit" is a real purchasing question.</p>
+<p>Here is the walk in Python. It is the one-node-per-bit version, which is slow but makes every step visible, and it is checked against a brute-force "test every prefix, keep the longest" lookup.</p>
+<div class="sourceCode" id="d05-cb1"><pre class="sourceCode python"><code class="sourceCode python"><span id="d05-cb1-1"><a href="#d05-cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Longest-prefix match with a binary trie, checked against brute force.&quot;&quot;&quot;</span></span>
+<span id="d05-cb1-2"><a href="#d05-cb1-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> ipaddress</span>
+<span id="d05-cb1-3"><a href="#d05-cb1-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> random</span>
+<span id="d05-cb1-4"><a href="#d05-cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb1-5"><a href="#d05-cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Node:</span>
+<span id="d05-cb1-6"><a href="#d05-cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">__slots__</span> <span class="op">=</span> (<span class="st">&quot;child&quot;</span>, <span class="st">&quot;route&quot;</span>)</span>
+<span id="d05-cb1-7"><a href="#d05-cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="fu">__init__</span>(<span class="va">self</span>):</span>
+<span id="d05-cb1-8"><a href="#d05-cb1-8" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.child <span class="op">=</span> [<span class="va">None</span>, <span class="va">None</span>]   <span class="co"># next node for bit 0 / bit 1</span></span>
+<span id="d05-cb1-9"><a href="#d05-cb1-9" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.route <span class="op">=</span> <span class="va">None</span>           <span class="co"># next hop if a prefix ends here</span></span>
+<span id="d05-cb1-10"><a href="#d05-cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb1-11"><a href="#d05-cb1-11" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Trie:</span>
+<span id="d05-cb1-12"><a href="#d05-cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="fu">__init__</span>(<span class="va">self</span>):</span>
+<span id="d05-cb1-13"><a href="#d05-cb1-13" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.root, <span class="va">self</span>.nodes <span class="op">=</span> Node(), <span class="dv">1</span></span>
+<span id="d05-cb1-14"><a href="#d05-cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb1-15"><a href="#d05-cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> insert(<span class="va">self</span>, prefix, nexthop):</span>
+<span id="d05-cb1-16"><a href="#d05-cb1-16" aria-hidden="true" tabindex="-1"></a>        net <span class="op">=</span> ipaddress.ip_network(prefix)</span>
+<span id="d05-cb1-17"><a href="#d05-cb1-17" aria-hidden="true" tabindex="-1"></a>        bits, node <span class="op">=</span> <span class="bu">int</span>(net.network_address), <span class="va">self</span>.root</span>
+<span id="d05-cb1-18"><a href="#d05-cb1-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(net.prefixlen):</span>
+<span id="d05-cb1-19"><a href="#d05-cb1-19" aria-hidden="true" tabindex="-1"></a>            b <span class="op">=</span> (bits <span class="op">&gt;&gt;</span> (<span class="dv">31</span> <span class="op">-</span> i)) <span class="op">&amp;</span> <span class="dv">1</span></span>
+<span id="d05-cb1-20"><a href="#d05-cb1-20" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> node.child[b] <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="d05-cb1-21"><a href="#d05-cb1-21" aria-hidden="true" tabindex="-1"></a>                node.child[b] <span class="op">=</span> Node()</span>
+<span id="d05-cb1-22"><a href="#d05-cb1-22" aria-hidden="true" tabindex="-1"></a>                <span class="va">self</span>.nodes <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d05-cb1-23"><a href="#d05-cb1-23" aria-hidden="true" tabindex="-1"></a>            node <span class="op">=</span> node.child[b]</span>
+<span id="d05-cb1-24"><a href="#d05-cb1-24" aria-hidden="true" tabindex="-1"></a>        node.route <span class="op">=</span> (prefix, nexthop)</span>
+<span id="d05-cb1-25"><a href="#d05-cb1-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb1-26"><a href="#d05-cb1-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> lookup(<span class="va">self</span>, addr, trace<span class="op">=</span><span class="va">False</span>):</span>
+<span id="d05-cb1-27"><a href="#d05-cb1-27" aria-hidden="true" tabindex="-1"></a>        bits, node, best <span class="op">=</span> <span class="bu">int</span>(ipaddress.ip_address(addr)), <span class="va">self</span>.root, <span class="va">None</span></span>
+<span id="d05-cb1-28"><a href="#d05-cb1-28" aria-hidden="true" tabindex="-1"></a>        depth <span class="op">=</span> <span class="dv">0</span></span>
+<span id="d05-cb1-29"><a href="#d05-cb1-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> node <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span>:</span>
+<span id="d05-cb1-30"><a href="#d05-cb1-30" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> node.route:</span>
+<span id="d05-cb1-31"><a href="#d05-cb1-31" aria-hidden="true" tabindex="-1"></a>                best <span class="op">=</span> node.route          <span class="co"># remember the deepest match so far</span></span>
+<span id="d05-cb1-32"><a href="#d05-cb1-32" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> trace:</span>
+<span id="d05-cb1-33"><a href="#d05-cb1-33" aria-hidden="true" tabindex="-1"></a>                    <span class="bu">print</span>(<span class="ss">f&quot;  depth </span><span class="sc">{</span>depth<span class="sc">:2}</span><span class="ss">: match </span><span class="sc">{</span>node<span class="sc">.</span>route[<span class="dv">0</span>]<span class="sc">:&lt;18}</span><span class="ss"> -&gt; </span><span class="sc">{</span>node<span class="sc">.</span>route[<span class="dv">1</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d05-cb1-34"><a href="#d05-cb1-34" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> depth <span class="op">==</span> <span class="dv">32</span>:</span>
+<span id="d05-cb1-35"><a href="#d05-cb1-35" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span></span>
+<span id="d05-cb1-36"><a href="#d05-cb1-36" aria-hidden="true" tabindex="-1"></a>            node <span class="op">=</span> node.child[(bits <span class="op">&gt;&gt;</span> (<span class="dv">31</span> <span class="op">-</span> depth)) <span class="op">&amp;</span> <span class="dv">1</span>]</span>
+<span id="d05-cb1-37"><a href="#d05-cb1-37" aria-hidden="true" tabindex="-1"></a>            depth <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d05-cb1-38"><a href="#d05-cb1-38" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> trace:</span>
+<span id="d05-cb1-39"><a href="#d05-cb1-39" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;  fell off the trie at depth </span><span class="sc">{</span>depth<span class="sc">}</span><span class="ss">; answer = </span><span class="sc">{</span>best[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d05-cb1-40"><a href="#d05-cb1-40" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> best</span>
+<span id="d05-cb1-41"><a href="#d05-cb1-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb1-42"><a href="#d05-cb1-42" aria-hidden="true" tabindex="-1"></a>TABLE <span class="op">=</span> [</span>
+<span id="d05-cb1-43"><a href="#d05-cb1-43" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;0.0.0.0/0&quot;</span>,       <span class="st">&quot;igw (default)&quot;</span>),</span>
+<span id="d05-cb1-44"><a href="#d05-cb1-44" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;10.0.0.0/8&quot;</span>,      <span class="st">&quot;tgw (corp)&quot;</span>),</span>
+<span id="d05-cb1-45"><a href="#d05-cb1-45" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;10.10.0.0/16&quot;</span>,    <span class="st">&quot;local VPC&quot;</span>),</span>
+<span id="d05-cb1-46"><a href="#d05-cb1-46" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;10.10.0.0/23&quot;</span>,    <span class="st">&quot;eng VLAN&quot;</span>),</span>
+<span id="d05-cb1-47"><a href="#d05-cb1-47" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;10.10.3.128/27&quot;</span>,  <span class="st">&quot;mgmt&quot;</span>),</span>
+<span id="d05-cb1-48"><a href="#d05-cb1-48" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;10.10.3.164/30&quot;</span>,  <span class="st">&quot;WAN B&quot;</span>),</span>
+<span id="d05-cb1-49"><a href="#d05-cb1-49" aria-hidden="true" tabindex="-1"></a>]</span>
+<span id="d05-cb1-50"><a href="#d05-cb1-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb1-51"><a href="#d05-cb1-51" aria-hidden="true" tabindex="-1"></a>t <span class="op">=</span> Trie()</span>
+<span id="d05-cb1-52"><a href="#d05-cb1-52" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> p, nh <span class="kw">in</span> TABLE:</span>
+<span id="d05-cb1-53"><a href="#d05-cb1-53" aria-hidden="true" tabindex="-1"></a>    t.insert(p, nh)</span>
+<span id="d05-cb1-54"><a href="#d05-cb1-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb1-55"><a href="#d05-cb1-55" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> a <span class="kw">in</span> (<span class="st">&quot;10.10.1.200&quot;</span>, <span class="st">&quot;10.10.3.166&quot;</span>, <span class="st">&quot;10.20.0.1&quot;</span>, <span class="st">&quot;192.0.2.7&quot;</span>):</span>
+<span id="d05-cb1-56"><a href="#d05-cb1-56" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;lookup </span><span class="sc">{</span>a<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d05-cb1-57"><a href="#d05-cb1-57" aria-hidden="true" tabindex="-1"></a>    t.lookup(a, trace<span class="op">=</span><span class="va">True</span>)</span>
+<span id="d05-cb1-58"><a href="#d05-cb1-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb1-59"><a href="#d05-cb1-59" aria-hidden="true" tabindex="-1"></a><span class="co"># brute force: every matching prefix, keep the longest</span></span>
+<span id="d05-cb1-60"><a href="#d05-cb1-60" aria-hidden="true" tabindex="-1"></a>nets <span class="op">=</span> [(ipaddress.ip_network(p), nh) <span class="cf">for</span> p, nh <span class="kw">in</span> TABLE]</span>
+<span id="d05-cb1-61"><a href="#d05-cb1-61" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> brute(addr):</span>
+<span id="d05-cb1-62"><a href="#d05-cb1-62" aria-hidden="true" tabindex="-1"></a>    a <span class="op">=</span> ipaddress.ip_address(addr)</span>
+<span id="d05-cb1-63"><a href="#d05-cb1-63" aria-hidden="true" tabindex="-1"></a>    m <span class="op">=</span> [(n.prefixlen, (<span class="bu">str</span>(n), nh)) <span class="cf">for</span> n, nh <span class="kw">in</span> nets <span class="cf">if</span> a <span class="kw">in</span> n]</span>
+<span id="d05-cb1-64"><a href="#d05-cb1-64" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">max</span>(m)[<span class="dv">1</span>]</span>
+<span id="d05-cb1-65"><a href="#d05-cb1-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb1-66"><a href="#d05-cb1-66" aria-hidden="true" tabindex="-1"></a>rng <span class="op">=</span> random.Random(<span class="dv">7</span>)</span>
+<span id="d05-cb1-67"><a href="#d05-cb1-67" aria-hidden="true" tabindex="-1"></a>probes <span class="op">=</span> [<span class="bu">str</span>(ipaddress.ip_address(rng.getrandbits(<span class="dv">32</span>))) <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">20000</span>)]</span>
+<span id="d05-cb1-68"><a href="#d05-cb1-68" aria-hidden="true" tabindex="-1"></a>probes <span class="op">+=</span> [<span class="bu">str</span>(ipaddress.ip_address(<span class="bn">0x0A0A0000</span> <span class="op">+</span> rng.getrandbits(<span class="dv">10</span>))) <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">20000</span>)]</span>
+<span id="d05-cb1-69"><a href="#d05-cb1-69" aria-hidden="true" tabindex="-1"></a>bad <span class="op">=</span> <span class="bu">sum</span>(t.lookup(a) <span class="op">!=</span> brute(a) <span class="cf">for</span> a <span class="kw">in</span> probes)</span>
+<span id="d05-cb1-70"><a href="#d05-cb1-70" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="sc">{</span><span class="bu">len</span>(probes)<span class="sc">}</span><span class="ss"> random lookups, </span><span class="sc">{</span>bad<span class="sc">}</span><span class="ss"> disagreements with brute force&quot;</span>)</span>
+<span id="d05-cb1-71"><a href="#d05-cb1-71" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;trie nodes for </span><span class="sc">{</span><span class="bu">len</span>(TABLE)<span class="sc">}</span><span class="ss"> prefixes: </span><span class="sc">{</span>t<span class="sc">.</span>nodes<span class="sc">}</span><span class="ss"> (uncompressed, one per bit)&quot;</span>)</span></code></pre></div>
+<p>Real output on CPython 3.13:</p>
+<pre><code>lookup 10.10.1.200
+  depth  0: match 0.0.0.0/0          -&gt; igw (default)
+  depth  8: match 10.0.0.0/8         -&gt; tgw (corp)
+  depth 16: match 10.10.0.0/16       -&gt; local VPC
+  depth 23: match 10.10.0.0/23       -&gt; eng VLAN
+  fell off the trie at depth 24; answer = 10.10.0.0/23
+lookup 10.10.3.166
+  depth  0: match 0.0.0.0/0          -&gt; igw (default)
+  depth  8: match 10.0.0.0/8         -&gt; tgw (corp)
+  depth 16: match 10.10.0.0/16       -&gt; local VPC
+  depth 30: match 10.10.3.164/30     -&gt; WAN B
+  fell off the trie at depth 31; answer = 10.10.3.164/30
+lookup 10.20.0.1
+  depth  0: match 0.0.0.0/0          -&gt; igw (default)
+  depth  8: match 10.0.0.0/8         -&gt; tgw (corp)
+  fell off the trie at depth 12; answer = 10.0.0.0/8
+lookup 192.0.2.7
+  depth  0: match 0.0.0.0/0          -&gt; igw (default)
+  fell off the trie at depth 1; answer = 0.0.0.0/0
+
+40000 random lookups, 0 disagreements with brute force
+trie nodes for 6 prefixes: 33 (uncompressed, one per bit)</code></pre>
+<p>Read the 10.10.1.200 trace against Module 05's "Worked 7". The trap answer there was "10.10.1.200 is unallocated." The trie shows why it isn't: the /23 node sits at depth 23, and the address's 24th bit is never consulted. Look at 10.20.0.1 too. It matches 10.0.0.0/8, then 10.10 and 10.20 part ways after 11 matching bits, and the walk ends at depth 12. That is the whole of LPM: walk until you can't, answer with what you last saw.</p>
+<h2 id="d05-kernel">Deep dive: what the kernel actually does</h2>
+<p>You never need to guess which route wins. Every OS will run the lookup for you and print the result. On Linux, <code>ip route get</code> asks the kernel's FIB the exact question a packet would (illustrative output from a host at 10.10.0.5 — your output will differ):</p>
+<pre><code>$ ip route show
+default via 10.10.0.1 dev eth0 proto dhcp src 10.10.0.5 metric 100
+10.0.0.0/8 via 10.10.0.254 dev eth0
+10.10.0.0/23 dev eth0 proto kernel scope link src 10.10.0.5
+10.10.3.128/27 via 10.10.0.254 dev eth0
+
+$ ip route get 10.10.1.200
+10.10.1.200 dev eth0 src 10.10.0.5 uid 1000
+    cache
+$ ip route get 10.20.0.1
+10.20.0.1 via 10.10.0.254 dev eth0 src 10.10.0.5 uid 1000
+    cache
+$ ip route get 192.0.2.7
+192.0.2.7 via 10.10.0.1 dev eth0 src 10.10.0.5 uid 1000
+    cache</code></pre>
+<p>The first answer has no <code>via</code>: 10.10.1.200 matched the connected /23, so the host will ARP for the destination itself (Module 06). The second matched the /8 and goes to the corporate router at .254. The third fell through to the default. Same table, three depths in the trie.</p>
+<p>You can look at the trie itself. Linux exposes its LC-trie in <code>/proc/net/fib_trie</code>. An abridged, illustrative excerpt for the table above:</p>
+<pre><code>Main:
+  +-- 0.0.0.0/4 1 0 0
+     |-- 0.0.0.0
+        /0 universe UNICAST
+     +-- 10.0.0.0/12 1 0 0
+        |-- 10.0.0.0
+           /8 universe UNICAST
+        +-- 10.10.0.0/22 1 0 0
+           |-- 10.10.0.0
+              /23 link UNICAST
+           |-- 10.10.3.128
+              /27 universe UNICAST</code></pre>
+<p>Lines starting <code>+--</code> are internal nodes, and each one sits exactly where two keys first differ. 0.0.0.0 and 10.0.0.0 differ in bit 4, so the root branches at /4. 10.0.0.0 and 10.10.0.0 differ in bit 12, so the next node is a /12. The first number after the prefix is how many bits that node indexes at once. Here it is <code>1</code> everywhere, a plain binary branch, because the table is tiny. In a real table with thousands of routes you see nodes with 3, 4 or more bits (8, 16 or more children): that is the level compression. Lines starting <code>|--</code> are leaves, keyed by an address, and each leaf lists every prefix length that shares that key. If you had both 10.10.0.0/16 and 10.10.0.0/23, they would hang off the same <code>10.10.0.0</code> leaf as <code>/16</code> and <code>/23</code>. The exact layout depends on the table and kernel version; what matters is the shape.</p>
+<p>Two Linux details are worth knowing. Since kernel 3.6 there is no global route cache. Every packet that lacks a cached socket route does this trie lookup. The <code>cache</code> line in <code>ip route get</code> output refers to per-destination exceptions such as a learned PMTU, not to a cache of lookups. And longest-prefix match runs <em>per routing table</em>. <code>ip rule</code> policy rules pick the table first, and only then does LPM run inside it. That is how VPN clients, Kubernetes CNIs and multi-homed hosts get different answers for the same destination.</p>
+<p>macOS has the same question with a different spelling (run on your Mac — your output will differ):</p>
+<pre><code>$ route -n get 10.10.1.200
+   route to: 10.10.1.200
+destination: 10.10.0.0
+       mask: 255.255.254.0
+  interface: en0
+      flags: &lt;UP,DONE,CLONING&gt;
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0</code></pre>
+<p><code>destination</code> plus <code>mask</code> is the prefix that won: 10.10.0.0 with 255.255.254.0, the /23. <code>CLONING</code> marks a connected route, which spawns per-host entries as ARP resolves neighbours. <code>netstat -rn -f inet</code> prints the whole table.</p>
+<h3 id="d05-the-1-trick-lpm-as-a-weapon">The /1 trick: LPM as a weapon</h3>
+<p>Full-tunnel VPN clients need to send everything through the tunnel without deleting your default route, which they would have to restore later. They exploit the trie. Here is a Linux laptop on Wi-Fi with an OpenVPN-style full tunnel up (illustrative):</p>
+<pre><code>$ ip route
+0.0.0.0/1 via 10.8.0.1 dev tun0
+default via 192.168.1.1 dev wlan0 proto dhcp metric 600
+10.8.0.0/24 dev tun0 proto kernel scope link src 10.8.0.6
+128.0.0.0/1 via 10.8.0.1 dev tun0
+192.168.1.0/24 dev wlan0 proto kernel scope link src 192.168.1.23 metric 600
+198.51.100.10 via 192.168.1.1 dev wlan0</code></pre>
+<p>The two /1 routes together cover all of IPv4, exactly like the /0. But each is one bit deeper in the trie, so it beats the default for every destination. The /32 for 198.51.100.10 — the VPN server itself — is deeper still, and it is load-bearing. Without it, packets to the VPN server would match a /1 and enter the tunnel they are supposed to carry, and the tunnel would collapse. The local /24 survives too: 192.168.1.0/24 is longer than /1, which is why you can still reach the printer. Split-tunnel VPNs and "local network access" settings are all just this: which prefixes, at which depths.</p>
+<h3 id="d05-cloud-route-tables-are-tries-too">Cloud route tables are tries too</h3>
+<p>An AWS VPC route table, an Azure UDR table and a GCP VPC route list all resolve by longest-prefix match. The VPC's own CIDR appears as a <code>local</code> route. For a long time it was effectively unbeatable. Since 2021 AWS lets you add a route <em>more specific</em> than the local route, to push traffic between subnets through a firewall appliance, and the trie rules apply as you'd expect. Where prefixes tie, each provider has its own tie-break rules (AWS prefers static routes over propagated ones, for example). Those rules are the part to look up, not to assume.</p>
+<h2 id="d05-numbers">Deep dive: by the numbers</h2>
+<p><strong>Global table size.</strong> The IPv4 default-free zone carried roughly a million prefixes by 2025–26, and IPv6 over 200,000 (bgp.potaroo.net tracks the live figures). A full-table router needs both in its FIB, plus internal routes. Most of the IPv4 table is /24s, because /24 is the longest prefix most networks will accept from a peer; announce a /25 and much of the internet will drop it. For IPv6 the equivalent boundary is /48.</p>
+<p><strong>Trie depth.</strong> A one-bit-per-node trie has depth at most 32 for IPv4 and 128 for IPv6. Path compression cuts the nodes visited to the number of real branch points. Level compression in Linux's LC-trie cuts it further, so a lookup in a large table touches a few nodes, not dozens. For capacity planning, the important number is not depth. It is that a software lookup costs a few cache misses, while a TCAM lookup is constant-time but bounded by entries.</p>
+<p><strong>Cloud subnet overhead.</strong> Every provider reserves a few addresses per subnet on top of the network and broadcast addresses:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Provider</th>
+<th>Reserved per subnet</th>
+<th>Which ones</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>AWS</td>
+<td>5</td>
+<td>network, .1 VPC router, .2 DNS, .3 future use, last (broadcast)</td>
+</tr>
+<tr class="even">
+<td>Azure</td>
+<td>5</td>
+<td>network, .1 gateway, .2 and .3 Azure DNS mapping, last</td>
+</tr>
+<tr class="odd">
+<td>Google Cloud</td>
+<td>4</td>
+<td>network, .1 gateway, second-to-last, last</td>
+</tr>
+</tbody>
+</table>
+<p>A /28 is AWS's smallest subnet: 16 addresses, 11 usable. On AWS, VPC CIDR blocks range from /16 to /28. Secondary CIDRs can be added later (five per VPC by default, raisable by quota), but the primary block cannot be changed. That last fact is why VPC sizing is a one-way door: pick too small and you will be bolting on secondary ranges forever.</p>
+<p><strong>Kubernetes ranges.</strong> A cluster has three address ranges that must not collide with each other or with anything the cluster needs to reach:</p>
+<ul>
+<li><strong>Node range</strong>: the VPC subnets the nodes sit in.</li>
+<li><strong>Pod range</strong> (<code>--cluster-cidr</code>): the controller manager hands each node a slice of this, sized by <code>--node-cidr-mask-size</code> (default /24 for IPv4, /64 for IPv6). With the kubelet's default of 110 pods per node, a /24 gives each node 256 addresses — roughly double what it needs, so addresses freed by dying pods aren't reused instantly.</li>
+<li><strong>Service range</strong> (<code>--service-cluster-ip-range</code>): virtual IPs that exist only in kube-proxy or eBPF rules on each node, never on any interface. kubeadm defaults to 10.96.0.0/12. The API server refuses an IPv4 service range larger than a /12.</li>
+</ul>
+<p>The node count falls straight out of the prefix arithmetic: a /14 pod range with /24 per node is 2^(24−14) = 1,024 nodes. A /16 pod range gives 256 nodes, and the 257th node joins the cluster with no pod CIDR and never goes Ready.</p>
+<p>Managed Kubernetes changes the formula. Google Kubernetes Engine (VPC-native) also allocates about twice the pod count per node: /24 for 110 pods, /28 for 8. The AWS VPC CNI is different: pods get real VPC addresses from the node's network interfaces (ENIs), so the limit is per instance type. Without prefix delegation, max pods = ENIs × (IPs per ENI − 1) + 2. With prefix delegation, each ENI slot holds a /28 instead of a single address, and the practical cap becomes the kubelet's max-pods setting (often 110). The script below runs those numbers and also checks a realistic plan for overlaps:</p>
+<div class="sourceCode" id="d05-cb7"><pre class="sourceCode python"><code class="sourceCode python"><span id="d05-cb7-1"><a href="#d05-cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Check a cloud + Kubernetes address plan for overlaps and capacity.&quot;&quot;&quot;</span></span>
+<span id="d05-cb7-2"><a href="#d05-cb7-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> ipaddress <span class="im">as</span> ip</span>
+<span id="d05-cb7-3"><a href="#d05-cb7-3" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> itertools <span class="im">import</span> combinations</span>
+<span id="d05-cb7-4"><a href="#d05-cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb7-5"><a href="#d05-cb7-5" aria-hidden="true" tabindex="-1"></a>PLAN <span class="op">=</span> {</span>
+<span id="d05-cb7-6"><a href="#d05-cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;vpc-prod&quot;</span>:        <span class="st">&quot;10.20.0.0/16&quot;</span>,</span>
+<span id="d05-cb7-7"><a href="#d05-cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;vpc-staging&quot;</span>:     <span class="st">&quot;10.21.0.0/16&quot;</span>,</span>
+<span id="d05-cb7-8"><a href="#d05-cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;on-prem&quot;</span>:         <span class="st">&quot;10.0.0.0/14&quot;</span>,</span>
+<span id="d05-cb7-9"><a href="#d05-cb7-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;k8s-pods (prod)&quot;</span>: <span class="st">&quot;100.64.0.0/14&quot;</span>,</span>
+<span id="d05-cb7-10"><a href="#d05-cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;k8s-svc (prod)&quot;</span>:  <span class="st">&quot;10.96.0.0/12&quot;</span>,     <span class="co"># kubeadm&#39;s default</span></span>
+<span id="d05-cb7-11"><a href="#d05-cb7-11" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;docker0 default&quot;</span>: <span class="st">&quot;172.17.0.0/16&quot;</span>,</span>
+<span id="d05-cb7-12"><a href="#d05-cb7-12" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;partner VPN&quot;</span>:     <span class="st">&quot;10.16.0.0/12&quot;</span>,</span>
+<span id="d05-cb7-13"><a href="#d05-cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;branch office&quot;</span>:   <span class="st">&quot;10.100.8.0/22&quot;</span>,</span>
+<span id="d05-cb7-14"><a href="#d05-cb7-14" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="d05-cb7-15"><a href="#d05-cb7-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb7-16"><a href="#d05-cb7-16" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;overlaps:&quot;</span>)</span>
+<span id="d05-cb7-17"><a href="#d05-cb7-17" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (a, pa), (b, pb) <span class="kw">in</span> combinations(PLAN.items(), <span class="dv">2</span>):</span>
+<span id="d05-cb7-18"><a href="#d05-cb7-18" aria-hidden="true" tabindex="-1"></a>    na, nb <span class="op">=</span> ip.ip_network(pa), ip.ip_network(pb)</span>
+<span id="d05-cb7-19"><a href="#d05-cb7-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> na.overlaps(nb):</span>
+<span id="d05-cb7-20"><a href="#d05-cb7-20" aria-hidden="true" tabindex="-1"></a>        inner, outer <span class="op">=</span> (na, nb) <span class="cf">if</span> na.prefixlen <span class="op">&gt;=</span> nb.prefixlen <span class="cf">else</span> (nb, na)</span>
+<span id="d05-cb7-21"><a href="#d05-cb7-21" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span>a<span class="sc">:&lt;16}</span><span class="ss"> </span><span class="sc">{</span>pa<span class="sc">:&lt;15}</span><span class="ss"> x </span><span class="sc">{</span>b<span class="sc">:&lt;16}</span><span class="ss"> </span><span class="sc">{</span>pb<span class="sc">:&lt;15}</span><span class="ss"> shared </span><span class="sc">{</span>inner<span class="sc">.</span>num_addresses<span class="sc">:&gt;9,}</span><span class="ss"> addrs&quot;</span>)</span>
+<span id="d05-cb7-22"><a href="#d05-cb7-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb7-23"><a href="#d05-cb7-23" aria-hidden="true" tabindex="-1"></a><span class="co"># Per-node pod ranges: controller-manager hands each node a /node_mask</span></span>
+<span id="d05-cb7-24"><a href="#d05-cb7-24" aria-hidden="true" tabindex="-1"></a>cluster, node_mask, max_pods <span class="op">=</span> ip.ip_network(PLAN[<span class="st">&quot;k8s-pods (prod)&quot;</span>]), <span class="dv">24</span>, <span class="dv">110</span></span>
+<span id="d05-cb7-25"><a href="#d05-cb7-25" aria-hidden="true" tabindex="-1"></a>nodes <span class="op">=</span> <span class="dv">2</span> <span class="op">**</span> (node_mask <span class="op">-</span> cluster.prefixlen)</span>
+<span id="d05-cb7-26"><a href="#d05-cb7-26" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="ss">pods </span><span class="sc">{</span>cluster<span class="sc">}</span><span class="ss">: /</span><span class="sc">{</span>node_mask<span class="sc">}</span><span class="ss"> per node -&gt; </span><span class="sc">{</span>nodes<span class="sc">}</span><span class="ss"> nodes, &quot;</span></span>
+<span id="d05-cb7-27"><a href="#d05-cb7-27" aria-hidden="true" tabindex="-1"></a>      <span class="ss">f&quot;</span><span class="sc">{</span><span class="dv">2</span> <span class="op">**</span> (<span class="dv">32</span> <span class="op">-</span> node_mask)<span class="sc">}</span><span class="ss"> addrs/node for max </span><span class="sc">{</span>max_pods<span class="sc">}</span><span class="ss"> pods&quot;</span>)</span>
+<span id="d05-cb7-28"><a href="#d05-cb7-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb7-29"><a href="#d05-cb7-29" aria-hidden="true" tabindex="-1"></a><span class="co"># AWS VPC CNI without prefix delegation: max pods = ENIs * (IPs per ENI - 1) + 2</span></span>
+<span id="d05-cb7-30"><a href="#d05-cb7-30" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> itype, enis, ips <span class="kw">in</span> [(<span class="st">&quot;m5.large&quot;</span>, <span class="dv">3</span>, <span class="dv">10</span>), (<span class="st">&quot;m5.xlarge&quot;</span>, <span class="dv">4</span>, <span class="dv">15</span>), (<span class="st">&quot;c5.4xlarge&quot;</span>, <span class="dv">8</span>, <span class="dv">30</span>)]:</span>
+<span id="d05-cb7-31"><a href="#d05-cb7-31" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span>itype<span class="sc">:&lt;11}</span><span class="ss"> ENIs=</span><span class="sc">{</span>enis<span class="sc">}</span><span class="ss"> IPs/ENI=</span><span class="sc">{</span>ips<span class="sc">:&lt;2}</span><span class="ss"> -&gt; max pods </span><span class="sc">{</span>enis <span class="op">*</span> (ips <span class="op">-</span> <span class="dv">1</span>) <span class="op">+</span> <span class="dv">2</span><span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d05-cb7-32"><a href="#d05-cb7-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb7-33"><a href="#d05-cb7-33" aria-hidden="true" tabindex="-1"></a><span class="co"># AWS reserves 5 addresses in every subnet</span></span>
+<span id="d05-cb7-34"><a href="#d05-cb7-34" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> p <span class="kw">in</span> (<span class="st">&quot;10.20.0.0/28&quot;</span>, <span class="st">&quot;10.20.0.0/24&quot;</span>, <span class="st">&quot;10.20.64.0/18&quot;</span>):</span>
+<span id="d05-cb7-35"><a href="#d05-cb7-35" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> ip.ip_network(p)</span>
+<span id="d05-cb7-36"><a href="#d05-cb7-36" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  AWS subnet </span><span class="sc">{</span>p<span class="sc">:&lt;14}</span><span class="ss"> </span><span class="sc">{</span>n<span class="sc">.</span>num_addresses<span class="sc">:&gt;6}</span><span class="ss"> addrs, </span><span class="sc">{</span>n<span class="sc">.</span>num_addresses <span class="op">-</span> <span class="dv">5</span><span class="sc">:&gt;6}</span><span class="ss"> usable&quot;</span>)</span>
+<span id="d05-cb7-37"><a href="#d05-cb7-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d05-cb7-38"><a href="#d05-cb7-38" aria-hidden="true" tabindex="-1"></a><span class="co"># IPv6: a /56 VPC holds how many /64 subnets?</span></span>
+<span id="d05-cb7-39"><a href="#d05-cb7-39" aria-hidden="true" tabindex="-1"></a>v6 <span class="op">=</span> ip.ip_network(<span class="st">&quot;2001:db8:1200::/56&quot;</span>)</span>
+<span id="d05-cb7-40"><a href="#d05-cb7-40" aria-hidden="true" tabindex="-1"></a>subs <span class="op">=</span> <span class="bu">list</span>(v6.subnets(new_prefix<span class="op">=</span><span class="dv">64</span>))</span>
+<span id="d05-cb7-41"><a href="#d05-cb7-41" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="sc">{</span>v6<span class="sc">}</span><span class="ss"> -&gt; </span><span class="sc">{</span><span class="bu">len</span>(subs)<span class="sc">}</span><span class="ss"> x /64; first </span><span class="sc">{</span>subs[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">, last </span><span class="sc">{</span>subs[<span class="op">-</span><span class="dv">1</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d05-cb7-42"><a href="#d05-cb7-42" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;one /80 per node (EKS IPv6 style) inside a /64: </span><span class="sc">{</span><span class="dv">2</span> <span class="op">**</span> (<span class="dv">80</span> <span class="op">-</span> <span class="dv">64</span>)<span class="sc">:,}</span><span class="ss"> nodes&quot;</span>)</span></code></pre></div>
+<p>Real output:</p>
+<pre><code>overlaps:
+  vpc-prod         10.20.0.0/16    x partner VPN      10.16.0.0/12    shared    65,536 addrs
+  vpc-staging      10.21.0.0/16    x partner VPN      10.16.0.0/12    shared    65,536 addrs
+  k8s-svc (prod)   10.96.0.0/12    x branch office    10.100.8.0/22   shared     1,024 addrs
+
+pods 100.64.0.0/14: /24 per node -&gt; 1024 nodes, 256 addrs/node for max 110 pods
+  m5.large    ENIs=3 IPs/ENI=10 -&gt; max pods 29
+  m5.xlarge   ENIs=4 IPs/ENI=15 -&gt; max pods 58
+  c5.4xlarge  ENIs=8 IPs/ENI=30 -&gt; max pods 234
+  AWS subnet 10.20.0.0/28       16 addrs,     11 usable
+  AWS subnet 10.20.0.0/24      256 addrs,    251 usable
+  AWS subnet 10.20.64.0/18   16384 addrs,  16379 usable
+
+2001:db8:1200::/56 -&gt; 256 x /64; first 2001:db8:1200::/64, last 2001:db8:1200:ff::/64
+one /80 per node (EKS IPv6 style) inside a /64: 65,536 nodes</code></pre>
+<p>Three findings, and none of them is an arithmetic slip. Both VPCs sit inside the partner's 10.16.0.0/12 (10.16 through 10.31), so that VPN can never be routed to either VPC without NAT. The kubeadm default service range 10.96.0.0/12 runs from 10.96.0.0 to 10.111.255.255 and quietly contains a branch office. And an m5.large on the default VPC CNI runs 29 pods, not 110, however big your subnets are. That one surprises people because it has nothing to do with the CIDR.</p>
+<p>A note on the worked plan's pod range. 100.64.0.0/10 is RFC 6598 "shared address space", reserved for carrier-grade NAT. Using it for pods (the EKS custom networking pattern) is a widespread convention that buys address space no corporate network uses. It is not free, though. Tailscale hands out tailnet addresses from that same /10, and some ISPs number customer CGNAT from it. Check before you claim it.</p>
+<p><strong>Worked: sizing a VPC for a cluster.</strong> Suppose 200 nodes at 110 pods each, with pods on VPC addresses (AWS CNI with prefix delegation). Pods need 200 × 110 = 22,000 addresses, but prefix delegation allocates in /28 chunks, so plan for 200 nodes × 7 chunks × 16 = 22,400, plus warm-pool headroom. Spread over three availability zones, each zone's pod subnet needs about 7,500 addresses before slack, which means a /19 (8,192) per zone. That is three /19s for pods alone — 24,576 addresses, more than a third of a /16. Add node subnets, load balancer subnets and growth, and the honest answer is "a /16 per cluster, or put pods in a secondary 100.64 range." Run this before you create the VPC, not after.</p>
+<h2 id="d05-failures">Deep dive: production failure modes</h2>
+<p>Each entry runs symptom → mechanism → proof → fix. Every one of them is longest-prefix match doing exactly what it was told.</p>
+<h3 id="d05-1-two-vpcs-wont-peer-or-peer-and-route-wrong">1. Two VPCs won't peer, or peer and route wrong</h3>
+<p><strong>Symptom.</strong> The peering request is rejected, or a Transit Gateway attachment is accepted but some destinations are unreachable from one side.</p>
+<p><strong>Mechanism.</strong> Both sides chose 10.0.0.0/16, the console default. A route table cannot hold two different next hops for the same prefix at the same depth: the trie has one node for 10.0.0.0/16, and the local route already owns it. AWS VPC peering refuses overlapping CIDRs outright. Transit gateways accept the attachments, but only one of the overlapping routes can be active.</p>
+<p><strong>Prove it.</strong> List every CIDR in play (<code>aws ec2 describe-vpcs --query 'Vpcs[].CidrBlockAssociationSet[].CidrBlock'</code>, plus the equivalent for on-prem and partners) and run them through an overlap check like the script above.</p>
+<p><strong>Fix.</strong> Renumber one side if you can. If you can't: put a private NAT gateway in front of the overlapping range so it appears as a non-overlapping one, expose only the services needed through PrivateLink-style endpoints, or move the traffic to IPv6. The durable fix is organisational: one IPAM, one allocator, and no team picking its own 10.0.0.0/16.</p>
+<h3 id="d05-2-the-laptop-that-cant-reach-the-vpn-since-docker-was-installed">2. The laptop that can't reach the VPN since Docker was installed</h3>
+<p><strong>Symptom.</strong> After installing Docker Desktop (or starting a compose project), a developer can't reach a corporate host in 172.17.x.x or 172.18.x.x. Everything else works.</p>
+<p><strong>Mechanism.</strong> Docker's default bridge is 172.17.0.0/16, and new compose networks are cut from its default pools (172.17–172.31 as /16s, then 192.168.0.0/16 as /20s). Creating a network adds a connected route. A connected /16 is longer than the VPN's /12 for 172.16.0.0, so the trie sends the traffic to a local bridge with nobody on it.</p>
+<p><strong>Prove it.</strong> On Linux, <code>ip route get 172.17.4.20</code> shows <code>dev docker0</code> (or a <code>br-…</code> bridge) instead of the tunnel, and <code>ip route | grep -E 'docker|br-'</code> lists the stolen prefixes. On a Mac the bridges live inside Docker Desktop's Linux VM, not in the host's routing table, so this exact clash is rarer there. The VM's own subnet can still collide with a corporate range; <code>route -n get &lt;addr&gt;</code> shows whether it does.</p>
+<p><strong>Fix.</strong> Set <code>default-address-pools</code> (and <code>bip</code>) in Docker's <code>daemon.json</code> to a range nobody routes, then recreate the networks. Put that range in the IPAM so the next team doesn't take it.</p>
+<h3 id="d05-3-kubernetes-service-range-swallows-a-real-network">3. Kubernetes service range swallows a real network</h3>
+<p><strong>Symptom.</strong> Pods can't reach a database at 10.100.9.15, but nodes can. No firewall logs show a drop.</p>
+<p><strong>Mechanism.</strong> The service CIDR is the default 10.96.0.0/12, which covers 10.96.0.0–10.111.255.255. kube-proxy (iptables or IPVS) or an eBPF dataplane intercepts traffic to service IPs before routing. Even where nothing matches a real service, the CNI's own routes may treat the whole range as cluster-internal. Packets from pods never reach the VPC route table.</p>
+<p><strong>Prove it.</strong> <code>kubectl cluster-info dump | grep -m1 service-cluster-ip-range</code>, or read the API server manifest. Then <code>python3 -c "import ipaddress as i; print(i.ip_address('10.100.9.15') in i.ip_network('10.96.0.0/12'))"</code> prints <code>True</code>. From a node, <code>ip route get 10.100.9.15</code> looks fine, which is exactly why this takes hours to find.</p>
+<p><strong>Fix.</strong> Move to a service range that is truly unused. Recent Kubernetes versions can add service ranges through the ServiceCIDR API, but getting existing services off the old range is still a migration, and for many teams a rebuild is simpler. Choose service and pod ranges from the IPAM <em>before</em> the first cluster, and never accept the defaults on a network you don't control end to end.</p>
+<h3 id="d05-4-pod-ip-exhaustion-with-plenty-of-addresses">4. Pod IP exhaustion with plenty of addresses</h3>
+<p><strong>Symptom.</strong> New pods sit in <code>ContainerCreating</code> with <code>failed to assign an IP address to container</code> (AWS VPC CNI) or the node reports no free addresses. Meanwhile the VPC has thousands of free addresses.</p>
+<p><strong>Mechanism.</strong> Two different limits. On AWS without prefix delegation, the node hit its ENI × IP limit (29 pods on an m5.large). Or the subnet is fragmented: prefix delegation needs a free, <em>aligned</em> /28, and a subnet full of scattered single-address assignments may have plenty of free addresses but no free aligned /28. That is the same alignment rule as Module 05's "a /26 must start on a multiple of 64", now causing an outage.</p>
+<p><strong>Prove it.</strong> <code>kubectl describe node</code> shows <code>Allocatable: pods</code>. The CNI logs (<code>/var/log/aws-routed-eni/ipamd.log</code> on EKS nodes) say which limit failed. Compare the subnet's free count with whether a /28 is free.</p>
+<p><strong>Fix.</strong> Enable prefix delegation on fresh subnets, or use subnet CIDR reservations to keep aligned space free for /28s. Move pods to a secondary range if the node subnets are small.</p>
+<h3 id="d05-5-a-more-specific-route-hijacks-traffic">5. A more-specific route hijacks traffic</h3>
+<p><strong>Symptom.</strong> Traffic to a service suddenly goes somewhere else, often with higher latency or not at all. Nothing in your own config changed.</p>
+<p><strong>Mechanism.</strong> Someone announced a longer prefix covering part of your space. On the internet that is a BGP hijack or route leak: your /22 is beaten everywhere by someone else's /24, because every router's trie prefers the deeper node. Inside a company it is a stray static /32 or /24 on a core router, left from a migration. Either way, the walk passes your prefix and keeps going.</p>
+<p><strong>Prove it.</strong> Internally, <code>ip route get &lt;addr&gt;</code> or <code>show ip route &lt;addr&gt;</code> on the router names the winning prefix. On the internet, check what the world sees with a public looking glass or RIPEstat, not your own router.</p>
+<p><strong>Fix.</strong> Internally: delete the stray route and add a config check for routes more specific than the ranges in your IPAM. Externally: RPKI route-origin validation with ROAs that set a sensible max-length, plus announcing your own /24s (the longest the internet accepts) so nobody can be more specific.</p>
+<h3 id="d05-6-wrong-mask-half-the-subnet-unreachable">6. Wrong mask, half the subnet unreachable</h3>
+<p><strong>Symptom.</strong> A host reaches some local peers but not others. Usually the ones in the "upper half".</p>
+<p><strong>Mechanism.</strong> The host is configured 10.10.0.20/24 while the subnet is really a /23. Its connected route covers 10.10.0.0–10.10.0.255 only. For 10.10.1.x it falls through to the default route and sends to the gateway. Depending on the gateway, that hairpins, gets an ICMP redirect, or dies at a stateful firewall that sees only half of each conversation.</p>
+<p><strong>Prove it.</strong> <code>ip -4 addr show</code> or <code>ifconfig en0</code> shows the mask. <code>ip route get 10.10.1.30</code> shows <code>via &lt;gateway&gt;</code> where you expected a direct route.</p>
+<p><strong>Fix.</strong> Correct the mask in DHCP or the static config. If a router "fixed" it with proxy ARP, see Module 06's deep dive for why that makes it worse later.</p>
+<h2 id="d05-planning">Deep dive: address planning for real VPCs and Kubernetes in 2026</h2>
+<p>Module 05 carved one /16 for one office. Real plans are hierarchical, and the hierarchy is what keeps tries small and ranges disjoint. A plan that survives contact with production looks something like this:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Level</th>
+<th>Example</th>
+<th>Rule</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Organisation</td>
+<td>10.0.0.0/8 (plus 100.64.0.0/10 for pods)</td>
+<td>One owner, one IPAM, nothing allocated outside it</td>
+</tr>
+<tr class="even">
+<td>Region</td>
+<td>10.16.0.0/12 per region</td>
+<td>Aggregates to one route per region in the core</td>
+</tr>
+<tr class="odd">
+<td>Environment / account</td>
+<td>10.20.0.0/16 per VPC</td>
+<td>Never reuse a /16, even in "isolated" sandboxes</td>
+</tr>
+<tr class="even">
+<td>Zone</td>
+<td>10.20.0.0/18 per AZ</td>
+<td>Three AZs plus a spare /18 for growth</td>
+</tr>
+<tr class="odd">
+<td>Subnet role</td>
+<td>/20 private, /22 public, /24 endpoints</td>
+<td>Size for scaling events, not average load</td>
+</tr>
+</tbody>
+</table>
+<p>Four rules turn that table into practice.</p>
+<p><strong>Assume everything will eventually be connected.</strong> The "isolated" dev VPC gets peered next quarter. The acquired company's network gets a VPN. The partner wants a private link. Every reused range becomes NAT, and NAT is where debugging goes to die. Allocate as if every range will someday be in one routing table, because one day it will be.</p>
+<p><strong>Reserve the ranges you don't own.</strong> Docker's pools, kubeadm's defaults, your VPN client pools, RFC 6598 and any provider-specific ranges all go in the IPAM as "reserved — do not allocate." Overlaps with them are the most common failures above, and they are entirely preventable.</p>
+<p><strong>Size for the burst, not the steady state.</strong> Autoscaling groups, blue/green deploys and node upgrades briefly double the address count. A subnet that runs at 60% full fails at the worst moment: during the rollout.</p>
+<p><strong>Use IPv6 where it removes the problem.</strong> IPv6 doesn't make you smarter about overlap. It makes overlap nearly impossible, and the planning rules are different and simpler:</p>
+<ul>
+<li><strong>Every LAN is a /64.</strong> Not because hosts need 2^64 addresses, but because SLAAC builds 64-bit interface identifiers (RFC 4291 and RFC 7421 explain why the boundary stuck). Android devices configure only via SLAAC, so a non-/64 client subnet breaks them. Don't make client subnets longer than /64.</li>
+<li><strong>Sites get /48s, smaller sites /56s</strong> (RFC 6177's guidance). Carve on nibble boundaries (/52, /56, /60, /64) so prefixes stay readable in hex.</li>
+<li><strong>Point-to-point links: /127</strong> (RFC 6164), usually with a whole /64 reserved per link so the plan stays regular. Loopbacks are /128s.</li>
+<li><strong>In the cloud</strong>: AWS gives a VPC a /56 from Amazon's pool and subnets are /64s, so the 256 /64s in the script output is your subnet budget. EKS in IPv6 mode delegates a /80 to each node and pods take addresses from it, which removes pod address exhaustion as a failure mode.</li>
+<li><strong>Private v6 space</strong> is ULA, fd00::/8, with a 40-bit <em>random</em> Global ID (RFC 4193). The random part is the point. Two organisations that follow the rule collide with probability about 1 in 2^40, so mergers stop requiring renumbering. Picking <code>fd00::/48</code> by hand throws that away.</li>
+</ul>
+<p>IPv6-only clusters with NAT64/DNS64 at the edge are a serious 2026 option, and dual-stack Kubernetes has been stable for years. The remaining v4 is often just the edge plus a few legacy dependencies. Even then, the v4 plan still has to be clean, because the edge and those dependencies are where the incidents happen.</p>
+<h2 id="d05-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: How does a router actually find the longest matching prefix? Don't say "it compares them."</strong></p>
+<p>It walks a trie keyed by the destination's bits, remembering the last node that terminated a prefix, and stops when no child matches the next bit. The remembered prefix is the answer. Software uses compressed tries: PATRICIA/radix in BSD and macOS, an LC-trie for Linux IPv4. Hardware uses TCAM, which compares all entries in parallel and returns the first match by position, so entries are stored longest-first. Lookup cost depends on branch points or TCAM width, not on the number of routes.</p>
+<p><strong>Q2: Two routes, 10.0.0.0/8 via A and 10.1.0.0/16 via B. Where does 10.1.2.3 go? What if I add 10.1.0.0/16 via C with a lower metric?</strong></p>
+<p>B, because /16 is deeper on the path than /8. Adding a second /16 doesn't change the depth; it creates a tie at the same node, and the metric (or administrative distance across protocols) breaks it. So C. Prefix length is compared first, metric only among equal lengths. People who answer "C, it has the lower metric" for the first case have the order backwards.</p>
+<p><strong>Q3: A full-tunnel VPN adds 0.0.0.0/1 and 128.0.0.0/1. Why not just replace the default route? And what breaks if it forgets one more route?</strong></p>
+<p>The two /1s cover everything and beat the /0 by one bit, so the original default stays in place and comes back untouched when the VPN drops. The client must also install a /32 for the VPN server via the physical gateway. Without it, the tunnel's own packets match a /1 and get routed into the tunnel, and the connection collapses.</p>
+<p><strong>Q4: Our EKS nodes are m5.large and pods are stuck in ContainerCreating, but the subnet is 80% free. What do you check?</strong></p>
+<p>The per-node limit first. With the VPC CNI without prefix delegation, an m5.large gets 3 ENIs × 10 IPs, which is 29 pods however large the subnet is. With prefix delegation, check whether the subnet still has a free aligned /28; scattered single-IP allocations can leave free addresses but no free /28. The ipamd log says which.</p>
+<p><strong>Q5: Why is kubeadm's default service CIDR dangerous in an enterprise, and why doesn't <code>ip route get</code> on the node reveal the problem?</strong></p>
+<p>10.96.0.0/12 spans 10.96 through 10.111, a range many enterprises already use. Service IPs are implemented in kube-proxy or eBPF rules that rewrite or capture traffic before the node's routing table matters, so the node's FIB looks innocent. You find it by comparing the configured range against your real networks, not by tracing routes.</p>
+<p><strong>Q6: Why must IPv6 client subnets be /64, and when is something other than /64 correct?</strong></p>
+<p>SLAAC forms a 64-bit interface identifier, so a client LAN with a longer prefix breaks address autoconfiguration — and some platforms, Android notably, support only SLAAC. Non-/64 is right where SLAAC isn't used: /127 on router-to-router links (RFC 6164, which avoids neighbour-cache exhaustion attacks), /128 on loopbacks, and delegated prefixes like EKS's per-node /80.</p>
+<p><strong>Q7: Two companies merge. Both used 10.0.0.0/16 for their main VPC. Give me the options in order of preference.</strong></p>
+<p>Renumber one side. It is painful once and then over. If you can't, expose services across the boundary with load balancer endpoints, so nobody needs the other side's raw range. Failing that, NAT the overlapping range into a unique one at the boundary, accepting that logs, ACLs and DNS now carry translated addresses. Long term, IPv6 with random-ID ULA or global space avoids the problem entirely. The wrong answer is "add more specific routes": a trie can't hold two next hops for the same addresses, so more-specifics just pick which half of each network becomes unreachable.</p>
+<p><strong>Q8: Why do internet providers filter announcements longer than /24, and what does that do to hijack defence?</strong></p>
+<p>Accepting longer prefixes would blow up every full-table router's FIB: roughly a million IPv4 prefixes is already the budget. So /24 is the de-facto floor, and a /25 is dropped by most networks. For defence, that means announcing your space as /24s leaves no more-specific for a hijacker to win with. Combine it with RPKI ROAs whose max-length matches what you actually announce.</p>

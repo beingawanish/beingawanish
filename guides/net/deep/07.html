@@ -1,0 +1,524 @@
+<h2 id="d07-deep-dive">Deep dive: DHCP and SLAAC as the machines they really are</h2>
+<p>The hotel desk is a good first picture. It hides three things you need once something breaks.</p>
+<p>First, there is no single "desk." DHCP state lives in four places: the client's state machine and lease file, the access switch's snooping table, the relay on the gateway, and the server's lease database. Each one can be wrong independently. Second, anyone on the wire can play clerk. The protocol has no authentication, so the network has to impose trust from outside. Third, IPv6 doesn't have one desk at all. The host builds its configuration from two sources, Router Advertisements and DHCPv6, and the host decides how to combine them. Different operating systems decide differently.</p>
+<p>The sections below go under the analogy: where the state lives, what the packets look like on a real VLAN, the timer arithmetic, how it fails, and where it shows up in 2026.</p>
+<h2 id="d07-mental-model">Deep dive: the real mental model — where the state lives</h2>
+<h3 id="d07-client-fsm">The client is a state machine with a lease file</h3>
+<p>RFC 2131 (section 4.4) defines the client as eight states: INIT, SELECTING, REQUESTING, BOUND, RENEWING, REBINDING, INIT-REBOOT and REBOOTING. DORA is just the INIT → SELECTING → REQUESTING → BOUND path. Two of the other paths matter far more in daily life.</p>
+<p><strong>INIT-REBOOT</strong> is what your laptop does when it rejoins a network it already has a lease for. It skips DISCOVER entirely. It broadcasts a REQUEST with option 50 (requested IP address) and no server identifier, which means "I believe 10.20.7.144 is still mine here." If the server agrees, it ACKs and the whole exchange is two packets. If the client moved to a different network, the server NAKs and the client falls back to INIT. That is why reconnecting to the office Wi-Fi feels instant while joining a new café network takes a little longer.</p>
+<p><strong>RENEWING and REBINDING</strong> are the T1 and T2 states from the module. In both, the address stays fully usable. The client is just trying to extend it.</p>
+<p>The lease survives reboots because the client writes it to disk. Where depends on the client:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Client</th>
+<th>Lease state lives in</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>macOS <code>configd</code> / <code>IPConfiguration</code></td>
+<td><code>/var/db/dhcpclient/leases/</code> (read it with <code>ipconfig getpacket en0</code>)</td>
+</tr>
+<tr class="even">
+<td>Linux <code>systemd-networkd</code></td>
+<td><code>/run/systemd/netif/leases/&lt;ifindex&gt;</code></td>
+</tr>
+<tr class="odd">
+<td>Linux ISC <code>dhclient</code></td>
+<td><code>/var/lib/dhcp/dhclient.leases</code> (path varies by distro)</td>
+</tr>
+<tr class="even">
+<td>Linux NetworkManager (internal client)</td>
+<td><code>/var/lib/NetworkManager/internal-*.lease</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="d07-server-db">The server is a database keyed by client identity</h3>
+<p>A DHCP server is a small database with one table that matters: leases. Each row is keyed by client identity, which is option 61 (client identifier) when the client sends it, else the hardware address in <code>chaddr</code>. The row holds the address, the expiry time, a state (free, offered, active, expired, abandoned) and, in an HA pair, which peer owns it.</p>
+<p>The server picks the scope from where the packet came from, not from who sent it. For a relayed packet, the deciding field is <code>giaddr</code>. For a packet that arrived directly, it is the receiving interface's subnet. Only after it has the scope does it look up the client.</p>
+<p>Some servers check before offering. ISC dhcpd pings the candidate address and skips it if anyone answers; Windows Server has a "conflict detection attempts" setting that is off by default. These are vendor behaviours, not protocol rules.</p>
+<h3 id="d07-relay">The relay is a stateless rewriter</h3>
+<p>The relay (the gateway's SVI, with <code>ip helper-address</code> on Cisco or the equivalent elsewhere) holds no lease state at all. On each client broadcast it does four things:</p>
+<ol type="1">
+<li>Sets <code>giaddr</code> to the address of the interface the broadcast arrived on — unless <code>giaddr</code> is already non-zero, because then an earlier relay already set it.</li>
+<li>Increments <code>hops</code>. Servers and relays drop packets past a configured hop limit (often 4 to 16).</li>
+<li>Optionally appends option 82 with its own circuit ID and remote ID.</li>
+<li>Unicasts the packet to each configured server, source port 67, destination port 67.</li>
+</ol>
+<p>On the way back, the server sends to <code>giaddr</code>, port 67. The relay strips option 82 and delivers the reply on the client's link. If the client didn't set the broadcast flag, the relay sends it as a unicast to <code>yiaddr</code>, addressed at Layer 2 to <code>chaddr</code>. It can't ARP for the client, because the client doesn't own the address yet. It writes the MAC straight into its forwarding path from the packet.</p>
+<h3 id="d07-snooping">The access switch keeps the only trustworthy table</h3>
+<p>DHCP has no authentication. RFC 3118 defined authentication in 2001, and practically nobody deployed it. So the network imposes trust from outside, at the access switch, with <strong>DHCP snooping</strong> (a vendor feature, implemented by every enterprise switch vendor under roughly the same name).</p>
+<p>The switch keeps two pieces of state. One is a list of <strong>trusted ports</strong>, normally just the uplinks toward the relay. Server messages (OFFER, ACK, NAK) arriving on any other port are dropped. The other is a <strong>binding table</strong>: (VLAN, MAC) → (IP, port, lease expiry), filled by watching ACKs go past and emptied by RELEASE, by lease expiry, or by the port going down.</p>
+<p>That binding table then feeds two more features. <strong>Dynamic ARP Inspection</strong> drops ARP packets whose sender IP/MAC pair doesn't match a binding on that port. <strong>IP Source Guard</strong> drops IP packets whose source address doesn't match. Together they turn "whoever shouts first wins" into "only addresses the real server handed out, only from the port they were handed out on."</p>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 440" role="img" aria-labelledby="d07-state-title d07-state-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
+<title id="d07-state-title">Where DHCP state lives: client, snooping switch, relay, server</title>
+<desc id="d07-state-desc">Four boxes from left to right: the host with its client state machine and lease file, the access switch with trusted ports and a snooping binding table, the gateway relay which keeps no lease state but rewrites giaddr, hops and option 82, and the server with its lease database. A broadcast DISCOVER travels through the switch and relay and becomes a unicast to the server; the OFFER returns via giaddr. A dashed line shows the T1 renewal going straight from host to server as a routed unicast, bypassing the relay and option 82.</desc>
+<text x="24" y="38" font-family="Georgia,serif" font-size="22" fill="#2d3142">Where DHCP state actually lives</text>
+<text x="24" y="62" font-family="system-ui,sans-serif" font-size="13" fill="#6b6f7e">four places, each can be wrong on its own — and the renewal skips one of them</text>
+<g font-family="system-ui,sans-serif">
+<text x="230" y="86" font-size="10" fill="#bf4520">◀ untrusted</text>
+<text x="392" y="86" text-anchor="end" font-size="10" fill="#2d3142">trusted ▶</text>
+<!-- boxes -->
+<rect x="24" y="94" width="170" height="190" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5" rx="6"/>
+<rect x="226" y="94" width="170" height="190" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5" rx="6"/>
+<rect x="428" y="94" width="170" height="190" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5" rx="6"/>
+<rect x="630" y="94" width="170" height="190" fill="#2d3142" rx="6"/>
+<text x="109" y="118" text-anchor="middle" font-size="14" font-weight="600" fill="#2d3142">Host</text>
+<text x="311" y="118" text-anchor="middle" font-size="14" font-weight="600" fill="#2d3142">Access switch</text>
+<text x="513" y="118" text-anchor="middle" font-size="14" font-weight="600" fill="#2d3142">Gateway / relay</text>
+<text x="715" y="118" text-anchor="middle" font-size="14" font-weight="600" fill="#f5f5f5">DHCP server</text>
+<g font-family="ui-monospace,Menlo,monospace" font-size="10.5" fill="#2d3142">
+<text x="36" y="146">client state machine</text>
+<text x="36" y="164">INIT → … → BOUND</text>
+<text x="36" y="182">RENEWING · REBINDING</text>
+<text x="36" y="200">INIT-REBOOT (2 pkts)</text>
+<text x="36" y="226" fill="#6b6f7e">lease file on disk</text>
+<text x="36" y="244" fill="#6b6f7e">T1 14400 · T2 25200</text>
+<text x="36" y="262" fill="#6b6f7e">lease 28800 s</text>
+<text x="238" y="146">DHCP snooping</text>
+<text x="238" y="164">drop OFFER/ACK/NAK</text>
+<text x="238" y="182">  from untrusted ports</text>
+<text x="238" y="208" fill="#6b6f7e">binding table</text>
+<text x="238" y="226" fill="#6b6f7e">(310, 3a:1f:…:e4) →</text>
+<text x="238" y="244" fill="#6b6f7e"> 10.20.7.144 Gi1/0/7</text>
+<text x="238" y="262" fill="#bf4520">→ feeds DAI, IPSG</text>
+<text x="440" y="146">no lease state</text>
+<text x="440" y="164">giaddr := 10.20.6.1</text>
+<text x="440" y="182">hops += 1</text>
+<text x="440" y="200">add opt 82 / strip it</text>
+<text x="440" y="226" fill="#6b6f7e">bcast in, unicast out</text>
+<text x="440" y="244" fill="#6b6f7e">UDP 67 → 67</text>
+<text x="440" y="262" fill="#6b6f7e">to every helper</text>
+<text x="642" y="146" fill="#f5f5f5">lease database</text>
+<text x="642" y="164" fill="#f5f5f5">scope ← giaddr</text>
+<text x="642" y="182" fill="#f5f5f5">key ← option 61</text>
+<text x="642" y="200" fill="#f5f5f5">  (else chaddr)</text>
+<text x="642" y="226" fill="#d8d4c8">10.20.7.144 active</text>
+<text x="642" y="244" fill="#d8d4c8">expires 17:02</text>
+<text x="642" y="262" fill="#d8d4c8">HA peer owns: none</text>
+</g>
+<!-- request path -->
+<line x1="109" y1="306" x2="705" y2="306" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="715,306 705,301 705,311" fill="#6b6f7e"/>
+<circle cx="311" cy="306" r="3.5" fill="#6b6f7e"/>
+<circle cx="513" cy="306" r="3.5" fill="#6b6f7e"/>
+<text x="210" y="300" text-anchor="middle" font-size="11" fill="#2d3142">DISCOVER broadcast</text>
+<text x="412" y="300" text-anchor="middle" font-size="11" fill="#2d3142">still broadcast in VLAN 310</text>
+<text x="614" y="300" text-anchor="middle" font-size="11" fill="#2d3142">unicast + giaddr + opt 82</text>
+<!-- reply path -->
+<line x1="715" y1="336" x2="119" y2="336" stroke="#2d3142" stroke-width="2"/>
+<polygon points="109,336 119,331 119,341" fill="#2d3142"/>
+<text x="412" y="354" text-anchor="middle" font-size="11" fill="#2d3142">OFFER/ACK: server → giaddr:67 → relay strips opt 82 → unicast to yiaddr, L2 dst = chaddr (no ARP)</text>
+<!-- renew path -->
+<line x1="109" y1="384" x2="705" y2="384" stroke="#bf4520" stroke-width="2" stroke-dasharray="8,6"/>
+<polygon points="715,384 705,379 705,389" fill="#bf4520"/>
+<text x="412" y="402" text-anchor="middle" font-size="11" fill="#bf4520">T1 renew: routed unicast 10.20.7.144 → 10.20.0.10 (option 54) — no relay rewrite, no option 82</text>
+<text x="24" y="428" font-size="12" fill="#6b6f7e">Only the switch sees every port; only the server is authoritative; the relay remembers nothing between packets.</text>
+</g>
+</svg>
+<h3 id="d07-v6-state">IPv6: the host keeps the lists, and the RA writes most of them</h3>
+<p>An IPv6 host has no single lease. RFC 4861 gives it a set of lists, each with its own timers:</p>
+<ul>
+<li><strong>Prefix list</strong> — prefixes that are on-link (from the PIO's L flag), each with a valid lifetime.</li>
+<li><strong>Default router list</strong> — routers from RAs with a non-zero router lifetime.</li>
+<li><strong>Address list</strong> — each address carries a <em>preferred</em> lifetime (use it for new connections) and a <em>valid</em> lifetime (keep it at all). Between the two, the address is <em>deprecated</em>: existing connections keep working, new ones pick another source address.</li>
+<li><strong>DNS servers</strong> — from the RA's RDNSS option (RFC 8106), from DHCPv6, or both.</li>
+<li><strong>DHCPv6 state</strong> — a DUID, and per-IA (identity association) addresses or prefixes with their own T1/T2.</li>
+</ul>
+<p>The RA flags M and O are <em>hints</em> to this machinery, not commands. RFC 4861 says hosts "may" act on them, and real systems disagree. Windows starts DHCPv6 when M=1. macOS does stateful DHCPv6 when M=1. Android has never implemented stateful DHCPv6 address assignment at all, so an M=1, A=0 network leaves an Android phone with only a link-local address. Design for the weakest host on the network, not for the RFC.</p>
+<h2 id="d07-wire">Deep dive: what the wire actually shows</h2>
+<p>The captures below were built byte for byte (Python <code>struct</code>) and then decoded by <code>tcpdump 4.99.4 -nn -v -e</code>. The decode is real tcpdump output. The scenario is the module's office: a laptop on VLAN 310 (<code>10.20.6.0/23</code>), gateway and relay <code>10.20.6.1</code>, DHCP server <code>10.20.0.10</code> two subnets away. The laptop uses a private Wi-Fi MAC, <code>3a:1f:9c:52:07:e4</code>. The <code>0x02</code> bit in the first octet marks it as locally administered — randomized, not burned in.</p>
+<p>To take the same captures on your own machine (run on your Mac — your output will differ):</p>
+<div class="sourceCode" id="d07-cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d07-cb1-1"><a href="#d07-cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># IPv4 DHCP on the Wi-Fi interface (Linux: -i wlan0 or eth0)</span></span>
+<span id="d07-cb1-2"><a href="#d07-cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tcpdump <span class="at">-nn</span> <span class="at">-v</span> <span class="at">-e</span> <span class="at">-i</span> en0 <span class="st">&#39;udp port 67 or udp port 68&#39;</span></span>
+<span id="d07-cb1-3"><a href="#d07-cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"># in another window, force a fresh exchange</span></span>
+<span id="d07-cb1-4"><a href="#d07-cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ipconfig set en0 DHCP            <span class="co"># Linux: sudo networkctl renew wlan0 (systemd-networkd)</span></span>
+<span id="d07-cb1-5"><a href="#d07-cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># IPv6 RS/RA (assumes no extension headers before ICMPv6) and DHCPv6</span></span>
+<span id="d07-cb1-6"><a href="#d07-cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tcpdump <span class="at">-nn</span> <span class="at">-v</span> <span class="at">-e</span> <span class="at">-i</span> en0 <span class="st">&#39;icmp6 and (ip6[40] == 133 or ip6[40] == 134)&#39;</span></span>
+<span id="d07-cb1-7"><a href="#d07-cb1-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tcpdump <span class="at">-nn</span> <span class="at">-v</span> <span class="at">-e</span> <span class="at">-i</span> en0 <span class="st">&#39;udp port 546 or udp port 547&#39;</span></span></code></pre></div>
+<h3 id="d07-wire-dora">The client's VLAN: DISCOVER and OFFER</h3>
+<pre><code>09:02:11.000000 3a:1f:9c:52:07:e4 &gt; ff:ff:ff:ff:ff:ff, ethertype IPv4 (0x0800), length 342: (tos 0x0, ttl 64, id 0, offset 0, flags [none], proto UDP (17), length 328)
+    0.0.0.0.68 &gt; 255.255.255.255.67: BOOTP/DHCP, Request from 3a:1f:9c:52:07:e4, length 300, xid 0x9f3a21c7, Flags [none]
+      Client-Ethernet-Address 3a:1f:9c:52:07:e4
+      Vendor-rfc1048 Extensions
+        Magic Cookie 0x63825363
+        DHCP-Message (53), length 1: Discover
+        Parameter-Request (55), length 12: 
+          Subnet-Mask (1), Classless-Static-Route (121), Default-Gateway (3), Domain-Name-Server (6)
+          Domain-Name (15), Unknown (108), URL (114), Unknown (119)
+          Unknown (252), LDAP (95), Netbios-Name-Server (44), Netbios-Node (46)
+        MSZ (57), length 2: 1500
+        Client-ID (61), length 7: ether 3a:1f:9c:52:07:e4
+        Hostname (12), length 7: &quot;lt-0412&quot;
+09:02:11.004811 00:1c:73:aa:10:01 &gt; 3a:1f:9c:52:07:e4, ethertype IPv4 (0x0800), length 346: (tos 0x0, ttl 255, id 0, offset 0, flags [none], proto UDP (17), length 332)
+    10.20.6.1.67 &gt; 10.20.7.144.68: BOOTP/DHCP, Reply, length 304, xid 0x9f3a21c7, Flags [none]
+      Your-IP 10.20.7.144
+      Gateway-IP 10.20.6.1
+      Client-Ethernet-Address 3a:1f:9c:52:07:e4
+      Vendor-rfc1048 Extensions
+        Magic Cookie 0x63825363
+        DHCP-Message (53), length 1: Offer
+        Server-ID (54), length 4: 10.20.0.10
+        Lease-Time (51), length 4: 28800
+        RN (58), length 4: 14400
+        RB (59), length 4: 25200
+        Subnet-Mask (1), length 4: 255.255.254.0
+        Default-Gateway (3), length 4: 10.20.6.1
+        Domain-Name-Server (6), length 4: 10.20.0.53
+        Domain-Name (15), length 16: &quot;corp.example.com&quot;</code></pre>
+<p>Read it line by line, because almost every field tells you something:</p>
+<ul>
+<li><strong>Lengths add up.</strong> 300 bytes of DHCP + 8 UDP + 20 IP = 328 on the IP line, plus 14 Ethernet = 342 for the frame. The DISCOVER is padded to exactly 300 bytes, the BOOTP-era minimum.</li>
+<li><strong><code>Flags [none]</code>.</strong> The broadcast flag is clear. Modern macOS, Linux and Windows clients can accept a unicast before their address is configured, so they don't ask for broadcast replies.</li>
+<li><strong>So the OFFER is unicast</strong>: Ethernet destination is the client's MAC, IP destination is <code>10.20.7.144</code>, an address the client doesn't hold yet. The relay took the MAC from <code>chaddr</code> and skipped ARP.</li>
+<li><strong>Source <code>10.20.6.1</code>, TTL 255.</strong> The client never sees the real server's address in the IP header. It sees the relay, which originated this packet. The real server appears only in option 54, and that is where the client will send its renewal.</li>
+<li><strong><code>Gateway-IP 10.20.6.1</code></strong> is <code>giaddr</code>, echoed back by the server. Its presence on the client's VLAN tells you instantly that a relay is involved.</li>
+<li><strong>Options 58 and 59</strong> state T1 = 14,400 s and T2 = 25,200 s explicitly: exactly 0.5 and 0.875 of the 28,800 s lease. A server may set them to anything, and clients must honour them.</li>
+<li><strong>The parameter request list (55)</strong> is the client asking. Option 121 (classless static routes, RFC 3442) comes <em>before</em> option 3 for a reason: RFC 3442 says that if a client receives 121, it must ignore option 3. Option 108 is "IPv6-Only Preferred" (RFC 8925). Option 114 is the captive-portal URL (RFC 8910). tcpdump 4.99 prints several of these as <code>Unknown</code>, and the order and contents of this list are distinctive enough that NAC products use them to fingerprint the operating system.</li>
+</ul>
+<p>The REQUEST and ACK that follow are the same shape. The REQUEST adds <code>Requested-IP (50): 10.20.7.144</code> and <code>Server-ID (54): 10.20.0.10</code>; that server ID is the broadcast "I chose this one" that tells other servers to withdraw. The ACK repeats the OFFER's option set with message type 5.</p>
+<h3 id="d07-wire-relay">The server's side: giaddr and option 82</h3>
+<p>The same DISCOVER, captured in front of the server 1.9 ms later:</p>
+<pre><code>09:02:11.001902 00:1c:73:aa:00:01 &gt; 00:50:56:9a:00:10, ethertype IPv4 (0x0800), length 362: (tos 0x0, ttl 254, id 0, offset 0, flags [none], proto UDP (17), length 348)
+    10.20.6.1.67 &gt; 10.20.0.10.67: BOOTP/DHCP, Request from 3a:1f:9c:52:07:e4, length 320, hops 1, xid 0x9f3a21c7, Flags [none]
+      Gateway-IP 10.20.6.1
+      Client-Ethernet-Address 3a:1f:9c:52:07:e4
+      Vendor-rfc1048 Extensions
+        Magic Cookie 0x63825363
+        DHCP-Message (53), length 1: Discover
+        [... options 55, 57, 61, 12 exactly as the client sent them ...]
+        Agent-Information (82), length 38: 
+          Circuit-ID SubOption 1, length 25: acc-3f-07:Gi1/0/7:vlan310
+          Remote-ID SubOption 2, length 9: acc-3f-07</code></pre>
+<ul>
+<li><strong>Port 67 to port 67.</strong> Relay-to-server traffic uses the server port on both ends. A firewall rule that only permits "UDP 68 → 67" between relay and server silently breaks every relayed client. This is one of the commonest "DHCP is down for one building" causes.</li>
+<li><strong><code>hops 1</code>, <code>giaddr 10.20.6.1</code>.</strong> The server selects the <code>10.20.6.0/23</code> scope from <code>giaddr</code>, not from the IP source. Here they happen to match. On many routers they don't, because the relay sources the packet from a loopback or the egress interface.</li>
+<li><strong>TTL 254</strong>: the relay originated the packet with 255 and one router hop sat in between.</li>
+<li><strong>Option 82 is 38 bytes</strong>: two sub-options, each 2 bytes of type/length plus a 25-byte and a 9-byte value. 4 + 25 + 9 = 38. The DHCP payload grew from 300 to 320 bytes. The client's own options ended at byte 280 and the rest was zero padding. The relay added 40 bytes (code, length and 38 bytes of sub-options), so the padding was no longer needed.</li>
+</ul>
+<p>The format of the circuit ID is vendor-specific. Many switches encode VLAN, module and port as binary rather than readable text. The server treats it as an opaque string to match against policy.</p>
+<h3 id="d07-wire-renew">The renewal at T1: no relay at all</h3>
+<p>Four hours later, on the client's VLAN:</p>
+<pre><code>13:02:11.000000 3a:1f:9c:52:07:e4 &gt; 00:1c:73:aa:10:01, ethertype IPv4 (0x0800), length 342: (tos 0x0, ttl 64, id 0, offset 0, flags [none], proto UDP (17), length 328)
+    10.20.7.144.68 &gt; 10.20.0.10.67: BOOTP/DHCP, Request from 3a:1f:9c:52:07:e4, length 300, xid 0x5b0c8e12, Flags [none]
+      Client-IP 10.20.7.144
+      [... options 53 Request, 61, 55, 57, 12 — no 50, no 54 ...]
+13:02:11.002100 00:1c:73:aa:10:01 &gt; 3a:1f:9c:52:07:e4, ethertype IPv4 (0x0800), length 346: (tos 0x0, ttl 63, id 0, offset 0, flags [none], proto UDP (17), length 332)
+    10.20.0.10.67 &gt; 10.20.7.144.68: BOOTP/DHCP, Reply, length 304, xid 0x5b0c8e12, Flags [none]
+      Client-IP 10.20.7.144
+      Your-IP 10.20.7.144
+      [... ACK with the same option set ...]</code></pre>
+<p>This is the detail the hotel analogy erases. The renewal is an ordinary routed unicast from <code>10.20.7.144</code> to the server's own address, through the default gateway (Ethernet destination is the gateway MAC). It does not pass through the relay function. So:</p>
+<ul>
+<li><code>ciaddr</code> (Client-IP) is filled in, and options 50 and 54 are absent. RFC 2131 forbids them in RENEWING.</li>
+<li><strong>No option 82.</strong> If the server's policy depends on circuit ID (a per-port lease time, a "building B gets the guest scope" rule), a renewal arrives without that information. RFC 5107 added option 82 sub-option 11, <em>server identifier override</em>: the relay tells the server "put my address in option 54," so that renewals come back through the relay and get option 82 again.</li>
+<li>TTL 63 on the ACK: the server sent 64 and one router forwarded it.</li>
+</ul>
+<h3 id="d07-wire-v6">IPv6 on the same VLAN: RS, RA, then stateless DHCPv6</h3>
+<pre><code>09:02:11.000000 3a:1f:9c:52:07:e4 &gt; 33:33:00:00:00:02, ethertype IPv6 (0x86dd), length 70: (hlim 255, next-header ICMPv6 (58) payload length: 16) fe80::1c8f:3e2a:9b40:d175 &gt; ff02::2: [icmp6 sum ok] ICMP6, router solicitation, length 16
+      source link-address option (1), length 8 (1): 3a:1f:9c:52:07:e4
+09:02:11.003100 00:1c:73:aa:10:01 &gt; 33:33:00:00:00:01, ethertype IPv6 (0x86dd), length 142: (hlim 255, next-header ICMPv6 (58) payload length: 88) fe80::21c:73ff:feaa:1001 &gt; ff02::1: [icmp6 sum ok] ICMP6, router advertisement, length 88
+    hop limit 64, Flags [other stateful], pref medium, router lifetime 1800s, reachable time 0ms, retrans timer 0ms
+      source link-address option (1), length 8 (1): 00:1c:73:aa:10:01
+      mtu option (5), length 8 (1):  1500
+      prefix info option (3), length 32 (4): 2001:db8:7:310::/64, Flags [onlink, auto], valid time 2592000s, pref. time 604800s
+      rdnss option (25), length 24 (3):  lifetime 1800s, addr: 2001:db8:7::53
+09:02:12.042000 3a:1f:9c:52:07:e4 &gt; 33:33:00:01:00:02, ethertype IPv6 (0x86dd), length 98: (hlim 1, next-header UDP (17) payload length: 44) fe80::1c8f:3e2a:9b40:d175.546 &gt; ff02::1:2.547: [udp sum ok] dhcp6 inf-req (xid=4d2e19 (client-ID hwaddr/time type 1 time 815903427 3a1f9c5207e4) (elapsed-time 0) (option-request DNS-server DNS-search-list))
+09:02:12.045700 00:1c:73:aa:10:01 &gt; 3a:1f:9c:52:07:e4, ethertype IPv6 (0x86dd), length 152: (hlim 64, next-header UDP (17) payload length: 98) fe80::21c:73ff:feaa:1001.547 &gt; fe80::1c8f:3e2a:9b40:d175.546: [udp sum ok] dhcp6 reply (xid=4d2e19 (client-ID hwaddr/time type 1 time 815903427 3a1f9c5207e4) (server-ID hwaddr/time type 1 time 788572673 001c73aa1001) (DNS-server 2001:db8:7::53) (DNS-search-list corp.example.com.) (lifetime 86400))</code></pre>
+<ul>
+<li><strong><code>hlim 255</code> on both RS and RA.</strong> RFC 4861 requires hosts to drop any RA whose hop limit isn't 255. A router decrements hop limit, so 255 proves the RA was sent on this link. A rogue RA therefore can't come from the internet. It has to come from a device on your VLAN.</li>
+<li><strong><code>Flags [other stateful]</code></strong> is tcpdump's name for the O flag. M is clear. The PIO says <code>onlink, auto</code>: L=1, A=1. So the host forms its own address from <code>2001:db8:7:310::/64</code> and asks DHCPv6 only for "other" configuration.</li>
+<li><strong>Lifetimes.</strong> Valid 2,592,000 s (30 days) and preferred 604,800 s (7 days) are the RFC 4861 defaults, and they are a problem when a prefix changes (see failure modes). Router lifetime 1800 s is 3 × the default 600 s maximum RA interval.</li>
+<li><strong>RDNSS is already here.</strong> This RA carries the DNS server itself. A host that understands RDNSS (Android, macOS, iOS, Windows 10 1703+, Linux with systemd-resolved or NetworkManager) has DNS before DHCPv6 says a word. The DHCPv6 exchange that follows is for hosts that don't, and for the search list.</li>
+<li><strong>The DHCPv6 Information-Request</strong> goes from link-local to <code>ff02::1:2</code> (all DHCP relay agents and servers) with hop limit 1. Note what's missing from the reply: no address, no prefix length, no default router. DHCPv6 has no router option. <strong>The default gateway in IPv6 always comes from an RA.</strong> Option 32 (information refresh time, 86,400 s) tells the client when to ask again.</li>
+<li><strong>The DUID</strong> (<code>hwaddr/time type 1</code>, DUID-LLT) is the DHCPv6 client identity. It's generated once and stored. It is not the MAC, even though it contains one, which is why DHCPv6 reservations keyed on MAC often don't work as people expect.</li>
+</ul>
+<h2 id="d07-numbers">Deep dive: by the numbers</h2>
+<h3 id="d07-numbers-timers">Lease timer arithmetic</h3>
+<p>RFC 2131 section 4.4.5 says how hard the client tries before giving up. In RENEWING it waits half the remaining time until T2 before retrying, and in REBINDING half the remaining time until expiry. Neither wait goes below 60 seconds. Section 4.1 sets the DISCOVER backoff: 4 seconds, doubling to a 64-second cap, each with ±1 s of jitter.</p>
+<div class="sourceCode" id="d07-cb6"><pre class="sourceCode python"><code class="sourceCode python"><span id="d07-cb6-1"><a href="#d07-cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;DHCPv4 client timers per RFC 2131 sections 4.1 and 4.4.5 (no randomization, for clarity).&quot;&quot;&quot;</span></span>
+<span id="d07-cb6-2"><a href="#d07-cb6-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb6-3"><a href="#d07-cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> hms(s: <span class="bu">float</span>) <span class="op">-&gt;</span> <span class="bu">str</span>:</span>
+<span id="d07-cb6-4"><a href="#d07-cb6-4" aria-hidden="true" tabindex="-1"></a>    s <span class="op">=</span> <span class="bu">round</span>(s)</span>
+<span id="d07-cb6-5"><a href="#d07-cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ss">f&quot;</span><span class="sc">{</span>s <span class="op">//</span> <span class="dv">3600</span><span class="sc">:02d}</span><span class="ss">:</span><span class="sc">{</span>s <span class="op">%</span> <span class="dv">3600</span> <span class="op">//</span> <span class="dv">60</span><span class="sc">:02d}</span><span class="ss">:</span><span class="sc">{</span>s <span class="op">%</span> <span class="dv">60</span><span class="sc">:02d}</span><span class="ss">&quot;</span></span>
+<span id="d07-cb6-6"><a href="#d07-cb6-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb6-7"><a href="#d07-cb6-7" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> retransmits(start: <span class="bu">float</span>, deadline: <span class="bu">float</span>, floor: <span class="bu">float</span> <span class="op">=</span> <span class="fl">60.0</span>) <span class="op">-&gt;</span> <span class="bu">list</span>[<span class="bu">float</span>]:</span>
+<span id="d07-cb6-8"><a href="#d07-cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;Wait half the remaining time to the deadline, never less than `floor` seconds.&quot;&quot;&quot;</span></span>
+<span id="d07-cb6-9"><a href="#d07-cb6-9" aria-hidden="true" tabindex="-1"></a>    t, out <span class="op">=</span> start, []</span>
+<span id="d07-cb6-10"><a href="#d07-cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="va">True</span>:</span>
+<span id="d07-cb6-11"><a href="#d07-cb6-11" aria-hidden="true" tabindex="-1"></a>        wait <span class="op">=</span> <span class="bu">max</span>((deadline <span class="op">-</span> t) <span class="op">/</span> <span class="dv">2</span>, floor)</span>
+<span id="d07-cb6-12"><a href="#d07-cb6-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> t <span class="op">+</span> wait <span class="op">&gt;=</span> deadline:</span>
+<span id="d07-cb6-13"><a href="#d07-cb6-13" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> out</span>
+<span id="d07-cb6-14"><a href="#d07-cb6-14" aria-hidden="true" tabindex="-1"></a>        t <span class="op">+=</span> wait</span>
+<span id="d07-cb6-15"><a href="#d07-cb6-15" aria-hidden="true" tabindex="-1"></a>        out.append(t)</span>
+<span id="d07-cb6-16"><a href="#d07-cb6-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb6-17"><a href="#d07-cb6-17" aria-hidden="true" tabindex="-1"></a>lease <span class="op">=</span> <span class="dv">8</span> <span class="op">*</span> <span class="dv">3600</span></span>
+<span id="d07-cb6-18"><a href="#d07-cb6-18" aria-hidden="true" tabindex="-1"></a>t1, t2 <span class="op">=</span> <span class="fl">0.5</span> <span class="op">*</span> lease, <span class="fl">0.875</span> <span class="op">*</span> lease      <span class="co"># defaults when the server omits options 58/59</span></span>
+<span id="d07-cb6-19"><a href="#d07-cb6-19" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;lease </span><span class="sc">{</span>hms(lease)<span class="sc">}</span><span class="ss">  T1 </span><span class="sc">{</span>hms(t1)<span class="sc">}</span><span class="ss">  T2 </span><span class="sc">{</span>hms(t2)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d07-cb6-20"><a href="#d07-cb6-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb6-21"><a href="#d07-cb6-21" aria-hidden="true" tabindex="-1"></a>renew <span class="op">=</span> [t1] <span class="op">+</span> retransmits(t1, t2)</span>
+<span id="d07-cb6-22"><a href="#d07-cb6-22" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;RENEWING  unicast REQUESTs at: </span><span class="sc">{</span><span class="st">&#39;, &#39;</span><span class="sc">.</span>join(hms(t) <span class="cf">for</span> t <span class="kw">in</span> renew)<span class="sc">}</span><span class="ss">  (</span><span class="sc">{</span><span class="bu">len</span>(renew)<span class="sc">}</span><span class="ss"> sent)&quot;</span>)</span>
+<span id="d07-cb6-23"><a href="#d07-cb6-23" aria-hidden="true" tabindex="-1"></a>rebind <span class="op">=</span> [t2] <span class="op">+</span> retransmits(t2, lease)</span>
+<span id="d07-cb6-24"><a href="#d07-cb6-24" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;REBINDING broadcast REQUESTs at: </span><span class="sc">{</span><span class="st">&#39;, &#39;</span><span class="sc">.</span>join(hms(t) <span class="cf">for</span> t <span class="kw">in</span> rebind)<span class="sc">}</span><span class="ss">  (</span><span class="sc">{</span><span class="bu">len</span>(rebind)<span class="sc">}</span><span class="ss"> sent)&quot;</span>)</span>
+<span id="d07-cb6-25"><a href="#d07-cb6-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb6-26"><a href="#d07-cb6-26" aria-hidden="true" tabindex="-1"></a><span class="co"># INIT state: DISCOVER retransmission starts at 4 s and doubles to a 64 s cap (each +/-1 s jitter).</span></span>
+<span id="d07-cb6-27"><a href="#d07-cb6-27" aria-hidden="true" tabindex="-1"></a>waits, w <span class="op">=</span> [], <span class="dv">4</span></span>
+<span id="d07-cb6-28"><a href="#d07-cb6-28" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="bu">sum</span>(waits) <span class="op">&lt;</span> <span class="dv">120</span>:</span>
+<span id="d07-cb6-29"><a href="#d07-cb6-29" aria-hidden="true" tabindex="-1"></a>    waits.append(w)</span>
+<span id="d07-cb6-30"><a href="#d07-cb6-30" aria-hidden="true" tabindex="-1"></a>    w <span class="op">=</span> <span class="bu">min</span>(w <span class="op">*</span> <span class="dv">2</span>, <span class="dv">64</span>)</span>
+<span id="d07-cb6-31"><a href="#d07-cb6-31" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;DISCOVER waits (s):&quot;</span>, waits, <span class="st">&quot;-&gt; cumulative&quot;</span>, [<span class="bu">sum</span>(waits[:i <span class="op">+</span> <span class="dv">1</span>]) <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="bu">len</span>(waits))])</span></code></pre></div>
+<p>Real output (Python 3.13):</p>
+<pre><code>lease 08:00:00  T1 04:00:00  T2 07:00:00
+RENEWING  unicast REQUESTs at: 04:00:00, 05:30:00, 06:15:00, 06:37:30, 06:48:45, 06:54:22, 06:57:11, 06:58:36, 06:59:36  (9 sent)
+REBINDING broadcast REQUESTs at: 07:00:00, 07:30:00, 07:45:00, 07:52:30, 07:56:15, 07:58:08, 07:59:08  (7 sent)
+DISCOVER waits (s): [4, 8, 16, 32, 64] -&gt; cumulative [4, 12, 28, 60, 124]</code></pre>
+<p>Three operational conclusions fall out of these numbers.</p>
+<p><strong>Your outage budget is T2 − T1 plus the lease − T2.</strong> With an 8-hour lease, a dead DHCP server is invisible to existing clients for three hours (RENEWING) and noticeable only to new arrivals. Clients begin dropping addresses at hour 8. With a 1-hour guest lease, you have 60 minutes. That's why short leases make DHCP server HA mandatory, not optional.</p>
+<p><strong>Configuration changes propagate at T1, not instantly.</strong> Change the DNS server in a scope and existing clients learn about it at their next renewal: up to half a lease later. The professional move is to drop the lease time a full old-lease-length ahead of a planned change, make the change, then raise it again. There is a FORCERENEW message (RFC 3203), but it requires authentication that almost nothing implements.</p>
+<p><strong>A dead network looks slow before it looks dead.</strong> A client that gets no OFFER retries at 4, 12, 28 and 60 seconds. Most operating systems give up on the first round after somewhere between 10 and 60 seconds and self-assign a 169.254.0.0/16 address (RFC 3927). They keep retrying DHCP in the background. The exact timing varies by OS.</p>
+<h3 id="d07-numbers-table">The numbers worth knowing</h3>
+<table>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Value</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>DHCPv4 ports</td>
+<td>client 68, server 67; relay → server 67 → 67</td>
+<td>RFC 2131</td>
+</tr>
+<tr class="even">
+<td>Minimum DHCP message a client must accept</td>
+<td>576 bytes of IP datagram</td>
+<td>RFC 2131</td>
+</tr>
+<tr class="odd">
+<td>T1 / T2 defaults</td>
+<td>0.5 × lease / 0.875 × lease</td>
+<td>RFC 2131</td>
+</tr>
+<tr class="even">
+<td>Renew/rebind retry floor</td>
+<td>60 s</td>
+<td>RFC 2131 §4.4.5</td>
+</tr>
+<tr class="odd">
+<td>Link-local fallback range</td>
+<td>169.254.0.0/16 (first and last /24 reserved)</td>
+<td>RFC 3927</td>
+</tr>
+<tr class="even">
+<td>Router Solicitations</td>
+<td>up to 3, 4 s apart, after a 0–1 s random delay</td>
+<td>RFC 4861</td>
+</tr>
+<tr class="odd">
+<td>RA interval</td>
+<td>MaxRtrAdvInterval default 600 s; router lifetime default 1800 s</td>
+<td>RFC 4861</td>
+</tr>
+<tr class="even">
+<td>Prefix lifetimes (router defaults)</td>
+<td>valid 30 days, preferred 7 days</td>
+<td>RFC 4861</td>
+</tr>
+<tr class="odd">
+<td>Duplicate Address Detection</td>
+<td>1 NS, 1 s wait (DupAddrDetectTransmits 1, RetransTimer 1000 ms)</td>
+<td>RFC 4862</td>
+</tr>
+<tr class="even">
+<td>DHCPv6 ports / multicast</td>
+<td>client 546, server 547; <code>ff02::1:2</code></td>
+<td>RFC 8415</td>
+</tr>
+<tr class="odd">
+<td>DHCPv6 SOLICIT backoff</td>
+<td>1 s initial, doubling, capped at 3600 s</td>
+<td>RFC 8415</td>
+</tr>
+<tr class="even">
+<td>DHCPv6 recommended T1 / T2</td>
+<td>0.5 / 0.8 × shortest preferred lifetime</td>
+<td>RFC 8415 §21.4</td>
+</tr>
+<tr class="odd">
+<td>Temporary address defaults</td>
+<td>preferred 1 day, valid 2 days</td>
+<td>RFC 8981</td>
+</tr>
+</tbody>
+</table>
+<p>The DAD second is easy to miss. Every new IPv6 address waits about a second before it's usable, unless the host uses Optimistic DAD (RFC 4429). It's one reason IPv6 sometimes lags IPv4 by a beat right after joining a network, and Happy Eyeballs hides it.</p>
+<h3 id="d07-numbers-iids">Interface identifiers and temporary addresses</h3>
+<p>The module named EUI-64 and privacy extensions. In 2026 there are really three kinds of interface identifier, and a laptop typically uses two of them at once:</p>
+<div class="sourceCode" id="d07-cb8"><pre class="sourceCode python"><code class="sourceCode python"><span id="d07-cb8-1"><a href="#d07-cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Three ways to pick the low 64 bits of a SLAAC address, plus temporary-address lifetime math.&quot;&quot;&quot;</span></span>
+<span id="d07-cb8-2"><a href="#d07-cb8-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="d07-cb8-3"><a href="#d07-cb8-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> ipaddress</span>
+<span id="d07-cb8-4"><a href="#d07-cb8-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> secrets</span>
+<span id="d07-cb8-5"><a href="#d07-cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb8-6"><a href="#d07-cb8-6" aria-hidden="true" tabindex="-1"></a>PREFIX <span class="op">=</span> ipaddress.IPv6Network(<span class="st">&quot;2001:db8:7:310::/64&quot;</span>)</span>
+<span id="d07-cb8-7"><a href="#d07-cb8-7" aria-hidden="true" tabindex="-1"></a>MAC <span class="op">=</span> <span class="st">&quot;3a:1f:9c:52:07:e4&quot;</span></span>
+<span id="d07-cb8-8"><a href="#d07-cb8-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb8-9"><a href="#d07-cb8-9" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> eui64(mac: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:                      <span class="co"># RFC 4291 appendix A</span></span>
+<span id="d07-cb8-10"><a href="#d07-cb8-10" aria-hidden="true" tabindex="-1"></a>    b <span class="op">=</span> <span class="bu">bytearray</span>(<span class="bu">bytes</span>.fromhex(mac.replace(<span class="st">&quot;:&quot;</span>, <span class="st">&quot;&quot;</span>)))</span>
+<span id="d07-cb8-11"><a href="#d07-cb8-11" aria-hidden="true" tabindex="-1"></a>    b[<span class="dv">0</span>] <span class="op">^=</span> <span class="bn">0x02</span>                                  <span class="co"># flip the universal/local bit</span></span>
+<span id="d07-cb8-12"><a href="#d07-cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">int</span>.from_bytes(b[:<span class="dv">3</span>] <span class="op">+</span> <span class="st">b&quot;</span><span class="ch">\xff\xfe</span><span class="st">&quot;</span> <span class="op">+</span> b[<span class="dv">3</span>:])</span>
+<span id="d07-cb8-13"><a href="#d07-cb8-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb8-14"><a href="#d07-cb8-14" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> stable(prefix, iface: <span class="bu">str</span>, net_id: <span class="bu">bytes</span>, dad_counter: <span class="bu">int</span>, key: <span class="bu">bytes</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:  <span class="co"># RFC 7217 shape</span></span>
+<span id="d07-cb8-15"><a href="#d07-cb8-15" aria-hidden="true" tabindex="-1"></a>    h <span class="op">=</span> hashlib.sha256(prefix.network_address.packed[:<span class="dv">8</span>] <span class="op">+</span> iface.encode() <span class="op">+</span> net_id</span>
+<span id="d07-cb8-16"><a href="#d07-cb8-16" aria-hidden="true" tabindex="-1"></a>                       <span class="op">+</span> dad_counter.to_bytes(<span class="dv">1</span>) <span class="op">+</span> key).digest()</span>
+<span id="d07-cb8-17"><a href="#d07-cb8-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">int</span>.from_bytes(h[:<span class="dv">8</span>])</span>
+<span id="d07-cb8-18"><a href="#d07-cb8-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb8-19"><a href="#d07-cb8-19" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> addr(iid: <span class="bu">int</span>) <span class="op">-&gt;</span> ipaddress.IPv6Address:</span>
+<span id="d07-cb8-20"><a href="#d07-cb8-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> PREFIX[iid]</span>
+<span id="d07-cb8-21"><a href="#d07-cb8-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb8-22"><a href="#d07-cb8-22" aria-hidden="true" tabindex="-1"></a>key <span class="op">=</span> <span class="bu">bytes</span>(<span class="dv">16</span>)                                   <span class="co"># per-host secret; fixed here so output is repeatable</span></span>
+<span id="d07-cb8-23"><a href="#d07-cb8-23" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;EUI-64        &quot;</span>, addr(eui64(MAC)))</span>
+<span id="d07-cb8-24"><a href="#d07-cb8-24" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;RFC 7217 home &quot;</span>, addr(stable(PREFIX, <span class="st">&quot;en0&quot;</span>, <span class="st">b&quot;corp-wifi&quot;</span>, <span class="dv">0</span>, key)))</span>
+<span id="d07-cb8-25"><a href="#d07-cb8-25" aria-hidden="true" tabindex="-1"></a>other <span class="op">=</span> ipaddress.IPv6Network(<span class="st">&quot;2001:db8:99:1::/64&quot;</span>)</span>
+<span id="d07-cb8-26"><a href="#d07-cb8-26" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;RFC 7217 cafe &quot;</span>, other[stable(other, <span class="st">&quot;en0&quot;</span>, <span class="st">b&quot;cafe-wifi&quot;</span>, <span class="dv">0</span>, key)], <span class="st">&quot;(unrelated low 64 bits)&quot;</span>)</span>
+<span id="d07-cb8-27"><a href="#d07-cb8-27" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;temporary     &quot;</span>, addr(<span class="bu">int</span>.from_bytes(secrets.token_bytes(<span class="dv">8</span>))), <span class="st">&quot;(random; changes every run)&quot;</span>)</span>
+<span id="d07-cb8-28"><a href="#d07-cb8-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb8-29"><a href="#d07-cb8-29" aria-hidden="true" tabindex="-1"></a><span class="co"># RFC 8981 lifetimes. Defaults: preferred 1 day, valid 2 days. Many OSes still use valid = 7 days.</span></span>
+<span id="d07-cb8-30"><a href="#d07-cb8-30" aria-hidden="true" tabindex="-1"></a>pref <span class="op">=</span> <span class="dv">86400</span></span>
+<span id="d07-cb8-31"><a href="#d07-cb8-31" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> valid <span class="kw">in</span> (<span class="dv">2</span> <span class="op">*</span> <span class="dv">86400</span>, <span class="dv">7</span> <span class="op">*</span> <span class="dv">86400</span>):</span>
+<span id="d07-cb8-32"><a href="#d07-cb8-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> desync <span class="kw">in</span> (<span class="dv">0</span>, <span class="fl">0.4</span> <span class="op">*</span> pref):                <span class="co"># DESYNC_FACTOR is random in [0, 0.4 * pref]</span></span>
+<span id="d07-cb8-33"><a href="#d07-cb8-33" aria-hidden="true" tabindex="-1"></a>        period <span class="op">=</span> pref <span class="op">-</span> desync                    <span class="co"># a new temporary address roughly this often</span></span>
+<span id="d07-cb8-34"><a href="#d07-cb8-34" aria-hidden="true" tabindex="-1"></a>        alive <span class="op">=</span> <span class="bu">int</span>(valid <span class="op">//</span> period)             <span class="co"># addresses still valid (deprecated + 1 preferred)</span></span>
+<span id="d07-cb8-35"><a href="#d07-cb8-35" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;valid </span><span class="sc">{</span>valid <span class="op">//</span> <span class="dv">86400</span><span class="sc">}</span><span class="ss">d desync </span><span class="sc">{</span>desync <span class="op">/</span> <span class="dv">3600</span><span class="sc">:4.1f}</span><span class="ss">h: new temp every &quot;</span></span>
+<span id="d07-cb8-36"><a href="#d07-cb8-36" aria-hidden="true" tabindex="-1"></a>              <span class="ss">f&quot;</span><span class="sc">{</span>period <span class="op">/</span> <span class="dv">3600</span><span class="sc">:4.1f}</span><span class="ss">h, up to </span><span class="sc">{</span>alive <span class="op">+</span> <span class="dv">1</span><span class="sc">}</span><span class="ss"> temp addresses on the interface&quot;</span>)</span></code></pre></div>
+<p>Real output (the temporary address differs on every run):</p>
+<pre><code>EUI-64         2001:db8:7:310:381f:9cff:fe52:7e4
+RFC 7217 home  2001:db8:7:310:b84e:5924:dc75:77a1
+RFC 7217 cafe  2001:db8:99:1:90e:bd22:2f48:2e48 (unrelated low 64 bits)
+temporary      2001:db8:7:310:8235:f59b:def3:e340 (random; changes every run)
+valid 2d desync  0.0h: new temp every 24.0h, up to 3 temp addresses on the interface
+valid 2d desync  9.6h: new temp every 14.4h, up to 4 temp addresses on the interface
+valid 7d desync  0.0h: new temp every 24.0h, up to 8 temp addresses on the interface
+valid 7d desync  9.6h: new temp every 14.4h, up to 12 temp addresses on the interface</code></pre>
+<ul>
+<li><strong>EUI-64</strong> puts the MAC in the address. Notice <code>381f</code> where the MAC starts <code>3a1f</code>: flipping bit <code>0x02</code> turned the locally administered <code>3a</code> into <code>38</code>. RFC 8064 (2017) recommends against EUI-64 as the default.</li>
+<li><strong>Stable-privacy (RFC 7217)</strong> hashes the prefix, the interface, a network ID and a host secret. The address is stable on one network, so firewall rules and logs still work, but unrelated across networks, so it can't be used to track you. The real PRF and inputs differ by OS; this is the shape, not Linux's exact function. macOS labels this address <code>secured</code> in <code>ifconfig</code>; Linux uses it when <code>addr_gen_mode</code> is 2 or 3.</li>
+<li><strong>Temporary (RFC 8981,</strong> which replaced RFC 4941 in 2021) is random and short-lived. It's preferred for outgoing connections (RFC 6724 source-address rule 7).</li>
+</ul>
+<p>The lifetime table explains a puzzle every IPv6 user hits: why does <code>ifconfig</code> show five or more global addresses? Each temporary address stays <em>valid</em> (still usable by old connections) long after it stops being <em>preferred</em>. With the RFC 8981 defaults you carry up to three or four at once. With a 7-day valid lifetime — still the default on macOS (<code>sysctl net.inet6.ip6.temppvltime</code> is 604800) and in the Linux kernel's <code>temp_valid_lft</code> (604800) — you can carry eight to twelve. Each one is a Neighbor Cache entry on the router, which matters on large Wi-Fi networks.</p>
+<h2 id="d07-failures">Deep dive: production failure modes</h2>
+<h3 id="d07-fail-rogue">A rogue DHCP server</h3>
+<p><strong>Symptom.</strong> Some clients on one VLAN get <code>192.168.0.x</code> or <code>192.168.1.x</code> with a gateway nobody recognises. They have "internet" in the sense that the rogue box NATs them somewhere, or they have nothing at all. It's random which clients are affected, because each client takes whichever OFFER arrives first.</p>
+<p><strong>Mechanism.</strong> Someone plugged a consumer router into a wall port LAN-side first. Its DHCP server answers every DISCOVER on the VLAN. It's on the same segment, so it usually beats the relayed real server by a millisecond or two.</p>
+<p><strong>Prove it.</strong></p>
+<div class="sourceCode" id="d07-cb10"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d07-cb10-1"><a href="#d07-cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Run on your Mac — every OFFER/ACK, with the server that sent it</span></span>
+<span id="d07-cb10-2"><a href="#d07-cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tcpdump <span class="at">-nn</span> <span class="at">-v</span> <span class="at">-i</span> en0 <span class="st">&#39;udp src port 67&#39;</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;Server-ID|Your-IP|Default-Gateway&#39;</span></span>
+<span id="d07-cb10-3"><a href="#d07-cb10-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Which server gave *you* your lease</span></span>
+<span id="d07-cb10-4"><a href="#d07-cb10-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ipconfig</span> getpacket en0 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;server_identifier|router|yiaddr&#39;</span></span>
+<span id="d07-cb10-5"><a href="#d07-cb10-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Linux: same tcpdump; or ask every server on the segment to answer (nmap is not preinstalled)</span></span>
+<span id="d07-cb10-6"><a href="#d07-cb10-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nmap <span class="at">--script</span> broadcast-dhcp-discover <span class="at">-e</span> eth0</span></code></pre></div>
+<p>Two different <code>Server-ID</code> values on one VLAN is the proof. The source MAC of the rogue OFFER, looked up in the switch's MAC table, gives you the port.</p>
+<p><strong>Fix.</strong> DHCP snooping, with only the uplinks trusted. Here is the logic of the switch from the mental-model section, as a toy:</p>
+<div class="sourceCode" id="d07-cb11"><pre class="sourceCode python"><code class="sourceCode python"><span id="d07-cb11-1"><a href="#d07-cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;A toy access switch running DHCP snooping + Dynamic ARP Inspection.</span></span>
+<span id="d07-cb11-2"><a href="#d07-cb11-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb11-3"><a href="#d07-cb11-3" aria-hidden="true" tabindex="-1"></a><span class="co">State: a set of trusted ports and a binding table {(vlan, mac): (ip, port, expires)}.</span></span>
+<span id="d07-cb11-4"><a href="#d07-cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d07-cb11-5"><a href="#d07-cb11-5" aria-hidden="true" tabindex="-1"></a>SERVER_MSGS <span class="op">=</span> {<span class="st">&quot;OFFER&quot;</span>, <span class="st">&quot;ACK&quot;</span>, <span class="st">&quot;NAK&quot;</span>}</span>
+<span id="d07-cb11-6"><a href="#d07-cb11-6" aria-hidden="true" tabindex="-1"></a>trusted <span class="op">=</span> {<span class="st">&quot;Gi1/0/48&quot;</span>}                       <span class="co"># uplink toward the relay / real server</span></span>
+<span id="d07-cb11-7"><a href="#d07-cb11-7" aria-hidden="true" tabindex="-1"></a>bindings: <span class="bu">dict</span>[<span class="bu">tuple</span>[<span class="bu">int</span>, <span class="bu">str</span>], <span class="bu">tuple</span>[<span class="bu">str</span>, <span class="bu">str</span>, <span class="bu">int</span>]] <span class="op">=</span> {}</span>
+<span id="d07-cb11-8"><a href="#d07-cb11-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb11-9"><a href="#d07-cb11-9" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> dhcp(now, port, vlan, msg, mac, ip<span class="op">=</span><span class="va">None</span>, lease<span class="op">=</span><span class="dv">0</span>):</span>
+<span id="d07-cb11-10"><a href="#d07-cb11-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> msg <span class="kw">in</span> SERVER_MSGS <span class="kw">and</span> port <span class="kw">not</span> <span class="kw">in</span> trusted:</span>
+<span id="d07-cb11-11"><a href="#d07-cb11-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ss">f&quot;DROP  </span><span class="sc">{</span>msg<span class="sc">}</span><span class="ss"> from untrusted </span><span class="sc">{</span>port<span class="sc">}</span><span class="ss"> (rogue server)&quot;</span></span>
+<span id="d07-cb11-12"><a href="#d07-cb11-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> msg <span class="op">==</span> <span class="st">&quot;ACK&quot;</span>:</span>
+<span id="d07-cb11-13"><a href="#d07-cb11-13" aria-hidden="true" tabindex="-1"></a>        bindings[(vlan, mac)] <span class="op">=</span> (ip, client_port[mac], now <span class="op">+</span> lease)</span>
+<span id="d07-cb11-14"><a href="#d07-cb11-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ss">f&quot;BIND  vlan </span><span class="sc">{</span>vlan<span class="sc">}</span><span class="ss"> </span><span class="sc">{</span>mac<span class="sc">}</span><span class="ss"> -&gt; </span><span class="sc">{</span>ip<span class="sc">}</span><span class="ss"> on </span><span class="sc">{</span>client_port[mac]<span class="sc">}</span><span class="ss"> for </span><span class="sc">{</span>lease<span class="sc">}</span><span class="ss">s&quot;</span></span>
+<span id="d07-cb11-15"><a href="#d07-cb11-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> msg <span class="op">==</span> <span class="st">&quot;RELEASE&quot;</span>:</span>
+<span id="d07-cb11-16"><a href="#d07-cb11-16" aria-hidden="true" tabindex="-1"></a>        bindings.pop((vlan, mac), <span class="va">None</span>)</span>
+<span id="d07-cb11-17"><a href="#d07-cb11-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ss">f&quot;UNBIND vlan </span><span class="sc">{</span>vlan<span class="sc">}</span><span class="ss"> </span><span class="sc">{</span>mac<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="d07-cb11-18"><a href="#d07-cb11-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ss">f&quot;FWD   </span><span class="sc">{</span>msg<span class="sc">}</span><span class="ss"> from </span><span class="sc">{</span>port<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="d07-cb11-19"><a href="#d07-cb11-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb11-20"><a href="#d07-cb11-20" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> arp(now, port, vlan, mac, claimed_ip):</span>
+<span id="d07-cb11-21"><a href="#d07-cb11-21" aria-hidden="true" tabindex="-1"></a>    b <span class="op">=</span> bindings.get((vlan, mac))</span>
+<span id="d07-cb11-22"><a href="#d07-cb11-22" aria-hidden="true" tabindex="-1"></a>    ok <span class="op">=</span> b <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span> <span class="kw">and</span> b[<span class="dv">0</span>] <span class="op">==</span> claimed_ip <span class="kw">and</span> b[<span class="dv">1</span>] <span class="op">==</span> port <span class="kw">and</span> b[<span class="dv">2</span>] <span class="op">&gt;</span> now</span>
+<span id="d07-cb11-23"><a href="#d07-cb11-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;FWD &#39;</span> <span class="cf">if</span> ok <span class="cf">else</span> <span class="st">&#39;DROP&#39;</span><span class="sc">}</span><span class="ss">  ARP on </span><span class="sc">{</span>port<span class="sc">}</span><span class="ss">: </span><span class="sc">{</span>claimed_ip<span class="sc">}</span><span class="ss"> is-at </span><span class="sc">{</span>mac<span class="sc">}</span><span class="ss">&quot;</span> <span class="op">+</span> (<span class="st">&quot;&quot;</span> <span class="cf">if</span> ok <span class="cf">else</span> <span class="st">&quot;  (no matching binding)&quot;</span>)</span>
+<span id="d07-cb11-24"><a href="#d07-cb11-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d07-cb11-25"><a href="#d07-cb11-25" aria-hidden="true" tabindex="-1"></a>client_port <span class="op">=</span> {<span class="st">&quot;3a:1f:9c:52:07:e4&quot;</span>: <span class="st">&quot;Gi1/0/7&quot;</span>}</span>
+<span id="d07-cb11-26"><a href="#d07-cb11-26" aria-hidden="true" tabindex="-1"></a>events <span class="op">=</span> [</span>
+<span id="d07-cb11-27"><a href="#d07-cb11-27" aria-hidden="true" tabindex="-1"></a>    dhcp(<span class="dv">0</span>, <span class="st">&quot;Gi1/0/7&quot;</span>, <span class="dv">310</span>, <span class="st">&quot;DISCOVER&quot;</span>, <span class="st">&quot;3a:1f:9c:52:07:e4&quot;</span>),</span>
+<span id="d07-cb11-28"><a href="#d07-cb11-28" aria-hidden="true" tabindex="-1"></a>    dhcp(<span class="dv">0</span>, <span class="st">&quot;Gi1/0/19&quot;</span>, <span class="dv">310</span>, <span class="st">&quot;OFFER&quot;</span>, <span class="st">&quot;3a:1f:9c:52:07:e4&quot;</span>, <span class="st">&quot;192.168.0.50&quot;</span>),   <span class="co"># home router plugged in</span></span>
+<span id="d07-cb11-29"><a href="#d07-cb11-29" aria-hidden="true" tabindex="-1"></a>    dhcp(<span class="dv">0</span>, <span class="st">&quot;Gi1/0/48&quot;</span>, <span class="dv">310</span>, <span class="st">&quot;OFFER&quot;</span>, <span class="st">&quot;3a:1f:9c:52:07:e4&quot;</span>, <span class="st">&quot;10.20.7.144&quot;</span>),</span>
+<span id="d07-cb11-30"><a href="#d07-cb11-30" aria-hidden="true" tabindex="-1"></a>    dhcp(<span class="dv">0</span>, <span class="st">&quot;Gi1/0/7&quot;</span>, <span class="dv">310</span>, <span class="st">&quot;REQUEST&quot;</span>, <span class="st">&quot;3a:1f:9c:52:07:e4&quot;</span>),</span>
+<span id="d07-cb11-31"><a href="#d07-cb11-31" aria-hidden="true" tabindex="-1"></a>    dhcp(<span class="dv">0</span>, <span class="st">&quot;Gi1/0/48&quot;</span>, <span class="dv">310</span>, <span class="st">&quot;ACK&quot;</span>, <span class="st">&quot;3a:1f:9c:52:07:e4&quot;</span>, <span class="st">&quot;10.20.7.144&quot;</span>, <span class="dv">28800</span>),</span>
+<span id="d07-cb11-32"><a href="#d07-cb11-32" aria-hidden="true" tabindex="-1"></a>    arp(<span class="dv">5</span>, <span class="st">&quot;Gi1/0/7&quot;</span>, <span class="dv">310</span>, <span class="st">&quot;3a:1f:9c:52:07:e4&quot;</span>, <span class="st">&quot;10.20.7.144&quot;</span>),</span>
+<span id="d07-cb11-33"><a href="#d07-cb11-33" aria-hidden="true" tabindex="-1"></a>    arp(<span class="dv">6</span>, <span class="st">&quot;Gi1/0/19&quot;</span>, <span class="dv">310</span>, <span class="st">&quot;b2:44:10:9e:3c:01&quot;</span>, <span class="st">&quot;10.20.6.1&quot;</span>),               <span class="co"># gateway spoof attempt</span></span>
+<span id="d07-cb11-34"><a href="#d07-cb11-34" aria-hidden="true" tabindex="-1"></a>    arp(<span class="dv">28801</span>, <span class="st">&quot;Gi1/0/7&quot;</span>, <span class="dv">310</span>, <span class="st">&quot;3a:1f:9c:52:07:e4&quot;</span>, <span class="st">&quot;10.20.7.144&quot;</span>),           <span class="co"># lease lapsed, no renew seen</span></span>
+<span id="d07-cb11-35"><a href="#d07-cb11-35" aria-hidden="true" tabindex="-1"></a>]</span>
+<span id="d07-cb11-36"><a href="#d07-cb11-36" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">&quot;</span>.join(events))</span>
+<span id="d07-cb11-37"><a href="#d07-cb11-37" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;binding table:&quot;</span>, bindings)</span></code></pre></div>
+<p>Real output:</p>
+<pre><code>FWD   DISCOVER from Gi1/0/7
+DROP  OFFER from untrusted Gi1/0/19 (rogue server)
+FWD   OFFER from Gi1/0/48
+FWD   REQUEST from Gi1/0/7
+BIND  vlan 310 3a:1f:9c:52:07:e4 -&gt; 10.20.7.144 on Gi1/0/7 for 28800s
+FWD   ARP on Gi1/0/7: 10.20.7.144 is-at 3a:1f:9c:52:07:e4
+DROP  ARP on Gi1/0/19: 10.20.6.1 is-at b2:44:10:9e:3c:01  (no matching binding)
+DROP  ARP on Gi1/0/7: 10.20.7.144 is-at 3a:1f:9c:52:07:e4  (no matching binding)
+binding table: {(310, &#39;3a:1f:9c:52:07:e4&#39;): (&#39;10.20.7.144&#39;, &#39;Gi1/0/7&#39;, 28800)}</code></pre>
+<p>The last line is a failure mode of the <em>fix</em>. If a binding expires, perhaps because the renewal was unicast along a path the switch didn't see, or the switch rebooted and lost its table, DAI starts dropping a legitimate host's ARP. Production switches mitigate this by saving the binding table to flash or a remote file, and by watching renewals that cross the access switch. When a host "loses the network at exactly the lease time," check DAI drop counters before you check the server.</p>
+<p>A newer variant uses the rogue server differently. <strong>TunnelVision</strong> (CVE-2024-3661, disclosed 2024) is a rogue DHCP server that hands out option 121 classless static routes more specific than the VPN's routes, such as <code>0.0.0.0/1</code> and <code>128.0.0.0/1</code> via the attacker. Many VPN clients install their tunnel as a default route, so the longer prefixes win and traffic leaves outside the tunnel. Android was unaffected because it doesn't implement option 121. The defence is the same snooping on the network side. On the client side it's a VPN that enforces its routing with firewall rules or a separate network namespace, not just with the routing table.</p>
+<h3 id="d07-fail-82">Snooping is on and every client gets 169.254</h3>
+<p><strong>Symptom.</strong> Someone enables DHCP snooping on access switches, and every relayed client stops getting addresses. The server sees nothing.</p>
+<p><strong>Mechanism.</strong> Several vendors' snooping inserts option 82 by default when it forwards a DISCOVER, but an access switch is a Layer-2 device, so it leaves <code>giaddr</code> at zero. The packet reaches the Layer-3 relay carrying option 82 with <code>giaddr</code> = 0. RFC 3046 section 2.1 tells a relay that receives exactly that on an untrusted circuit to discard it, because it looks like a client forging relay information. The two features are each doing the right thing.</p>
+<p><strong>Prove it.</strong> A capture on the client VLAN shows DISCOVERs leaving the access switch's uplink with option 82 present and <code>Gateway-IP</code> absent. The relay's DHCP statistics show a rising count of dropped packets with relay information (exact counter names are vendor-specific).</p>
+<p><strong>Fix.</strong> Either stop the access switch inserting option 82, or tell the relay to trust option 82 from that interface. On Cisco those are <code>no ip dhcp snooping information option</code> and <code>ip dhcp relay information trusted</code> respectively (vendor commands; other vendors have equivalents).</p>
+<h3 id="d07-fail-return">The server answers but the client never hears it</h3>
+<p><strong>Symptom.</strong> Server logs show DISCOVER → OFFER for the client's MAC, repeatedly. The client sits in INIT and ends up on 169.254.</p>
+<p><strong>Mechanism.</strong> The server sends the OFFER to <code>giaddr</code>. If the server has no route back to the client's subnet, or a firewall between them passes 68→67 but not 67→67, or the relay sources from a loopback that isn't advertised, the OFFER dies on the return path. The DISCOVER direction proves nothing about the return direction.</p>
+<p><strong>Prove it.</strong> Capture on the server: you see OFFERs leaving toward <code>giaddr</code>. Capture on the relay's server-facing side: they never arrive. <code>traceroute -n &lt;giaddr&gt;</code> from the server usually shows where it stops.</p>
+<p><strong>Fix.</strong> Route <code>giaddr</code>'s subnet back to the server. Permit UDP 67↔︎67 between relays and servers in both directions.</p>
+<h3 id="d07-fail-ra">A rogue Router Advertisement</h3>
+<p><strong>Symptom.</strong> IPv6 is "flaky" for some hosts. Connections to dual-stacked sites stall for a few hundred milliseconds and then succeed over IPv4. A few hosts show an unexpected prefix or a second default router.</p>
+<p><strong>Mechanism.</strong> A device on the VLAN sends RAs: a Windows box with Internet Connection Sharing, a VM bridged with a misconfigured router image, or an attacker. Hosts install it as a default router. Traffic sent to it goes nowhere. Happy Eyeballs (RFC 8305) masks most of the damage by racing IPv4, which is exactly why the problem lingers for months.</p>
+<p><strong>Prove it.</strong></p>
+<div class="sourceCode" id="d07-cb13"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d07-cb13-1"><a href="#d07-cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Run on your Mac: the default routers and prefixes you&#39;ve learned, and who sent them</span></span>
+<span id="d07-cb13-2"><a href="#d07-cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ndp</span> <span class="at">-rn</span></span>
+<span id="d07-cb13-3"><a href="#d07-cb13-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ndp</span> <span class="at">-pn</span></span>
+<span id="d07-cb13-4"><a href="#d07-cb13-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Every RA on the link, with its source</span></span>
+<span id="d07-cb13-5"><a href="#d07-cb13-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tcpdump <span class="at">-nn</span> <span class="at">-v</span> <span class="at">-e</span> <span class="at">-i</span> en0 <span class="st">&#39;icmp6 and ip6[40] == 134&#39;</span></span>
+<span id="d07-cb13-6"><a href="#d07-cb13-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Linux equivalents</span></span>
+<span id="d07-cb13-7"><a href="#d07-cb13-7" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-6</span> route show default</span>
+<span id="d07-cb13-8"><a href="#d07-cb13-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rdisc6 wlan0          <span class="co"># from the ndisc6 package: send an RS and print every RA</span></span></code></pre></div>
+<p>More than one router in <code>ndp -rn</code> when you expected one, or an RA from a MAC that isn't your gateway's, is the proof.</p>
+<p><strong>Fix.</strong> RA Guard (RFC 6105) on access ports: drop RAs except from the router-facing ports. Implementations must look past IPv6 extension headers to find the ICMPv6 type, because the classic evasion hides the RA behind a fragment header; RFC 7112 now requires the full header chain in the first fragment, and RFC 7113 gives RA Guard implementation advice. On the remediation side, an RA from the same link-local source with router lifetime 0 tells hosts to drop that router immediately.</p>
+<h3 id="d07-fail-renumber">Renumbering leaves hosts with a dead prefix</h3>
+<p><strong>Symptom.</strong> After an ISP changes your home or branch prefix, IPv6 breaks for hours or days. Hosts still have addresses in the old prefix, prefer them, and their packets go nowhere.</p>
+<p><strong>Mechanism.</strong> The old RA said valid 30 days, preferred 7 days. When the CPE router reboots with a new delegated prefix, it often just stops advertising the old one. It doesn't send a final RA with the old prefix's preferred lifetime set to 0. RFC 4862's "two-hour rule" adds to this: an unauthenticated RA can't cut an existing prefix's valid lifetime below 2 hours, to stop an attacker from wiping your addresses.</p>
+<p><strong>Fix.</strong> RFC 9096 (2021) tells CE routers to advertise much shorter lifetimes (it caps valid at 5,400 s and preferred at 2,700 s) and to deprecate stale prefixes explicitly. In an enterprise, keep prefixes static and plan renumbering by lowering lifetimes in advance, just as you'd lower a DNS TTL.</p>
+<h2 id="d07-2026">Deep dive: 2026 context</h2>
+<p><strong>Cloud VPCs.</strong> In AWS, Azure and GCP, a NIC's private address is assigned by the cloud's API when the NIC is created. DHCP inside the guest is only a delivery channel: the hypervisor answers the guest's DISCOVER with the address the control plane already chose. There is no broadcast domain to share, so your own DHCP server can't hand out VPC addresses and a rogue one can't hijack neighbours. Azure answers DHCP (and DNS) from the virtual IP <code>168.63.129.16</code>. GCP gives instances a /32 netmask and a route to the gateway, so every packet, even to a "neighbour," goes through the virtual router. What you control is the option set: AWS calls it a DHCP options set (DNS servers, domain name, NTP). Changing it reaches running instances only at their next renewal, which is the T1 point from above, with a cloud name on it.</p>
+<p><strong>Kubernetes.</strong> Pods don't use DHCP. The CNI plugin's IPAM assigns addresses: <code>host-local</code> ranges carved from the node's pod CIDR, or cloud-native IPAM that attaches secondary addresses or prefixes to the node's NIC (AWS VPC CNI, Azure CNI). The node itself still gets its address by DHCP from the cloud. There is a CNI <code>dhcp</code> IPAM plugin, used with Multus when pods must sit on a real Layer-2 network; then you're back to DHCP leases, now held on the pod's behalf by a daemon on the node.</p>
+<p><strong>IPv6-mostly networks.</strong> Option 108 (RFC 8925) lets a client say "I can live without IPv4." The server answers with option 108 and a wait time and offers no address. The client then runs IPv6-only, reaching IPv4 destinations through NAT64 (it learns the NAT64 prefix from the PREF64 RA option, RFC 8781, or DNS64). Legacy devices that don't send 108 still get IPv4. That's how large networks are draining their IPv4 scopes in 2026 without a flag day. Look for 108 in your Mac's parameter request list with <code>ipconfig getpacket en0</code>.</p>
+<p><strong>One prefix per device.</strong> RFC 9663 (2024) describes giving each client its own /64 by DHCPv6 prefix delegation, instead of many addresses out of a shared /64. The host can then hand addresses to its containers, VMs or tethered devices without Neighbor Discovery tricks, and the router keeps one route per device instead of a growing neighbour cache. Support is still uneven across client OSes.</p>
+<p><strong>MAC randomization.</strong> iOS, Android, Windows and macOS all use private Wi-Fi addresses by default, typically one per SSID, and some modes rotate them. Every new MAC is a new client identity to the DHCP server: a new lease, a broken reservation, a new row in the snooping table. Guest networks with long leases fill up faster than the visitor count suggests. Network access control that tracks "this MAC is this device" breaks. Identity has to come from 802.1X or the application layer instead.</p>
+<p><strong>Zero trust.</strong> DHCP gives a device an address. It doesn't establish who the device is. In a zero-trust design, the address is just a locator. Authorization comes from device certificates and user identity at each request. DHCP data still earns its keep as telemetry: the snooping binding table and the server's lease log answer "which device had 10.20.7.144 at 14:32," and option 55 fingerprints feed device classification.</p>
+<h2 id="d07-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1. A client's T1 renewal never passes through the relay. What breaks because of that, and how is it fixed?</strong></p>
+<p>The renewal is a routed unicast to the address in option 54, so the relay doesn't touch it and option 82 isn't added. Any server policy keyed on circuit ID or remote ID — per-port leases, location-based scopes, subscriber accounting — sees renewals without that context. RFC 5107's server-identifier-override sub-option makes the relay put its own address in option 54, so renewals go back through the relay and pick up option 82 again.</p>
+<p><strong>Q2. Why does the server choose the scope from <code>giaddr</code> rather than from the IP source address of the relayed packet?</strong></p>
+<p>Because the source address names the relay's outgoing interface, which can be a loopback or an uplink, not the client's link. <code>giaddr</code> explicitly names the interface the broadcast arrived on, which is the subnet the client needs an address in. When <code>giaddr</code> can't be an address in the client subnet (unnumbered interfaces, VRFs), the relay adds option 82 sub-option 5, link selection (RFC 3527), to name the subnet separately.</p>
+<p><strong>Q3. What exactly does DHCP snooping store, and why do other security features depend on it?</strong></p>
+<p>A binding per (VLAN, MAC): the IP, the port and the lease expiry, built only from server messages that arrived on trusted ports. It's the only place on the network where an IP-to-MAC-to-port mapping is backed by the authoritative server rather than by whatever a host claims. Dynamic ARP Inspection uses it to reject forged ARP, and IP Source Guard uses it to reject spoofed source addresses. Without snooping, both have nothing to check against.</p>
+<p><strong>Q4. An RA arrives with M=1 and A=1. What does the host end up with, and where does its default gateway come from?</strong></p>
+<p>Potentially two global addresses per prefix: one from SLAAC (because A=1) and one from DHCPv6 (because M=1), if the OS honours M. The default gateway comes only from the RA's router lifetime and source address. DHCPv6 has no router option, and it doesn't carry a prefix length either: on-link prefixes come from the RA's PIO with L=1. An RA with router lifetime 0 means "I am not a default router," even if it carries prefixes.</p>
+<p><strong>Q5. Why must an RA have a hop limit of 255?</strong></p>
+<p>Every router decrements hop limit, so a packet that arrives with 255 can't have been forwarded. RFC 4861 makes hosts drop RAs (and other ND messages) without it. That limits RA spoofing to devices on the same link, which is exactly the scope RA Guard defends.</p>
+<p><strong>Q6. Your temporary IPv6 address gets deprecated in the middle of a long SSH session. What happens?</strong></p>
+<p>Nothing visible. Deprecated means "don't pick this for new connections," not "stop using it." The session keeps its source address until the address's valid lifetime ends, which with common OS defaults is days later. New connections pick the newer preferred temporary address. Only when the valid lifetime expires does the address disappear and the session break.</p>
+<p><strong>Q7. Why can't an RA shorten a prefix's valid lifetime below two hours, and what problem does that cause?</strong></p>
+<p>RFC 4862 section 5.5.3 ignores an unauthenticated RA that would cut a remaining valid lifetime below 2 hours, so an on-link attacker can't wipe everyone's addresses with one packet. The cost is slow cleanup after a legitimate renumbering: hosts keep a dead prefix's addresses for at least 2 hours, or for the full advertised lifetime if the router simply stops advertising the prefix. That's why RFC 9096 asks CE routers to use short lifetimes in the first place.</p>
+<p><strong>Q8. Design DHCP for a 20,000-person campus with 200 VLANs. What do you decide, and what do you monitor?</strong></p>
+<p>Two servers in an HA or failover pair, central, with relays on every SVI pointing at both. Lease length per VLAN class: hours for guest and conference Wi-Fi, a day or more for wired desks. Snooping, DAI and IP Source Guard on every access switch, uplinks trusted, binding tables persisted. Option 82 only where policy needs it, with relay trust configured so the two features don't fight. IPv6 with SLAAC plus RDNSS for Android's sake, stateless DHCPv6 for search lists, RA Guard on access ports. Monitor scope utilisation per VLAN (alert near 80%), NAK and DECLINE rates, DAI drop counters, and the count of distinct server identifiers seen per VLAN. That last one should always be one.</p>

@@ -1,0 +1,542 @@
+<h2 id="d13-deep-dive">Deep dive: what the "nearest copy" picture hid</h2>
+<p>The module's picture is a user, an edge, and an origin, with a cache in the middle that either has the copy or doesn't. That picture is right, and it hides almost everything that goes wrong in production.</p>
+<p>Four things sit under it. First, "nearest" is decided by a routing system, either BGP or a DNS mapping service, and neither one measures distance. Second, "the copy" is not one object. It is a primary key plus a list of variants, each with its own clock. Third, a miss rarely goes straight to your origin. It passes through a coalescing table and a second cache tier, and those two structures decide what your origin actually sees. Fourth, "purge" is a message fanned out to thousands of machines, not a delete.</p>
+<p>This deep dive walks through that machine: the state it keeps, what it looks like on the wire, the arithmetic of hit ratios, how it fails, and what a senior interviewer will push on.</p>
+<h2 id="d13-mental-model">Deep dive: the real mental model</h2>
+<p>Hold a CDN in your head as three systems stacked on top of each other. A <strong>steering system</strong> picks a PoP for each client. A <strong>cache hierarchy</strong> inside and between PoPs decides whether the bytes already exist. A <strong>control plane</strong> pushes configuration and purges to every node. Each has its own state and its own failure modes.</p>
+<div style="overflow-x:auto">
+<svg viewBox="0 0 720 580" style="min-width:720px;width:100%;height:auto;background:#f5f5f5;border:1px solid rgba(45,49,66,0.12);border-radius:6px" role="img" aria-labelledby="d13-mach-title d13-mach-desc">
+<title id="d13-mach-title">The CDN as a machine: steering, the cache index, coalescing, the shield, and purge fan-out</title>
+<desc id="d13-mach-desc">A client is steered to an edge PoP by anycast or DNS mapping. Inside the PoP, a router spreads flows by ECMP to layer-4 load balancers, then to a TLS and HTTP proxy, then to the cache node that owns the key. The cache node holds an index from primary key to Vary variants with freshness state, and a pending-fetch table that collapses concurrent misses into one upstream fetch. Misses go to a shield PoP chosen by hashing the key, and from there to the origin. A purge API fans invalidations out to every tier.</desc>
+<defs>
+<marker id="d13-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2e5aa8"/></marker>
+<marker id="d13-arr-m" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4f5d75"/></marker>
+<marker id="d13-arr-acc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#bf4520"/></marker>
+</defs>
+<!-- client and steering -->
+<rect x="20" y="24" width="110" height="56" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="75" y="48" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">CLIENT</text>
+<text x="75" y="66" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="middle">resolver + ISP</text>
+<line x1="130" y1="52" x2="168" y2="52" stroke="#2e5aa8" stroke-width="1.4" marker-end="url(#d13-arr)"/>
+<rect x="170" y="20" width="372" height="64" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="356" y="38" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="12" font-weight="600" fill="#2d3142" text-anchor="middle">STEERING: WHICH POP?</text>
+<text x="182" y="56" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">anycast: same prefix everywhere, ISP's BGP policy picks</text>
+<text x="182" y="72" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">DNS: CNAME -&gt; mapping (resolver IP / ECS) -&gt; PoP VIP, TTL 20-60 s</text>
+<line x1="330" y1="84" x2="330" y2="118" stroke="#2e5aa8" stroke-width="1.4" marker-end="url(#d13-arr)"/>
+<!-- edge pop container -->
+<rect x="20" y="120" width="478" height="352" rx="8" fill="rgba(45,49,66,0.03)" stroke="#bfc0c0" stroke-dasharray="5,4"/>
+<text x="34" y="140" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="12" font-weight="600" fill="#2d3142">EDGE POP</text>
+<!-- pipeline -->
+<rect x="34" y="152" width="100" height="44" rx="5" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="84" y="171" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">ROUTER</text>
+<text x="84" y="186" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">ECMP on 5-tuple</text>
+<line x1="134" y1="174" x2="150" y2="174" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#d13-arr)"/>
+<rect x="152" y="152" width="100" height="44" rx="5" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="202" y="171" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">L4 LB</text>
+<text x="202" y="186" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">hash flow / QUIC CID</text>
+<line x1="252" y1="174" x2="268" y2="174" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#d13-arr)"/>
+<rect x="270" y="152" width="100" height="44" rx="5" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="320" y="171" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">TLS + HTTP</text>
+<text x="320" y="186" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">builds cache key</text>
+<line x1="370" y1="174" x2="386" y2="174" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#d13-arr)"/>
+<rect x="388" y="152" width="100" height="44" rx="5" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="438" y="171" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">CACHE NODE</text>
+<text x="438" y="186" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">owner = hash(key)</text>
+<!-- cache index table -->
+<rect x="34" y="214" width="300" height="160" rx="5" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="46" y="232" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" font-weight="600" fill="#2d3142">CACHE INDEX (per node)</text>
+<text x="46" y="252" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2e5aa8">primary: GET https://shop.example/p?id=7</text>
+<text x="56" y="270" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">Vary: Accept-Encoding</text>
+<text x="56" y="288" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">├ ae=br    age 20  max-age 60  etag "a1f3"</text>
+<text x="56" y="304" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">├ ae=gzip  age 15  max-age 60  etag "a1f3"</text>
+<text x="56" y="320" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">└ swr 30, sie 600, tags: product-7</text>
+<text x="46" y="342" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">tag index: product-7 -&gt; {p?id=7, /api/p/7}</text>
+<text x="46" y="360" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">lookup = primary key, then match a variant</text>
+<!-- pending table -->
+<rect x="346" y="214" width="142" height="160" rx="5" fill="#f5f5f5" stroke="#bf4520"/>
+<text x="358" y="232" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" font-weight="600" fill="#bf4520">PENDING FETCHES</text>
+<text x="358" y="252" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">key -&gt; waiters</text>
+<text x="358" y="272" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">p?id=9|br -&gt; 41</text>
+<text x="358" y="290" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">app.js|gz -&gt; 3</text>
+<text x="358" y="316" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">41 misses, one</text>
+<text x="358" y="330" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">upstream fetch</text>
+<text x="358" y="356" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">(collapsing)</text>
+<line x1="438" y1="196" x2="438" y2="212" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d13-arr-m)"/>
+<line x1="388" y1="190" x2="300" y2="212" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d13-arr-m)"/>
+<!-- freshness strip -->
+<text x="34" y="398" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" font-weight="600" fill="#2d3142">EACH VARIANT'S CLOCK (max-age=60, swr=30, sie=600)</text>
+<rect x="34" y="408" width="120" height="22" fill="rgba(46,90,168,0.15)" stroke="#2e5aa8"/>
+<text x="94" y="423" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2e5aa8" text-anchor="middle">0-60 s fresh</text>
+<rect x="154" y="408" width="90" height="22" fill="rgba(191,69,32,0.12)" stroke="#bf4520"/>
+<text x="199" y="423" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#bf4520" text-anchor="middle">60-90 swr</text>
+<rect x="244" y="408" width="150" height="22" fill="rgba(79,93,117,0.12)" stroke="#4f5d75"/>
+<text x="319" y="423" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#4f5d75" text-anchor="middle">90-660 only if origin fails</text>
+<rect x="394" y="408" width="94" height="22" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="441" y="423" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="middle">revalidate</text>
+<text x="34" y="452" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">age arrives in the Age header: a 40 s-old copy from the shield has 20 s left here</text>
+<!-- shield -->
+<rect x="530" y="130" width="170" height="120" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="615" y="152" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="12" font-weight="600" fill="#2d3142" text-anchor="middle">SHIELD POP</text>
+<text x="542" y="172" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">chosen by hash(key)</text>
+<text x="542" y="188" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">same index + pending</text>
+<text x="542" y="204" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">table, fed by ALL edges</text>
+<text x="542" y="228" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#bf4520">300 edge misses -&gt; 1</text>
+<line x1="488" y1="300" x2="528" y2="230" stroke="#bf4520" stroke-width="1.6" marker-end="url(#d13-arr-acc)"/>
+<!-- origin -->
+<rect x="530" y="300" width="170" height="56" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="615" y="324" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="12" font-weight="600" fill="#2d3142" text-anchor="middle">ORIGIN</text>
+<text x="615" y="342" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="middle">200, or 304 to a conditional</text>
+<line x1="615" y1="250" x2="615" y2="298" stroke="#bf4520" stroke-width="1.6" marker-end="url(#d13-arr-acc)"/>
+<text x="608" y="278" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#bf4520" text-anchor="end">miss / If-None-Match</text>
+<!-- control plane -->
+<rect x="530" y="392" width="170" height="80" rx="6" fill="#f5f5f5" stroke="#bfc0c0" stroke-dasharray="5,4"/>
+<text x="615" y="414" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="12" font-weight="600" fill="#2d3142" text-anchor="middle">PURGE API</text>
+<text x="542" y="434" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">by URL, tag, or generation</text>
+<text x="542" y="450" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">hard = delete</text>
+<text x="542" y="464" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">soft = mark stale</text>
+<line x1="530" y1="420" x2="500" y2="420" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#d13-arr-m)"/>
+<line x1="700" y1="410" x2="710" y2="410" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4"/>
+<line x1="710" y1="410" x2="710" y2="190" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4"/>
+<line x1="710" y1="190" x2="702" y2="190" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#d13-arr-m)"/>
+<!-- footer note -->
+<rect x="20" y="490" width="680" height="44" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.12)"/>
+<text x="34" y="508" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" font-style="italic" fill="#2d3142">Origin load depends on how many misses survive two collapsing points: the edge's pending table and the shield's.</text>
+<text x="34" y="526" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" font-style="italic" fill="#2d3142">A purge must reach the shield before the edges, or edges refill from the shield's old copy.</text>
+<!-- legend -->
+<line x1="20" y1="556" x2="38" y2="556" stroke="#2e5aa8" stroke-width="1.4"/>
+<text x="44" y="560" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580">request path</text>
+<line x1="150" y1="556" x2="168" y2="556" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4"/>
+<text x="174" y="560" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580">control plane</text>
+<line x1="290" y1="556" x2="308" y2="556" stroke="#bf4520" stroke-width="1.6"/>
+<text x="314" y="560" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580">the miss path (focal)</text>
+</svg>
+</div>
+<h3 id="d13-routing">Request routing: anycast versus DNS mapping</h3>
+<p><strong>Anycast</strong> puts the same prefix (say <code>192.0.2.0/24</code>) into BGP from every PoP. Your packets go wherever your ISP's BGP best-path selection sends them. That selection compares local preference first, then AS-path length, then a handful of tie-breakers. Local preference usually encodes business policy: customer routes beat peer routes, and peer routes beat transit. Latency appears nowhere in that list. So "nearest" really means "best according to your ISP's policy". That is usually close, and occasionally a different country. The set of clients that land on a given PoP is called its <em>catchment</em>. CDNs shape catchments with selective announcements, AS-path prepending, and BGP communities. That is engineering work, not physics.</p>
+<p><strong>DNS mapping</strong> gives each customer hostname a CNAME into the CDN's namespace. The CDN's authoritative servers answer with the unicast addresses of a PoP chosen for that query. The mapping system only sees the <em>resolver's</em> address, not yours. If your resolver forwards EDNS Client Subnet (RFC 7871), it also sees a truncated client prefix, typically a /24 for IPv4. Some large public resolvers deliberately do not send ECS, for privacy. Answers carry short TTLs, often 20–60 seconds, so the mapping can move load quickly. Failover is bounded by that TTL plus the resolvers and clients that hold answers longer than they should.</p>
+<p>The trade-off is control versus speed of reaction.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th></th>
+<th>Anycast</th>
+<th>DNS mapping</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Who chooses the PoP</td>
+<td>Your ISP's BGP policy</td>
+<td>The CDN's mapping system</td>
+</tr>
+<tr class="even">
+<td>Granularity</td>
+<td>Per network path</td>
+<td>Per resolver, or per ECS subnet</td>
+</tr>
+<tr class="odd">
+<td>Failover</td>
+<td>Route withdrawal; BGP reconverges in seconds to a minute or so</td>
+<td>TTL expiry, plus stale resolver caches</td>
+</tr>
+<tr class="even">
+<td>Load shedding from a hot PoP</td>
+<td>Coarse: prepend or withdraw, which moves whole catchments</td>
+<td>Fine: change the answer for some fraction of queries</td>
+</tr>
+<tr class="odd">
+<td>Main blind spot</td>
+<td>Path policy is not latency</td>
+<td>Resolver location is not client location</td>
+</tr>
+</tbody>
+</table>
+<p>Most large CDNs run both. A common shape is anycast for the DNS servers and the edge, with DNS mapping layered on for products that need fine-grained load control, such as large video or software downloads.</p>
+<p><strong>Inside the PoP</strong> there is a second routing layer that the module did not show. The border router spreads packets for the anycast address across several layer-4 load balancers using ECMP, which hashes the 5-tuple. Each load balancer then picks a proxy server, again by consistent hashing. Hashing keeps every packet of one TCP connection on the same machine. QUIC complicates this: a client's address and port can change mid-connection, so QUIC-aware load balancers route on the connection ID, which the server encoded with routing information when it issued it.</p>
+<p>The proxy that terminates TLS is often not the machine that stores the object. Many CDNs hash the cache key to choose a storage node within the PoP. That turns forty servers into one large cache instead of forty small copies of the same popular objects. Hot objects get replicated anyway, so one node doesn't melt.</p>
+<h3 id="d13-keys">Cache keys and Vary: a two-level lookup</h3>
+<p>RFC 9111 (§4.1) describes the lookup in two stages, and real caches follow it closely.</p>
+<ol type="1">
+<li>The <strong>primary key</strong> is the method plus the target URI. CDNs normalise it first: lowercase the host, maybe sort query parameters, maybe drop <code>utm_*</code> parameters, maybe ignore the query string entirely. Each of those choices is configuration, and each one changes which requests share an entry.</li>
+<li>Under that primary key sits a <strong>list of stored variants</strong>. Each stored response carries its own <code>Vary</code> header, which names request headers. The cache saved the values those headers had on the request that produced the response. A new request matches a variant only if its values for those headers match the saved ones. Caches may normalise values first, for example collapsing <code>Accept-Encoding</code> into "br", "gzip", or "identity". <code>Vary: *</code> never matches, which makes the response effectively uncacheable for reuse.</li>
+</ol>
+<p>So the true key is primary key plus the secondary key built from <code>Vary</code>. Two consequences follow.</p>
+<p><strong>Variant count multiplies.</strong> <code>Vary: Accept-Encoding, Accept-Language</code> across 3 encodings and 20 languages gives up to 60 copies of each URL. Each copy has to be fetched, stored, and kept fresh on its own. <code>Vary: User-Agent</code> gives one copy per distinct browser build string, which means thousands. <code>Vary: Cookie</code> gives roughly one copy per user, which is a private cache wearing a shared cache's clothes.</p>
+<p><strong>The key must match the response.</strong> This is the rule behind almost every cache security bug. <em>Every input that changes the response must be in the key, and every part of the key should change the response.</em> Break the first half and you get poisoning or data leaks. Break the second half and your hit ratio collapses.</p>
+<h3 id="d13-freshness">Freshness is a per-variant clock</h3>
+<p>Each stored variant carries a few timestamps and the directives that came with it. From those, the cache computes the response's current age (RFC 9111 §4.2.3):</p>
+<pre class="text"><code>apparent_age          = max(0, response_time - date_value)
+corrected_age_value   = age_value + (response_time - request_time)
+corrected_initial_age = max(apparent_age, corrected_age_value)
+current_age           = corrected_initial_age + (now - response_time)</code></pre>
+<p><code>age_value</code> is the <code>Age</code> header the response arrived with. That detail matters in a tiered CDN. When an edge fetches from a shield that has held the object for 40 seconds, the response arrives with <code>Age: 40</code>. With <code>max-age=60</code>, the edge's copy is fresh for only 20 more seconds. Edge copies therefore expire in lockstep with the shield's copy, not on their own schedule.</p>
+<p>When <code>max-age</code> (or <code>s-maxage</code> for shared caches) is absent, a cache may use a heuristic. RFC 9111 suggests a typical value of 10% of the time since <code>Last-Modified</code>. A file last modified 30 days ago gets about 3 days of heuristic freshness. That is how "we never set caching headers" turns into "users saw a stale file for three days".</p>
+<p>With <code>stale-while-revalidate</code> and <code>stale-if-error</code> (RFC 5861), every variant moves through a small state machine:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Current age (for <code>max-age=60, stale-while-revalidate=30, stale-if-error=600</code>)</th>
+<th>Origin healthy</th>
+<th>Origin failing</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0–59 s</td>
+<td>Hit, fresh</td>
+<td>Hit, fresh</td>
+</tr>
+<tr class="even">
+<td>60–89 s</td>
+<td>Serve stale now, revalidate in the background</td>
+<td>Serve stale</td>
+</tr>
+<tr class="odd">
+<td>90–659 s</td>
+<td>Block on revalidation</td>
+<td>Serve stale (<code>stale-if-error</code>)</td>
+</tr>
+<tr class="even">
+<td>660 s and older</td>
+<td>Block on revalidation</td>
+<td>Error to the client</td>
+</tr>
+</tbody>
+</table>
+<p><code>must-revalidate</code> switches off the stale paths. Once stale, the cache must revalidate or return 504. Use it on content where stale is worse than an error, and nowhere else.</p>
+<h3 id="d13-tiers">Misses: coalescing and the shield</h3>
+<p>A miss is not one fetch. Each cache node keeps a <strong>pending-fetch table</strong> keyed by cache key. The first request for a cold key creates an entry and starts one upstream fetch. Every later request for that key joins the entry as a waiter. When the response arrives, the cache stores it once and answers all the waiters. Vendors call this request collapsing or coalescing.</p>
+<p>There is a catch. Coalescing only works if the response turns out to be cacheable. If it comes back <code>private</code> or <code>no-store</code>, the waiters cannot share it. Each one has to be sent upstream again, one after another, unless the cache remembers "this key is uncacheable" for a while. Varnish calls that memory a hit-for-pass object. Without it, a single uncacheable hot URL turns coalescing into a serial queue.</p>
+<p>The <strong>shield</strong> (also called a tier-2 cache or origin shield) is the same machinery one level up. An edge that misses asks the shield chosen for that key, usually by hashing it, rather than asking the origin. The shield coalesces misses from every edge. A cold object requested by 300 PoPs at once becomes one origin fetch, not 300.</p>
+<p>Some CDNs choose one shield region per origin. Others hash keys across several upper-tier PoPs. Either way, the origin's load becomes a function of the <em>global</em> request rate per object, not the per-PoP rate. The numbers section shows why that matters so much.</p>
+<h3 id="d13-purge">Purge semantics: invalidation is a message</h3>
+<p>A purge request reaches the CDN's API. The control plane fans it out to every PoP and tier, and each node applies it to its local index. Three things follow from that.</p>
+<p><strong>There are two kinds of purge.</strong> A <em>hard purge</em> deletes the entry, so the next request is a full miss. A <em>soft purge</em> marks it stale, so the next request revalidates. If the origin answers <code>304</code>, the body never moves. Under <code>stale-while-revalidate</code> or <code>stale-if-error</code>, the stale copy can still be served while that happens. Soft purge is the safer default because it cannot cause a stampede of full-body fetches.</p>
+<p><strong>There are several ways to name what to purge.</strong> Purge-by-URL maps directly to a primary key, and normally removes all of that key's variants. Purge-by-tag needs an index: the origin labels responses with tags (vendor headers such as <code>Surrogate-Key</code> or <code>Cache-Tag</code>), and each node keeps a map from tag to keys. Purge-everything and prefix purges are rarely implemented by walking the cache. A cheaper trick is to bump a generation number that is part of every key, or to add a rule that lookups check lazily (Varnish calls these bans). The old objects become unreachable and age out on their own.</p>
+<p><strong>Tiers can race.</strong> Suppose an edge processes the purge before the shield does. The next request misses at the edge, goes to the shield, and gets the <em>old</em> object back, often with plenty of TTL left. The edge has been purged and refilled with stale content within the same second. CDNs order or retry purges to avoid this, but you should verify it with <code>Age</code> and <code>Cache-Status</code> after any critical purge.</p>
+<p>And one limit no CDN can lift: <strong>you cannot purge a browser</strong>. A <code>max-age=86400</code> that reached a user's browser stays there for a day, whatever you do at the edge. That is why HTML usually gets a short <code>max-age</code> for browsers and a longer <code>s-maxage</code>, or <code>CDN-Cache-Control</code>, for the edge you <em>can</em> purge.</p>
+<h2 id="d13-wire">Deep dive: what the wire actually shows</h2>
+<h3 id="d13-wire-dns">Steering, seen from DNS</h3>
+<p>DNS mapping shows up as a CNAME chain that ends in short-TTL answers. These outputs are annotated illustrations built on documentation names and addresses. <strong>Run on your Mac against a real CDN-fronted site — your output will differ.</strong></p>
+<div class="sourceCode" id="d13-cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d13-cb2-1"><a href="#d13-cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># DNS-mapped CDN: the answer depends on who is asking</span></span>
+<span id="d13-cb2-2"><a href="#d13-cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">dig</span> +noall +answer www.shop.example A</span>
+<span id="d13-cb2-3"><a href="#d13-cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co"># www.shop.example.              300  IN CNAME shop.example.edge.example.net.</span></span>
+<span id="d13-cb2-4"><a href="#d13-cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co"># shop.example.edge.example.net.  60  IN CNAME e17.fra.edge.example.net.   &lt;- mapping decision</span></span>
+<span id="d13-cb2-5"><a href="#d13-cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co"># e17.fra.edge.example.net.       20  IN A     198.51.100.21               &lt;- 20 s TTL: easy to move</span></span>
+<span id="d13-cb2-6"><a href="#d13-cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co"># e17.fra.edge.example.net.       20  IN A     198.51.100.22</span></span>
+<span id="d13-cb2-7"><a href="#d13-cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb2-8"><a href="#d13-cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Pretend to be a client in São Paulo by sending an ECS option (dig supports +subnet)</span></span>
+<span id="d13-cb2-9"><a href="#d13-cb2-9" aria-hidden="true" tabindex="-1"></a><span class="ex">dig</span> +noall +answer +subnet=203.0.113.0/24 www.shop.example A</span>
+<span id="d13-cb2-10"><a href="#d13-cb2-10" aria-hidden="true" tabindex="-1"></a><span class="co"># ...                             60  IN CNAME e17.gru.edge.example.net.   &lt;- a different PoP</span></span>
+<span id="d13-cb2-11"><a href="#d13-cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb2-12"><a href="#d13-cb2-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Anycast CDN: the same answer everywhere; the PoP is chosen later, by BGP</span></span>
+<span id="d13-cb2-13"><a href="#d13-cb2-13" aria-hidden="true" tabindex="-1"></a><span class="ex">dig</span> +short www.other.example A</span>
+<span id="d13-cb2-14"><a href="#d13-cb2-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 192.0.2.10</span></span></code></pre></div>
+<p>Not every authoritative server honours ECS from arbitrary clients, so <code>+subnet</code> can come back with the same answer. To see what <em>your</em> resolver reveals, Google runs a diagnostic name that echoes the resolver address and any ECS subnet: <code>dig +short TXT o-o.myaddr.l.google.com @ns1.google.com</code>.</p>
+<h3 id="d13-wire-curl">A miss, a hit, and a stale hit</h3>
+<p>The headers below come from three requests to the same URL through a tiered CDN, trimmed to the lines that matter. They use <code>Cache-Status</code> (RFC 9211), the standard header a cache uses to explain what it did. Its list is ordered origin-side first, and each cache appends its own entry. Many CDNs still use vendor headers instead (<code>X-Cache</code>, <code>CF-Cache-Status</code>), so expect variation.</p>
+<pre class="text"><code>$ curl -sv -o /dev/null -H &#39;Accept-Encoding: br&#39; &#39;https://www.shop.example/p?id=7&#39;     # t = 0 s
+&gt; GET /p?id=7 HTTP/2
+&gt; accept-encoding: br
+&lt; HTTP/2 200
+&lt; cache-control: public, max-age=60, stale-while-revalidate=30
+&lt; vary: Accept-Encoding
+&lt; content-encoding: br
+&lt; etag: &quot;a1f3&quot;
+&lt; age: 0
+&lt; cache-status: shield-ams; fwd=uri-miss; stored, edge-fra; fwd=uri-miss; stored
+#   both tiers missed; each stored a copy keyed (GET, /p?id=7) + {accept-encoding: br}
+
+$ curl ... same request ...                                                             # t = 20 s
+&lt; age: 20
+&lt; cache-status: shield-ams; fwd=uri-miss; stored, edge-fra; hit; ttl=40
+#   the shield&#39;s entry is part of the stored response; the edge appended &quot;hit&quot;
+#   ttl = 60 - 20: freshness lifetime left at this cache
+
+$ curl ... same request, but Accept-Encoding: gzip ...                                  # t = 25 s
+&lt; age: 0
+&lt; cache-status: shield-ams; fwd=vary-miss; stored, edge-fra; fwd=vary-miss; stored
+#   same primary key, but no variant for gzip: a second fetch and a second copy
+
+$ curl ... the br request again ...                                                     # t = 75 s
+&lt; age: 75
+&lt; cache-status: shield-ams; fwd=uri-miss; stored, edge-fra; hit; ttl=-15; detail=&quot;stale-while-revalidate&quot;
+#   15 s past max-age, inside the 30 s window: served instantly, refreshed in the background</code></pre>
+<p>Here is what the origin logged for that background refresh. The shield's copy was the same age, so the shield sent a conditional request. Nothing had changed, so no body crossed the wire:</p>
+<pre class="text"><code>198.51.100.40 - - [16/Oct/2026:12:01:15 +0000] &quot;GET /p?id=7 HTTP/1.1&quot; 304 0 &quot;-&quot; &quot;edge-fetch&quot; inm=&quot;a1f3&quot;</code></pre>
+<h3 id="d13-wire-python">The machine in Python</h3>
+<p>The script below is a toy shared cache. It is small enough to read in one sitting and follows the same rules: normalised primary keys, <code>Vary</code> matching against saved request headers, the freshness state machine from the table above, and one poisoning bug. Run it: <code>~/.local/bin/python3.13 d13_cache_key.py</code></p>
+<div class="sourceCode" id="d13-cb5"><pre class="sourceCode python"><code class="sourceCode python"><span id="d13-cb5-1"><a href="#d13-cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;A toy shared cache: primary key, Vary secondary key, freshness states, and a poisoning bug.&quot;&quot;&quot;</span></span>
+<span id="d13-cb5-2"><a href="#d13-cb5-2" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> urllib.parse <span class="im">import</span> urlsplit, parse_qsl, urlencode</span>
+<span id="d13-cb5-3"><a href="#d13-cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb5-4"><a href="#d13-cb5-4" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> primary_key(method: <span class="bu">str</span>, url: <span class="bu">str</span>, keep_params<span class="op">=</span><span class="va">None</span>) <span class="op">-&gt;</span> <span class="bu">str</span>:</span>
+<span id="d13-cb5-5"><a href="#d13-cb5-5" aria-hidden="true" tabindex="-1"></a>    u <span class="op">=</span> urlsplit(url)</span>
+<span id="d13-cb5-6"><a href="#d13-cb5-6" aria-hidden="true" tabindex="-1"></a>    params <span class="op">=</span> <span class="bu">sorted</span>(parse_qsl(u.query))                     <span class="co"># normalise order</span></span>
+<span id="d13-cb5-7"><a href="#d13-cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> keep_params <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span>:</span>
+<span id="d13-cb5-8"><a href="#d13-cb5-8" aria-hidden="true" tabindex="-1"></a>        params <span class="op">=</span> [(k, v) <span class="cf">for</span> k, v <span class="kw">in</span> params <span class="cf">if</span> k <span class="kw">in</span> keep_params]</span>
+<span id="d13-cb5-9"><a href="#d13-cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ss">f&quot;</span><span class="sc">{</span>method<span class="sc">}</span><span class="ss"> </span><span class="sc">{</span>u<span class="sc">.</span>scheme<span class="sc">}</span><span class="ss">://</span><span class="sc">{</span>u<span class="sc">.</span>hostname<span class="sc">.</span>lower()<span class="sc">}{</span>u<span class="sc">.</span>path<span class="sc">}</span><span class="ss">?</span><span class="sc">{</span>urlencode(params)<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="d13-cb5-10"><a href="#d13-cb5-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb5-11"><a href="#d13-cb5-11" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> norm_ae(value: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="bu">str</span>:                            <span class="co"># Accept-Encoding -&gt; 3 buckets</span></span>
+<span id="d13-cb5-12"><a href="#d13-cb5-12" aria-hidden="true" tabindex="-1"></a>    v <span class="op">=</span> value.lower()</span>
+<span id="d13-cb5-13"><a href="#d13-cb5-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="st">&quot;br&quot;</span> <span class="cf">if</span> <span class="st">&quot;br&quot;</span> <span class="kw">in</span> v <span class="cf">else</span> <span class="st">&quot;gzip&quot;</span> <span class="cf">if</span> <span class="st">&quot;gzip&quot;</span> <span class="kw">in</span> v <span class="cf">else</span> <span class="st">&quot;identity&quot;</span></span>
+<span id="d13-cb5-14"><a href="#d13-cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb5-15"><a href="#d13-cb5-15" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Cache:</span>
+<span id="d13-cb5-16"><a href="#d13-cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="fu">__init__</span>(<span class="va">self</span>, normalise<span class="op">=</span><span class="va">True</span>):</span>
+<span id="d13-cb5-17"><a href="#d13-cb5-17" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.store, <span class="va">self</span>.normalise <span class="op">=</span> {}, normalise          <span class="co"># pkey -&gt; list of variants</span></span>
+<span id="d13-cb5-18"><a href="#d13-cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> _secondary(<span class="va">self</span>, vary, req):</span>
+<span id="d13-cb5-19"><a href="#d13-cb5-19" aria-hidden="true" tabindex="-1"></a>        out <span class="op">=</span> []</span>
+<span id="d13-cb5-20"><a href="#d13-cb5-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> h <span class="kw">in</span> vary:</span>
+<span id="d13-cb5-21"><a href="#d13-cb5-21" aria-hidden="true" tabindex="-1"></a>            v <span class="op">=</span> req.get(h, <span class="st">&quot;&quot;</span>)</span>
+<span id="d13-cb5-22"><a href="#d13-cb5-22" aria-hidden="true" tabindex="-1"></a>            out.append(norm_ae(v) <span class="cf">if</span> <span class="va">self</span>.normalise <span class="kw">and</span> h <span class="op">==</span> <span class="st">&quot;accept-encoding&quot;</span> <span class="cf">else</span> v)</span>
+<span id="d13-cb5-23"><a href="#d13-cb5-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="bu">tuple</span>(out)</span>
+<span id="d13-cb5-24"><a href="#d13-cb5-24" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> lookup(<span class="va">self</span>, pkey, req):</span>
+<span id="d13-cb5-25"><a href="#d13-cb5-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> vary, sec, resp <span class="kw">in</span> <span class="va">self</span>.store.get(pkey, []):</span>
+<span id="d13-cb5-26"><a href="#d13-cb5-26" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="va">self</span>._secondary(vary, req) <span class="op">==</span> sec:</span>
+<span id="d13-cb5-27"><a href="#d13-cb5-27" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> resp</span>
+<span id="d13-cb5-28"><a href="#d13-cb5-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">None</span></span>
+<span id="d13-cb5-29"><a href="#d13-cb5-29" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> put(<span class="va">self</span>, pkey, req, resp):</span>
+<span id="d13-cb5-30"><a href="#d13-cb5-30" aria-hidden="true" tabindex="-1"></a>        vary <span class="op">=</span> [h.strip().lower() <span class="cf">for</span> h <span class="kw">in</span> resp.get(<span class="st">&quot;vary&quot;</span>, <span class="st">&quot;&quot;</span>).split(<span class="st">&quot;,&quot;</span>) <span class="cf">if</span> h.strip()]</span>
+<span id="d13-cb5-31"><a href="#d13-cb5-31" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.store.setdefault(pkey, []).append((vary, <span class="va">self</span>._secondary(vary, req), resp))</span>
+<span id="d13-cb5-32"><a href="#d13-cb5-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> variants(<span class="va">self</span>):</span>
+<span id="d13-cb5-33"><a href="#d13-cb5-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="bu">sum</span>(<span class="bu">len</span>(v) <span class="cf">for</span> v <span class="kw">in</span> <span class="va">self</span>.store.values())</span>
+<span id="d13-cb5-34"><a href="#d13-cb5-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb5-35"><a href="#d13-cb5-35" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> freshness(age, max_age, swr, sie, origin_up):</span>
+<span id="d13-cb5-36"><a href="#d13-cb5-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> age <span class="op">&lt;</span> max_age:</span>
+<span id="d13-cb5-37"><a href="#d13-cb5-37" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="st">&quot;HIT fresh&quot;</span></span>
+<span id="d13-cb5-38"><a href="#d13-cb5-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> age <span class="op">&lt;</span> max_age <span class="op">+</span> swr:</span>
+<span id="d13-cb5-39"><a href="#d13-cb5-39" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="st">&quot;HIT stale, serve now + background revalidate&quot;</span></span>
+<span id="d13-cb5-40"><a href="#d13-cb5-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="kw">not</span> origin_up <span class="kw">and</span> age <span class="op">&lt;</span> max_age <span class="op">+</span> sie:</span>
+<span id="d13-cb5-41"><a href="#d13-cb5-41" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="st">&quot;HIT stale-if-error (origin down)&quot;</span></span>
+<span id="d13-cb5-42"><a href="#d13-cb5-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="st">&quot;MISS must fetch/revalidate&quot;</span> <span class="cf">if</span> origin_up <span class="cf">else</span> <span class="st">&quot;ERROR 5xx to client&quot;</span></span>
+<span id="d13-cb5-43"><a href="#d13-cb5-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb5-44"><a href="#d13-cb5-44" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;1) Query normalisation&quot;</span>)</span>
+<span id="d13-cb5-45"><a href="#d13-cb5-45" aria-hidden="true" tabindex="-1"></a>a <span class="op">=</span> primary_key(<span class="st">&quot;GET&quot;</span>, <span class="st">&quot;https://Shop.example/p?id=7&amp;utm_source=mail&quot;</span>)</span>
+<span id="d13-cb5-46"><a href="#d13-cb5-46" aria-hidden="true" tabindex="-1"></a>b <span class="op">=</span> primary_key(<span class="st">&quot;GET&quot;</span>, <span class="st">&quot;https://shop.example/p?utm_source=ad&amp;id=7&quot;</span>)</span>
+<span id="d13-cb5-47"><a href="#d13-cb5-47" aria-hidden="true" tabindex="-1"></a>c <span class="op">=</span> primary_key(<span class="st">&quot;GET&quot;</span>, <span class="st">&quot;https://shop.example/p?utm_source=ad&amp;id=7&quot;</span>, keep_params<span class="op">=</span>{<span class="st">&quot;id&quot;</span>})</span>
+<span id="d13-cb5-48"><a href="#d13-cb5-48" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> k <span class="kw">in</span> (a, b, c):</span>
+<span id="d13-cb5-49"><a href="#d13-cb5-49" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;  &quot;</span>, k)</span>
+<span id="d13-cb5-50"><a href="#d13-cb5-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb5-51"><a href="#d13-cb5-51" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">2) Vary: Accept-Encoding vs Vary: User-Agent over 1,000 requests&quot;</span>)</span>
+<span id="d13-cb5-52"><a href="#d13-cb5-52" aria-hidden="true" tabindex="-1"></a>agents <span class="op">=</span> [<span class="ss">f&quot;Mozilla/5.0 (build </span><span class="sc">{</span>i <span class="op">%</span> <span class="dv">400</span><span class="sc">}</span><span class="ss">)&quot;</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1000</span>)]     <span class="co"># 400 distinct UAs</span></span>
+<span id="d13-cb5-53"><a href="#d13-cb5-53" aria-hidden="true" tabindex="-1"></a>encodings <span class="op">=</span> [<span class="st">&quot;br, gzip&quot;</span>, <span class="st">&quot;gzip, deflate, br, zstd&quot;</span>, <span class="st">&quot;gzip&quot;</span>, <span class="st">&quot;identity&quot;</span>]</span>
+<span id="d13-cb5-54"><a href="#d13-cb5-54" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> vary, normalise <span class="kw">in</span> ((<span class="st">&quot;Accept-Encoding&quot;</span>, <span class="va">False</span>), (<span class="st">&quot;Accept-Encoding&quot;</span>, <span class="va">True</span>),</span>
+<span id="d13-cb5-55"><a href="#d13-cb5-55" aria-hidden="true" tabindex="-1"></a>                        (<span class="st">&quot;User-Agent&quot;</span>, <span class="va">False</span>)):</span>
+<span id="d13-cb5-56"><a href="#d13-cb5-56" aria-hidden="true" tabindex="-1"></a>    cache, misses <span class="op">=</span> Cache(normalise), <span class="dv">0</span></span>
+<span id="d13-cb5-57"><a href="#d13-cb5-57" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i, ua <span class="kw">in</span> <span class="bu">enumerate</span>(agents):</span>
+<span id="d13-cb5-58"><a href="#d13-cb5-58" aria-hidden="true" tabindex="-1"></a>        req <span class="op">=</span> {<span class="st">&quot;user-agent&quot;</span>: ua, <span class="st">&quot;accept-encoding&quot;</span>: encodings[i <span class="op">%</span> <span class="dv">4</span>]}</span>
+<span id="d13-cb5-59"><a href="#d13-cb5-59" aria-hidden="true" tabindex="-1"></a>        pk <span class="op">=</span> primary_key(<span class="st">&quot;GET&quot;</span>, <span class="st">&quot;https://shop.example/app.js&quot;</span>)</span>
+<span id="d13-cb5-60"><a href="#d13-cb5-60" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> cache.lookup(pk, req) <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="d13-cb5-61"><a href="#d13-cb5-61" aria-hidden="true" tabindex="-1"></a>            misses <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d13-cb5-62"><a href="#d13-cb5-62" aria-hidden="true" tabindex="-1"></a>            cache.put(pk, req, {<span class="st">&quot;vary&quot;</span>: vary, <span class="st">&quot;body&quot;</span>: <span class="st">&quot;...&quot;</span>})</span>
+<span id="d13-cb5-63"><a href="#d13-cb5-63" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;   Vary: </span><span class="sc">{</span>vary<span class="sc">:&lt;15}</span><span class="ss"> normalise=</span><span class="sc">{</span>normalise<span class="sc">!s:&lt;5}</span><span class="ss">&quot;</span></span>
+<span id="d13-cb5-64"><a href="#d13-cb5-64" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot; variants=</span><span class="sc">{</span>cache<span class="sc">.</span>variants()<span class="sc">:&gt;4}</span><span class="ss">  hit ratio=</span><span class="sc">{</span><span class="dv">1</span> <span class="op">-</span> misses <span class="op">/</span> <span class="dv">1000</span><span class="sc">:.1%}</span><span class="ss">&quot;</span>)</span>
+<span id="d13-cb5-65"><a href="#d13-cb5-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb5-66"><a href="#d13-cb5-66" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">3) Freshness for max-age=60, stale-while-revalidate=30, stale-if-error=600&quot;</span>)</span>
+<span id="d13-cb5-67"><a href="#d13-cb5-67" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> age, up <span class="kw">in</span> ((<span class="dv">10</span>, <span class="va">True</span>), (<span class="dv">75</span>, <span class="va">True</span>), (<span class="dv">200</span>, <span class="va">True</span>), (<span class="dv">200</span>, <span class="va">False</span>), (<span class="dv">900</span>, <span class="va">False</span>)):</span>
+<span id="d13-cb5-68"><a href="#d13-cb5-68" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;   age=</span><span class="sc">{</span>age<span class="sc">:&gt;3}</span><span class="ss">s origin_up=</span><span class="sc">{</span>up<span class="sc">!s:&lt;5}</span><span class="ss"> -&gt; </span><span class="sc">{</span>freshness(age, <span class="dv">60</span>, <span class="dv">30</span>, <span class="dv">600</span>, up)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d13-cb5-69"><a href="#d13-cb5-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb5-70"><a href="#d13-cb5-70" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">4) Poisoning: origin reflects an unkeyed header into a cacheable body&quot;</span>)</span>
+<span id="d13-cb5-71"><a href="#d13-cb5-71" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> origin(req):</span>
+<span id="d13-cb5-72"><a href="#d13-cb5-72" aria-hidden="true" tabindex="-1"></a>    host <span class="op">=</span> req.get(<span class="st">&quot;x-forwarded-host&quot;</span>, <span class="st">&quot;shop.example&quot;</span>)</span>
+<span id="d13-cb5-73"><a href="#d13-cb5-73" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> {<span class="st">&quot;body&quot;</span>: <span class="ss">f&#39;&lt;script src=&quot;https://</span><span class="sc">{</span>host<span class="sc">}</span><span class="ss">/app.js&quot;&gt;&#39;</span>, <span class="st">&quot;cache-control&quot;</span>: <span class="st">&quot;max-age=300&quot;</span>}</span>
+<span id="d13-cb5-74"><a href="#d13-cb5-74" aria-hidden="true" tabindex="-1"></a>cache <span class="op">=</span> Cache()</span>
+<span id="d13-cb5-75"><a href="#d13-cb5-75" aria-hidden="true" tabindex="-1"></a>pk <span class="op">=</span> primary_key(<span class="st">&quot;GET&quot;</span>, <span class="st">&quot;https://shop.example/&quot;</span>)</span>
+<span id="d13-cb5-76"><a href="#d13-cb5-76" aria-hidden="true" tabindex="-1"></a>attacker <span class="op">=</span> {<span class="st">&quot;x-forwarded-host&quot;</span>: <span class="st">&quot;evil.example&quot;</span>}</span>
+<span id="d13-cb5-77"><a href="#d13-cb5-77" aria-hidden="true" tabindex="-1"></a>cache.put(pk, attacker, origin(attacker))                  <span class="co"># attacker&#39;s request fills the slot</span></span>
+<span id="d13-cb5-78"><a href="#d13-cb5-78" aria-hidden="true" tabindex="-1"></a>victim <span class="op">=</span> {}</span>
+<span id="d13-cb5-79"><a href="#d13-cb5-79" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;   victim receives:&quot;</span>, cache.lookup(pk, victim)[<span class="st">&quot;body&quot;</span>])</span></code></pre></div>
+<p>Real output:</p>
+<pre class="text"><code>1) Query normalisation
+   GET https://shop.example/p?id=7&amp;utm_source=mail
+   GET https://shop.example/p?id=7&amp;utm_source=ad
+   GET https://shop.example/p?id=7
+
+2) Vary: Accept-Encoding vs Vary: User-Agent over 1,000 requests
+   Vary: Accept-Encoding normalise=False variants=   4  hit ratio=99.6%
+   Vary: Accept-Encoding normalise=True  variants=   3  hit ratio=99.7%
+   Vary: User-Agent      normalise=False variants= 400  hit ratio=60.0%
+
+3) Freshness for max-age=60, stale-while-revalidate=30, stale-if-error=600
+   age= 10s origin_up=True  -&gt; HIT fresh
+   age= 75s origin_up=True  -&gt; HIT stale, serve now + background revalidate
+   age=200s origin_up=True  -&gt; MISS must fetch/revalidate
+   age=200s origin_up=False -&gt; HIT stale-if-error (origin down)
+   age=900s origin_up=False -&gt; ERROR 5xx to client
+
+4) Poisoning: origin reflects an unkeyed header into a cacheable body
+   victim receives: &lt;script src=&quot;https://evil.example/app.js&quot;&gt;</code></pre>
+<p>Read part 2 slowly. The two <code>Accept-Encoding</code> rows differ by one variant, because normalising "br, gzip" and "gzip, deflate, br, zstd" into one "br" bucket saves a fetch. The <code>User-Agent</code> row is the real lesson. Only 400 distinct agents, and the hit ratio already falls to 60%. Real traffic carries thousands of distinct strings. Part 4 is the whole of cache poisoning in four lines: the header changed the body, the key ignored the header, and the victim got the attacker's version.</p>
+<h2 id="d13-numbers">Deep dive: by the numbers</h2>
+<h3 id="d13-hit-math">Hit ratio from first principles</h3>
+<p>Take one object with requests arriving at rate λ per second at one cache, and a TTL of T seconds. Each miss starts a freshness window. During that window, about λT more requests arrive and hit. So every window holds one miss and λT hits:</p>
+<pre class="text"><code>hit ratio = λT / (1 + λT)        origin fetch rate = λ / (1 + λT)</code></pre>
+<p>This assumes Poisson arrivals, no eviction, and a full refetch on expiry. It is crude, but it explains why CDNs behave the way they do. The script checks the formula against a simulation, then applies it to a Zipf-distributed catalogue spread across 50 PoPs. Run it: <code>~/.local/bin/python3.13 d13_hit_math.py</code></p>
+<div class="sourceCode" id="d13-cb8"><pre class="sourceCode python"><code class="sourceCode python"><span id="d13-cb8-1"><a href="#d13-cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Hit-ratio math for a TTL cache, per PoP and behind a shield (Python 3.13 stdlib).&quot;&quot;&quot;</span></span>
+<span id="d13-cb8-2"><a href="#d13-cb8-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> random</span>
+<span id="d13-cb8-3"><a href="#d13-cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb8-4"><a href="#d13-cb8-4" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> ttl_hit_ratio(rate: <span class="bu">float</span>, ttl: <span class="bu">float</span>) <span class="op">-&gt;</span> <span class="bu">float</span>:</span>
+<span id="d13-cb8-5"><a href="#d13-cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Poisson arrivals at `rate`/s; a miss fetches and starts a TTL window.</span></span>
+<span id="d13-cb8-6"><a href="#d13-cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Each window holds 1 miss + on average rate*ttl hits.</span></span>
+<span id="d13-cb8-7"><a href="#d13-cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> rate <span class="op">*</span> ttl <span class="op">/</span> (<span class="dv">1</span> <span class="op">+</span> rate <span class="op">*</span> ttl)</span>
+<span id="d13-cb8-8"><a href="#d13-cb8-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb8-9"><a href="#d13-cb8-9" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> simulate(rate: <span class="bu">float</span>, ttl: <span class="bu">float</span>, requests: <span class="bu">int</span>, seed: <span class="bu">int</span> <span class="op">=</span> <span class="dv">7</span>) <span class="op">-&gt;</span> <span class="bu">float</span>:</span>
+<span id="d13-cb8-10"><a href="#d13-cb8-10" aria-hidden="true" tabindex="-1"></a>    rng, t, expires, hits, total <span class="op">=</span> random.Random(seed), <span class="fl">0.0</span>, <span class="op">-</span><span class="fl">1.0</span>, <span class="dv">0</span>, <span class="dv">0</span></span>
+<span id="d13-cb8-11"><a href="#d13-cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> total <span class="op">&lt;</span> requests:</span>
+<span id="d13-cb8-12"><a href="#d13-cb8-12" aria-hidden="true" tabindex="-1"></a>        t <span class="op">+=</span> rng.expovariate(rate)</span>
+<span id="d13-cb8-13"><a href="#d13-cb8-13" aria-hidden="true" tabindex="-1"></a>        total <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d13-cb8-14"><a href="#d13-cb8-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> t <span class="op">&lt;</span> expires:</span>
+<span id="d13-cb8-15"><a href="#d13-cb8-15" aria-hidden="true" tabindex="-1"></a>            hits <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d13-cb8-16"><a href="#d13-cb8-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span>:</span>
+<span id="d13-cb8-17"><a href="#d13-cb8-17" aria-hidden="true" tabindex="-1"></a>            expires <span class="op">=</span> t <span class="op">+</span> ttl          <span class="co"># miss: fetch, store, start freshness</span></span>
+<span id="d13-cb8-18"><a href="#d13-cb8-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> hits <span class="op">/</span> total</span>
+<span id="d13-cb8-19"><a href="#d13-cb8-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb8-20"><a href="#d13-cb8-20" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;1) One object, one PoP, TTL = 60 s&quot;</span>)</span>
+<span id="d13-cb8-21"><a href="#d13-cb8-21" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> rate <span class="kw">in</span> (<span class="fl">0.01</span>, <span class="fl">0.1</span>, <span class="fl">1.0</span>, <span class="fl">10.0</span>):</span>
+<span id="d13-cb8-22"><a href="#d13-cb8-22" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;   </span><span class="sc">{</span>rate<span class="sc">:&gt;5}</span><span class="ss"> req/s  formula </span><span class="sc">{</span>ttl_hit_ratio(rate, <span class="dv">60</span>)<span class="sc">:6.1%}</span><span class="ss">&quot;</span></span>
+<span id="d13-cb8-23"><a href="#d13-cb8-23" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;   simulated </span><span class="sc">{</span>simulate(rate, <span class="dv">60</span>, <span class="dv">200_000</span>)<span class="sc">:6.1%}</span><span class="ss">&quot;</span>)</span>
+<span id="d13-cb8-24"><a href="#d13-cb8-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb8-25"><a href="#d13-cb8-25" aria-hidden="true" tabindex="-1"></a><span class="co"># 2) A Zipf catalogue spread over many PoPs, with and without a shield.</span></span>
+<span id="d13-cb8-26"><a href="#d13-cb8-26" aria-hidden="true" tabindex="-1"></a>OBJECTS, POPS, TOTAL_RPS, TTL, S <span class="op">=</span> <span class="dv">200_000</span>, <span class="dv">50</span>, <span class="dv">20_000</span>, <span class="dv">300</span>, <span class="fl">0.9</span></span>
+<span id="d13-cb8-27"><a href="#d13-cb8-27" aria-hidden="true" tabindex="-1"></a>weights <span class="op">=</span> [<span class="dv">1</span> <span class="op">/</span> (k <span class="op">**</span> S) <span class="cf">for</span> k <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1</span>, OBJECTS <span class="op">+</span> <span class="dv">1</span>)]</span>
+<span id="d13-cb8-28"><a href="#d13-cb8-28" aria-hidden="true" tabindex="-1"></a>norm <span class="op">=</span> <span class="bu">sum</span>(weights)</span>
+<span id="d13-cb8-29"><a href="#d13-cb8-29" aria-hidden="true" tabindex="-1"></a>obj_rps <span class="op">=</span> [TOTAL_RPS <span class="op">*</span> w <span class="op">/</span> norm <span class="cf">for</span> w <span class="kw">in</span> weights]      <span class="co"># global rate per object</span></span>
+<span id="d13-cb8-30"><a href="#d13-cb8-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb8-31"><a href="#d13-cb8-31" aria-hidden="true" tabindex="-1"></a>edge_miss <span class="op">=</span> <span class="bu">sum</span>(POPS <span class="op">*</span> (r <span class="op">/</span> POPS) <span class="op">/</span> (<span class="dv">1</span> <span class="op">+</span> (r <span class="op">/</span> POPS) <span class="op">*</span> TTL) <span class="cf">for</span> r <span class="kw">in</span> obj_rps)</span>
+<span id="d13-cb8-32"><a href="#d13-cb8-32" aria-hidden="true" tabindex="-1"></a>shield_miss <span class="op">=</span> <span class="bu">sum</span>(r <span class="op">/</span> (<span class="dv">1</span> <span class="op">+</span> r <span class="op">*</span> TTL) <span class="cf">for</span> r <span class="kw">in</span> obj_rps)  <span class="co"># misses collapse at shield</span></span>
+<span id="d13-cb8-33"><a href="#d13-cb8-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb8-34"><a href="#d13-cb8-34" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="ss">2) </span><span class="sc">{</span>OBJECTS<span class="sc">:,}</span><span class="ss"> objects, Zipf s=</span><span class="sc">{</span>S<span class="sc">}</span><span class="ss">, </span><span class="sc">{</span>TOTAL_RPS<span class="sc">:,}</span><span class="ss"> req/s over </span><span class="sc">{</span>POPS<span class="sc">}</span><span class="ss"> PoPs, TTL=</span><span class="sc">{</span>TTL<span class="sc">}</span><span class="ss">s&quot;</span>)</span>
+<span id="d13-cb8-35"><a href="#d13-cb8-35" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;   edge hit ratio            : </span><span class="sc">{</span><span class="dv">1</span> <span class="op">-</span> edge_miss <span class="op">/</span> TOTAL_RPS<span class="sc">:6.1%}</span><span class="ss">&quot;</span>)</span>
+<span id="d13-cb8-36"><a href="#d13-cb8-36" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;   origin req/s, no shield   : </span><span class="sc">{</span>edge_miss<span class="sc">:8.0f}</span><span class="ss">&quot;</span>)</span>
+<span id="d13-cb8-37"><a href="#d13-cb8-37" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;   origin req/s, one shield  : </span><span class="sc">{</span>shield_miss<span class="sc">:8.0f}</span><span class="ss">&quot;</span></span>
+<span id="d13-cb8-38"><a href="#d13-cb8-38" aria-hidden="true" tabindex="-1"></a>      <span class="ss">f&quot;   (shield hit ratio on edge misses </span><span class="sc">{</span><span class="dv">1</span> <span class="op">-</span> shield_miss <span class="op">/</span> edge_miss<span class="sc">:.1%}</span><span class="ss">)&quot;</span>)</span>
+<span id="d13-cb8-39"><a href="#d13-cb8-39" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;   origin offload with shield: </span><span class="sc">{</span><span class="dv">1</span> <span class="op">-</span> shield_miss <span class="op">/</span> TOTAL_RPS<span class="sc">:6.2%}</span><span class="ss">&quot;</span>)</span>
+<span id="d13-cb8-40"><a href="#d13-cb8-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d13-cb8-41"><a href="#d13-cb8-41" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">3) Origin load vs hit ratio at 100,000 req/s&quot;</span>)</span>
+<span id="d13-cb8-42"><a href="#d13-cb8-42" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> h <span class="kw">in</span> (<span class="fl">0.90</span>, <span class="fl">0.95</span>, <span class="fl">0.99</span>, <span class="fl">0.999</span>):</span>
+<span id="d13-cb8-43"><a href="#d13-cb8-43" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;   hit </span><span class="sc">{</span>h<span class="sc">:6.1%}</span><span class="ss"> -&gt; origin </span><span class="sc">{</span><span class="dv">100_000</span> <span class="op">*</span> (<span class="dv">1</span> <span class="op">-</span> h)<span class="sc">:&gt;7,.0f}</span><span class="ss"> req/s&quot;</span>)</span></code></pre></div>
+<p>Real output:</p>
+<pre class="text"><code>1) One object, one PoP, TTL = 60 s
+    0.01 req/s  formula  37.5%   simulated  37.6%
+     0.1 req/s  formula  85.7%   simulated  85.7%
+     1.0 req/s  formula  98.4%   simulated  98.4%
+    10.0 req/s  formula  99.8%   simulated  99.8%
+
+2) 200,000 objects, Zipf s=0.9, 20,000 req/s over 50 PoPs, TTL=300s
+   edge hit ratio            :  67.3%
+   origin req/s, no shield   :     6535
+   origin req/s, one shield  :      594   (shield hit ratio on edge misses 90.9%)
+   origin offload with shield: 97.03%
+
+3) Origin load vs hit ratio at 100,000 req/s
+   hit  90.0% -&gt; origin  10,000 req/s
+   hit  95.0% -&gt; origin   5,000 req/s
+   hit  99.0% -&gt; origin   1,000 req/s
+   hit  99.9% -&gt; origin     100 req/s</code></pre>
+<p>Three lessons are in that output.</p>
+<p><strong>The long tail decides your hit ratio.</strong> An object requested once every 100 seconds at a PoP gets a 37.5% hit ratio, even with a 60-second TTL. Popular objects are easy. The tail is where the misses live, and spreading traffic across more PoPs pushes more objects into the tail, because each PoP sees only its own share.</p>
+<p><strong>A shield turns per-PoP rates back into global rates.</strong> In the Zipf run, the edges alone hit 67.3%, leaving 6,535 req/s for the origin. With one shield in front of the origin, that falls to 594 req/s. The model ignores <code>Age</code> inheritance, which makes the real edge numbers slightly worse. The shape holds anyway. That is the case for tiered caching in one number.</p>
+<p><strong>Each extra nine is worth more than the last.</strong> Going from 95% to 99% cuts origin traffic by a factor of five. Going from 99% to 99.9% cuts it by another factor of ten. That is why teams fight over the last percent.</p>
+<h3 id="d13-latency">Tail latency follows the miss rate</h3>
+<p>Expected time to first byte is a weighted average: <code>E[TTFB] = h × t_hit + (1 − h) × t_miss</code>. With a 20 ms hit, a 220 ms miss, and h = 0.95, the mean is 30 ms. That sounds fine.</p>
+<p>Percentiles tell a different story. With 5% misses, the p99 request is a miss, because more than 1% of requests pay 220 ms. Your p99 is therefore your miss latency until the miss rate drops below 1%. When a dashboard shows a great mean and an ugly p99 behind a CDN, look at the miss path first.</p>
+<h3 id="d13-ref-numbers">Reference numbers</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Typical value</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>DNS mapping TTL</td>
+<td>20–60 s</td>
+<td>Vendor choice; resolvers sometimes hold answers longer</td>
+</tr>
+<tr class="even">
+<td>BGP withdrawal to reconvergence</td>
+<td>Seconds to about a minute</td>
+<td>Depends on the paths involved</td>
+</tr>
+<tr class="odd">
+<td>Heuristic freshness</td>
+<td>10% of (now − <code>Last-Modified</code>)</td>
+<td>RFC 9111's suggested figure; caches vary</td>
+</tr>
+<tr class="even">
+<td>Heuristically cacheable statuses</td>
+<td>200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501</td>
+<td>RFC 9110 §15.1; note that 404 is on the list</td>
+</tr>
+<tr class="odd">
+<td>Global purge propagation</td>
+<td>Typically well under a minute; vendors quote seconds or less</td>
+<td>Not atomic: PoPs flip at different moments</td>
+</tr>
+<tr class="even">
+<td><code>Vary: Accept-Encoding</code> variants</td>
+<td>2–4 (br, gzip, zstd, identity)</td>
+<td>After normalisation</td>
+</tr>
+<tr class="odd">
+<td>p99 TTFB behind a CDN</td>
+<td>Equals miss latency while miss rate is above 1%</td>
+<td>From the percentile argument above</td>
+</tr>
+</tbody>
+</table>
+<h2 id="d13-failures">Deep dive: production failure modes</h2>
+<p>Each failure below follows the same pattern: what you see, what is actually happening, how to prove it, and how to fix it. Test only against systems you own, and always use a cache-busting query parameter. That way a poisoning test can only ever poison a key nobody else requests.</p>
+<p><strong>1. Cache poisoning through an unkeyed header.</strong> <em>Symptom:</em> users intermittently load scripts or redirects pointing at a host you don't own. <em>Mechanism:</em> the origin builds absolute URLs from a header such as <code>X-Forwarded-Host</code> or <code>X-Forwarded-Scheme</code>. The CDN forwards that header but leaves it out of the key, so one attacker request fills the shared entry. <em>Prove it:</em></p>
+<div class="sourceCode" id="d13-cb10"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d13-cb10-1"><a href="#d13-cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># run on your Mac against your own site; cb= makes a throwaway key</span></span>
+<span id="d13-cb10-2"><a href="#d13-cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="at">-H</span> <span class="st">&#39;X-Forwarded-Host: canary.example&#39;</span> <span class="st">&#39;https://www.shop.example/?cb=8812&#39;</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-c</span> canary.example</span>
+<span id="d13-cb10-3"><a href="#d13-cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="st">&#39;https://www.shop.example/?cb=8812&#39;</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-c</span> canary.example    <span class="co"># non-zero = poisoned</span></span></code></pre></div>
+<p><em>Fix:</em> stop trusting forwarded headers at the origin unless your own proxy set them. Strip them at the edge. If a header genuinely changes the response, put it in the key.</p>
+<p><strong>2. Web cache deception.</strong> <em>Symptom:</em> one user's account page is served to others. <em>Mechanism:</em> the CDN caches "anything ending in <code>.css</code>" by rule. Meanwhile the origin's router serves <code>/account/x.css</code> as <code>/account</code>, because it ignores the trailing segment. An attacker lures a victim to that URL, the victim's private page gets cached under a public key, and the attacker fetches it. <em>Prove it:</em> request <code>/account/nonexistent.css</code> with a session cookie, then again without one, and compare <code>Cache-Status</code> and the body. <em>Fix:</em> cache on the origin's <code>Cache-Control</code>, not on file extensions. Make the origin return 404 for paths it doesn't recognise. Mark account pages <code>private</code> or <code>no-store</code>. Some CDNs also check that the <code>Content-Type</code> matches the extension before caching.</p>
+<p><strong>3. Cached error pages (cache-poisoned denial of service).</strong> <em>Symptom:</em> a page returns 400 or 404 for everyone, but works fine when you hit the origin directly. <em>Mechanism:</em> a request with an oversized header, a stray meta character, or a method-override header makes the origin fail. The CDN stores that error under the normal key. Researchers documented this class in 2019 as CPDoS. Remember too that 404 is heuristically cacheable. <em>Prove it:</em> <code>curl -s -o /dev/null -w '%{http_code} %header{cache-status}\n' URL</code> shows a hit on an error status. (<code>%header{}</code> needs curl 7.84 or newer; recent macOS ships curl 8.) <em>Fix:</em> cache error statuses for seconds at most, or not at all, and reject malformed requests at the edge rather than forwarding them.</p>
+<p><strong>4. Thundering herd after a purge.</strong> <em>Symptom:</em> origin CPU and connection count spike within seconds of a deploy, and latency follows. <em>Mechanism:</em> a hard purge-everything, combined with weak coalescing or no shield, sends every PoP's next miss straight to the origin. Synchronised TTLs cause the same thing on a schedule: everything published at 09:00 with <code>max-age=3600</code> expires at 10:00. <em>Prove it:</em> origin request rate lines up exactly with the purge timestamp. <code>Cache-Status</code> shows <code>fwd=uri-miss</code> from many PoPs, and <code>collapsed</code> is absent. <em>Fix:</em> use soft purges, purge by tag rather than everything, put a shield in front of the origin, keep <code>stale-while-revalidate</code> on, and add jitter to TTLs.</p>
+<p><strong>5. Hit ratio collapse from key fragmentation.</strong> <em>Symptom:</em> the hit ratio drops after a release, and nothing about content popularity changed. <em>Mechanism:</em> the release added <code>Vary: User-Agent</code> or <code>Vary: Cookie</code>, or a new tracking parameter now appears in the URL. The working set multiplied. <em>Prove it:</em> count distinct keys per URL path in the CDN logs. <code>fwd=vary-miss</code> dominates when <code>Vary</code> is the cause. <em>Fix:</em> normalise in the key (an allowlist of query parameters, bucketed headers), use <code>Vary</code> only on low-cardinality headers, and move personalisation to the client or into a separate uncached request.</p>
+<p><strong>6. Wrong-region users.</strong> <em>Symptom:</em> users in one country see two or three times the latency of their neighbours. <em>Mechanism:</em> with DNS mapping, their resolver sits elsewhere and sends no ECS. With anycast, their ISP's policy routes them to a distant PoP. <em>Prove it:</em> compare <code>dig</code> answers with and without <code>+subnet</code>. Read the vendor's PoP identifier header. Run <code>traceroute -n</code> (or <code>mtr -rw</code> on Linux) to the edge address from an affected network. <em>Fix:</em> for DNS, the CDN can map on ECS where resolvers send it. For anycast, it is a peering and traffic-engineering problem on the CDN's side. Send them traceroutes and RTTs, not adjectives.</p>
+<p><strong>7. Stale content you cannot purge.</strong> <em>Symptom:</em> the purge succeeded, the edge shows a fresh <code>Age</code>, and users still report the old page. <em>Mechanism:</em> the browser holds its own copy under <code>max-age</code>. <em>Prove it:</em> DevTools shows "(disk cache)" or "(memory cache)" for the request. <em>Fix:</em> give HTML a short browser lifetime (<code>max-age=0, must-revalidate</code>, or a short <code>max-age</code>) and a long edge lifetime (<code>s-maxage</code>, or <code>CDN-Cache-Control</code>). Fingerprint the assets.</p>
+<h2 id="d13-2026">Deep dive: 2026 context</h2>
+<p><strong>HTTP/3 at the edge.</strong> Most large CDNs terminate QUIC. Clients learn about it from <code>Alt-Svc</code> or from DNS <code>HTTPS</code> records (RFC 9460). Anycast and QUIC fit well together. Load balancers inside the PoP route on connection IDs, so a client whose NAT rebinding changes its port still reaches the same proxy. Moving a live connection <em>between</em> PoPs is still not something you can count on.</p>
+<p><strong>Standard debugging headers.</strong> <code>Cache-Status</code> (RFC 9211) and <code>CDN-Cache-Control</code> (RFC 9213) replace a decade of vendor headers. <code>CDN-Cache-Control</code> lets you give the CDN a different lifetime from browsers without abusing <code>s-maxage</code>. Adoption is uneven, so check what your vendor emits and obeys.</p>
+<p><strong>New key dimensions.</strong> Compression Dictionary Transport (the <code>Use-As-Dictionary</code> and <code>Available-Dictionary</code> headers) lets a browser decompress a new bundle against the old one, so deploys ship deltas. That adds a dictionary dimension to the key, and caches must vary on it. Separately, a proposed <code>No-Vary-Search</code> header lets the origin declare which query parameters don't affect the response, moving key normalisation out of CDN configuration and into the response.</p>
+<p><strong>Encrypted Client Hello.</strong> With ECH, the TLS SNI is encrypted. On-path networks can no longer see which CDN-fronted site you visit. The CDN still sees everything, because it terminates TLS.</p>
+<p><strong>Edge compute owns the key.</strong> Workers and edge functions let code rewrite requests before lookup. That is powerful, and it is also how key bugs ship. A function that reads a cookie to personalise must also put that cookie, or a bucket of it, into the key.</p>
+<p><strong>Origin protection is a zero-trust problem.</strong> Allowlisting the CDN's published IP ranges at the origin only proves "some customer of this CDN". Anyone else on the same CDN can reach your origin. Authenticate the CDN to the origin with mTLS (often sold as authenticated origin pulls), a signed header, or private connectivity into the VPC.</p>
+<p><strong>Kubernetes and cloud egress.</strong> In clusters, the CDN usually fronts an ingress or gateway. Two operational facts follow. The client address arrives in <code>X-Forwarded-For</code>, and you must trust only the hop you control. And cloud egress is billed per gigabyte, so a shield's offload ratio shows up directly on the invoice.</p>
+<h2 id="d13-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: The CDN dashboard says 95% hit ratio, but origin traffic barely dropped. How is that possible?</strong></p>
+<p>A: Several ways, and I'd check each one. The ratio may be per request while the origin pain is in bytes, because large objects miss more often. It may count shield hits as hits, which says nothing about the edges. Revalidations that end in <code>304</code> often count as hits at the edge, yet each one still reaches the origin. Requests that bypass the cache (<code>no-store</code>, POST, cookie rules) may be left out of the denominator. I'd measure origin offload directly: one minus origin requests over edge requests, in requests and in bytes.</p>
+<p><strong>Q2: When would you choose DNS mapping over anycast?</strong></p>
+<p>A: When I need fine-grained, load-aware steering. Large video or download delivery is the classic case: I want to send 10% of one region's users to a second PoP without moving everyone. Anycast moves whole catchments, and its only levers are BGP announcements. Anycast wins on failover speed and on not depending on resolver location. Many CDNs combine them.</p>
+<p><strong>Q3: What is in a cache key, exactly?</strong></p>
+<p>A: The primary key is the method and target URI after the CDN's normalisation rules. The secondary key comes from the stored response's <code>Vary</code>: the values of the named request headers, often normalised. A lookup matches the primary key, then walks that key's variants. <code>Vary: *</code> never matches. The design rule is that the key must contain every input that changes the response, and nothing that doesn't.</p>
+<p><strong>Q4: Explain cache poisoning versus web cache deception.</strong></p>
+<p>A: In poisoning, the attacker controls an <em>input</em> the key ignores, so their malicious response gets served to others. In deception, the attacker controls the <em>URL</em> so that a victim's private response lands under a cacheable key, and the attacker reads it. The first is the key missing an input. The second is caching policy not following the origin's <code>Cache-Control</code>. Both are fixed by making the key and the caching decision follow what the response actually depends on.</p>
+<p><strong>Q5: You purged a URL. Why might users still get the old version?</strong></p>
+<p>A: Browser caches can't be purged. Propagation isn't atomic, so some PoPs flip later than others. An edge that refills from a shield before the shield processes the purge gets the old object back. The purge may also have named a different key, for example a different query string or host normalisation. I'd check <code>Age</code> and <code>Cache-Status</code> from several PoPs, and look at the browser's cache.</p>
+<p><strong>Q6: An object with <code>max-age=60</code> keeps getting re-fetched at the edge every 20 seconds. Why?</strong></p>
+<p>A: The edge inherits <code>Age</code> from the shield. If the shield's copy is already 40 seconds old when the edge fetches it, the edge has only 20 seconds of freshness left. Edge and shield expire together, and every edge revalidates at the same moment.</p>
+<p><strong>Q7: How do you raise the hit ratio on long-tail content without raising TTLs?</strong></p>
+<p>A: Raise the request rate each cache sees per key. A shield or tiered cache aggregates misses across PoPs. Consistent hashing inside a PoP makes forty servers behave like one cache. Cutting variants (normalised query strings, bucketed headers) concentrates traffic onto fewer keys. With <code>λT/(1+λT)</code>, raising λ works just as well as raising T, and it doesn't make content staler.</p>
+<p><strong>Q8: Why is <code>stale-while-revalidate</code> safer than a long <code>max-age</code>?</strong></p>
+<p>A: It bounds staleness differently. With <code>max-age=60, stale-while-revalidate=30</code>, no user ever sees content more than 90 seconds old, and almost no user waits on the origin, because the refresh happens in the background after the first stale hit. A long <code>max-age</code> gives the same latency with much worse staleness. Pair it with <code>stale-if-error</code> and an origin outage turns into slightly old pages rather than errors.</p>
+<p><strong>Standards cited in this deep dive:</strong> RFC 9111 (HTTP Caching), RFC 9110 (HTTP Semantics), RFC 5861 (<code>stale-while-revalidate</code>, <code>stale-if-error</code>), RFC 9211 (<code>Cache-Status</code>), RFC 9213 (<code>CDN-Cache-Control</code>), RFC 7871 (EDNS Client Subnet), RFC 9460 (SVCB and HTTPS records), RFC 4786 (Operation of Anycast Services). <code>Surrogate-Key</code> and <code>Cache-Tag</code> are vendor headers, and Compression Dictionary Transport and <code>No-Vary-Search</code> are newer IETF work. Check your vendor's support before relying on them.</p>
