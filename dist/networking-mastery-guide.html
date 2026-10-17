@@ -310,7 +310,7 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li><a href="#how-to-use-this-guide" id="toc-how-to-use-this-guide">How to use this guide</a></li>
 <li><a href="#how-to-run-the-examples" id="toc-how-to-run-the-examples">How to run the examples</a></li>
 <li><a href="#conventions-used-in-this-guide" id="toc-conventions-used-in-this-guide">Conventions used in this guide</a></li>
-<li><a href="#the-eighteen-modules" id="toc-the-eighteen-modules">The twenty-one modules</a></li>
+<li><a href="#the-eighteen-modules" id="toc-the-eighteen-modules">The twenty-two modules</a></li>
 </ul></li>
 <li><a href="#module-01--think-like-a-network-engineer" id="toc-module-01--think-like-a-network-engineer">Module 01 — Think Like a Network Engineer</a> <ul> <li><a href="#1-why-it-matters" id="toc-1-why-it-matters">1. Why it matters</a></li>
 <li><a href="#2-the-mental-model" id="toc-2-the-mental-model">2. The mental model</a> <ul> <li><a href="#why-two-models-exist-osi-7-vs-tcpip-5" id="toc-why-two-models-exist-osi-7-vs-tcpip-5">Why two models exist: OSI 7 vs TCP/IP 5</a></li>
@@ -692,6 +692,24 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li><a href="#m20-deep-dive-2026-context" id="toc-m20-deep-dive-2026-context">Deep dive: 2026 context</a></li>
 <li><a href="#m20-deep-dive-senior-interview-questions" id="toc-m20-deep-dive-senior-interview-questions">Deep dive: senior interview questions</a></li>
 </ul></li>
+<li><a href="#module-21--bgp--how-the-internet-routes" id="toc-module-21--bgp--how-the-internet-routes">Module 21 — BGP &amp; How the Internet Routes</a> <ul>
+<li><a href="#m21-1-why-it-matters" id="toc-m21-1-why-it-matters">1. Why it matters</a></li>
+<li><a href="#m21-2-the-mental-model" id="toc-m21-2-the-mental-model">2. The mental model</a></li>
+<li><a href="#m21-3-how-it-works" id="toc-m21-3-how-it-works">3. How it works</a></li>
+<li><a href="#m21-4-the-exact-structure" id="toc-m21-4-the-exact-structure">4. The exact structure</a></li>
+<li><a href="#m21-5-a-realistic-example" id="toc-m21-5-a-realistic-example">5. A realistic example</a></li>
+<li><a href="#m21-6-misconceptions--common-mistakes" id="toc-m21-6-misconceptions--common-mistakes">6. Misconceptions &amp; common mistakes</a></li>
+<li><a href="#m21-7-interview-qa" id="toc-m21-7-interview-qa">7. Interview Q&amp;A</a></li>
+<li><a href="#m21-8-try-it" id="toc-m21-8-try-it">8. Try it</a></li>
+<li><a href="#m21-9-code-a-toy-best-path-selector" id="toc-m21-9-code-a-toy-best-path-selector">9. Code: a toy best-path selector</a></li>
+<li><a href="#m21-deep-dive" id="toc-m21-deep-dive">Deep dive: what the summary view leaves out</a></li>
+<li><a href="#m21-deep-the-real-mental-model" id="toc-m21-deep-the-real-mental-model">Deep dive: the real mental model</a></li>
+<li><a href="#m21-deep-what-the-wire-actually-carries" id="toc-m21-deep-what-the-wire-actually-carries">Deep dive: what the wire actually carries</a></li>
+<li><a href="#m21-deep-by-the-numbers" id="toc-m21-deep-by-the-numbers">Deep dive: by the numbers</a></li>
+<li><a href="#m21-deep-production-failure-modes" id="toc-m21-deep-production-failure-modes">Deep dive: production failure modes</a></li>
+<li><a href="#m21-deep-2026-context" id="toc-m21-deep-2026-context">Deep dive: 2026 context</a></li>
+<li><a href="#m21-deep-senior-interview-questions" id="toc-m21-deep-senior-interview-questions">Deep dive: senior interview questions</a></li>
+</ul></li>
 <li><a href="#module-22--cloud-networking" id="toc-module-22--cloud-networking">Module 22 — Cloud Networking</a> <ul>
 <li><a href="#m22-1-why-it-matters" id="toc-m22-1-why-it-matters">1. Why it matters</a></li>
 <li><a href="#m22-2-the-mental-model" id="toc-m22-2-the-mental-model">2. The mental model</a></li>
@@ -710,7 +728,7 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li><a href="#m22-deep-dive-2026-context" id="toc-m22-deep-dive-2026-context">Deep dive: 2026 context</a></li>
 <li><a href="#m22-deep-dive-senior-interview-questions" id="toc-m22-deep-dive-senior-interview-questions">Deep dive: senior interview questions</a></li>
 </ul></li>
-<li><a href="#module-22--back-matter" id="toc-module-22--back-matter">Module 22 — Back Matter</a> <ul> <li><a href="#glossary" id="toc-glossary">Glossary</a></li>
+<li><a href="#module-23--back-matter" id="toc-module-23--back-matter">Module 23 — Back Matter</a> <ul> <li><a href="#glossary" id="toc-glossary">Glossary</a></li>
 <li><a href="#subnetting-cheat-sheet" id="toc-subnetting-cheat-sheet">Subnetting cheat sheet</a></li>
 <li><a href="#common-ports" id="toc-common-ports">Common ports</a></li>
 <li><a href="#troubleshooting-flowchart" id="toc-troubleshooting-flowchart">Troubleshooting flowchart</a></li>
@@ -719,7 +737,7 @@ details.answer > p:last-child{ margin-bottom:14px; }
 </nav>
 <p><a id="orientation"></a></p>
 <h1 id="networking-mastery-guide">Networking Mastery Guide</h1>
-<p><em>From "packets go in, packets come out" to reading a network the way you read code — twenty-one modules, built for an engineer who thinks in systems.</em></p>
+<p><em>From "packets go in, packets come out" to reading a network the way you read code — twenty-two modules, built for an engineer who thinks in systems.</em></p>
 <h2 id="who-this-guide-is-for">Who this guide is for</h2>
 <p>You are a working engineer. You can reason about distributed systems, you read packet captures without flinching at hex, and you have been nodding along in design reviews when someone says "the LB terminates TLS and the edge caches it." This guide turns those nods into real understanding: what actually happens to your bytes between <code>send()</code> and the other side's <code>recv()</code>, and why networks are designed the way they are.</p>
 <p>No prior networking study is assumed. Python fluency helps — the runnable examples are Python — but every example is small and explained line by line.</p>
@@ -740,7 +758,7 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li><strong>Sample outputs from live commands</strong> (ping, dig, traceroute) are annotated illustrations, clearly labeled — your output will differ.</li>
 <li><strong>Diagrams</strong> are hand-drawn schematics, not packet captures. Bit widths and field orders are accurate; they are drawn to teach, not to scale.</li>
 </ul>
-<h2 id="the-eighteen-modules">The twenty-one modules</h2>
+<h2 id="the-eighteen-modules">The twenty-two modules</h2>
 <ol type="1">
 <li>Think Like a Network Engineer — layers, encapsulation, the end-to-end principle</li>
 <li>How Data Actually Moves — bits to frames to packets to segments</li>
@@ -766,11 +784,12 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li>Load Balancing — L4 vs L7, algorithms from round robin to Maglev, health checks, draining, global load balancing</li>
 <li>QUIC &amp; HTTP/3 — streams without head-of-line blocking, connection IDs and migration, 0-RTT, discovery and fallback</li>
 <li>BGP &amp; How the Internet Routes — autonomous systems, peering and transit, best-path selection, hijacks and RPKI</li>
+<li>Cloud Networking — VPCs as overlays, route tables, NAT gateways, security groups, peering, Transit Gateway, PrivateLink</li>
 </ol>
 <p>Every module from 01 to 18 also ends with a set of <strong>Deep dive</strong> sections. They replace the analogy with the real machine: the state it keeps, what the wire and the kernel actually do, the numbers that matter, how it fails in production and how to prove it, and the questions a senior interviewer asks.</p>
 <p>Back matter: glossary, subnetting cheat sheet, common-ports table, troubleshooting flowchart.</p>
 <h1 id="module-01--think-like-a-network-engineer">Module 01 — Think Like a Network Engineer</h1>
-<p><em>Networking Mastery Guide · Module 1 of 21</em></p>
+<p><em>Networking Mastery Guide · Module 1 of 22</em></p>
 <hr />
 <h2 id="1-why-it-matters">1. Why it matters</h2>
 <p>Picture a 2 AM page. Checkout is failing for some customers but not all. The app logs look clean. The database is fine. Somewhere between the browser and the backend, something is dropping or mangling traffic — and nobody can say where.</p>
@@ -1031,7 +1050,7 @@ every layer below its own untouched -- that is the peer illusion.</code></pre>
 <hr />
 <p><em>Next: Module 2 — How Data Actually Moves. Encapsulation, byte by byte: what each header carries, what changes at every hop, and what stays untouched end to end.</em></p>
 <h1 id="module-02--how-data-actually-moves">Module 02 — How Data Actually Moves</h1>
-<p><em>Networking Mastery Guide · Module 2 of 21</em></p>
+<p><em>Networking Mastery Guide · Module 2 of 22</em></p>
 <hr />
 <h2 id="1-why-it-matters-1">1. Why it matters</h2>
 <p>Module 1 gave you the map: five layers, each wrapping the payload from above. This module walks the territory. You will see exactly what gets added at each layer, and how many bytes it costs. And — the part that surprises most people — what changes as a packet crosses each router, and what stays untouched from sender to receiver.</p>
@@ -1279,7 +1298,7 @@ a Linux server, and a router ASIC all read the same bytes.</code></pre>
 <hr />
 <p><em>Next: Module 3 — Ethernet &amp; Switching. MAC addresses, the frame layout, how switches learn, and why a loop at Layer 2 melts a network in seconds.</em></p>
 <h1 id="module-03--ethernet--switching">Module 03 — Ethernet &amp; Switching</h1>
-<p><em>Networking Mastery Guide · Module 3 of 21</em></p>
+<p><em>Networking Mastery Guide · Module 3 of 22</em></p>
 <hr />
 <h2 id="1-why-it-matters-2">1. Why it matters</h2>
 <p>Everything above the link layer assumes the link layer works. IP assumes it can hand a packet to a neighbor. TCP assumes segments arrive uncorrupted. When the link layer misbehaves, the symptoms show up everywhere else — as retransmissions, as "no route to host," as a gateway that answers ARP sometimes and not others.</p>
@@ -1477,7 +1496,7 @@ ff:ff:ff:ff:ff:ff  -- broadcast
 <hr />
 <p><em>Next: Module 4 — IPv4 + IPv6. Addressing, CIDR, the IPv4 header field by field, fragmentation, and the 128-bit redesign that fixed IPv4's regrets.</em></p>
 <h1 id="module-04--ipv4--ipv6">Module 04 — IPv4 + IPv6</h1>
-<p><em>Networking Mastery Guide · Module 4 of 21</em></p>
+<p><em>Networking Mastery Guide · Module 4 of 22</em></p>
 <hr />
 <h2 id="1-why-it-matters-3">1. Why it matters</h2>
 <p>IP is the narrow waist of the Internet — the one protocol everything converges on, from Module 1's diagram. Every routing decision, every firewall rule, every load-balancer target, every Kubernetes Service is ultimately an IP address and a prefix. If you are fuzzy on addressing, you are fuzzy on all of them.</p>
@@ -12003,6 +12022,1375 @@ $ curl -sv --http3-only -o /dev/null https://example.com/   # can QUIC actually 
 <p><strong>Q9: When would you deliberately not enable HTTP/3?</strong></p>
 <p>A: Internal east-west traffic in a low-loss data centre, where it adds CPU and operational complexity for little gain. Paths where you can't route UDP by connection ID and clients change addresses often — you'd get the cost without migration. Environments where UDP 443 is filtered for most clients. And any deployment where you can't keep TCP as a fallback. Wherever you do enable it, measure h3 against h2 per client network before declaring a win.</p>
 <p><strong>Standards cited:</strong> RFC 9000 (QUIC transport), RFC 9001 (TLS for QUIC), RFC 9002 (loss detection and congestion control), RFC 9114 (HTTP/3), RFC 9204 (QPACK), RFC 8999 (version-independent properties), RFC 9218 (Extensible Priorities), RFC 9220 (extended CONNECT for HTTP/3), RFC 9221 (DATAGRAM frames), RFC 9287 (greasing the QUIC bit), RFC 9297 (HTTP Datagrams), RFC 9298 (CONNECT-UDP), RFC 9312 (QUIC manageability), RFC 9368 (compatible version negotiation), RFC 9369 (QUIC v2), RFC 9460 (SVCB and HTTPS records), RFC 9484 (CONNECT-IP), RFC 7838 (Alt-Svc), RFC 8470 (425 Too Early), RFC 8879 (TLS certificate compression), RFC 8899 (DPLPMTUD), RFC 4787 (NAT UDP behaviour), RFC 7413 (TCP Fast Open), RFC 6298 (TCP RTO).</p>
+<h1 id="module-21--bgp--how-the-internet-routes">Module 21 — BGP &amp; How the Internet Routes</h1>
+<p><em>Networking Mastery Guide · Module 21 of 23</em></p>
+<hr />
+<h2 id="m21-1-why-it-matters">1. Why it matters</h2>
+<p>On 4 October 2021, Facebook, Instagram and WhatsApp vanished from the internet for about six hours. Their servers were running. Their data centres had power. What disappeared was a handful of BGP announcements. A maintenance command took down Facebook's backbone, and its authoritative DNS servers, no longer able to reach the data centres behind them, did what they were built to do: they withdrew the BGP routes for their own anycast addresses. Within a couple of minutes no network on earth had a route to Facebook's DNS. Resolvers everywhere returned SERVFAIL, and retries from billions of apps piled extra load onto everyone else's resolvers.</p>
+<p>That is the thing to hold onto about BGP. Every other module in this guide assumes that a packet addressed to a public IP will find its way there. BGP is the reason that assumption is true, and also the reason it sometimes stops being true for an hour at a time.</p>
+<p>Module 9 gave you the one-line version: BGP is the path-vector protocol that runs between autonomous systems and optimises for policy rather than distance. This module opens it up. You will see what an AS is and why some networks pay others, how two routers bring up a session and what bytes they exchange, how a router picks one path out of many, why a /24 beats a /22 everywhere on earth, and how a mistake in one small network becomes a global outage.</p>
+<p>It also matters closer to home than you might expect. In 2026, BGP is not only the protocol between ISPs. Your cloud provider runs it on Direct Connect, ExpressRoute and Cloud Router sessions. Large data centres use it as their only routing protocol. Your Kubernetes cluster may well be running it right now: Calico, MetalLB and Cilium all speak BGP to announce pod and service addresses to the physical network. When a <code>LoadBalancer</code> service stops answering from outside the cluster, the root cause is often a BGP session you didn't know existed.</p>
+<h2 id="m21-2-the-mental-model">2. The mental model</h2>
+<p>Start with the right picture of the internet. It is not one network. It is about 75,000 to 80,000 independently run networks, called <strong>autonomous systems</strong> (ASes), each with its own routers, its own policies and its own commercial interests. An AS is a network under one administration with one routing policy. Comcast is an AS. So is Cloudflare, a university, a mid-sized hosting company, and a bank that wants its own address space reachable over two ISPs.</p>
+<p>No central authority tells these networks how to reach each other. Instead, each AS tells its neighbours which address blocks (<strong>prefixes</strong>) it can deliver traffic to. Those neighbours tell their neighbours, adding their own AS number to the front of a list as they go. That list is the <strong>AS_PATH</strong>. By the time a route for <code>203.0.113.0/24</code> reaches you, it reads something like <code>64497 64502 64511</code>: "send it to 64497, who will hand it to 64502, who will hand it to 64511, which owns the prefix."</p>
+<p>So a BGP route is a promise passed along a chain. Each link in the chain says, "I can get traffic there, and here is the chain of networks it will cross." This is why BGP is called <strong>path-vector</strong>. A distance-vector protocol like RIP only passes on a number. BGP passes on the whole path, and that path does two jobs at once. It prevents loops, because a router that sees its own AS number in a path rejects the route. And it gives each network something to make policy decisions on.</p>
+<p>Here is the part that trips people up. BGP does not find the shortest path. It finds the path each network <em>prefers</em>, and preference is mostly about money. A network would rather send traffic to a customer (who pays it) than to a peer (free) than to a transit provider (who it pays). Path length is a tie-breaker that only counts after policy has had its say. The internet's routing is the sum of tens of thousands of selfish local decisions. That it converges on working paths at all is a result of a few conventions everyone follows. That it sometimes doesn't is a result of someone not following them.</p>
+<p>Three properties fall out of this picture, and you will use them all through the module:</p>
+<ul>
+<li><strong>You control your outbound traffic; you only influence your inbound traffic.</strong> Your routers choose where your packets leave. Other networks' routers choose how packets reach you, using their policies, not yours.</li>
+<li><strong>BGP trusts what it hears.</strong> The base protocol has no way to check that the AS announcing a prefix is allowed to. Every hijack and leak in this module comes from that one gap. RPKI is the partial patch.</li>
+<li><strong>Paths are asymmetric.</strong> The route from A to B and the route from B to A are chosen by different networks with different policies. They rarely match.</li>
+</ul>
+<h2 id="m21-3-how-it-works">3. How it works</h2>
+<h3 id="m21-31-autonomous-systems-and-as-numbers">3.1 Autonomous systems and AS numbers</h3>
+<p>Each AS gets an <strong>AS number</strong> (ASN) from a regional internet registry (ARIN, RIPE NCC, APNIC, LACNIC, AFRINIC). ASNs were 16 bits until RFC 4893 (now RFC 6793) widened them to 32 bits. The ranges you need to recognise:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Range</th>
+<th>What it is</th>
+<th>Standard</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1 – 64495</td>
+<td>Public 16-bit ASNs</td>
+<td>RFC 1930 / IANA registry</td>
+</tr>
+<tr class="even">
+<td>23456</td>
+<td><code>AS_TRANS</code>: placeholder a 4-byte ASN shows to a 2-byte-only peer</td>
+<td>RFC 6793</td>
+</tr>
+<tr class="odd">
+<td>64496 – 64511</td>
+<td>Documentation and examples (used throughout this module)</td>
+<td>RFC 5398</td>
+</tr>
+<tr class="even">
+<td>64512 – 65534</td>
+<td>Private use, like RFC 1918 for ASNs</td>
+<td>RFC 6996</td>
+</tr>
+<tr class="odd">
+<td>65536 – 65551</td>
+<td>Documentation, 32-bit</td>
+<td>RFC 5398</td>
+</tr>
+<tr class="even">
+<td>131072 – 4199999999</td>
+<td>Public 32-bit ASNs (allocated in blocks)</td>
+<td>IANA registry</td>
+</tr>
+<tr class="odd">
+<td>4200000000 – 4294967294</td>
+<td>Private use, 32-bit</td>
+<td>RFC 6996</td>
+</tr>
+</tbody>
+</table>
+<p>Private ASNs matter more than they look. Data-centre fabrics and Kubernetes clusters use them by the hundred (§Deep dive: 2026 context), and they must be stripped before a route reaches the public internet.</p>
+<p>Some real ASNs you will see in looking glasses: AS13335 (Cloudflare), AS15169 (Google), AS16509 (Amazon), AS32934 (Facebook/Meta), AS3356 (Lumen), AS1299 (Arelion), AS174 (Cogent), AS2914 (NTT).</p>
+<h3 id="m21-32-transit-peering-and-the-money">3.2 Transit, peering and the money</h3>
+<p>Every BGP relationship between two ASes is one of two commercial kinds.</p>
+<p><strong>Transit</strong> is a paid service. The customer pays the provider, and the provider promises to carry the customer's traffic to the whole internet and to announce the customer's prefixes to the whole internet. The customer usually receives either a full table (every route the provider knows) or just a default route.</p>
+<p><strong>Peering</strong> is an exchange between equals. Two networks agree to swap traffic for each other's customers, usually without money changing hands ("settlement-free"). Crucially, a peer only gives you routes to <em>its own and its customers'</em> prefixes. It is not selling you the rest of the internet.</p>
+<p>A handful of networks buy transit from nobody. They reach every destination through their own customers and through settlement-free peering with each other. These are called <strong>Tier 1</strong> networks; Lumen (AS3356), Arelion (AS1299), NTT (AS2914) and Cogent (AS174) are commonly listed. "Tier 1" is a convention, not a certification, and the exact membership is argued about.</p>
+<p>The commercial relationships translate directly into routing policy. The standard model is named after Lixin Gao and Jennifer Rexford, who showed in 2001 that if every network follows these rules, BGP is guaranteed to converge:</p>
+<div style="overflow-x:auto">
+<svg viewBox="0 0 760 450" role="img" aria-labelledby="m21-rel-title m21-rel-desc" style="min-width:760px;max-width:100%;height:auto;">
+<title id="m21-rel-title">Transit, peering and customers: who pays and which routes flow</title>
+<desc id="m21-rel-desc">Your AS buys transit from one AS, peers settlement-free with another at an IXP, and sells transit to a customer. Export rules: customers get everything; peers and transit providers get only your own and your customers' routes.</desc>
+<rect x="0" y="0" width="760" height="450" fill="#f5f5f5"/>
+<text x="24" y="34" font-family="monospace" font-size="11" fill="#8a8f98" letter-spacing="2">M21 · BGP</text>
+<text x="24" y="62" font-family="sans-serif" font-size="21" font-weight="600" fill="#2d3142">Relationships decide which routes flow where</text>
+<g font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">
+<rect x="270" y="92" width="200" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="370" y="118" text-anchor="middle">AS 64497</text><text x="370" y="140" text-anchor="middle" font-family="monospace" font-weight="400" font-size="11" fill="#6b6f7e">transit provider</text>
+<rect x="30" y="212" width="190" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="125" y="238" text-anchor="middle">AS 64498</text><text x="125" y="260" text-anchor="middle" font-family="monospace" font-weight="400" font-size="11" fill="#6b6f7e">peer, met at an IXP</text>
+<rect x="270" y="212" width="200" height="64" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2.5"/><text x="370" y="238" text-anchor="middle">AS 64496 (you)</text><text x="370" y="260" text-anchor="middle" font-family="monospace" font-weight="400" font-size="11" fill="#6b6f7e">announces 203.0.113.0/24</text>
+<rect x="270" y="332" width="200" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="370" y="358" text-anchor="middle">AS 64499</text><text x="370" y="380" text-anchor="middle" font-family="monospace" font-weight="400" font-size="11" fill="#6b6f7e">your customer</text>
+</g>
+<g stroke="#2d3142" stroke-width="1.5">
+<line x1="370" y1="156" x2="370" y2="212"/>
+<line x1="220" y1="244" x2="270" y2="244"/>
+<line x1="370" y1="276" x2="370" y2="332"/>
+</g>
+<g font-family="monospace" font-size="11" fill="#bf4520">
+<rect x="378" y="174" width="96" height="16" fill="#f5f5f5"/><text x="382" y="186">you pay ↑</text>
+<text x="210" y="204">no money</text>
+<rect x="378" y="294" width="110" height="16" fill="#f5f5f5"/><text x="382" y="306">they pay you ↑</text>
+</g>
+<rect x="510" y="92" width="226" height="212" rx="6" fill="#ffffff" stroke="#d8d4cc"/>
+<g font-family="sans-serif" font-size="12" fill="#2d3142">
+<text x="524" y="116" font-weight="600" font-size="13">Export rules (Gao–Rexford)</text>
+<text x="524" y="142">to customer:</text><text x="618" y="142" font-family="monospace" font-size="11">everything</text>
+<text x="524" y="164">to peer:</text><text x="618" y="164" font-family="monospace" font-size="11">own + customers'</text>
+<text x="524" y="186">to transit:</text><text x="618" y="186" font-family="monospace" font-size="11">own + customers'</text>
+<text x="524" y="220" font-weight="600" font-size="13">Import: LOCAL_PREF</text>
+<text x="524" y="244" font-family="monospace" font-size="11">customer 200</text>
+<text x="524" y="262" font-family="monospace" font-size="11">peer     150</text>
+<text x="524" y="280" font-family="monospace" font-size="11">transit  100  (convention)</text>
+</g>
+<text x="24" y="418" font-family="sans-serif" font-size="12" fill="#8a8f98">Pass a peer's or provider's route to another peer or provider and you have leaked it:</text>
+<text x="24" y="436" font-family="sans-serif" font-size="12" fill="#8a8f98">you now carry traffic that nobody pays you for.</text>
+</svg>
+</div>
+
+<p>The rules in the diagram are two tables in every border router's config:</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Route learned from</th>
+<th>Typical LOCAL_PREF on import</th>
+<th>Exported to customers?</th>
+<th>Exported to peers?</th>
+<th>Exported to transit?</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Customer</td>
+<td>200</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr class="even">
+<td>Peer</td>
+<td>150</td>
+<td>Yes</td>
+<td><strong>No</strong></td>
+<td><strong>No</strong></td>
+</tr>
+<tr class="odd">
+<td>Transit provider</td>
+<td>100</td>
+<td>Yes</td>
+<td><strong>No</strong></td>
+<td><strong>No</strong></td>
+</tr>
+<tr class="even">
+<td>Your own prefixes</td>
+<td>(locally originated)</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+</tbody>
+</table>
+<p>The LOCAL_PREF numbers are a convention; each operator picks their own. The ordering (customer &gt; peer &gt; transit) is what matters, because it makes the router prefer the route that earns money over the one that costs money.</p>
+<p>The export rules produce what's called <strong>valley-free</strong> routing. A path goes up through providers, optionally across one peering link, then down through customers. It never goes down and back up. A path that dips into a network and climbs out again (provider → you → another provider) would mean you are giving free transit between two networks bigger than you. When that happens by accident, it is a <strong>route leak</strong> (RFC 7908 has the formal taxonomy).</p>
+<h3 id="m21-33-internet-exchange-points">3.3 Internet exchange points</h3>
+<p>Peering needs a place to connect. You can run a private cable between two routers in the same building (a <strong>private network interconnect</strong>, PNI). Or you can connect once to an <strong>internet exchange point</strong> (IXP) and peer with hundreds of networks over a single port.</p>
+<p>An IXP is, physically, a big Ethernet switch fabric in one or more data centres. Every member gets a port and an address on a shared peering LAN. DE-CIX Frankfurt, AMS-IX and LINX are among the largest, with peak traffic in the tens of terabits per second. The IXP itself usually does not route anything. Members run BGP sessions directly with each other across the shared LAN.</p>
+<p>Running hundreds of bilateral sessions is tedious, so most IXPs offer <strong>route servers</strong> (RFC 7947). A member opens one session to the route server, which collects everyone's routes, filters them (many route servers now drop RPKI-invalid routes) and reflects them out. Unlike a normal BGP speaker, a route server does not add its own ASN to the AS_PATH, and it leaves the NEXT_HOP pointing at the member who announced the route. Traffic flows member-to-member across the switch; the route server only carries the control plane. Route servers commonly run BIRD or OpenBGPD.</p>
+<p>PeeringDB (<code>peeringdb.com</code>) is the public directory of who is present at which IXP and facility, and what their peering policy is. It is the first place a network engineer looks when planning where to peer.</p>
+<h3 id="m21-34-ebgp-and-ibgp">3.4 eBGP and iBGP</h3>
+<p>BGP runs in two modes that share one protocol but behave differently.</p>
+<p><strong>eBGP</strong> (external) runs between routers in <em>different</em> ASes. It is the mode everything above has described. An eBGP speaker prepends its own ASN to the AS_PATH when it sends a route, and it sets NEXT_HOP to its own address. By default, eBGP packets are sent with IP TTL 1, because the neighbour is expected to sit on a directly connected link. (<code>ebgp-multihop</code> raises it; the GTSM trick in RFC 5082 inverts it and sends TTL 255, so the receiver can drop anything with TTL below 255 as spoofed from afar.)</p>
+<p><strong>iBGP</strong> (internal) runs between routers in the <em>same</em> AS. Its job is to carry external routes across your network, so that a router in London knows what your router in Frankfurt learned from a transit provider there. Three rules make iBGP different:</p>
+<ol type="1">
+<li><strong>No AS_PATH prepend.</strong> The route stays inside one AS, so the path doesn't change.</li>
+<li><strong>NEXT_HOP is passed through unchanged.</strong> A route learned over eBGP in Frankfurt still names the Frankfurt transit router's address as next hop when it reaches London. If London has no IGP route to that address, the BGP route is unusable. This is why border routers almost always set <code>next-hop-self</code> on their iBGP sessions.</li>
+<li><strong>iBGP split horizon.</strong> A route learned from one iBGP peer is never passed to another iBGP peer. Without an AS_PATH change, iBGP has no loop detection, so this rule stands in for it.</li>
+</ol>
+<p>Rule 3 means every iBGP router must peer with every other one: a full mesh of n(n−1)/2 sessions. Fifty routers need 1,225 sessions. Two standard fixes exist. <strong>Route reflectors</strong> (RFC 4456) are allowed to break the split-horizon rule for their clients; they add ORIGINATOR_ID and CLUSTER_LIST attributes to stop loops. <strong>Confederations</strong> (RFC 5065) split one AS into private sub-ASes that speak a modified eBGP to each other. Route reflectors won in practice.</p>
+<p>iBGP carries the <em>external</em> routes. An IGP (OSPF or IS-IS) still runs underneath to carry the routes to loopbacks and links inside the AS, including the next-hop addresses BGP depends on.</p>
+<h3 id="m21-35-sessions-tcp-port-179-and-a-six-state-machine">3.5 Sessions: TCP port 179 and a six-state machine</h3>
+<p>A BGP session is one ordinary TCP connection to port 179. BGP has no discovery and no multicast hellos, unlike OSPF. You configure each neighbour by address and ASN, and the routers connect. Running over TCP is a deliberate choice: BGP gets reliable, ordered delivery for free, so it never has to retransmit or sequence its own messages. Once a route is sent, it stays valid until it is explicitly withdrawn or the session dies.</p>
+<p>Each session runs a finite state machine defined in RFC 4271 §8:</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>State</th>
+<th>What the router is doing</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Idle</td>
+<td>Refusing connections. Starts here, and returns here after any error.</td>
+</tr>
+<tr class="even">
+<td>Connect</td>
+<td>Waiting for its outgoing TCP connection to complete.</td>
+</tr>
+<tr class="odd">
+<td>Active</td>
+<td>Listening for the peer to connect in (despite the name, this is the passive state).</td>
+</tr>
+<tr class="even">
+<td>OpenSent</td>
+<td>TCP is up; it has sent OPEN and is waiting for the peer's OPEN.</td>
+</tr>
+<tr class="odd">
+<td>OpenConfirm</td>
+<td>OPENs exchanged and accepted; waiting for the first KEEPALIVE.</td>
+</tr>
+<tr class="even">
+<td>Established</td>
+<td>Exchanging UPDATEs. The only state in which routes flow.</td>
+</tr>
+</tbody>
+</table>
+<p>A session stuck flipping between Active and Connect means TCP itself isn't working: wrong address, a firewall dropping 179, a missing route to the neighbour, or a TTL problem. A session that reaches OpenSent and falls back to Idle means the OPEN was rejected, usually because of a wrong ASN or a mismatched capability. Those two cases cover most "BGP won't come up" tickets.</p>
+<p>Two timers keep the session alive. The <strong>hold time</strong> is negotiated in the OPEN messages; the lower of the two offers wins. RFC 4271 suggests 90 seconds. Each side then sends a KEEPALIVE every hold/3 seconds, if it has nothing else to send. If no message arrives within the hold time, the router declares the peer dead, sends a NOTIFICATION, tears down the session and withdraws every route learned from it. Defaults vary: Cisco IOS uses 60/180 seconds keepalive/hold, FRR's <code>datacenter</code> profile uses 3/9 seconds.</p>
+<h3 id="m21-36-four-messages-and-a-fifth">3.6 Four messages (and a fifth)</h3>
+<p>Every BGP message starts with the same 19-byte header: a 16-byte marker of all ones, a 2-byte length and a 1-byte type. The maximum message size is 4,096 bytes, unless both sides negotiate extended messages (RFC 8654, up to 65,535).</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Type</th>
+<th>Name</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1</td>
+<td>OPEN</td>
+<td>First message after TCP comes up: version, ASN, hold time, router ID, capabilities</td>
+</tr>
+<tr class="even">
+<td>2</td>
+<td>UPDATE</td>
+<td>Announce new routes, withdraw old ones, or both</td>
+</tr>
+<tr class="odd">
+<td>3</td>
+<td>NOTIFICATION</td>
+<td>Report a fatal error. The session is closed right after it is sent.</td>
+</tr>
+<tr class="even">
+<td>4</td>
+<td>KEEPALIVE</td>
+<td>Header only, 19 bytes. "I'm still here."</td>
+</tr>
+<tr class="odd">
+<td>5</td>
+<td>ROUTE-REFRESH</td>
+<td>Ask the peer to resend all its routes (RFC 2918), so new import policy can apply without a reset</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Capabilities</strong> (RFC 5492) ride inside the OPEN and are how BGP has grown without a version 5. The important ones are multiprotocol extensions (RFC 4760, which is how BGP carries IPv6, VPN routes and EVPN), 4-octet ASNs, route refresh, graceful restart (RFC 4724) and add-path (RFC 7911). If a capability is not advertised by both sides, it is not used.</p>
+<h3 id="m21-37-path-attributes">3.7 Path attributes</h3>
+<p>An UPDATE carries a set of <strong>path attributes</strong> that apply to every prefix in that UPDATE. The attributes are the raw material of every BGP decision. Here are the ones that matter:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Code</th>
+<th>Attribute</th>
+<th>Category</th>
+<th>What it carries</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1</td>
+<td>ORIGIN</td>
+<td>well-known mandatory</td>
+<td>How the route entered BGP: IGP (0), EGP (1), INCOMPLETE (2, usually redistributed)</td>
+</tr>
+<tr class="even">
+<td>2</td>
+<td>AS_PATH</td>
+<td>well-known mandatory</td>
+<td>The ASes the route has crossed, newest first</td>
+</tr>
+<tr class="odd">
+<td>3</td>
+<td>NEXT_HOP</td>
+<td>well-known mandatory</td>
+<td>The IPv4 address to forward traffic to</td>
+</tr>
+<tr class="even">
+<td>4</td>
+<td>MULTI_EXIT_DISC (MED)</td>
+<td>optional non-transitive</td>
+<td>A hint to a <em>neighbouring</em> AS about which of several links to use. Lower is better.</td>
+</tr>
+<tr class="odd">
+<td>5</td>
+<td>LOCAL_PREF</td>
+<td>well-known, iBGP only</td>
+<td>Your own AS's preference for this path. Higher is better. Never sent over eBGP.</td>
+</tr>
+<tr class="even">
+<td>8</td>
+<td>COMMUNITIES</td>
+<td>optional transitive</td>
+<td>32-bit tags (<code>ASN:value</code>) that carry policy signals (RFC 1997)</td>
+</tr>
+<tr class="odd">
+<td>9, 10</td>
+<td>ORIGINATOR_ID, CLUSTER_LIST</td>
+<td>optional non-transitive</td>
+<td>Loop prevention for route reflectors (RFC 4456)</td>
+</tr>
+<tr class="even">
+<td>14, 15</td>
+<td>MP_REACH_NLRI, MP_UNREACH_NLRI</td>
+<td>optional non-transitive</td>
+<td>Announce and withdraw IPv6 and other address families (RFC 4760)</td>
+</tr>
+<tr class="odd">
+<td>32</td>
+<td>LARGE_COMMUNITY</td>
+<td>optional transitive</td>
+<td>96-bit tags for 4-byte ASNs (RFC 8092)</td>
+</tr>
+</tbody>
+</table>
+<p>"Transitive" means a router that doesn't understand the attribute still passes it on. That is how communities can travel several ASes.</p>
+<p><strong>Communities</strong> are the most useful attribute nobody teaches. They are how networks talk policy to each other. A transit provider might publish a list like this: tag your route <code>64497:70</code> and we will set our LOCAL_PREF to 70 (making it a backup); tag it <code>64497:3003</code> and we will prepend three times towards Europe. A few communities are standardised: <code>NO_EXPORT</code> (65535:65281) keeps a route inside the receiving AS, <code>BLACKHOLE</code> (65535:666, RFC 7999) asks the neighbour to drop traffic to the prefix during a DDoS, and <code>GRACEFUL_SHUTDOWN</code> (65535:0, RFC 8326) asks the neighbour to depreference a path before you take it down for maintenance.</p>
+<h3 id="m21-38-best-path-selection-the-order-that-decides-everything">3.8 Best-path selection: the order that decides everything</h3>
+<p>A router often learns the same prefix from several neighbours. It installs exactly one of them as best (or several, if multipath is configured and they tie far enough down the list). It decides by walking a fixed list of tie-breakers, stopping at the first one that separates the candidates. RFC 4271 §9.1 defines the core; vendors add steps. This is the order most implementations share, with vendor-specific steps marked:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Step</th>
+<th>Rule</th>
+<th>Prefer</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0</td>
+<td>NEXT_HOP must be reachable</td>
+<td>—</td>
+<td>An unreachable next hop makes the path ineligible, not just worse</td>
+</tr>
+<tr class="even">
+<td>1</td>
+<td>Weight</td>
+<td>Highest</td>
+<td><strong>Cisco-only</strong>, local to one router, never sent</td>
+</tr>
+<tr class="odd">
+<td>2</td>
+<td>LOCAL_PREF</td>
+<td>Highest</td>
+<td>Default 100. Your AS-wide policy knob.</td>
+</tr>
+<tr class="even">
+<td>3</td>
+<td>Locally originated</td>
+<td>Local</td>
+<td>Routes from <code>network</code>, <code>aggregate</code> or redistribution on this router</td>
+</tr>
+<tr class="odd">
+<td>4</td>
+<td>AS_PATH length</td>
+<td>Shortest</td>
+<td>An AS_SET counts as 1. Prepending makes a path look longer.</td>
+</tr>
+<tr class="even">
+<td>5</td>
+<td>ORIGIN</td>
+<td>IGP &lt; EGP &lt; INCOMPLETE</td>
+<td></td>
+</tr>
+<tr class="odd">
+<td>6</td>
+<td>MED</td>
+<td>Lowest</td>
+<td>Only compared between paths from the <em>same</em> neighbouring AS, unless <code>always-compare-med</code></td>
+</tr>
+<tr class="even">
+<td>7</td>
+<td>eBGP over iBGP</td>
+<td>eBGP</td>
+<td>Get traffic out of your network as soon as possible</td>
+</tr>
+<tr class="odd">
+<td>8</td>
+<td>IGP cost to NEXT_HOP</td>
+<td>Lowest</td>
+<td>"Hot-potato" routing: use the nearest exit</td>
+</tr>
+<tr class="even">
+<td>9</td>
+<td>Oldest eBGP path</td>
+<td>Oldest</td>
+<td><strong>Cisco</strong>; reduces churn. Many implementations skip it.</td>
+</tr>
+<tr class="odd">
+<td>10</td>
+<td>Router ID (ORIGINATOR_ID if reflected)</td>
+<td>Lowest</td>
+<td></td>
+</tr>
+<tr class="even">
+<td>11</td>
+<td>CLUSTER_LIST length</td>
+<td>Shortest</td>
+<td>RFC 4456</td>
+</tr>
+<tr class="odd">
+<td>12</td>
+<td>Neighbour address</td>
+<td>Lowest</td>
+<td>Final, deterministic tie-break</td>
+</tr>
+</tbody>
+</table>
+<p>Read the list as a story. Steps 2 and 3 are policy: what <em>you</em> decided. Step 4 is what the rest of the internet is telling you about distance, in AS hops rather than milliseconds. Steps 5 and 6 are hints from neighbours. Steps 7 and 8 are about getting the packet off your network cheaply. Everything after that is a coin toss made deterministic.</p>
+<p>Two consequences come up in every senior interview. First, LOCAL_PREF beats AS_PATH length. A customer route through four ASes beats a transit route through two, because step 2 runs before step 4. Second, AS_PATH length counts ASes, not latency. A one-AS path that crosses an ocean beats a two-AS path inside your city. BGP has no idea how long anything takes.</p>
+<p>You will build this selector in Python in §9.</p>
+<h3 id="m21-39-prefix-length-more-specifics-and-aggregation">3.9 Prefix length, more-specifics and aggregation</h3>
+<p>BGP picks a best path <em>per prefix</em>. Forwarding then uses longest-prefix match across all prefixes (Module 9). These are two separate steps, and the interaction between them is the most powerful lever in all of internet routing.</p>
+<p>Suppose AS 64511 announces <code>203.0.112.0/22</code>. Someone else announces <code>203.0.113.0/24</code>. They are different prefixes, so BGP never compares them. Both get installed. A packet to <code>203.0.113.10</code> matches both, and the /24 wins because it is longer. No LOCAL_PREF, no AS_PATH length, no policy of any kind can make a router prefer the /22 for that address. The more-specific always wins, everywhere it is accepted.</p>
+<p>That fact is used deliberately every day. Operators announce more-specifics for traffic engineering (send this /24 only via Frankfurt), and DDoS mitigation services announce a customer's /24 to pull its traffic through a scrubbing centre. It is also how the worst hijacks work, as §Deep dive shows.</p>
+<p>The global table would be unmanageable if anyone could announce anything, so the operational community enforces limits by convention. <strong>Most networks drop IPv4 prefixes longer than /24 and IPv6 prefixes longer than /48.</strong> No RFC mandates these numbers. They are what everyone filters on, so a /25 announced to the internet usually reaches almost nobody. Aggregation is the opposite force: announcing one /22 instead of four /24s keeps everyone's tables smaller. The global IPv4 table holds roughly 1 million prefixes in 2025–26 and IPv6 a little over 200,000. The precise count changes daily; <code>bgp.potaroo.net</code> tracks it.</p>
+<h3 id="m21-310-anycast">3.10 Anycast</h3>
+<p>Module 13 introduced anycast as "the same IP announced from many PoPs." Now you can see the mechanism exactly. A CDN announces <code>198.51.100.0/24</code> from 300 locations, each with the same origin ASN. Every network on the internet receives several paths to that prefix and runs best-path selection as usual. Each picks one, usually the one with the highest LOCAL_PREF and then the shortest AS_PATH. Traffic from that network goes to whichever PoP sits at the end of the chosen path.</p>
+<p>So "nearest" in anycast means <em>nearest by BGP policy</em>, not by geography or latency. A user in Lisbon whose ISP buys transit only from a carrier that peers with the CDN in Madrid will land in Madrid even if there is a PoP in Lisbon. CDNs spend real engineering effort on peering placement for exactly this reason.</p>
+<p>Anycast fails over by withdrawal. If a PoP stops announcing, routers that used it fall back to their next-best path, typically within seconds to a few minutes. This is the same mechanism that took Facebook offline: its DNS servers withdrew their anycast routes when they decided they were unhealthy, and they all decided it at once. The DNS root servers (13 identities, well over a thousand instances) and public resolvers like 1.1.1.1 and 8.8.8.8 are all anycast. RFC 4786 is the operational guide.</p>
+<h3 id="m21-311-convergence">3.11 Convergence</h3>
+<p>When something changes, BGP has to tell everyone, one hop at a time. How long the internet takes to agree again is called <strong>convergence</strong>, and for BGP it is slow by design.</p>
+<p>An announcement of a new prefix spreads fast: each router runs best-path, sees a new route, passes it on. Seconds to tens of seconds globally.</p>
+<p>A withdrawal is worse. When a prefix disappears, a router that loses its best path falls back to its next-best path, which may also be about to disappear but hasn't been withdrawn yet. It announces that path, then withdraws it, then tries a longer one. This is called <strong>path hunting</strong> (or path exploration). Measurements going back to Labovitz and colleagues in 2000 show withdrawals taking minutes to settle, where announcements take seconds.</p>
+<p>Two mechanisms slow things down on purpose. The <strong>MinRouteAdvertisementInterval</strong> (MRAI) stops a router sending updates for the same destination to a peer more often than every 30 seconds on eBGP and 5 seconds on iBGP, as RFC 4271 suggests. It batches churn at the cost of delay. Implementations differ here, and data-centre profiles (FRR's <code>datacenter</code>, for one) set it to 0. <strong>Route flap damping</strong> (RFC 2439) suppresses prefixes that flap repeatedly. Early aggressive damping settings made outages worse, and RFC 7196 raised the thresholds.</p>
+<p>Failure detection is the other half. A hold timer of 90 seconds means a silently dead peer (a cut fibre behind a media converter, say) can blackhole traffic for a minute and a half. Operators pair BGP with <strong>BFD</strong> (RFC 5880), which sends lightweight probes every few hundred milliseconds and tells BGP to drop the session in under a second.</p>
+<h3 id="m21-312-leaks-hijacks-and-rpki-in-one-page">3.12 Leaks, hijacks and RPKI, in one page</h3>
+<p>Because BGP trusts what it hears, two kinds of bad route spread:</p>
+<ul>
+<li>A <strong>hijack</strong> is an announcement of a prefix by an AS that has no right to originate it. Sometimes it is a typo, sometimes malicious.</li>
+<li>A <strong>route leak</strong> is a legitimate route passed somewhere the export rules say it should not go, typically a provider's or peer's routes re-announced to another provider. The origin is correct; the path is not.</li>
+</ul>
+<p>Both are worst when they involve more-specifics, because §3.9's rule means the bad route wins outright wherever it is accepted.</p>
+<p>The main defence deployed today is <strong>RPKI</strong> (Resource Public Key Infrastructure, RFC 6480) with <strong>Route Origin Validation</strong> (ROV, RFC 6811). The holder of an address block signs a <strong>Route Origin Authorization</strong> (ROA, RFC 6482, now RFC 9582) through its regional registry: "AS 64511 may originate <code>203.0.112.0/22</code>, with prefixes up to length /24." Validators such as Routinator, rpki-client and FORT download and verify every ROA in the world and feed the result to routers over the RPKI-to-Router protocol (RFC 8210). Each route then gets one of three states:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>ROV state</th>
+<th>Meaning</th>
+<th>Typical action</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Valid</td>
+<td>A ROA covers the prefix, the origin AS matches, and the length is within maxLength</td>
+<td>Accept</td>
+</tr>
+<tr class="even">
+<td>Invalid</td>
+<td>A ROA covers the prefix, but the origin or the length doesn't match</td>
+<td>Drop</td>
+</tr>
+<tr class="odd">
+<td>NotFound</td>
+<td>No ROA covers the prefix at all</td>
+<td>Accept. A shrinking share of the table as ROA coverage grows.</td>
+</tr>
+</tbody>
+</table>
+<p>ROV checks the <em>origin</em> only. It cannot stop a leak, where the origin is correct, and it cannot stop an attacker who forges the path by putting the legitimate origin ASN at the end. Defences for those are newer: RFC 9234 adds BGP Roles and the Only-to-Customer (OTC) attribute to catch leaks, and ASPA (Autonomous System Provider Authorization) lets an AS publish its list of upstream providers so paths can be checked for valleys. ASPA was still being standardised and only beginning deployment in 2026. BGPsec (RFC 8205), which signs every hop, exists on paper and almost nowhere else.</p>
+<hr />
+<h2 id="m21-4-the-exact-structure">4. The exact structure</h2>
+<p>These layouts come from RFC 4271. The byte values in the margins are from a real UPDATE built by the script in the deep dive and decoded by <code>tcpdump</code>.</p>
+<p><strong>Message header (every message):</strong></p>
+<pre class="text"><code> 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                     Marker (16 bytes, all 0xff)               +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Length (19..4096)    |      Type     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+</code></pre>
+<p><strong>OPEN body:</strong> version (1 byte, always 4), My AS (2 bytes; 23456 if the real ASN needs 4 bytes), Hold Time (2 bytes, 0 or ≥ 3), BGP Identifier (4 bytes, the router ID), Optional Parameters Length (1 byte), then the parameters. Capabilities are parameter type 2, each a code/length/value triple.</p>
+<pre class="text"><code>ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff   marker
+00 2d                                             length 45
+01                                                type 1 = OPEN
+04                                                version 4
+fb f0                                             My AS 64496
+00 5a                                             hold time 90 s
+c0 00 02 01                                       BGP ID 192.0.2.1
+10                                                opt params length 16
+02 0e                                             param type 2 (capabilities), 14 bytes
+   01 04 00 01 00 01                              cap 1 MP-BGP: AFI 1 (IPv4), SAFI 1 (unicast)
+   02 00                                          cap 2 route refresh
+   41 04 00 00 fb f0                              cap 65 4-octet AS: 64496</code></pre>
+<p><strong>UPDATE body:</strong> Withdrawn Routes Length (2 bytes), withdrawn prefixes, Total Path Attribute Length (2 bytes), the attributes, then the announced prefixes (NLRI) filling the rest of the message. Prefixes on the wire are a length byte followed by only as many address bytes as that length needs, so a /24 takes 4 bytes and a /8 takes 2.</p>
+<pre class="text"><code>ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff   marker
+00 36                                             length 54
+02                                                type 2 = UPDATE
+00 00                                             withdrawn routes length 0
+00 1b                                             path attribute length 27
+40 01 01 00                                       ORIGIN      flags 0x40 (transitive), IGP
+40 02 06 02 01 00 00 fb ff                        AS_PATH     AS_SEQUENCE, 1 ASN: 64511 (4-byte)
+40 03 04 7f 00 00 02                              NEXT_HOP    127.0.0.2
+c0 08 04 fb ff 00 64                              COMMUNITIES flags 0xc0 (optional transitive), 64511:100
+18 cb 00 71                                       NLRI        /24  203.0.113.0</code></pre>
+<p>Each attribute starts with a flags byte. Its top four bits are Optional (0x80), Transitive (0x40), Partial (0x20) and Extended Length (0x10, meaning a 2-byte length follows). The arithmetic checks out: 19 header + 2 + 2 + 27 attributes + 4 NLRI = 54 bytes.</p>
+<p>An UPDATE with no withdrawn routes, no attributes and no NLRI is 23 bytes long. Graceful restart (RFC 4724) gives that empty message a meaning: <strong>End-of-RIB</strong>, "I have now sent you my whole table."</p>
+<p><strong>NOTIFICATION body:</strong> error code (1 byte), subcode (1 byte), optional data. The codes you'll see in logs:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Code</th>
+<th>Name</th>
+<th>Common subcodes and real causes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1</td>
+<td>Message Header Error</td>
+<td>Bad marker or length; usually a bug or a middlebox mangling TCP</td>
+</tr>
+<tr class="even">
+<td>2</td>
+<td>OPEN Message Error</td>
+<td>2 = Bad Peer AS (you configured the wrong remote ASN); 6 = Unacceptable Hold Time</td>
+</tr>
+<tr class="odd">
+<td>3</td>
+<td>UPDATE Message Error</td>
+<td>Malformed attribute. RFC 7606 now makes most of these "treat-as-withdraw" instead of a session reset.</td>
+</tr>
+<tr class="even">
+<td>4</td>
+<td>Hold Timer Expired</td>
+<td>No message from the peer within the hold time</td>
+</tr>
+<tr class="odd">
+<td>5</td>
+<td>Finite State Machine Error</td>
+<td>Message arrived in a state that doesn't expect it</td>
+</tr>
+<tr class="even">
+<td>6</td>
+<td>Cease</td>
+<td>1 = maximum prefixes reached; 2 = administrative shutdown; 4 = administrative reset</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="m21-5-a-realistic-example">5. A realistic example</h2>
+<p>You run network engineering for a SaaS company, AS 64496. You own <code>203.0.112.0/22</code> and have a ROA for it with maxLength /24. You buy 10 Gbit/s of transit from AS 64497 in Frankfurt and 10 Gbit/s from AS 64498 in Ashburn, Virginia. The plan was simple: Europeans arrive via Frankfurt, Americans via Ashburn.</p>
+<p>On Monday the Ashburn port is at 9.2 Gbit/s and Frankfurt is at 1.1. Latency dashboards show European users paying an extra 80 ms. Here is how you work it.</p>
+<p><strong>Step 1: confirm what you are announcing.</strong> On your Frankfurt edge router (FRR here; output illustrative):</p>
+<pre class="text"><code>edge-fra# show bgp ipv4 unicast neighbors 192.0.2.1 advertised-routes
+   Network          Next Hop            Metric LocPrf Weight Path
+*&gt; 203.0.112.0/22   0.0.0.0                  0         32768 i
+
+Total number of prefixes 1</code></pre>
+<p>One prefix, no prepend, origin IGP. The Ashburn router shows the same. So your announcements are symmetric. The asymmetry is in how other networks <em>choose</em> between them.</p>
+<p><strong>Step 2: look from the outside.</strong> You can't see other networks' decisions from your own routers. A looking glass or a route collector can. RIPE RIS and RouteViews collect full tables from hundreds of networks; bgp.tools and RIPEstat put a web UI on top. Here is what a European eyeball network sees (illustrative):</p>
+<pre class="text"><code>lg&gt; show ip bgp 203.0.112.0/22
+BGP routing table entry for 203.0.112.0/22
+Paths: (2 available, best #2)
+  64505 64497 64496                         &lt;- via a Tier 1 that buys nothing, then your Frankfurt transit
+    Origin IGP, localpref 100, valid, external
+  64506 64498 64496                         &lt;- via 64506, which buys transit from your Ashburn provider
+    Origin IGP, localpref 200, valid, external, best</code></pre>
+<p>The second path wins, and it wins at LOCAL_PREF. This European ISP buys transit from 64506 and gives that upstream LOCAL_PREF 200, perhaps because it is cheaper. 64506 in turn is a customer of your Ashburn transit, 64498, so 64506 learns your prefix as a customer route via 64498 and prefers it. Both paths are three ASes long. Policy, set two networks away from you, decided the outcome at step 2. Path length never got a vote.</p>
+<p><strong>Step 3: pick the right lever.</strong> You have three tools for inbound traffic, in increasing strength:</p>
+<ol type="1">
+<li><strong>AS_PATH prepending.</strong> Announce via Ashburn as <code>64496 64496 64496</code>. This only wins at step 4. It does nothing against a network whose LOCAL_PREF already prefers the Ashburn path, which is the exact network you need to move. Prepending also has diminishing returns; beyond three or so, it mostly just makes your routes look strange.</li>
+<li><strong>Provider action communities.</strong> Your Ashburn transit, 64498, publishes communities that change <em>its</em> behaviour. Its documentation says <code>64498:2120</code> means "do not announce to customers in the EU region" (the exact values differ for every provider; read their documentation). Tag your Ashburn announcement with it, and 64506 stops learning your route through 64498 at all.</li>
+<li><strong>More-specifics.</strong> Announce <code>203.0.112.0/24</code> and <code>203.0.113.0/24</code> only in Frankfurt, keeping the /22 everywhere. Longest-prefix match then sends all traffic for those /24s to Frankfurt from anywhere that accepts them. This is the strongest tool and the bluntest. It adds routes to everyone's table. And it depends on your ROA: with maxLength /22 instead of /24, every network doing ROV would see your /24s as <strong>Invalid</strong> and drop them. The prefix would vanish exactly where you meant to steer it.</li>
+</ol>
+<p>You choose option 2, because it is targeted, and you prepend once on the Ashburn session as a second nudge.</p>
+<p><strong>Step 4: verify.</strong> Re-query the same looking glass ten minutes later:</p>
+<pre class="text"><code>lg&gt; show ip bgp 203.0.112.0/22
+Paths: (1 available, best #1)
+  64505 64497 64496
+    Origin IGP, localpref 100, valid, external, best</code></pre>
+<p>The Ashburn path is gone from this network's view. Over the next hour your Frankfurt port climbs to 5.8 Gbit/s and Ashburn falls to 4.3. European latency drops back.</p>
+<p><strong>What the example teaches.</strong> Outbound traffic is yours to steer: set LOCAL_PREF and you're done. Inbound traffic is the product of other people's step 2. You can only hint at their decisions (prepending, MED), ask your direct neighbours to change theirs (communities), or overrule them with longest-prefix match (more-specifics). And every one of those hints is checked against your ROA.</p>
+<hr />
+<h2 id="m21-6-misconceptions--common-mistakes">6. Misconceptions &amp; common mistakes</h2>
+<p><strong>"BGP picks the shortest path."</strong> It picks the most <em>preferred</em> path. LOCAL_PREF runs before AS_PATH length, and AS_PATH length counts networks, not kilometres or milliseconds. A three-AS path through a customer beats a one-AS path through a provider every time.</p>
+<p><strong>"Prepending will move my inbound traffic."</strong> Only for networks where everything up to step 4 ties. Any network that sets LOCAL_PREF by relationship (which is all of them) ignores your prepends whenever the two paths come from different relationship classes. Prepending is a hint. Communities and more-specifics are instructions.</p>
+<p><strong>"BGP is a routing protocol, so it finds failures quickly."</strong> BGP finds out about failures when TCP or the hold timer tells it. With a 90-second hold time and no BFD, a silently dead neighbour keeps attracting traffic for up to 90 seconds. Then withdrawal path-hunting adds more time on top.</p>
+<p><strong>"RPKI stops hijacks."</strong> ROV stops one class of hijack: a wrong origin AS, or a more-specific beyond the ROA's maxLength. It does nothing for leaks, and nothing for an attacker who forges the path with your ASN at the end. It also does nothing if your upstream doesn't drop Invalids.</p>
+<p><strong>"A /24 announced anywhere is reachable everywhere."</strong> It is reachable through networks that accept it. Prefixes longer than /24 (IPv4) or /48 (IPv6) are filtered almost everywhere. Prefixes with no matching IRR object, or that are RPKI-Invalid, are filtered by a growing number of networks. "I announced it" and "the internet accepted it" are different claims; a looking glass tells you which one is true.</p>
+<p><strong>"Anycast sends users to the nearest server."</strong> It sends them to the server at the end of the path their ISP preferred. That is usually close, sometimes absurdly far, and it can change when anyone between the user and you changes policy.</p>
+<hr />
+<h2 id="m21-7-interview-qa">7. Interview Q&amp;A</h2>
+<p><strong>Q1: What is the difference between eBGP and iBGP, and why does iBGP need a full mesh?</strong></p>
+<p>eBGP runs between different ASes: it prepends the local ASN and rewrites NEXT_HOP. iBGP runs inside one AS: it leaves AS_PATH and NEXT_HOP alone. Because AS_PATH doesn't change inside the AS, iBGP can't use it to detect loops. So it uses a rule instead: never pass an iBGP-learned route to another iBGP peer. That rule means each router must hear every external route directly from the router that learned it, which means a full mesh. Route reflectors relax the rule for designated clients and add ORIGINATOR_ID and CLUSTER_LIST to keep loop detection working.</p>
+<p><strong>Q2: Two routes to the same prefix: one has LOCAL_PREF 200 and AS_PATH length 5, the other LOCAL_PREF 100 and length 1. Which wins?</strong></p>
+<p>The LOCAL_PREF 200 route. LOCAL_PREF is compared at step 2; AS_PATH length isn't looked at until step 4. Add that LOCAL_PREF is your own AS's policy, typically set from the business relationship, so this is exactly what you want: a long path through a paying customer beats a short path through a provider you pay.</p>
+<p><strong>Q3: What's the difference between a route leak and a hijack?</strong></p>
+<p>A hijack is an announcement by an AS that isn't authorised to originate the prefix: the origin is wrong. A leak is a real route, with the right origin, sent where the export policy says it shouldn't go, for example a provider's routes passed to another provider. ROV can catch a hijack with the wrong origin. It cannot catch a leak. Leak defences are prefix filters and max-prefix limits on customer sessions, RFC 9234 roles with the OTC attribute, and in future ASPA.</p>
+<p><strong>Q4: You announce 203.0.113.0/24 and someone else announces 203.0.113.0/25 and 203.0.113.128/25. What happens?</strong></p>
+<p>Wherever the /25s are accepted, they win by longest-prefix match, regardless of any BGP attribute; BGP never even compares them with your /24 because they are different prefixes. In practice most networks filter IPv4 prefixes longer than /24, so the /25s propagate less widely. And if you have a ROA for the /24 with maxLength 24, the /25s are RPKI-Invalid and networks doing ROV drop them. That's two independent reasons a /25 hijack fails today. Neither the /24 filter nor path length helps against a /24 hijack of a /22 you announce; only a ROA with a tight maxLength makes that one Invalid.</p>
+<p><strong>Q5: A BGP session flaps between Active and Connect and never reaches Established. What do you check?</strong></p>
+<p>Those states mean the TCP connection is not completing. Check reachability to the peer address from the right source address, a firewall or ACL dropping TCP 179, the eBGP TTL (a neighbour that is not directly connected needs multihop), and an MD5/TCP-AO password mismatch, which makes the receiving kernel silently drop segments. <code>tcpdump -nn port 179</code> on the router tells you within seconds whether SYNs leave and whether anything comes back.</p>
+<hr />
+<h2 id="m21-8-try-it">8. Try it</h2>
+<p>Everything here is read-only. Each command is labelled <strong>run on your Mac — your output will differ</strong>; they need a real internet connection.</p>
+<p><strong>Which AS announces an address?</strong> Team Cymru's IP-to-ASN service answers over whois and DNS:</p>
+<div class="sourceCode" id="m21-cb7"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="m21-cb7-1"><a href="#m21-cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">whois</span> <span class="at">-h</span> whois.cymru.com <span class="st">&quot; -v 1.1.1.1&quot;</span>      <span class="co"># run on your Mac — your output will differ</span></span>
+<span id="m21-cb7-2"><a href="#m21-cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">dig</span> +short TXT 4.4.8.8.origin.asn.cymru.com <span class="co"># octets reversed: this asks about 8.8.4.4</span></span></code></pre></div>
+<p>Expect something shaped like <code>"15169 | 8.8.4.0/24 | US | arin | ..."</code>: origin ASN, the announced prefix, country, registry. bgp.tools offers the same query with <code>whois -h bgp.tools " -v 1.1.1.1"</code>.</p>
+<p><strong>Is that announcement RPKI-valid?</strong> RIPEstat has a JSON API:</p>
+<div class="sourceCode" id="m21-cb8"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="m21-cb8-1"><a href="#m21-cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="st">&quot;https://stat.ripe.net/data/rpki-validation/data.json?resource=AS13335&amp;prefix=1.1.1.0/24&quot;</span> <span class="dt">\</span></span>
+<span id="m21-cb8-2"><a href="#m21-cb8-2" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="ex">python3</span> <span class="at">-m</span> json.tool <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;&quot;status&quot;|&quot;origin&quot;|&quot;max_length&quot;&#39;</span>   <span class="co"># run on your Mac — your output will differ</span></span></code></pre></div>
+<p>You should see <code>"status": "valid"</code> and the ROA that matched it. Try a different ASN as <code>resource</code> and watch it turn <code>invalid</code>.</p>
+<p><strong>What does the rest of the internet see?</strong> RIPEstat's looking-glass endpoint shows the paths that RIS collectors hold for a prefix:</p>
+<div class="sourceCode" id="m21-cb9"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="m21-cb9-1"><a href="#m21-cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="st">&quot;https://stat.ripe.net/data/looking-glass/data.json?resource=1.1.1.0/24&quot;</span> <span class="dt">\</span></span>
+<span id="m21-cb9-2"><a href="#m21-cb9-2" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="ex">python3</span> <span class="at">-c</span> <span class="st">&#39;import json,sys; d=json.load(sys.stdin)[&quot;data&quot;]</span></span>
+<span id="m21-cb9-3"><a href="#m21-cb9-3" aria-hidden="true" tabindex="-1"></a><span class="st">for rrc in d[&quot;rrcs&quot;][:3]:</span></span>
+<span id="m21-cb9-4"><a href="#m21-cb9-4" aria-hidden="true" tabindex="-1"></a><span class="st">    for p in rrc[&quot;peers&quot;][:3]:</span></span>
+<span id="m21-cb9-5"><a href="#m21-cb9-5" aria-hidden="true" tabindex="-1"></a><span class="st">        print(rrc[&quot;location&quot;], &quot;|&quot;, p[&quot;as_path&quot;])&#39;</span>   <span class="co"># run on your Mac — your output will differ</span></span></code></pre></div>
+<p>Each line is one collector's peer and the AS_PATH it uses. Notice how many different paths end in <code>13335</code>. That is anycast as seen from the control plane.</p>
+<p><strong>Map a traceroute to ASes.</strong> macOS <code>traceroute</code> has <code>-a</code> for AS lookups; on Linux the flag is <code>-A</code>:</p>
+<div class="sourceCode" id="m21-cb10"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="m21-cb10-1"><a href="#m21-cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">traceroute</span> <span class="at">-a</span> example.com        <span class="co"># run on your Mac — your output will differ</span></span>
+<span id="m21-cb10-2"><a href="#m21-cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">traceroute</span> <span class="at">-A</span> example.com        <span class="co"># Linux equivalent</span></span></code></pre></div>
+<p>Watch where the ASN changes between hops. Each change is an eBGP boundary: a transit hand-off, a peering link, or an IXP.</p>
+<p><strong>Browse the relationships.</strong> Open <code>https://bgp.tools/as/13335</code> and <code>https://www.peeringdb.com/asn/13335</code> in a browser. bgp.tools lists upstreams, peers and downstreams inferred from real paths. PeeringDB lists the IXPs and facilities where the network says it peers.</p>
+<p><strong>Run the selector.</strong> The script in §9 needs only Python 3:</p>
+<div class="sourceCode" id="m21-cb11"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="m21-cb11-1"><a href="#m21-cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> bestpath.py              <span class="co"># macOS or Linux, any Python 3.10+</span></span></code></pre></div>
+<p>Change a LOCAL_PREF, add a prepend, give two routes the same neighbour AS. Predict the winner before you run it.</p>
+<hr />
+<h2 id="m21-9-code-a-toy-best-path-selector">9. Code: a toy best-path selector</h2>
+<p>This script implements the RFC 4271 decision process (§3.8) as a sequence of eliminations, so you can watch which step decides each contest. It leaves out the vendor-specific steps (Cisco weight, oldest eBGP path) and multipath. Python 3.13, stdlib only. <code>bestpath.py</code>:</p>
+<div class="sourceCode" id="m21-cb12"><pre class="sourceCode python"><code class="sourceCode python"><span id="m21-cb12-1"><a href="#m21-cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;A toy BGP best-path selector (RFC 4271 9.1.2.2 + RFC 4456 tie-breaks).</span></span>
+<span id="m21-cb12-2"><a href="#m21-cb12-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-3"><a href="#m21-cb12-3" aria-hidden="true" tabindex="-1"></a><span class="co">Not a router: no Cisco &quot;weight&quot;, no &quot;oldest eBGP path&quot; step, no multipath.</span></span>
+<span id="m21-cb12-4"><a href="#m21-cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co">Each step removes candidates; the explanation shows who fell out and why.</span></span>
+<span id="m21-cb12-5"><a href="#m21-cb12-5" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="m21-cb12-6"><a href="#m21-cb12-6" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> dataclasses <span class="im">import</span> dataclass, field</span>
+<span id="m21-cb12-7"><a href="#m21-cb12-7" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> ipaddress <span class="im">import</span> ip_address</span>
+<span id="m21-cb12-8"><a href="#m21-cb12-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-9"><a href="#m21-cb12-9" aria-hidden="true" tabindex="-1"></a>ORIGIN_RANK <span class="op">=</span> {<span class="st">&quot;i&quot;</span>: <span class="dv">0</span>, <span class="st">&quot;e&quot;</span>: <span class="dv">1</span>, <span class="st">&quot;?&quot;</span>: <span class="dv">2</span>}          <span class="co"># IGP &lt; EGP &lt; INCOMPLETE</span></span>
+<span id="m21-cb12-10"><a href="#m21-cb12-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-11"><a href="#m21-cb12-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-12"><a href="#m21-cb12-12" aria-hidden="true" tabindex="-1"></a><span class="at">@dataclass</span></span>
+<span id="m21-cb12-13"><a href="#m21-cb12-13" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Route:</span>
+<span id="m21-cb12-14"><a href="#m21-cb12-14" aria-hidden="true" tabindex="-1"></a>    name: <span class="bu">str</span></span>
+<span id="m21-cb12-15"><a href="#m21-cb12-15" aria-hidden="true" tabindex="-1"></a>    peer_ip: <span class="bu">str</span></span>
+<span id="m21-cb12-16"><a href="#m21-cb12-16" aria-hidden="true" tabindex="-1"></a>    router_id: <span class="bu">str</span></span>
+<span id="m21-cb12-17"><a href="#m21-cb12-17" aria-hidden="true" tabindex="-1"></a>    session: <span class="bu">str</span>                 <span class="co"># &quot;ebgp&quot;, &quot;ibgp&quot; or &quot;local&quot;</span></span>
+<span id="m21-cb12-18"><a href="#m21-cb12-18" aria-hidden="true" tabindex="-1"></a>    as_path: <span class="bu">list</span> <span class="op">=</span> field(default_factory<span class="op">=</span><span class="bu">list</span>)</span>
+<span id="m21-cb12-19"><a href="#m21-cb12-19" aria-hidden="true" tabindex="-1"></a>    local_pref: <span class="bu">int</span> <span class="op">=</span> <span class="dv">100</span>        <span class="co"># default LOCAL_PREF on most implementations</span></span>
+<span id="m21-cb12-20"><a href="#m21-cb12-20" aria-hidden="true" tabindex="-1"></a>    origin: <span class="bu">str</span> <span class="op">=</span> <span class="st">&quot;i&quot;</span></span>
+<span id="m21-cb12-21"><a href="#m21-cb12-21" aria-hidden="true" tabindex="-1"></a>    med: <span class="bu">int</span> <span class="op">|</span> <span class="va">None</span> <span class="op">=</span> <span class="va">None</span>       <span class="co"># missing MED is treated as 0 (RFC 4271)</span></span>
+<span id="m21-cb12-22"><a href="#m21-cb12-22" aria-hidden="true" tabindex="-1"></a>    igp_cost: <span class="bu">int</span> <span class="op">=</span> <span class="dv">0</span>            <span class="co"># IGP metric to the BGP NEXT_HOP</span></span>
+<span id="m21-cb12-23"><a href="#m21-cb12-23" aria-hidden="true" tabindex="-1"></a>    nh_reachable: <span class="bu">bool</span> <span class="op">=</span> <span class="va">True</span></span>
+<span id="m21-cb12-24"><a href="#m21-cb12-24" aria-hidden="true" tabindex="-1"></a>    cluster_len: <span class="bu">int</span> <span class="op">=</span> <span class="dv">0</span>         <span class="co"># length of CLUSTER_LIST (reflected routes)</span></span>
+<span id="m21-cb12-25"><a href="#m21-cb12-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-26"><a href="#m21-cb12-26" aria-hidden="true" tabindex="-1"></a>    <span class="at">@property</span></span>
+<span id="m21-cb12-27"><a href="#m21-cb12-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> neighbor_as(<span class="va">self</span>):</span>
+<span id="m21-cb12-28"><a href="#m21-cb12-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">self</span>.as_path[<span class="dv">0</span>] <span class="cf">if</span> <span class="va">self</span>.as_path <span class="cf">else</span> <span class="va">None</span></span>
+<span id="m21-cb12-29"><a href="#m21-cb12-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-30"><a href="#m21-cb12-30" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> short(<span class="va">self</span>):</span>
+<span id="m21-cb12-31"><a href="#m21-cb12-31" aria-hidden="true" tabindex="-1"></a>        path <span class="op">=</span> <span class="st">&quot; &quot;</span>.join(<span class="bu">map</span>(<span class="bu">str</span>, <span class="va">self</span>.as_path)) <span class="kw">or</span> <span class="st">&quot;(local)&quot;</span></span>
+<span id="m21-cb12-32"><a href="#m21-cb12-32" aria-hidden="true" tabindex="-1"></a>        med <span class="op">=</span> <span class="st">&quot;-&quot;</span> <span class="cf">if</span> <span class="va">self</span>.med <span class="kw">is</span> <span class="va">None</span> <span class="cf">else</span> <span class="va">self</span>.med</span>
+<span id="m21-cb12-33"><a href="#m21-cb12-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> (<span class="ss">f&quot;</span><span class="sc">{</span><span class="va">self</span><span class="sc">.</span>name<span class="sc">:&lt;9}</span><span class="ss"> lp=</span><span class="sc">{</span><span class="va">self</span><span class="sc">.</span>local_pref<span class="sc">:&lt;3}</span><span class="ss"> path=[</span><span class="sc">{</span>path<span class="sc">}</span><span class="ss">] &quot;</span></span>
+<span id="m21-cb12-34"><a href="#m21-cb12-34" aria-hidden="true" tabindex="-1"></a>                <span class="ss">f&quot;origin=</span><span class="sc">{</span><span class="va">self</span><span class="sc">.</span>origin<span class="sc">}</span><span class="ss"> med=</span><span class="sc">{</span>med<span class="sc">}</span><span class="ss"> </span><span class="sc">{</span><span class="va">self</span><span class="sc">.</span>session<span class="sc">}</span><span class="ss"> igp=</span><span class="sc">{</span><span class="va">self</span><span class="sc">.</span>igp_cost<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m21-cb12-35"><a href="#m21-cb12-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-36"><a href="#m21-cb12-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-37"><a href="#m21-cb12-37" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> keep_min(cands, key):</span>
+<span id="m21-cb12-38"><a href="#m21-cb12-38" aria-hidden="true" tabindex="-1"></a>    best <span class="op">=</span> <span class="bu">min</span>(key(r) <span class="cf">for</span> r <span class="kw">in</span> cands)</span>
+<span id="m21-cb12-39"><a href="#m21-cb12-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> [r <span class="cf">for</span> r <span class="kw">in</span> cands <span class="cf">if</span> key(r) <span class="op">==</span> best]</span>
+<span id="m21-cb12-40"><a href="#m21-cb12-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-41"><a href="#m21-cb12-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-42"><a href="#m21-cb12-42" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> select(routes, verbose<span class="op">=</span><span class="va">True</span>):</span>
+<span id="m21-cb12-43"><a href="#m21-cb12-43" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;Elimination in the RFC order. Returns the winner.&quot;&quot;&quot;</span></span>
+<span id="m21-cb12-44"><a href="#m21-cb12-44" aria-hidden="true" tabindex="-1"></a>    steps <span class="op">=</span> [</span>
+<span id="m21-cb12-45"><a href="#m21-cb12-45" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;next hop reachable&quot;</span>, <span class="kw">lambda</span> c: [r <span class="cf">for</span> r <span class="kw">in</span> c <span class="cf">if</span> r.nh_reachable]),</span>
+<span id="m21-cb12-46"><a href="#m21-cb12-46" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;highest LOCAL_PREF&quot;</span>, <span class="kw">lambda</span> c: keep_min(c, <span class="kw">lambda</span> r: <span class="op">-</span>r.local_pref)),</span>
+<span id="m21-cb12-47"><a href="#m21-cb12-47" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;locally originated&quot;</span>, <span class="kw">lambda</span> c: keep_min(c, <span class="kw">lambda</span> r: r.session <span class="op">!=</span> <span class="st">&quot;local&quot;</span>)),</span>
+<span id="m21-cb12-48"><a href="#m21-cb12-48" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;shortest AS_PATH&quot;</span>, <span class="kw">lambda</span> c: keep_min(c, <span class="kw">lambda</span> r: <span class="bu">len</span>(r.as_path))),</span>
+<span id="m21-cb12-49"><a href="#m21-cb12-49" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;lowest ORIGIN&quot;</span>, <span class="kw">lambda</span> c: keep_min(c, <span class="kw">lambda</span> r: ORIGIN_RANK[r.origin])),</span>
+<span id="m21-cb12-50"><a href="#m21-cb12-50" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;lowest MED (per neighbour AS)&quot;</span>, med_step),</span>
+<span id="m21-cb12-51"><a href="#m21-cb12-51" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;eBGP over iBGP&quot;</span>, <span class="kw">lambda</span> c: keep_min(c, <span class="kw">lambda</span> r: r.session <span class="op">!=</span> <span class="st">&quot;ebgp&quot;</span>)),</span>
+<span id="m21-cb12-52"><a href="#m21-cb12-52" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;lowest IGP cost to next hop&quot;</span>, <span class="kw">lambda</span> c: keep_min(c, <span class="kw">lambda</span> r: r.igp_cost)),</span>
+<span id="m21-cb12-53"><a href="#m21-cb12-53" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;lowest router ID&quot;</span>, <span class="kw">lambda</span> c: keep_min(c, <span class="kw">lambda</span> r: ip_address(r.router_id))),</span>
+<span id="m21-cb12-54"><a href="#m21-cb12-54" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;shortest CLUSTER_LIST&quot;</span>, <span class="kw">lambda</span> c: keep_min(c, <span class="kw">lambda</span> r: r.cluster_len)),</span>
+<span id="m21-cb12-55"><a href="#m21-cb12-55" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;lowest peer address&quot;</span>, <span class="kw">lambda</span> c: keep_min(c, <span class="kw">lambda</span> r: ip_address(r.peer_ip))),</span>
+<span id="m21-cb12-56"><a href="#m21-cb12-56" aria-hidden="true" tabindex="-1"></a>    ]</span>
+<span id="m21-cb12-57"><a href="#m21-cb12-57" aria-hidden="true" tabindex="-1"></a>    cands <span class="op">=</span> <span class="bu">list</span>(routes)</span>
+<span id="m21-cb12-58"><a href="#m21-cb12-58" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> n, (label, fn) <span class="kw">in</span> <span class="bu">enumerate</span>(steps, <span class="dv">1</span>):</span>
+<span id="m21-cb12-59"><a href="#m21-cb12-59" aria-hidden="true" tabindex="-1"></a>        after <span class="op">=</span> fn(cands)</span>
+<span id="m21-cb12-60"><a href="#m21-cb12-60" aria-hidden="true" tabindex="-1"></a>        gone <span class="op">=</span> [r.name <span class="cf">for</span> r <span class="kw">in</span> cands <span class="cf">if</span> r <span class="kw">not</span> <span class="kw">in</span> after]</span>
+<span id="m21-cb12-61"><a href="#m21-cb12-61" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> verbose <span class="kw">and</span> gone:</span>
+<span id="m21-cb12-62"><a href="#m21-cb12-62" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;  step </span><span class="sc">{</span>n<span class="sc">:&gt;2}</span><span class="ss"> </span><span class="sc">{</span>label<span class="sc">:&lt;30}</span><span class="ss"> drops </span><span class="sc">{</span><span class="st">&#39;, &#39;</span><span class="sc">.</span>join(gone)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m21-cb12-63"><a href="#m21-cb12-63" aria-hidden="true" tabindex="-1"></a>        cands <span class="op">=</span> after</span>
+<span id="m21-cb12-64"><a href="#m21-cb12-64" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="bu">len</span>(cands) <span class="op">==</span> <span class="dv">1</span>:</span>
+<span id="m21-cb12-65"><a href="#m21-cb12-65" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> verbose:</span>
+<span id="m21-cb12-66"><a href="#m21-cb12-66" aria-hidden="true" tabindex="-1"></a>                <span class="bu">print</span>(<span class="ss">f&quot;  =&gt; best: </span><span class="sc">{</span>cands[<span class="dv">0</span>]<span class="sc">.</span>name<span class="sc">}</span><span class="ss"> (decided at step </span><span class="sc">{</span>n<span class="sc">}</span><span class="ss">: </span><span class="sc">{</span>label<span class="sc">}</span><span class="ss">)&quot;</span>)</span>
+<span id="m21-cb12-67"><a href="#m21-cb12-67" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> cands[<span class="dv">0</span>]</span>
+<span id="m21-cb12-68"><a href="#m21-cb12-68" aria-hidden="true" tabindex="-1"></a>    <span class="cf">raise</span> <span class="pp">AssertionError</span>(<span class="st">&quot;tie survived every step&quot;</span>)</span>
+<span id="m21-cb12-69"><a href="#m21-cb12-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-70"><a href="#m21-cb12-70" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-71"><a href="#m21-cb12-71" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> med_step(cands):</span>
+<span id="m21-cb12-72"><a href="#m21-cb12-72" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;MED only compares routes learned from the same neighbouring AS.&quot;&quot;&quot;</span></span>
+<span id="m21-cb12-73"><a href="#m21-cb12-73" aria-hidden="true" tabindex="-1"></a>    survivors <span class="op">=</span> []</span>
+<span id="m21-cb12-74"><a href="#m21-cb12-74" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> nas <span class="kw">in</span> <span class="bu">dict</span>.fromkeys(r.neighbor_as <span class="cf">for</span> r <span class="kw">in</span> cands):</span>
+<span id="m21-cb12-75"><a href="#m21-cb12-75" aria-hidden="true" tabindex="-1"></a>        group <span class="op">=</span> [r <span class="cf">for</span> r <span class="kw">in</span> cands <span class="cf">if</span> r.neighbor_as <span class="op">==</span> nas]</span>
+<span id="m21-cb12-76"><a href="#m21-cb12-76" aria-hidden="true" tabindex="-1"></a>        survivors <span class="op">+=</span> keep_min(group, <span class="kw">lambda</span> r: r.med <span class="kw">or</span> <span class="dv">0</span>)</span>
+<span id="m21-cb12-77"><a href="#m21-cb12-77" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> [r <span class="cf">for</span> r <span class="kw">in</span> cands <span class="cf">if</span> r <span class="kw">in</span> survivors]</span>
+<span id="m21-cb12-78"><a href="#m21-cb12-78" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-79"><a href="#m21-cb12-79" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-80"><a href="#m21-cb12-80" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> pairwise_better(a, b):</span>
+<span id="m21-cb12-81"><a href="#m21-cb12-81" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;One-on-one comparison, the way a router walks paths in arrival order</span></span>
+<span id="m21-cb12-82"><a href="#m21-cb12-82" aria-hidden="true" tabindex="-1"></a><span class="co">    when &#39;deterministic MED&#39; is off. MED is consulted only if same neighbour AS.&quot;&quot;&quot;</span></span>
+<span id="m21-cb12-83"><a href="#m21-cb12-83" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> a.local_pref <span class="op">!=</span> b.local_pref:</span>
+<span id="m21-cb12-84"><a href="#m21-cb12-84" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> a <span class="cf">if</span> a.local_pref <span class="op">&gt;</span> b.local_pref <span class="cf">else</span> b</span>
+<span id="m21-cb12-85"><a href="#m21-cb12-85" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span>(a.as_path) <span class="op">!=</span> <span class="bu">len</span>(b.as_path):</span>
+<span id="m21-cb12-86"><a href="#m21-cb12-86" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> a <span class="cf">if</span> <span class="bu">len</span>(a.as_path) <span class="op">&lt;</span> <span class="bu">len</span>(b.as_path) <span class="cf">else</span> b</span>
+<span id="m21-cb12-87"><a href="#m21-cb12-87" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> a.neighbor_as <span class="op">==</span> b.neighbor_as <span class="kw">and</span> (a.med <span class="kw">or</span> <span class="dv">0</span>) <span class="op">!=</span> (b.med <span class="kw">or</span> <span class="dv">0</span>):</span>
+<span id="m21-cb12-88"><a href="#m21-cb12-88" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> a <span class="cf">if</span> (a.med <span class="kw">or</span> <span class="dv">0</span>) <span class="op">&lt;</span> (b.med <span class="kw">or</span> <span class="dv">0</span>) <span class="cf">else</span> b</span>
+<span id="m21-cb12-89"><a href="#m21-cb12-89" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> a.igp_cost <span class="op">!=</span> b.igp_cost:</span>
+<span id="m21-cb12-90"><a href="#m21-cb12-90" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> a <span class="cf">if</span> a.igp_cost <span class="op">&lt;</span> b.igp_cost <span class="cf">else</span> b</span>
+<span id="m21-cb12-91"><a href="#m21-cb12-91" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> a <span class="cf">if</span> ip_address(a.router_id) <span class="op">&lt;</span> ip_address(b.router_id) <span class="cf">else</span> b</span>
+<span id="m21-cb12-92"><a href="#m21-cb12-92" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-93"><a href="#m21-cb12-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-94"><a href="#m21-cb12-94" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> show(title, routes):</span>
+<span id="m21-cb12-95"><a href="#m21-cb12-95" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="sc">{</span>title<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m21-cb12-96"><a href="#m21-cb12-96" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> r <span class="kw">in</span> routes:</span>
+<span id="m21-cb12-97"><a href="#m21-cb12-97" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="st">&quot;  &quot;</span> <span class="op">+</span> r.short())</span>
+<span id="m21-cb12-98"><a href="#m21-cb12-98" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> select(routes)</span>
+<span id="m21-cb12-99"><a href="#m21-cb12-99" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-100"><a href="#m21-cb12-100" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-101"><a href="#m21-cb12-101" aria-hidden="true" tabindex="-1"></a><span class="co"># Scenario 1: policy beats path length --------------------------------------</span></span>
+<span id="m21-cb12-102"><a href="#m21-cb12-102" aria-hidden="true" tabindex="-1"></a><span class="co"># AS 64496 buys transit from 64497, peers with 64498, sells transit to 64499.</span></span>
+<span id="m21-cb12-103"><a href="#m21-cb12-103" aria-hidden="true" tabindex="-1"></a><span class="co"># Inbound policy stamps LOCAL_PREF: customer 200, peer 150, transit 100.</span></span>
+<span id="m21-cb12-104"><a href="#m21-cb12-104" aria-hidden="true" tabindex="-1"></a>s1 <span class="op">=</span> [</span>
+<span id="m21-cb12-105"><a href="#m21-cb12-105" aria-hidden="true" tabindex="-1"></a>    Route(<span class="st">&quot;transit&quot;</span>, <span class="st">&quot;192.0.2.1&quot;</span>, <span class="st">&quot;10.0.0.1&quot;</span>, <span class="st">&quot;ebgp&quot;</span>, [<span class="dv">64497</span>, <span class="dv">64511</span>], <span class="dv">100</span>),</span>
+<span id="m21-cb12-106"><a href="#m21-cb12-106" aria-hidden="true" tabindex="-1"></a>    Route(<span class="st">&quot;peer&quot;</span>, <span class="st">&quot;192.0.2.5&quot;</span>, <span class="st">&quot;10.0.0.7&quot;</span>, <span class="st">&quot;ebgp&quot;</span>, [<span class="dv">64498</span>, <span class="dv">64511</span>], <span class="dv">150</span>),</span>
+<span id="m21-cb12-107"><a href="#m21-cb12-107" aria-hidden="true" tabindex="-1"></a>    Route(<span class="st">&quot;customer&quot;</span>, <span class="st">&quot;192.0.2.9&quot;</span>, <span class="st">&quot;10.0.0.9&quot;</span>, <span class="st">&quot;ebgp&quot;</span>,</span>
+<span id="m21-cb12-108"><a href="#m21-cb12-108" aria-hidden="true" tabindex="-1"></a>          [<span class="dv">64499</span>, <span class="dv">64499</span>, <span class="dv">64499</span>, <span class="dv">64511</span>], <span class="dv">200</span>),</span>
+<span id="m21-cb12-109"><a href="#m21-cb12-109" aria-hidden="true" tabindex="-1"></a>]</span>
+<span id="m21-cb12-110"><a href="#m21-cb12-110" aria-hidden="true" tabindex="-1"></a>show(<span class="st">&quot;Scenario 1: 203.0.113.0/24 seen from transit, peer and customer&quot;</span>, s1)</span>
+<span id="m21-cb12-111"><a href="#m21-cb12-111" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-112"><a href="#m21-cb12-112" aria-hidden="true" tabindex="-1"></a><span class="co"># Scenario 2: two equal transit routes, learned at two different border</span></span>
+<span id="m21-cb12-113"><a href="#m21-cb12-113" aria-hidden="true" tabindex="-1"></a><span class="co"># routers; this router hears one over eBGP and one over iBGP.</span></span>
+<span id="m21-cb12-114"><a href="#m21-cb12-114" aria-hidden="true" tabindex="-1"></a>s2 <span class="op">=</span> [</span>
+<span id="m21-cb12-115"><a href="#m21-cb12-115" aria-hidden="true" tabindex="-1"></a>    Route(<span class="st">&quot;via-edge1&quot;</span>, <span class="st">&quot;192.0.2.1&quot;</span>, <span class="st">&quot;10.0.0.1&quot;</span>, <span class="st">&quot;ebgp&quot;</span>, [<span class="dv">64497</span>, <span class="dv">64511</span>],</span>
+<span id="m21-cb12-116"><a href="#m21-cb12-116" aria-hidden="true" tabindex="-1"></a>          med<span class="op">=</span><span class="dv">50</span>, igp_cost<span class="op">=</span><span class="dv">0</span>),</span>
+<span id="m21-cb12-117"><a href="#m21-cb12-117" aria-hidden="true" tabindex="-1"></a>    Route(<span class="st">&quot;via-edge2&quot;</span>, <span class="st">&quot;10.255.0.2&quot;</span>, <span class="st">&quot;10.255.0.2&quot;</span>, <span class="st">&quot;ibgp&quot;</span>, [<span class="dv">64501</span>, <span class="dv">64511</span>],</span>
+<span id="m21-cb12-118"><a href="#m21-cb12-118" aria-hidden="true" tabindex="-1"></a>          med<span class="op">=</span><span class="dv">0</span>, igp_cost<span class="op">=</span><span class="dv">20</span>),</span>
+<span id="m21-cb12-119"><a href="#m21-cb12-119" aria-hidden="true" tabindex="-1"></a>]</span>
+<span id="m21-cb12-120"><a href="#m21-cb12-120" aria-hidden="true" tabindex="-1"></a>show(<span class="st">&quot;Scenario 2: equal policy, equal length, different upstream ASes&quot;</span>, s2)</span>
+<span id="m21-cb12-121"><a href="#m21-cb12-121" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-122"><a href="#m21-cb12-122" aria-hidden="true" tabindex="-1"></a><span class="co"># Scenario 3: same upstream AS at two exits -&gt; MED is comparable,</span></span>
+<span id="m21-cb12-123"><a href="#m21-cb12-123" aria-hidden="true" tabindex="-1"></a><span class="co"># both learned over iBGP, so MED decides before IGP cost.</span></span>
+<span id="m21-cb12-124"><a href="#m21-cb12-124" aria-hidden="true" tabindex="-1"></a>s3 <span class="op">=</span> [</span>
+<span id="m21-cb12-125"><a href="#m21-cb12-125" aria-hidden="true" tabindex="-1"></a>    Route(<span class="st">&quot;exit-fra&quot;</span>, <span class="st">&quot;10.255.0.11&quot;</span>, <span class="st">&quot;10.255.0.11&quot;</span>, <span class="st">&quot;ibgp&quot;</span>, [<span class="dv">64497</span>, <span class="dv">64511</span>],</span>
+<span id="m21-cb12-126"><a href="#m21-cb12-126" aria-hidden="true" tabindex="-1"></a>          med<span class="op">=</span><span class="dv">200</span>, igp_cost<span class="op">=</span><span class="dv">5</span>),</span>
+<span id="m21-cb12-127"><a href="#m21-cb12-127" aria-hidden="true" tabindex="-1"></a>    Route(<span class="st">&quot;exit-ams&quot;</span>, <span class="st">&quot;10.255.0.12&quot;</span>, <span class="st">&quot;10.255.0.12&quot;</span>, <span class="st">&quot;ibgp&quot;</span>, [<span class="dv">64497</span>, <span class="dv">64511</span>],</span>
+<span id="m21-cb12-128"><a href="#m21-cb12-128" aria-hidden="true" tabindex="-1"></a>          med<span class="op">=</span><span class="dv">10</span>, igp_cost<span class="op">=</span><span class="dv">40</span>),</span>
+<span id="m21-cb12-129"><a href="#m21-cb12-129" aria-hidden="true" tabindex="-1"></a>]</span>
+<span id="m21-cb12-130"><a href="#m21-cb12-130" aria-hidden="true" tabindex="-1"></a>show(<span class="st">&quot;Scenario 3: one upstream AS, two exits, MED says &#39;use Amsterdam&#39;&quot;</span>, s3)</span>
+<span id="m21-cb12-131"><a href="#m21-cb12-131" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb12-132"><a href="#m21-cb12-132" aria-hidden="true" tabindex="-1"></a><span class="co"># Scenario 4: the MED non-transitivity trap -------------------------------</span></span>
+<span id="m21-cb12-133"><a href="#m21-cb12-133" aria-hidden="true" tabindex="-1"></a>A <span class="op">=</span> Route(<span class="st">&quot;A&quot;</span>, <span class="st">&quot;10.255.0.1&quot;</span>, <span class="st">&quot;10.255.0.1&quot;</span>, <span class="st">&quot;ibgp&quot;</span>, [<span class="dv">64497</span>, <span class="dv">64511</span>], med<span class="op">=</span><span class="dv">200</span>, igp_cost<span class="op">=</span><span class="dv">5</span>)</span>
+<span id="m21-cb12-134"><a href="#m21-cb12-134" aria-hidden="true" tabindex="-1"></a>B <span class="op">=</span> Route(<span class="st">&quot;B&quot;</span>, <span class="st">&quot;10.255.0.2&quot;</span>, <span class="st">&quot;10.255.0.2&quot;</span>, <span class="st">&quot;ibgp&quot;</span>, [<span class="dv">64498</span>, <span class="dv">64511</span>], med<span class="op">=</span><span class="dv">50</span>, igp_cost<span class="op">=</span><span class="dv">10</span>)</span>
+<span id="m21-cb12-135"><a href="#m21-cb12-135" aria-hidden="true" tabindex="-1"></a>C <span class="op">=</span> Route(<span class="st">&quot;C&quot;</span>, <span class="st">&quot;10.255.0.3&quot;</span>, <span class="st">&quot;10.255.0.3&quot;</span>, <span class="st">&quot;ibgp&quot;</span>, [<span class="dv">64497</span>, <span class="dv">64511</span>], med<span class="op">=</span><span class="dv">100</span>, igp_cost<span class="op">=</span><span class="dv">15</span>)</span>
+<span id="m21-cb12-136"><a href="#m21-cb12-136" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">Scenario 4: three iBGP paths, MED comparable only between A and C&quot;</span>)</span>
+<span id="m21-cb12-137"><a href="#m21-cb12-137" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> r <span class="kw">in</span> (A, B, C):</span>
+<span id="m21-cb12-138"><a href="#m21-cb12-138" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;  &quot;</span> <span class="op">+</span> r.short())</span>
+<span id="m21-cb12-139"><a href="#m21-cb12-139" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> x, y <span class="kw">in</span> ((A, B), (B, C), (A, C)):</span>
+<span id="m21-cb12-140"><a href="#m21-cb12-140" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  pairwise </span><span class="sc">{</span>x<span class="sc">.</span>name<span class="sc">}</span><span class="ss"> vs </span><span class="sc">{</span>y<span class="sc">.</span>name<span class="sc">}</span><span class="ss">: </span><span class="sc">{</span>pairwise_better(x, y)<span class="sc">.</span>name<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m21-cb12-141"><a href="#m21-cb12-141" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> order <span class="kw">in</span> ((A, B, C), (B, C, A), (C, A, B)):</span>
+<span id="m21-cb12-142"><a href="#m21-cb12-142" aria-hidden="true" tabindex="-1"></a>    best <span class="op">=</span> order[<span class="dv">0</span>]</span>
+<span id="m21-cb12-143"><a href="#m21-cb12-143" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> r <span class="kw">in</span> order[<span class="dv">1</span>:]:</span>
+<span id="m21-cb12-144"><a href="#m21-cb12-144" aria-hidden="true" tabindex="-1"></a>        best <span class="op">=</span> pairwise_better(best, r)</span>
+<span id="m21-cb12-145"><a href="#m21-cb12-145" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  arrival order </span><span class="sc">{</span><span class="st">&#39;&#39;</span><span class="sc">.</span>join(r.name <span class="cf">for</span> r <span class="kw">in</span> order)<span class="sc">}</span><span class="ss"> -&gt; pairwise walk picks </span><span class="sc">{</span>best<span class="sc">.</span>name<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m21-cb12-146"><a href="#m21-cb12-146" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;  grouped by neighbour AS (deterministic MED):&quot;</span>)</span>
+<span id="m21-cb12-147"><a href="#m21-cb12-147" aria-hidden="true" tabindex="-1"></a>select([A, B, C])</span></code></pre></div>
+<p>Output from a real run:</p>
+<pre class="text"><code>Scenario 1: 203.0.113.0/24 seen from transit, peer and customer
+  transit   lp=100 path=[64497 64511] origin=i med=- ebgp igp=0
+  peer      lp=150 path=[64498 64511] origin=i med=- ebgp igp=0
+  customer  lp=200 path=[64499 64499 64499 64511] origin=i med=- ebgp igp=0
+  step  2 highest LOCAL_PREF             drops transit, peer
+  =&gt; best: customer (decided at step 2: highest LOCAL_PREF)
+
+Scenario 2: equal policy, equal length, different upstream ASes
+  via-edge1 lp=100 path=[64497 64511] origin=i med=50 ebgp igp=0
+  via-edge2 lp=100 path=[64501 64511] origin=i med=0 ibgp igp=20
+  step  7 eBGP over iBGP                 drops via-edge2
+  =&gt; best: via-edge1 (decided at step 7: eBGP over iBGP)
+
+Scenario 3: one upstream AS, two exits, MED says &#39;use Amsterdam&#39;
+  exit-fra  lp=100 path=[64497 64511] origin=i med=200 ibgp igp=5
+  exit-ams  lp=100 path=[64497 64511] origin=i med=10 ibgp igp=40
+  step  6 lowest MED (per neighbour AS)  drops exit-fra
+  =&gt; best: exit-ams (decided at step 6: lowest MED (per neighbour AS))
+
+Scenario 4: three iBGP paths, MED comparable only between A and C
+  A         lp=100 path=[64497 64511] origin=i med=200 ibgp igp=5
+  B         lp=100 path=[64498 64511] origin=i med=50 ibgp igp=10
+  C         lp=100 path=[64497 64511] origin=i med=100 ibgp igp=15
+  pairwise A vs B: A
+  pairwise B vs C: B
+  pairwise A vs C: C
+  arrival order ABC -&gt; pairwise walk picks C
+  arrival order BCA -&gt; pairwise walk picks A
+  arrival order CAB -&gt; pairwise walk picks B
+  grouped by neighbour AS (deterministic MED):
+  step  6 lowest MED (per neighbour AS)  drops A
+  step  8 lowest IGP cost to next hop    drops C
+  =&gt; best: B (decided at step 8: lowest IGP cost to next hop)</code></pre>
+<p>Read the four scenarios in order.</p>
+<p><strong>Scenario 1</strong> is the Gao–Rexford rule in action. The customer's route has been prepended twice and is the longest path on offer. It still wins, at step 2, because import policy gave it LOCAL_PREF 200. Path length never got a look.</p>
+<p><strong>Scenario 2</strong> ties all the way to step 6. MED can't separate the two routes because they come from different neighbouring ASes (64497 and 64501), and comparing their MEDs would be meaningless. So the decision falls to step 7, where the route learned directly over eBGP beats the one carried over iBGP from another border router. That is "get traffic off my network at the nearest exit," expressed as a rule.</p>
+<p><strong>Scenario 3</strong> shows the one place MED does work: two links to the <em>same</em> neighbour AS. The upstream says, through MED, "please use Amsterdam," and step 6 obeys before IGP cost (which would have picked Frankfurt) is consulted.</p>
+<p><strong>Scenario 4</strong> is the subtle one, and a favourite senior interview question. Because MED only applies within one neighbour AS, "better than" stops being transitive. A beats B on IGP cost, B beats C on IGP cost, and C beats A on MED. A router that compares paths pairwise in the order they arrived picks a different winner depending on that order. Three orders give three different answers. Two routers in the same AS can then disagree on the best path, and in route-reflector topologies that can cause persistent route oscillation (RFC 3345 documents this). The fix is what the elimination function does: group paths by neighbouring AS, apply MED within each group, then compare the survivors. Cisco calls that <code>bgp deterministic-med</code>; turn it on, or use <code>always-compare-med</code> if all your neighbours set MED consistently.</p>
+<hr />
+<h2 id="m21-deep-dive">Deep dive: what the summary view leaves out</h2>
+<p>The first nine sections give you the protocol as operators describe it. The deep dive goes underneath. It covers the data structures inside a BGP speaker, the actual bytes on a real session, the numbers that size the system, and the ways it breaks in production, using real incidents rather than hypotheticals. Then come the places BGP turns up in a 2026 stack, and the interview questions that separate people who have run BGP from people who have read about it.</p>
+<h2 id="m21-deep-the-real-mental-model">Deep dive: the real mental model</h2>
+<p>Picture a BGP speaker not as "a router that runs BGP" but as a pipeline of tables with policy in between. RFC 4271 §3.2 names three Routing Information Bases, and every implementation keeps something close to them.</p>
+<div style="overflow-x:auto">
+<svg viewBox="0 0 760 470" role="img" aria-labelledby="m21-rib-title m21-rib-desc" style="min-width:760px;max-width:100%;height:auto;">
+<title id="m21-rib-title">Inside a BGP speaker: RIBs, policy and the FIB</title>
+<desc id="m21-rib-desc">Routes from each neighbour land in that neighbour's Adj-RIB-In, pass import policy, compete in the Loc-RIB where one best path per prefix is chosen, get installed in the RIB and FIB, and pass export policy into each neighbour's Adj-RIB-Out before being sent as UPDATEs.</desc>
+<rect x="0" y="0" width="760" height="470" fill="#f5f5f5"/>
+<text x="24" y="34" font-family="monospace" font-size="11" fill="#8a8f98" letter-spacing="2">M21 · DEEP DIVE</text>
+<text x="24" y="62" font-family="sans-serif" font-size="21" font-weight="600" fill="#2d3142">Inside one BGP speaker</text>
+<defs>
+<marker id="m21-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2d3142"/></marker>
+<marker id="m21-arr-a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#bf4520"/></marker>
+</defs>
+<g font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">
+<rect x="20" y="96" width="120" height="76" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="80" y="122" text-anchor="middle">neighbours</text><text x="80" y="142" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">UPDATE in</text><text x="80" y="158" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">(TCP 179)</text>
+<rect x="170" y="96" width="140" height="76" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="240" y="122" text-anchor="middle">Adj-RIB-In</text><text x="240" y="142" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">one per neighbour</text><text x="240" y="158" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">as received</text>
+<rect x="340" y="96" width="140" height="76" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="410" y="122" text-anchor="middle">import policy</text><text x="410" y="142" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">filter, ROV, max-pfx</text><text x="410" y="158" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">set LOCAL_PREF</text>
+<rect x="510" y="96" width="110" height="206" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2.5"/><text x="565" y="176" text-anchor="middle">Loc-RIB</text><text x="565" y="198" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">all paths that</text><text x="565" y="212" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">passed import;</text><text x="565" y="226" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">one best per</text><text x="565" y="240" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">prefix</text>
+<rect x="650" y="96" width="94" height="76" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="697" y="122" text-anchor="middle">RIB</text><text x="697" y="142" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">vs OSPF,</text><text x="697" y="158" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">static (AD)</text>
+<rect x="650" y="226" width="94" height="76" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="697" y="252" text-anchor="middle">FIB</text><text x="697" y="272" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">kernel or</text><text x="697" y="288" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">ASIC TCAM</text>
+<rect x="340" y="226" width="140" height="76" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="410" y="252" text-anchor="middle">export policy</text><text x="410" y="272" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">per neighbour:</text><text x="410" y="288" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">who may hear what</text>
+<rect x="170" y="226" width="140" height="76" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="240" y="252" text-anchor="middle">Adj-RIB-Out</text><text x="240" y="272" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">what we told</text><text x="240" y="288" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">each neighbour</text>
+<rect x="20" y="226" width="120" height="76" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="80" y="252" text-anchor="middle">neighbours</text><text x="80" y="272" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">UPDATE out</text><text x="80" y="288" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">(paced by MRAI)</text>
+</g>
+<g stroke="#2d3142" stroke-width="1.5">
+<line x1="140" y1="134" x2="168" y2="134" marker-end="url(#m21-arr)"/>
+<line x1="310" y1="134" x2="338" y2="134" marker-end="url(#m21-arr)"/>
+<line x1="480" y1="134" x2="508" y2="134" marker-end="url(#m21-arr)"/>
+<line x1="620" y1="134" x2="648" y2="134" marker-end="url(#m21-arr)"/>
+<line x1="697" y1="172" x2="697" y2="224" marker-end="url(#m21-arr)"/>
+<line x1="510" y1="264" x2="482" y2="264" marker-end="url(#m21-arr)"/>
+<line x1="340" y1="264" x2="312" y2="264" marker-end="url(#m21-arr)"/>
+<line x1="170" y1="264" x2="142" y2="264" marker-end="url(#m21-arr)"/>
+</g>
+<rect x="20" y="330" width="724" height="84" rx="6" fill="#ffffff" stroke="#d8d4cc"/>
+<g font-family="monospace" font-size="11" fill="#2d3142">
+<text x="36" y="354" font-family="sans-serif" font-size="13" font-weight="600">Per-session state</text>
+<text x="36" y="376">FSM: Idle → Connect/Active → OpenSent → OpenConfirm → Established</text>
+<text x="36" y="396">timers: hold 90 s (keepalive = hold/3) · ConnectRetry 120 s · MRAI 30 s eBGP, 5 s iBGP</text>
+</g>
+<text x="24" y="440" font-family="sans-serif" font-size="12" fill="#8a8f98">Timer values are RFC 4271 suggestions. Vendors ship different defaults</text>
+<text x="24" y="458" font-family="sans-serif" font-size="12" fill="#8a8f98">(Cisco IOS 60/180 s keepalive/hold; FRR's datacenter profile 3/9 s).</text>
+</svg>
+</div>
+
+<p><strong>Adj-RIB-In</strong>, one per neighbour, holds what that neighbour sent, before your policy touches it. Many implementations only keep the post-policy version to save memory. That's why "soft reconfiguration inbound" exists as an option: it keeps a pre-policy copy so you can change import policy without asking the neighbour to resend. Route refresh (RFC 2918) made that copy largely unnecessary, because you can simply ask the neighbour to send everything again.</p>
+<p><strong>Import policy</strong> is where your network's intent lives. Prefix lists drop bogons and anything too specific. AS-path filters drop paths containing networks you never want to transit. ROV drops Invalids. Max-prefix limits tear the session down if a neighbour suddenly sends far more routes than expected. And route maps set LOCAL_PREF and communities from the relationship. RFC 8212 says an eBGP session with no import or export policy configured should accept and send nothing. FRR enforces this by default (<code>bgp ebgp-requires-policy</code>), which is why a new FRR eBGP session comes up Established and exchanges zero prefixes until you add a policy.</p>
+<p><strong>Loc-RIB</strong> holds every path that survived import, grouped by prefix, with one marked best. Every time a path for a prefix is added, changed or removed, the decision process reruns for that prefix only. This per-prefix scope is why BGP handles a million prefixes: a change to one prefix costs one small comparison, not a global recomputation. (Contrast OSPF, where one link change triggers an SPF run over the whole area.)</p>
+<p><strong>RIB and FIB.</strong> The best BGP path competes with routes from other sources (connected, static, OSPF) for a place in the router's main routing table. Vendors break that tie with administrative distance (Cisco: eBGP 20, OSPF 110, iBGP 200). Linux's kernel has no such concept, so FRR's <code>zebra</code> daemon does the arbitration before it programs the kernel FIB through netlink. On hardware routers the FIB is pushed down into ASIC memory (TCAM or algorithmic lookup tables). And that memory is finite, which matters below.</p>
+<p><strong>Export policy and Adj-RIB-Out.</strong> For each neighbour, the router runs export policy over the Loc-RIB's best paths and records what it decided to send. Only <em>best</em> paths are exported by default. If your best path for a prefix came from a peer, you export nothing to your other peers and transits, even if you also hold a customer path you could legally export. (Add-path, RFC 7911, lets a speaker send more than one path per prefix, mostly used between route reflectors and their clients.)</p>
+<p>Three practical consequences follow from this picture:</p>
+<ol type="1">
+<li><strong>"I see the route in <code>show bgp</code> but traffic doesn't use it."</strong> It's in Loc-RIB but either lost best-path, lost to a lower-distance route in the RIB, or failed to program into the FIB. Check each table in turn: <code>show bgp &lt;prefix&gt;</code>, then <code>show ip route &lt;prefix&gt;</code>, then the hardware or kernel FIB (<code>ip route get &lt;addr&gt;</code> on Linux).</li>
+<li><strong>Next-hop tracking ties BGP to the IGP.</strong> Every BGP path depends on its NEXT_HOP resolving through the RIB. When an IGP change makes a next hop unreachable, every BGP path using it becomes ineligible at once, even though no BGP message has arrived. Modern implementations react to that within milliseconds of the IGP change. Prefix-independent convergence (BGP PIC) goes further: the FIB keeps a pre-computed backup next hop shared by all affected prefixes, so failover is one pointer change rather than a million route rewrites.</li>
+<li><strong>Every change is per-prefix, but updates are packed per attribute set.</strong> One UPDATE carries one set of path attributes and every prefix that shares it. A full table of a million prefixes typically packs into a few hundred thousand UPDATE messages, because so many prefixes share identical attributes.</li>
+</ol>
+<h2 id="m21-deep-what-the-wire-actually-carries">Deep dive: what the wire actually carries</h2>
+<p>The capture below is real. It was made by running two toy BGP speakers (the script further down) on Linux loopback, R1 (AS 64496, <code>127.0.0.1</code>) and R2 (AS 64511, <code>127.0.0.2</code>), with <code>tcpdump -i lo -nn -v -s0 'tcp port 179'</code> running alongside. It is trimmed: the timestamps and pure ACK lines are shown once and then elided, and the <code>cksum ... (incorrect -&gt; ...)</code> notes are removed. Loopback packets skip checksum calculation, so tcpdump always flags them as incorrect there; on a real interface the NIC fills the checksum in.</p>
+<pre class="text"><code>127.0.0.2.46887 &gt; 127.0.0.1.179: Flags [S], seq 196912679, win 65495,
+    options [mss 65495,sackOK,TS val 2658700183 ecr 0,nop,wscale 10], length 0
+127.0.0.1.179 &gt; 127.0.0.2.46887: Flags [S.], seq 2822400681, ack 196912680, ...
+127.0.0.2.46887 &gt; 127.0.0.1.179: Flags [.], ack 1, ...          &lt;- TCP up. R2 connected, so R1 is the &quot;passive&quot; side.
+
+127.0.0.2.46887 &gt; 127.0.0.1.179: Flags [P.], seq 1:46, ack 1, length 45: BGP
+    Open Message (1), length: 45
+      Version 4, my AS 64511, Holdtime 30s, ID 192.0.2.2       &lt;- R2 offers 30 s
+      Optional parameters, length: 16
+        Option Capabilities Advertisement (2), length: 14
+          Multiprotocol Extensions (1), length: 4
+        AFI IPv4 (1), SAFI Unicast (1)
+          Route Refresh (2), length: 0
+          32-Bit AS Number (65), length: 4
+         4 Byte AS 64511
+127.0.0.1.179 &gt; 127.0.0.2.46887: Flags [P.], seq 1:46, ack 46, length 45: BGP
+    Open Message (1), length: 45
+      Version 4, my AS 64496, Holdtime 90s, ID 192.0.2.1       &lt;- R1 offers 90 s; negotiated = min = 30 s
+      ... same three capabilities, 4 Byte AS 64496
+127.0.0.1.179 &gt; 127.0.0.2.46887: Flags [P.], seq 46:65, ack 46, length 19: BGP
+    Keepalive Message (4), length: 19                          &lt;- R1: OpenSent/Active -&gt; OpenConfirm
+127.0.0.2.46887 &gt; 127.0.0.1.179: Flags [P.], seq 46:65, ack 65, length 19: BGP
+    Keepalive Message (4), length: 19                          &lt;- both sides now Established
+
+127.0.0.2.46887 &gt; 127.0.0.1.179: Flags [P.], seq 65:169, ack 65, length 104: BGP
+    Update Message (2), length: 54                             &lt;- three BGP messages, one TCP segment
+      Origin (1), length: 1, Flags [T]: IGP
+      AS Path (2), length: 6, Flags [T]: 64511                 &lt;- 6 = segment type + count + one 4-byte ASN
+      Next Hop (3), length: 4, Flags [T]: 127.0.0.2
+      Community (8), length: 4, Flags [OT]: 64511:100           &lt;- O = optional, T = transitive
+      Updated routes:
+        203.0.113.0/24
+    Update Message (2), length: 23
+      End-of-Rib Marker (empty NLRI)                           &lt;- RFC 4724: &quot;that&#39;s my whole table&quot;
+    Update Message (2), length: 27
+      Withdrawn routes:
+        203.0.113.0/24
+      End-of-Rib Marker (empty NLRI)                           &lt;- tcpdump quirk: see below
+127.0.0.1.179 &gt; 127.0.0.2.46887: Flags [P.], seq 65:86, ack 169, length 21: BGP
+    Notification Message (3), length: 21, Cease (6), subcode Administrative Shutdown (2)
+127.0.0.1.179 &gt; 127.0.0.2.46887: Flags [F.], seq 86, ack 169, ...   &lt;- NOTIFICATION, then close</code></pre>
+<p>The numbers all add up. Each OPEN is 45 bytes (19 header + 10 fixed fields + 16 bytes of optional parameters). The two OPENs plus two KEEPALIVEs advance each side's sequence numbers by exactly 45 + 19 = 64, so both sides' next data starts at relative sequence 65. The 104-byte segment is 54 + 23 + 27. The NOTIFICATION is the 19-byte header plus a code byte and a subcode byte.</p>
+<p>Four things in this capture are worth carrying around.</p>
+<p><strong>BGP messages are not packets.</strong> TCP is a byte stream, and the three UPDATEs travelled in one segment. A big UPDATE can equally span several segments. The receiver finds message boundaries from the 2-byte length field after the marker. This is why a BGP decoder that assumes "one message per packet" gives garbage on a busy session, and why a TCP problem (a black-holed MSS, a retransmission storm) stalls BGP as a whole.</p>
+<p><strong>The hold time is the minimum of the two offers.</strong> Neither side "wins"; both use 30 s here and send KEEPALIVEs every 10 s if idle. An offer of 0 means "no keepalives at all", and a value of 1 or 2 is illegal and rejected with OPEN error subcode 6.</p>
+<p><strong>A withdrawal carries only the prefix.</strong> No attributes are needed to say "forget this." The withdraw UPDATE here is 27 bytes: 19 header, 2 bytes of withdrawn length, the 4-byte prefix, 2 bytes of zero attribute length. tcpdump also prints "End-of-Rib Marker" under it. That is a decoder quirk: it labels any UPDATE with no NLRI that way. A true End-of-RIB (RFC 4724) has no withdrawals and no attributes either, like the 23-byte message before it.</p>
+<p><strong>Closing is explicit.</strong> A NOTIFICATION precedes the FIN, so the peer logs a reason. If you see a session drop with no NOTIFICATION in a capture, the TCP connection died underneath BGP: a reset from a middlebox, a hold-timer expiry on one side only, or a dead link.</p>
+<p>Here is the script that produced the capture. It speaks just enough BGP to bring a session up and exchange routes. It's no router, but every byte it sends is valid RFC 4271, which is why tcpdump decodes it.</p>
+<div class="sourceCode" id="m21-cb15"><pre class="sourceCode python"><code class="sourceCode python"><span id="m21-cb15-1"><a href="#m21-cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Two toy BGP speakers on loopback: OPEN, KEEPALIVE, UPDATE, End-of-RIB,</span></span>
+<span id="m21-cb15-2"><a href="#m21-cb15-2" aria-hidden="true" tabindex="-1"></a><span class="co">withdraw, NOTIFICATION. Real RFC 4271 bytes, so tcpdump decodes them.</span></span>
+<span id="m21-cb15-3"><a href="#m21-cb15-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-4"><a href="#m21-cb15-4" aria-hidden="true" tabindex="-1"></a><span class="co">Usage: python3 bgp_wire.py [port]      (port 179 needs root; default 1179)</span></span>
+<span id="m21-cb15-5"><a href="#m21-cb15-5" aria-hidden="true" tabindex="-1"></a><span class="co">On Linux 127.0.0.2 is already a loopback address. On macOS run</span></span>
+<span id="m21-cb15-6"><a href="#m21-cb15-6" aria-hidden="true" tabindex="-1"></a><span class="co">`sudo ifconfig lo0 alias 127.0.0.2` first (remove with `-alias`).</span></span>
+<span id="m21-cb15-7"><a href="#m21-cb15-7" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="m21-cb15-8"><a href="#m21-cb15-8" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> socket</span>
+<span id="m21-cb15-9"><a href="#m21-cb15-9" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> struct</span>
+<span id="m21-cb15-10"><a href="#m21-cb15-10" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> sys</span>
+<span id="m21-cb15-11"><a href="#m21-cb15-11" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> threading</span>
+<span id="m21-cb15-12"><a href="#m21-cb15-12" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> ipaddress <span class="im">import</span> ip_address, ip_network</span>
+<span id="m21-cb15-13"><a href="#m21-cb15-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-14"><a href="#m21-cb15-14" aria-hidden="true" tabindex="-1"></a>PORT <span class="op">=</span> <span class="bu">int</span>(sys.argv[<span class="dv">1</span>]) <span class="cf">if</span> <span class="bu">len</span>(sys.argv) <span class="op">&gt;</span> <span class="dv">1</span> <span class="cf">else</span> <span class="dv">1179</span></span>
+<span id="m21-cb15-15"><a href="#m21-cb15-15" aria-hidden="true" tabindex="-1"></a>MARKER <span class="op">=</span> <span class="st">b&quot;</span><span class="ch">\xff</span><span class="st">&quot;</span> <span class="op">*</span> <span class="dv">16</span></span>
+<span id="m21-cb15-16"><a href="#m21-cb15-16" aria-hidden="true" tabindex="-1"></a>TYPES <span class="op">=</span> {<span class="dv">1</span>: <span class="st">&quot;OPEN&quot;</span>, <span class="dv">2</span>: <span class="st">&quot;UPDATE&quot;</span>, <span class="dv">3</span>: <span class="st">&quot;NOTIFICATION&quot;</span>, <span class="dv">4</span>: <span class="st">&quot;KEEPALIVE&quot;</span>}</span>
+<span id="m21-cb15-17"><a href="#m21-cb15-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-18"><a href="#m21-cb15-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-19"><a href="#m21-cb15-19" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> msg(mtype, body<span class="op">=</span><span class="st">b&quot;&quot;</span>):</span>
+<span id="m21-cb15-20"><a href="#m21-cb15-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> MARKER <span class="op">+</span> struct.pack(<span class="st">&quot;!HB&quot;</span>, <span class="dv">19</span> <span class="op">+</span> <span class="bu">len</span>(body), mtype) <span class="op">+</span> body</span>
+<span id="m21-cb15-21"><a href="#m21-cb15-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-22"><a href="#m21-cb15-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-23"><a href="#m21-cb15-23" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> open_msg(asn, hold, router_id):</span>
+<span id="m21-cb15-24"><a href="#m21-cb15-24" aria-hidden="true" tabindex="-1"></a>    caps <span class="op">=</span> (<span class="st">b&quot;</span><span class="ch">\x01\x04</span><span class="st">&quot;</span> <span class="op">+</span> struct.pack(<span class="st">&quot;!HBB&quot;</span>, <span class="dv">1</span>, <span class="dv">0</span>, <span class="dv">1</span>)    <span class="co"># MP-BGP: IPv4 unicast</span></span>
+<span id="m21-cb15-25"><a href="#m21-cb15-25" aria-hidden="true" tabindex="-1"></a>            <span class="op">+</span> <span class="st">b&quot;</span><span class="ch">\x02\x00</span><span class="st">&quot;</span>                                  <span class="co"># route refresh</span></span>
+<span id="m21-cb15-26"><a href="#m21-cb15-26" aria-hidden="true" tabindex="-1"></a>            <span class="op">+</span> <span class="st">b&quot;</span><span class="ch">\x41\x04</span><span class="st">&quot;</span> <span class="op">+</span> struct.pack(<span class="st">&quot;!I&quot;</span>, asn))        <span class="co"># 4-octet AS number</span></span>
+<span id="m21-cb15-27"><a href="#m21-cb15-27" aria-hidden="true" tabindex="-1"></a>    opt <span class="op">=</span> <span class="st">b&quot;</span><span class="ch">\x02</span><span class="st">&quot;</span> <span class="op">+</span> <span class="bu">bytes</span>([<span class="bu">len</span>(caps)]) <span class="op">+</span> caps               <span class="co"># one Capabilities param</span></span>
+<span id="m21-cb15-28"><a href="#m21-cb15-28" aria-hidden="true" tabindex="-1"></a>    my_as <span class="op">=</span> asn <span class="cf">if</span> asn <span class="op">&lt;</span> <span class="dv">65536</span> <span class="cf">else</span> <span class="dv">23456</span>                   <span class="co"># AS_TRANS if needed</span></span>
+<span id="m21-cb15-29"><a href="#m21-cb15-29" aria-hidden="true" tabindex="-1"></a>    body <span class="op">=</span> struct.pack(<span class="st">&quot;!BHH&quot;</span>, <span class="dv">4</span>, my_as, hold) <span class="op">+</span> ip_address(router_id).packed</span>
+<span id="m21-cb15-30"><a href="#m21-cb15-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> msg(<span class="dv">1</span>, body <span class="op">+</span> <span class="bu">bytes</span>([<span class="bu">len</span>(opt)]) <span class="op">+</span> opt)</span>
+<span id="m21-cb15-31"><a href="#m21-cb15-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-32"><a href="#m21-cb15-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-33"><a href="#m21-cb15-33" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> attr(flags, code, value):</span>
+<span id="m21-cb15-34"><a href="#m21-cb15-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> struct.pack(<span class="st">&quot;!BBB&quot;</span>, flags, code, <span class="bu">len</span>(value)) <span class="op">+</span> value</span>
+<span id="m21-cb15-35"><a href="#m21-cb15-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-36"><a href="#m21-cb15-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-37"><a href="#m21-cb15-37" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> nlri(prefix):</span>
+<span id="m21-cb15-38"><a href="#m21-cb15-38" aria-hidden="true" tabindex="-1"></a>    net <span class="op">=</span> ip_network(prefix)</span>
+<span id="m21-cb15-39"><a href="#m21-cb15-39" aria-hidden="true" tabindex="-1"></a>    nbytes <span class="op">=</span> (net.prefixlen <span class="op">+</span> <span class="dv">7</span>) <span class="op">//</span> <span class="dv">8</span></span>
+<span id="m21-cb15-40"><a href="#m21-cb15-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">bytes</span>([net.prefixlen]) <span class="op">+</span> net.network_address.packed[:nbytes]</span>
+<span id="m21-cb15-41"><a href="#m21-cb15-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-42"><a href="#m21-cb15-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-43"><a href="#m21-cb15-43" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> update(withdrawn<span class="op">=</span>(), announce<span class="op">=</span>(), as_path<span class="op">=</span>(), next_hop<span class="op">=</span><span class="va">None</span>, communities<span class="op">=</span>()):</span>
+<span id="m21-cb15-44"><a href="#m21-cb15-44" aria-hidden="true" tabindex="-1"></a>    wd <span class="op">=</span> <span class="st">b&quot;&quot;</span>.join(nlri(p) <span class="cf">for</span> p <span class="kw">in</span> withdrawn)</span>
+<span id="m21-cb15-45"><a href="#m21-cb15-45" aria-hidden="true" tabindex="-1"></a>    attrs <span class="op">=</span> <span class="st">b&quot;&quot;</span></span>
+<span id="m21-cb15-46"><a href="#m21-cb15-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> announce:</span>
+<span id="m21-cb15-47"><a href="#m21-cb15-47" aria-hidden="true" tabindex="-1"></a>        seg <span class="op">=</span> struct.pack(<span class="st">&quot;!BB&quot;</span>, <span class="dv">2</span>, <span class="bu">len</span>(as_path)) <span class="op">+</span> <span class="st">b&quot;&quot;</span>.join(</span>
+<span id="m21-cb15-48"><a href="#m21-cb15-48" aria-hidden="true" tabindex="-1"></a>            struct.pack(<span class="st">&quot;!I&quot;</span>, a) <span class="cf">for</span> a <span class="kw">in</span> as_path)          <span class="co"># AS_SEQUENCE, 4-byte ASNs</span></span>
+<span id="m21-cb15-49"><a href="#m21-cb15-49" aria-hidden="true" tabindex="-1"></a>        attrs <span class="op">+=</span> attr(<span class="bn">0x40</span>, <span class="dv">1</span>, <span class="st">b&quot;</span><span class="ch">\x00</span><span class="st">&quot;</span>)                      <span class="co"># ORIGIN = IGP</span></span>
+<span id="m21-cb15-50"><a href="#m21-cb15-50" aria-hidden="true" tabindex="-1"></a>        attrs <span class="op">+=</span> attr(<span class="bn">0x40</span>, <span class="dv">2</span>, seg)                          <span class="co"># AS_PATH</span></span>
+<span id="m21-cb15-51"><a href="#m21-cb15-51" aria-hidden="true" tabindex="-1"></a>        attrs <span class="op">+=</span> attr(<span class="bn">0x40</span>, <span class="dv">3</span>, ip_address(next_hop).packed)  <span class="co"># NEXT_HOP</span></span>
+<span id="m21-cb15-52"><a href="#m21-cb15-52" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> communities:</span>
+<span id="m21-cb15-53"><a href="#m21-cb15-53" aria-hidden="true" tabindex="-1"></a>            attrs <span class="op">+=</span> attr(<span class="bn">0xC0</span>, <span class="dv">8</span>, <span class="st">b&quot;&quot;</span>.join(</span>
+<span id="m21-cb15-54"><a href="#m21-cb15-54" aria-hidden="true" tabindex="-1"></a>                struct.pack(<span class="st">&quot;!HH&quot;</span>, <span class="op">*</span>c) <span class="cf">for</span> c <span class="kw">in</span> communities))</span>
+<span id="m21-cb15-55"><a href="#m21-cb15-55" aria-hidden="true" tabindex="-1"></a>    body <span class="op">=</span> (struct.pack(<span class="st">&quot;!H&quot;</span>, <span class="bu">len</span>(wd)) <span class="op">+</span> wd <span class="op">+</span> struct.pack(<span class="st">&quot;!H&quot;</span>, <span class="bu">len</span>(attrs))</span>
+<span id="m21-cb15-56"><a href="#m21-cb15-56" aria-hidden="true" tabindex="-1"></a>            <span class="op">+</span> attrs <span class="op">+</span> <span class="st">b&quot;&quot;</span>.join(nlri(p) <span class="cf">for</span> p <span class="kw">in</span> announce))</span>
+<span id="m21-cb15-57"><a href="#m21-cb15-57" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> msg(<span class="dv">2</span>, body)</span>
+<span id="m21-cb15-58"><a href="#m21-cb15-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-59"><a href="#m21-cb15-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-60"><a href="#m21-cb15-60" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> read_msg(sock):</span>
+<span id="m21-cb15-61"><a href="#m21-cb15-61" aria-hidden="true" tabindex="-1"></a>    hdr <span class="op">=</span> <span class="st">b&quot;&quot;</span></span>
+<span id="m21-cb15-62"><a href="#m21-cb15-62" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="bu">len</span>(hdr) <span class="op">&lt;</span> <span class="dv">19</span>:</span>
+<span id="m21-cb15-63"><a href="#m21-cb15-63" aria-hidden="true" tabindex="-1"></a>        chunk <span class="op">=</span> sock.recv(<span class="dv">19</span> <span class="op">-</span> <span class="bu">len</span>(hdr))</span>
+<span id="m21-cb15-64"><a href="#m21-cb15-64" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">not</span> chunk:</span>
+<span id="m21-cb15-65"><a href="#m21-cb15-65" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="va">None</span>, <span class="va">None</span></span>
+<span id="m21-cb15-66"><a href="#m21-cb15-66" aria-hidden="true" tabindex="-1"></a>        hdr <span class="op">+=</span> chunk</span>
+<span id="m21-cb15-67"><a href="#m21-cb15-67" aria-hidden="true" tabindex="-1"></a>    length, mtype <span class="op">=</span> struct.unpack(<span class="st">&quot;!HB&quot;</span>, hdr[<span class="dv">16</span>:<span class="dv">19</span>])</span>
+<span id="m21-cb15-68"><a href="#m21-cb15-68" aria-hidden="true" tabindex="-1"></a>    body <span class="op">=</span> <span class="st">b&quot;&quot;</span></span>
+<span id="m21-cb15-69"><a href="#m21-cb15-69" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="bu">len</span>(body) <span class="op">&lt;</span> length <span class="op">-</span> <span class="dv">19</span>:</span>
+<span id="m21-cb15-70"><a href="#m21-cb15-70" aria-hidden="true" tabindex="-1"></a>        body <span class="op">+=</span> sock.recv(length <span class="op">-</span> <span class="dv">19</span> <span class="op">-</span> <span class="bu">len</span>(body))</span>
+<span id="m21-cb15-71"><a href="#m21-cb15-71" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> mtype, body</span>
+<span id="m21-cb15-72"><a href="#m21-cb15-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-73"><a href="#m21-cb15-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-74"><a href="#m21-cb15-74" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> describe(mtype, body):</span>
+<span id="m21-cb15-75"><a href="#m21-cb15-75" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> mtype <span class="op">==</span> <span class="dv">1</span>:</span>
+<span id="m21-cb15-76"><a href="#m21-cb15-76" aria-hidden="true" tabindex="-1"></a>        ver, my_as, hold <span class="op">=</span> struct.unpack(<span class="st">&quot;!BHH&quot;</span>, body[:<span class="dv">5</span>])</span>
+<span id="m21-cb15-77"><a href="#m21-cb15-77" aria-hidden="true" tabindex="-1"></a>        rid <span class="op">=</span> ip_address(body[<span class="dv">5</span>:<span class="dv">9</span>])</span>
+<span id="m21-cb15-78"><a href="#m21-cb15-78" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ss">f&quot;OPEN v</span><span class="sc">{</span>ver<span class="sc">}</span><span class="ss"> AS</span><span class="sc">{</span>my_as<span class="sc">}</span><span class="ss"> hold=</span><span class="sc">{</span>hold<span class="sc">}</span><span class="ss">s id=</span><span class="sc">{</span>rid<span class="sc">}</span><span class="ss"> optlen=</span><span class="sc">{</span>body[<span class="dv">9</span>]<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="m21-cb15-79"><a href="#m21-cb15-79" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> mtype <span class="op">==</span> <span class="dv">2</span>:</span>
+<span id="m21-cb15-80"><a href="#m21-cb15-80" aria-hidden="true" tabindex="-1"></a>        wlen <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, body[:<span class="dv">2</span>])[<span class="dv">0</span>]</span>
+<span id="m21-cb15-81"><a href="#m21-cb15-81" aria-hidden="true" tabindex="-1"></a>        alen <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, body[<span class="dv">2</span> <span class="op">+</span> wlen:<span class="dv">4</span> <span class="op">+</span> wlen])[<span class="dv">0</span>]</span>
+<span id="m21-cb15-82"><a href="#m21-cb15-82" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> wlen <span class="op">==</span> <span class="dv">0</span> <span class="kw">and</span> alen <span class="op">==</span> <span class="dv">0</span>:</span>
+<span id="m21-cb15-83"><a href="#m21-cb15-83" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="st">&quot;UPDATE (empty: End-of-RIB for IPv4 unicast)&quot;</span></span>
+<span id="m21-cb15-84"><a href="#m21-cb15-84" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ss">f&quot;UPDATE withdrawn_len=</span><span class="sc">{</span>wlen<span class="sc">}</span><span class="ss"> attrs_len=</span><span class="sc">{</span>alen<span class="sc">}</span><span class="ss"> nlri_len=</span><span class="sc">{</span><span class="bu">len</span>(body) <span class="op">-</span> <span class="dv">4</span> <span class="op">-</span> wlen <span class="op">-</span> alen<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="m21-cb15-85"><a href="#m21-cb15-85" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> mtype <span class="op">==</span> <span class="dv">3</span>:</span>
+<span id="m21-cb15-86"><a href="#m21-cb15-86" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ss">f&quot;NOTIFICATION code=</span><span class="sc">{</span>body[<span class="dv">0</span>]<span class="sc">}</span><span class="ss"> subcode=</span><span class="sc">{</span>body[<span class="dv">1</span>]<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="m21-cb15-87"><a href="#m21-cb15-87" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> TYPES.get(mtype, <span class="ss">f&quot;type </span><span class="sc">{</span>mtype<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m21-cb15-88"><a href="#m21-cb15-88" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-89"><a href="#m21-cb15-89" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-90"><a href="#m21-cb15-90" aria-hidden="true" tabindex="-1"></a>log_lock <span class="op">=</span> threading.Lock()</span>
+<span id="m21-cb15-91"><a href="#m21-cb15-91" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-92"><a href="#m21-cb15-92" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-93"><a href="#m21-cb15-93" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> log(who, text):</span>
+<span id="m21-cb15-94"><a href="#m21-cb15-94" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> log_lock:</span>
+<span id="m21-cb15-95"><a href="#m21-cb15-95" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>who<span class="sc">}</span><span class="ss">: </span><span class="sc">{</span>text<span class="sc">}</span><span class="ss">&quot;</span>, flush<span class="op">=</span><span class="va">True</span>)</span>
+<span id="m21-cb15-96"><a href="#m21-cb15-96" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-97"><a href="#m21-cb15-97" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-98"><a href="#m21-cb15-98" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> r1_server(ready):</span>
+<span id="m21-cb15-99"><a href="#m21-cb15-99" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;AS 64496, router ID 192.0.2.1: the &#39;passive&#39; side.&quot;&quot;&quot;</span></span>
+<span id="m21-cb15-100"><a href="#m21-cb15-100" aria-hidden="true" tabindex="-1"></a>    srv <span class="op">=</span> socket.socket()</span>
+<span id="m21-cb15-101"><a href="#m21-cb15-101" aria-hidden="true" tabindex="-1"></a>    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, <span class="dv">1</span>)</span>
+<span id="m21-cb15-102"><a href="#m21-cb15-102" aria-hidden="true" tabindex="-1"></a>    srv.bind((<span class="st">&quot;127.0.0.1&quot;</span>, PORT))</span>
+<span id="m21-cb15-103"><a href="#m21-cb15-103" aria-hidden="true" tabindex="-1"></a>    srv.listen(<span class="dv">1</span>)</span>
+<span id="m21-cb15-104"><a href="#m21-cb15-104" aria-hidden="true" tabindex="-1"></a>    log(<span class="st">&quot;R1&quot;</span>, <span class="ss">f&quot;Idle -&gt; Active (listening on 127.0.0.1:</span><span class="sc">{</span>PORT<span class="sc">}</span><span class="ss">)&quot;</span>)</span>
+<span id="m21-cb15-105"><a href="#m21-cb15-105" aria-hidden="true" tabindex="-1"></a>    ready.<span class="bu">set</span>()</span>
+<span id="m21-cb15-106"><a href="#m21-cb15-106" aria-hidden="true" tabindex="-1"></a>    conn, peer <span class="op">=</span> srv.accept()</span>
+<span id="m21-cb15-107"><a href="#m21-cb15-107" aria-hidden="true" tabindex="-1"></a>    log(<span class="st">&quot;R1&quot;</span>, <span class="ss">f&quot;TCP up from </span><span class="sc">{</span>peer[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>peer[<span class="dv">1</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m21-cb15-108"><a href="#m21-cb15-108" aria-hidden="true" tabindex="-1"></a>    mtype, body <span class="op">=</span> read_msg(conn)</span>
+<span id="m21-cb15-109"><a href="#m21-cb15-109" aria-hidden="true" tabindex="-1"></a>    log(<span class="st">&quot;R1&quot;</span>, <span class="st">&quot;rx &quot;</span> <span class="op">+</span> describe(mtype, body))</span>
+<span id="m21-cb15-110"><a href="#m21-cb15-110" aria-hidden="true" tabindex="-1"></a>    conn.sendall(open_msg(<span class="dv">64496</span>, <span class="dv">90</span>, <span class="st">&quot;192.0.2.1&quot;</span>))</span>
+<span id="m21-cb15-111"><a href="#m21-cb15-111" aria-hidden="true" tabindex="-1"></a>    peer_hold <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, body[<span class="dv">3</span>:<span class="dv">5</span>])[<span class="dv">0</span>]</span>
+<span id="m21-cb15-112"><a href="#m21-cb15-112" aria-hidden="true" tabindex="-1"></a>    hold <span class="op">=</span> <span class="bu">min</span>(<span class="dv">90</span>, peer_hold)</span>
+<span id="m21-cb15-113"><a href="#m21-cb15-113" aria-hidden="true" tabindex="-1"></a>    log(<span class="st">&quot;R1&quot;</span>, <span class="ss">f&quot;tx OPEN; Active -&gt; OpenConfirm; negotiated hold=</span><span class="sc">{</span>hold<span class="sc">}</span><span class="ss">s keepalive=</span><span class="sc">{</span>hold <span class="op">//</span> <span class="dv">3</span><span class="sc">}</span><span class="ss">s&quot;</span>)</span>
+<span id="m21-cb15-114"><a href="#m21-cb15-114" aria-hidden="true" tabindex="-1"></a>    conn.sendall(msg(<span class="dv">4</span>))</span>
+<span id="m21-cb15-115"><a href="#m21-cb15-115" aria-hidden="true" tabindex="-1"></a>    rib <span class="op">=</span> {}</span>
+<span id="m21-cb15-116"><a href="#m21-cb15-116" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="va">True</span>:</span>
+<span id="m21-cb15-117"><a href="#m21-cb15-117" aria-hidden="true" tabindex="-1"></a>        mtype, body <span class="op">=</span> read_msg(conn)</span>
+<span id="m21-cb15-118"><a href="#m21-cb15-118" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> mtype <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="m21-cb15-119"><a href="#m21-cb15-119" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span></span>
+<span id="m21-cb15-120"><a href="#m21-cb15-120" aria-hidden="true" tabindex="-1"></a>        log(<span class="st">&quot;R1&quot;</span>, <span class="st">&quot;rx &quot;</span> <span class="op">+</span> describe(mtype, body))</span>
+<span id="m21-cb15-121"><a href="#m21-cb15-121" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> mtype <span class="op">==</span> <span class="dv">4</span> <span class="kw">and</span> <span class="kw">not</span> rib.get(<span class="st">&quot;_up&quot;</span>):</span>
+<span id="m21-cb15-122"><a href="#m21-cb15-122" aria-hidden="true" tabindex="-1"></a>            rib[<span class="st">&quot;_up&quot;</span>] <span class="op">=</span> <span class="va">True</span></span>
+<span id="m21-cb15-123"><a href="#m21-cb15-123" aria-hidden="true" tabindex="-1"></a>            log(<span class="st">&quot;R1&quot;</span>, <span class="st">&quot;OpenConfirm -&gt; Established&quot;</span>)</span>
+<span id="m21-cb15-124"><a href="#m21-cb15-124" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> mtype <span class="op">==</span> <span class="dv">2</span>:</span>
+<span id="m21-cb15-125"><a href="#m21-cb15-125" aria-hidden="true" tabindex="-1"></a>            wlen <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, body[:<span class="dv">2</span>])[<span class="dv">0</span>]</span>
+<span id="m21-cb15-126"><a href="#m21-cb15-126" aria-hidden="true" tabindex="-1"></a>            alen <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, body[<span class="dv">2</span> <span class="op">+</span> wlen:<span class="dv">4</span> <span class="op">+</span> wlen])[<span class="dv">0</span>]</span>
+<span id="m21-cb15-127"><a href="#m21-cb15-127" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> wlen:</span>
+<span id="m21-cb15-128"><a href="#m21-cb15-128" aria-hidden="true" tabindex="-1"></a>                log(<span class="st">&quot;R1&quot;</span>, <span class="st">&quot;  Adj-RIB-In: withdraw 203.0.113.0/24&quot;</span>)</span>
+<span id="m21-cb15-129"><a href="#m21-cb15-129" aria-hidden="true" tabindex="-1"></a>                rib.pop(<span class="st">&quot;203.0.113.0/24&quot;</span>, <span class="va">None</span>)</span>
+<span id="m21-cb15-130"><a href="#m21-cb15-130" aria-hidden="true" tabindex="-1"></a>            <span class="cf">elif</span> alen:</span>
+<span id="m21-cb15-131"><a href="#m21-cb15-131" aria-hidden="true" tabindex="-1"></a>                rib[<span class="st">&quot;203.0.113.0/24&quot;</span>] <span class="op">=</span> <span class="st">&quot;AS_PATH 64511&quot;</span></span>
+<span id="m21-cb15-132"><a href="#m21-cb15-132" aria-hidden="true" tabindex="-1"></a>                log(<span class="st">&quot;R1&quot;</span>, <span class="st">&quot;  Adj-RIB-In: add 203.0.113.0/24 AS_PATH 64511&quot;</span>)</span>
+<span id="m21-cb15-133"><a href="#m21-cb15-133" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> wlen:</span>
+<span id="m21-cb15-134"><a href="#m21-cb15-134" aria-hidden="true" tabindex="-1"></a>                conn.sendall(msg(<span class="dv">3</span>, <span class="st">b&quot;</span><span class="ch">\x06\x02</span><span class="st">&quot;</span>))    <span class="co"># Cease / Administrative Shutdown</span></span>
+<span id="m21-cb15-135"><a href="#m21-cb15-135" aria-hidden="true" tabindex="-1"></a>                log(<span class="st">&quot;R1&quot;</span>, <span class="st">&quot;tx NOTIFICATION Cease/Admin Shutdown; Established -&gt; Idle&quot;</span>)</span>
+<span id="m21-cb15-136"><a href="#m21-cb15-136" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span></span>
+<span id="m21-cb15-137"><a href="#m21-cb15-137" aria-hidden="true" tabindex="-1"></a>    conn.close()</span>
+<span id="m21-cb15-138"><a href="#m21-cb15-138" aria-hidden="true" tabindex="-1"></a>    srv.close()</span>
+<span id="m21-cb15-139"><a href="#m21-cb15-139" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-140"><a href="#m21-cb15-140" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-141"><a href="#m21-cb15-141" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> r2_client():</span>
+<span id="m21-cb15-142"><a href="#m21-cb15-142" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;AS 64511, router ID 192.0.2.2: originates 203.0.113.0/24.&quot;&quot;&quot;</span></span>
+<span id="m21-cb15-143"><a href="#m21-cb15-143" aria-hidden="true" tabindex="-1"></a>    s <span class="op">=</span> socket.socket()</span>
+<span id="m21-cb15-144"><a href="#m21-cb15-144" aria-hidden="true" tabindex="-1"></a>    s.bind((<span class="st">&quot;127.0.0.2&quot;</span>, <span class="dv">0</span>))</span>
+<span id="m21-cb15-145"><a href="#m21-cb15-145" aria-hidden="true" tabindex="-1"></a>    s.<span class="ex">connect</span>((<span class="st">&quot;127.0.0.1&quot;</span>, PORT))</span>
+<span id="m21-cb15-146"><a href="#m21-cb15-146" aria-hidden="true" tabindex="-1"></a>    log(<span class="st">&quot;R2&quot;</span>, <span class="st">&quot;Connect -&gt; OpenSent (tx OPEN hold=30)&quot;</span>)</span>
+<span id="m21-cb15-147"><a href="#m21-cb15-147" aria-hidden="true" tabindex="-1"></a>    s.sendall(open_msg(<span class="dv">64511</span>, <span class="dv">30</span>, <span class="st">&quot;192.0.2.2&quot;</span>))</span>
+<span id="m21-cb15-148"><a href="#m21-cb15-148" aria-hidden="true" tabindex="-1"></a>    mtype, body <span class="op">=</span> read_msg(s)</span>
+<span id="m21-cb15-149"><a href="#m21-cb15-149" aria-hidden="true" tabindex="-1"></a>    log(<span class="st">&quot;R2&quot;</span>, <span class="st">&quot;rx &quot;</span> <span class="op">+</span> describe(mtype, body))</span>
+<span id="m21-cb15-150"><a href="#m21-cb15-150" aria-hidden="true" tabindex="-1"></a>    s.sendall(msg(<span class="dv">4</span>))</span>
+<span id="m21-cb15-151"><a href="#m21-cb15-151" aria-hidden="true" tabindex="-1"></a>    mtype, body <span class="op">=</span> read_msg(s)</span>
+<span id="m21-cb15-152"><a href="#m21-cb15-152" aria-hidden="true" tabindex="-1"></a>    log(<span class="st">&quot;R2&quot;</span>, <span class="st">&quot;rx &quot;</span> <span class="op">+</span> describe(mtype, body) <span class="op">+</span> <span class="st">&quot;; OpenConfirm -&gt; Established&quot;</span>)</span>
+<span id="m21-cb15-153"><a href="#m21-cb15-153" aria-hidden="true" tabindex="-1"></a>    s.sendall(update(announce<span class="op">=</span>[<span class="st">&quot;203.0.113.0/24&quot;</span>], as_path<span class="op">=</span>[<span class="dv">64511</span>],</span>
+<span id="m21-cb15-154"><a href="#m21-cb15-154" aria-hidden="true" tabindex="-1"></a>                     next_hop<span class="op">=</span><span class="st">&quot;127.0.0.2&quot;</span>, communities<span class="op">=</span>[(<span class="dv">64511</span>, <span class="dv">100</span>)]))</span>
+<span id="m21-cb15-155"><a href="#m21-cb15-155" aria-hidden="true" tabindex="-1"></a>    s.sendall(update())                                   <span class="co"># End-of-RIB marker</span></span>
+<span id="m21-cb15-156"><a href="#m21-cb15-156" aria-hidden="true" tabindex="-1"></a>    s.sendall(update(withdrawn<span class="op">=</span>[<span class="st">&quot;203.0.113.0/24&quot;</span>]))</span>
+<span id="m21-cb15-157"><a href="#m21-cb15-157" aria-hidden="true" tabindex="-1"></a>    mtype, body <span class="op">=</span> read_msg(s)</span>
+<span id="m21-cb15-158"><a href="#m21-cb15-158" aria-hidden="true" tabindex="-1"></a>    log(<span class="st">&quot;R2&quot;</span>, <span class="st">&quot;rx &quot;</span> <span class="op">+</span> describe(mtype, body))</span>
+<span id="m21-cb15-159"><a href="#m21-cb15-159" aria-hidden="true" tabindex="-1"></a>    s.close()</span>
+<span id="m21-cb15-160"><a href="#m21-cb15-160" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-161"><a href="#m21-cb15-161" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m21-cb15-162"><a href="#m21-cb15-162" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="m21-cb15-163"><a href="#m21-cb15-163" aria-hidden="true" tabindex="-1"></a>    ready <span class="op">=</span> threading.Event()</span>
+<span id="m21-cb15-164"><a href="#m21-cb15-164" aria-hidden="true" tabindex="-1"></a>    t <span class="op">=</span> threading.Thread(target<span class="op">=</span>r1_server, args<span class="op">=</span>(ready,))</span>
+<span id="m21-cb15-165"><a href="#m21-cb15-165" aria-hidden="true" tabindex="-1"></a>    t.start()</span>
+<span id="m21-cb15-166"><a href="#m21-cb15-166" aria-hidden="true" tabindex="-1"></a>    ready.wait()</span>
+<span id="m21-cb15-167"><a href="#m21-cb15-167" aria-hidden="true" tabindex="-1"></a>    r2_client()</span>
+<span id="m21-cb15-168"><a href="#m21-cb15-168" aria-hidden="true" tabindex="-1"></a>    t.join()</span>
+<span id="m21-cb15-169"><a href="#m21-cb15-169" aria-hidden="true" tabindex="-1"></a>    sizes <span class="op">=</span> {<span class="st">&quot;OPEN&quot;</span>: <span class="bu">len</span>(open_msg(<span class="dv">64496</span>, <span class="dv">90</span>, <span class="st">&quot;192.0.2.1&quot;</span>)), <span class="st">&quot;KEEPALIVE&quot;</span>: <span class="bu">len</span>(msg(<span class="dv">4</span>)),</span>
+<span id="m21-cb15-170"><a href="#m21-cb15-170" aria-hidden="true" tabindex="-1"></a>             <span class="st">&quot;UPDATE(announce)&quot;</span>: <span class="bu">len</span>(update(announce<span class="op">=</span>[<span class="st">&quot;203.0.113.0/24&quot;</span>], as_path<span class="op">=</span>[<span class="dv">64511</span>],</span>
+<span id="m21-cb15-171"><a href="#m21-cb15-171" aria-hidden="true" tabindex="-1"></a>                                            next_hop<span class="op">=</span><span class="st">&quot;127.0.0.2&quot;</span>, communities<span class="op">=</span>[(<span class="dv">64511</span>, <span class="dv">100</span>)])),</span>
+<span id="m21-cb15-172"><a href="#m21-cb15-172" aria-hidden="true" tabindex="-1"></a>             <span class="st">&quot;UPDATE(End-of-RIB)&quot;</span>: <span class="bu">len</span>(update()),</span>
+<span id="m21-cb15-173"><a href="#m21-cb15-173" aria-hidden="true" tabindex="-1"></a>             <span class="st">&quot;UPDATE(withdraw)&quot;</span>: <span class="bu">len</span>(update(withdrawn<span class="op">=</span>[<span class="st">&quot;203.0.113.0/24&quot;</span>])),</span>
+<span id="m21-cb15-174"><a href="#m21-cb15-174" aria-hidden="true" tabindex="-1"></a>             <span class="st">&quot;NOTIFICATION&quot;</span>: <span class="bu">len</span>(msg(<span class="dv">3</span>, <span class="st">b&quot;</span><span class="ch">\x06\x02</span><span class="st">&quot;</span>))}</span>
+<span id="m21-cb15-175"><a href="#m21-cb15-175" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;message sizes (bytes):&quot;</span>, <span class="st">&quot;, &quot;</span>.join(<span class="ss">f&quot;</span><span class="sc">{</span>k<span class="sc">}</span><span class="ss">=</span><span class="sc">{</span>v<span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> k, v <span class="kw">in</span> sizes.items()))</span></code></pre></div>
+<p>Its own log, from the same run:</p>
+<pre class="text"><code>R1: Idle -&gt; Active (listening on 127.0.0.1:179)
+R2: Connect -&gt; OpenSent (tx OPEN hold=30)
+R1: TCP up from 127.0.0.2:46887
+R1: rx OPEN v4 AS64511 hold=30s id=192.0.2.2 optlen=16
+R1: tx OPEN; Active -&gt; OpenConfirm; negotiated hold=30s keepalive=10s
+R2: rx OPEN v4 AS64496 hold=90s id=192.0.2.1 optlen=16
+R2: rx KEEPALIVE; OpenConfirm -&gt; Established
+R1: rx KEEPALIVE
+R1: OpenConfirm -&gt; Established
+R1: rx UPDATE withdrawn_len=0 attrs_len=27 nlri_len=4
+R1:   Adj-RIB-In: add 203.0.113.0/24 AS_PATH 64511
+R1: rx UPDATE (empty: End-of-RIB for IPv4 unicast)
+R1: rx UPDATE withdrawn_len=4 attrs_len=0 nlri_len=0
+R1:   Adj-RIB-In: withdraw 203.0.113.0/24
+R1: tx NOTIFICATION Cease/Admin Shutdown; Established -&gt; Idle
+R2: rx NOTIFICATION code=6 subcode=2
+message sizes (bytes): OPEN=45, KEEPALIVE=19, UPDATE(announce)=54, UPDATE(End-of-RIB)=23, UPDATE(withdraw)=27, NOTIFICATION=21</code></pre>
+<p>To reproduce: as root on Linux, start <code>tcpdump -i lo -nn -v -s0 'tcp port 179'</code> in one terminal and run <code>python3 bgp_wire.py 179</code> in another. On macOS, add the second loopback address first (<code>sudo ifconfig lo0 alias 127.0.0.2</code>), capture with <code>sudo tcpdump -i lo0 -nn -v 'tcp port 179'</code>, and run the script with <code>sudo</code>. Without root, <code>python3 bgp_wire.py</code> uses port 1179, which works but which tcpdump won't decode as BGP.</p>
+<p>On a real router, the equivalent views are <code>show bgp summary</code> (state, uptime and prefix count per neighbour) and <code>show bgp neighbors &lt;addr&gt;</code> (negotiated hold time, capabilities, message counters and the last error). In FRR the summary looks like this (illustrative):</p>
+<pre class="text"><code>Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt
+192.0.2.1       4      64497    912034      2741        0    0    0 6d03h12m      1003841        1
+192.0.2.5       4      64498     88213      2739        0    0    0 6d03h11m        41207        1
+192.0.2.9       4      64499      2762      3094        0    0    0 02:14:55       Idle (PfxCt)    0</code></pre>
+<p>That last line is a session shut down by a max-prefix limit; the <code>(PfxCt)</code> marker is FRR's way of saying so. The customer sent more prefixes than its configured limit, and the router sent Cease subcode 1 rather than accept what was probably a leak.</p>
+<h2 id="m21-deep-by-the-numbers">Deep dive: by the numbers</h2>
+<p>Treat these as orders of magnitude. The table numbers change daily, and timer defaults differ by vendor and release.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Typical value</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>IPv4 global table</td>
+<td>~1 million prefixes (2025–26)</td>
+<td>Over half are /24s. Track at <code>bgp.potaroo.net</code>.</td>
+</tr>
+<tr class="even">
+<td>IPv6 global table</td>
+<td>~200,000+ prefixes</td>
+<td>Growing faster than IPv4 in relative terms</td>
+</tr>
+<tr class="odd">
+<td>ASes visible in the table</td>
+<td>~75,000–80,000</td>
+<td></td>
+</tr>
+<tr class="even">
+<td>Average AS_PATH length</td>
+<td>around 4 ASes</td>
+<td>The internet is "flat": big networks peer directly</td>
+</tr>
+<tr class="odd">
+<td>Hold / keepalive</td>
+<td>90 / 30 s (RFC suggestion); 180 / 60 s (Cisco IOS); 9 / 3 s (FRR datacenter profile)</td>
+<td>Negotiated to the lower hold time</td>
+</tr>
+<tr class="even">
+<td>ConnectRetry</td>
+<td>120 s (RFC suggestion)</td>
+<td>Why a session that fails to connect retries slowly</td>
+</tr>
+<tr class="odd">
+<td>MRAI</td>
+<td>30 s eBGP, 5 s iBGP (RFC suggestion); often 0 in data centres</td>
+<td>Batches updates per destination</td>
+</tr>
+<tr class="even">
+<td>BFD detection</td>
+<td>e.g. 300 ms × 3 = 900 ms</td>
+<td>Interval and multiplier are configured per session</td>
+</tr>
+<tr class="odd">
+<td>Max BGP message</td>
+<td>4,096 bytes; 65,535 with RFC 8654</td>
+<td></td>
+</tr>
+<tr class="even">
+<td>KEEPALIVE size</td>
+<td>19 bytes</td>
+<td>Header only</td>
+</tr>
+<tr class="odd">
+<td>Max prefix accepted by convention</td>
+<td>IPv4 /24, IPv6 /48</td>
+<td>Convention, not standard</td>
+</tr>
+<tr class="even">
+<td>AWS Direct Connect private VIF</td>
+<td>100 prefixes advertised to AWS per session</td>
+<td>Exceed it and AWS puts the session into idle</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Worked example: how big is a full-table transfer?</strong> Assume 1 million IPv4 prefixes, and that, after packing, an average UPDATE carries four prefixes and 60 bytes of attributes. A /24 encodes in 4 bytes. That's 250,000 UPDATEs × (19 + 4 + 60 + 4 × 4 = 99 bytes) ≈ 25 MB. Over a fast link that's under a second of transfer. In practice an initial full-table load takes from a few seconds to a few minutes, because the receiver's CPU, not the link, is the bottleneck: every prefix needs policy evaluation, best-path, and a FIB write. That's also why a router reloading with eight full-table peers is noticeably slower to converge than one with two.</p>
+<p><strong>Worked example: the cost of a hold timer.</strong> A link carrying 4 Gbit/s fails in a way the interface doesn't notice (a dead optical amplifier, a broken provider switch in the middle). With a 90 s hold timer, BGP keeps pointing traffic at the dead next hop for up to 90 s. That's 4 × 10⁹ × 90 / 8 = 45 GB of traffic dropped. With BFD at 300 ms × 3, the same failure costs about 450 MB. That ratio is why BFD is standard on every serious eBGP link.</p>
+<p><strong>The FIB has a ceiling.</strong> On 12 August 2014 the global IPv4 table briefly passed 512,000 routes. A lot of widely deployed routers (Cisco Catalyst 6500 and 7600 series with certain supervisor cards, for example) had their TCAM partitioned for 512k IPv4 routes by default. Past that, they fell back to software forwarding or dropped routes, and outages followed at a number of ISPs. The fix was a config change and a reload to re-partition the TCAM. The general lesson still applies: the table keeps growing, and hardware FIB capacity is a number to check before it checks you.</p>
+<h2 id="m21-deep-production-failure-modes">Deep dive: production failure modes</h2>
+<p>Each case below follows the same shape: symptom, mechanism, how to prove it, fix. The internet incidents are described as their operators and independent analysts reported them. Where details are disputed, the text says so.</p>
+<h3 id="m21-route-leak-verizon-dqe-and-a-bgp-optimiser-24-june-2019">Route leak: Verizon, DQE and a BGP optimiser (24 June 2019)</h3>
+<p><strong>Symptom.</strong> For about two hours, large parts of Cloudflare, AWS, Linode and many other networks were slow or unreachable for some users.</p>
+<p><strong>Mechanism.</strong> DQE Communications (AS33154) ran a "BGP optimiser", software that generates more-specific routes for internal traffic engineering. Those more-specifics leaked to DQE's customer Allegheny Technologies (AS396531). Allegheny was also a Verizon customer, and it re-announced them to Verizon (AS701). Verizon accepted them from a customer with no prefix filter and no effective max-prefix limit, and passed them to the rest of the internet. Because they were more-specifics, they won by longest-prefix match wherever they were accepted. Huge volumes of traffic headed for a small steel company's links and died there. This is the classic valley: provider routes from one upstream leaked to another upstream.</p>
+<p><strong>How to prove it.</strong> From outside, a looking glass or bgp.tools shows unfamiliar more-specifics of your prefixes, with a path like <code>... 701 396531 33154 &lt;your ASN&gt;</code>. A route-monitoring tool (BGPalerter, bgp.tools alerts, Cloudflare Radar's route-leak detection) fires on "new more-specific" and "unexpected upstream". From inside, <code>show bgp &lt;your-prefix&gt; longer-prefixes</code> on a router that accepts the full table shows the intruders.</p>
+<p><strong>Fix.</strong> For you as a victim: call the networks involved, and in parallel announce your own matching more-specifics to compete (as long as your ROA allows them). For the network that should have stopped it: prefix filters on every customer session, built from IRR data with a tool like <code>bgpq4</code>, plus a max-prefix limit. RFC 9234 roles would have caught it too, because Allegheny would have been marked as a customer that must not send provider routes upward.</p>
+<h3 id="m21-hijack-by-more-specific-pakistan-telecom-and-youtube-24-february-2008">Hijack by more-specific: Pakistan Telecom and YouTube (24 February 2008)</h3>
+<p><strong>Symptom.</strong> YouTube was unreachable from most of the internet for roughly two hours.</p>
+<p><strong>Mechanism.</strong> The Pakistani government ordered YouTube blocked inside the country. Pakistan Telecom (AS17557) chose to do it by announcing <code>208.65.153.0/24</code>, a more-specific of YouTube's <code>208.65.152.0/22</code>, intending to blackhole it domestically. The announcement leaked to its upstream PCCW (AS3491), which propagated it worldwide. Every network that accepted the /24 sent YouTube's traffic to Pakistan. YouTube responded by announcing the same /24 itself, and then two /25s, to win back traffic by longest-prefix match. The hijack ended when PCCW withdrew the route.</p>
+<p><strong>What would stop it today.</strong> A ROA for <code>208.65.152.0/22</code> with maxLength 22, plus ROV at PCCW or its peers, would have made the /24 Invalid on arrival. Even without RPKI, an IRR-based customer prefix filter at PCCW would have stopped it.</p>
+<h3 id="m21-hijack-for-theft-amazon-route-53-and-myetherwallet-24-april-2018">Hijack for theft: Amazon Route 53 and MyEtherWallet (24 April 2018)</h3>
+<p><strong>Symptom.</strong> For about two hours, some users of the cryptocurrency wallet site myetherwallet.com reached a phishing copy of it.</p>
+<p><strong>Mechanism.</strong> Attackers got more-specific /24 routes for parts of Amazon Route 53's authoritative DNS address space announced through eNet (AS10297), an ISP in Ohio. Resolvers whose upstreams accepted those routes sent DNS queries for myetherwallet.com to the attackers' server instead of to Route 53, and got back the address of a server in Russia. That server presented a self-signed TLS certificate. Users who clicked through the browser warning had their wallets drained. Google Public DNS was among the resolvers that received the bad route for a time.</p>
+<p><strong>Lessons.</strong> BGP hijacks are a way to attack DNS, and DNS is how you attack everything else. TLS held: every victim had to click past a certificate warning. And Amazon has since published ROAs for this space, so the same /24s from the wrong origin would now be Invalid wherever ROV is enforced.</p>
+<h3 id="m21-mass-hijack-china-telecom-8-april-2010">Mass hijack: China Telecom (8 April 2010)</h3>
+<p>For about 18 minutes, China Telecom (AS23724) announced around 37,000 prefixes belonging to other networks, roughly 15% of the routing table at the time, including some US government and military prefixes. Only some networks accepted the routes, and how much traffic was actually diverted is disputed. The widely accepted explanation is a misconfiguration. It is still the standard example of how far one mistake can reach. An older one is AS7007 on 25 April 1997, when a router at MAI Network Services de-aggregated much of the routing table into /24s, re-announced them as its own, and pulled large parts of the internet's traffic into a small network for hours.</p>
+<h3 id="m21-self-inflicted-withdrawal-facebook-4-october-2021">Self-inflicted withdrawal: Facebook (4 October 2021)</h3>
+<p><strong>Symptom.</strong> facebook.com, Instagram and WhatsApp unreachable for about six hours. DNS lookups for them failed worldwide.</p>
+<p><strong>Mechanism.</strong> A command issued during routine maintenance, meant to assess global backbone capacity, took down all of Facebook's backbone connections. An audit tool should have stopped the command but had a bug. Facebook's authoritative DNS servers are designed to withdraw their anycast BGP announcements whenever they can't reach the data centres, on the theory that an unhealthy site should stop attracting queries. Every site lost the backbone at once, so every site withdrew. The prefixes holding Facebook's nameservers disappeared from the global table. Recovery was slow because the tools engineers would normally use for remote repair depended on the same network, and staff had to get physical access to data centre equipment.</p>
+<p><strong>How it looked from outside.</strong> Route collectors showed a burst of withdrawals from AS32934 around 15:40 UTC. <code>dig @a.ns.facebook.com facebook.com</code> timed out, because there was no route to the nameserver's address at all. That is a very different failure from SERVFAIL caused by a broken zone.</p>
+<p><strong>Lesson.</strong> Health-check-driven withdrawal is a powerful anycast pattern with a nasty correlated-failure mode: if every site reaches the same conclusion at once, you withdraw yourself from the internet. Protect against it with a minimum-sites floor ("never withdraw the last N"), or by keeping at least one announcement statically pinned.</p>
+<h3 id="m21-your-own-roa-eats-your-announcement">Your own ROA eats your announcement</h3>
+<p><strong>Symptom.</strong> You announce a new more-specific for traffic engineering, as in §5. Traffic for it barely moves. Some networks see it, many don't.</p>
+<p><strong>Mechanism.</strong> Your ROA covers the aggregate with maxLength equal to the aggregate length, so the more-specific is RPKI-Invalid. Every network enforcing ROV drops it.</p>
+<p><strong>How to prove it.</strong> Use the RIPEstat RPKI validation query from §8 for the exact prefix and origin; it returns <code>invalid</code> with reason <code>as</code> or <code>length</code>. Validators show it locally too: <code>routinator vrps</code> lists the validated ROA payloads, and Routinator's <code>validate</code> subcommand checks a single route and origin (see <code>routinator validate --help</code>).</p>
+<p><strong>Fix.</strong> Publish a ROA that covers exactly the more-specifics you announce. RFC 9319 advises against a loose maxLength (like /24 on a /16). A loose maxLength lets a hijacker announce any more-specific with your origin ASN forged at the end of the path and still look Valid.</p>
+<h3 id="m21-the-session-that-comes-up-and-then-dies-mtu">The session that comes up and then dies (MTU)</h3>
+<p><strong>Symptom.</strong> A new eBGP session reaches Established, starts receiving the full table, then hangs. After exactly one hold time it drops with "hold timer expired." Then it repeats, forever.</p>
+<p><strong>Mechanism.</strong> OPEN and KEEPALIVE are small. Full-table UPDATEs fill TCP segments to the MSS. Somewhere on the path the real MTU is lower than the endpoints think: a GRE or IPsec tunnel, a misconfigured MTU on one side of a link. Large segments are dropped, and the ICMP "fragmentation needed" that should trigger Path MTU Discovery is filtered or never generated. TCP retransmits the same large segment forever. Small KEEPALIVEs can't get past it in the stream, so the hold timer expires.</p>
+<p><strong>How to prove it.</strong> <code>tcpdump -nn -i &lt;if&gt; 'tcp port 179'</code> shows repeated retransmissions of one full-sized segment. <code>ping -D -s 1472 &lt;peer&gt;</code> on macOS (<code>ping -M do -s 1472 &lt;peer&gt;</code> on Linux) fails while smaller sizes succeed.</p>
+<p><strong>Fix.</strong> Make the MTU consistent end to end, or lower the TCP MSS for BGP (most implementations have a per-neighbour <code>tcp-mss</code> setting, or enable PMTUD for BGP).</p>
+<h2 id="m21-deep-2026-context">Deep dive: 2026 context</h2>
+<h3 id="m21-bgp-as-the-data-centre-routing-protocol">BGP as the data-centre routing protocol</h3>
+<p>Large data centres stopped using OSPF in the fabric years ago. RFC 7938 describes the design most of them use: a Clos (leaf-spine) topology where <em>every</em> link runs eBGP, and BGP is the only routing protocol.</p>
+<div style="overflow-x:auto">
+<svg viewBox="0 0 760 430" role="img" aria-labelledby="m21-clos-title m21-clos-desc" style="min-width:760px;max-width:100%;height:auto;">
+<title id="m21-clos-title">An eBGP leaf-spine fabric with Kubernetes nodes peering into it</title>
+<desc id="m21-clos-desc">Two spines share one private ASN; each of four leaves has its own ASN; every leaf-spine link carries one eBGP session. Below the leaves, Kubernetes nodes run Calico or MetalLB speakers that peer with their leaf and announce pod blocks or service IPs.</desc>
+<rect x="0" y="0" width="760" height="430" fill="#f5f5f5"/>
+<text x="24" y="34" font-family="monospace" font-size="11" fill="#8a8f98" letter-spacing="2">M21 · 2026 CONTEXT</text>
+<text x="24" y="62" font-family="sans-serif" font-size="21" font-weight="600" fill="#2d3142">BGP inside the data centre (RFC 7938 shape)</text>
+<g stroke="#6b6f7e" stroke-width="1.2">
+<line x1="250" y1="140" x2="110" y2="220"/><line x1="250" y1="140" x2="290" y2="220"/><line x1="250" y1="140" x2="470" y2="220"/><line x1="250" y1="140" x2="650" y2="220"/>
+<line x1="510" y1="140" x2="110" y2="220"/><line x1="510" y1="140" x2="290" y2="220"/><line x1="510" y1="140" x2="470" y2="220"/><line x1="510" y1="140" x2="650" y2="220"/>
+</g>
+<g stroke="#bf4520" stroke-width="1.5" stroke-dasharray="5,4">
+<line x1="110" y1="268" x2="110" y2="320"/><line x1="650" y1="268" x2="650" y2="320"/><line x1="470" y1="268" x2="470" y2="320"/>
+</g>
+<g font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">
+<rect x="180" y="92" width="140" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="250" y="114" text-anchor="middle">spine 1</text><text x="250" y="131" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">AS 65100</text>
+<rect x="440" y="92" width="140" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="510" y="114" text-anchor="middle">spine 2</text><text x="510" y="131" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">AS 65100</text>
+<rect x="50" y="220" width="120" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="110" y="242" text-anchor="middle">leaf 1</text><text x="110" y="259" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">AS 65101</text>
+<rect x="230" y="220" width="120" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="290" y="242" text-anchor="middle">leaf 2</text><text x="290" y="259" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">AS 65102</text>
+<rect x="410" y="220" width="120" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="470" y="242" text-anchor="middle">leaf 3</text><text x="470" y="259" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">AS 65103</text>
+<rect x="590" y="220" width="120" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/><text x="650" y="242" text-anchor="middle">leaf 4</text><text x="650" y="259" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">AS 65104</text>
+<rect x="30" y="320" width="160" height="56" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2"/><text x="110" y="342" text-anchor="middle" font-size="12">k8s node (Calico)</text><text x="110" y="362" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">announces 10.244.3.0/26</text>
+<rect x="390" y="320" width="160" height="56" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2"/><text x="470" y="342" text-anchor="middle" font-size="12">k8s node (MetalLB)</text><text x="470" y="362" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">announces 198.51.100.10/32</text>
+<rect x="570" y="320" width="160" height="56" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2"/><text x="650" y="342" text-anchor="middle" font-size="12">k8s node (MetalLB)</text><text x="650" y="362" text-anchor="middle" font-family="monospace" font-weight="400" font-size="10" fill="#6b6f7e">announces 198.51.100.10/32</text>
+</g>
+<text x="740" y="84" text-anchor="end" font-family="monospace" font-size="11" fill="#6b6f7e">every grey line = one eBGP session</text>
+<text x="24" y="400" font-family="sans-serif" font-size="12" fill="#8a8f98">Two nodes announce the same /32, so the fabric spreads flows across them with ECMP.</text>
+<text x="24" y="418" font-family="sans-serif" font-size="12" fill="#8a8f98">Spines share one ASN, so AS_PATH loop detection kills paths that bounce leaf → spine → leaf → spine.</text>
+</svg>
+</div>
+
+<p>Why eBGP, when the whole thing is one organisation? Because eBGP's behaviour fits a fabric. Each tier gets private ASNs (often 4-byte ones, from the 4200000000+ range, so there are plenty). Spines in one fabric commonly share an ASN, so AS_PATH loop detection automatically rejects paths that would bounce leaf → spine → leaf → spine. Every link is a simple point-to-point session, with no IGP flooding domain whose failure takes out the whole data centre. Multipath is natural. A leaf learns a server prefix from every spine with equal AS_PATH length and installs all of them for ECMP; <code>bestpath as-path multipath-relax</code> lets it do so even when the paths cross different ASNs.</p>
+<p>Two refinements show up in most modern fabrics. <strong>BGP unnumbered</strong> (an FRR and Cumulus innovation) runs sessions over IPv6 link-local addresses discovered by router advertisements, so nobody assigns a /31 to every link. IPv4 prefixes are carried with IPv6 next hops using RFC 8950 (which obsoleted RFC 5549). And <strong>EVPN</strong> (RFC 7432, with RFC 8365 for VXLAN) uses BGP as the control plane for overlay networks, carrying MAC and IP reachability so tenant Layer 2 segments can stretch across a Layer 3 fabric without flooding.</p>
+<h3 id="m21-kubernetes-calico-metallb-cilium">Kubernetes: Calico, MetalLB, Cilium</h3>
+<p>Inside a bare-metal or on-prem Kubernetes cluster, BGP is how pod and service addresses become reachable from the physical network without tunnels.</p>
+<p><strong>Calico</strong> runs a BGP daemon (BIRD) inside each <code>calico-node</code> pod. Calico's IPAM gives each node one or more address blocks (/26 by default) for its pods, and the node announces those blocks. Out of the box the nodes form a full iBGP mesh using AS 64512; that suits clusters up to roughly 100 nodes. Larger clusters switch the mesh off and use route reflectors, or peer each node with its top-of-rack leaf over eBGP, which is the design in the diagram. Calico can also advertise service ClusterIP, external IP and LoadBalancer ranges. <code>calicoctl node status</code> on a node shows its sessions (illustrative):</p>
+<pre class="text"><code>Calico process is running.
+
+IPv4 BGP status
++--------------+-------------------+-------+----------+-------------+
+| PEER ADDRESS |     PEER TYPE     | STATE |  SINCE   |    INFO     |
++--------------+-------------------+-------+----------+-------------+
+| 10.0.1.12    | node-to-node mesh | up    | 09:14:02 | Established |
+| 10.0.1.13    | node-to-node mesh | start | 09:14:02 | Connect     |
++--------------+-------------------+-------+----------+-------------+</code></pre>
+<p>The second line is the §3.5 diagnosis in miniature. <code>Connect</code> means TCP to 10.0.1.13 port 179 isn't completing. Usual culprits: a host firewall, a cloud security group, or the wrong node IP autodetected on a multi-NIC host.</p>
+<p><strong>MetalLB</strong> gives <code>type: LoadBalancer</code> services an external IP on bare metal. In BGP mode, a speaker on each node peers with your routers and announces each service IP as a /32. Several nodes announce the same /32, and the routers spread flows across them with ECMP. With <code>externalTrafficPolicy: Local</code>, only nodes that run a ready endpoint for the service announce it, which avoids an extra hop and preserves the client source IP. A minimal peer looks like this (MetalLB's <code>metallb.io</code> CRDs):</p>
+<div class="sourceCode" id="m21-cb19"><pre class="sourceCode yaml"><code class="sourceCode yaml"><span id="m21-cb19-1"><a href="#m21-cb19-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> metallb.io/v1beta2</span></span>
+<span id="m21-cb19-2"><a href="#m21-cb19-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> BGPPeer</span></span>
+<span id="m21-cb19-3"><a href="#m21-cb19-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="m21-cb19-4"><a href="#m21-cb19-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> leaf3</span></span>
+<span id="m21-cb19-5"><a href="#m21-cb19-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> metallb-system</span></span>
+<span id="m21-cb19-6"><a href="#m21-cb19-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="m21-cb19-7"><a href="#m21-cb19-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">myASN</span><span class="kw">:</span><span class="at"> </span><span class="dv">65203</span></span>
+<span id="m21-cb19-8"><a href="#m21-cb19-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">peerASN</span><span class="kw">:</span><span class="at"> </span><span class="dv">65103</span></span>
+<span id="m21-cb19-9"><a href="#m21-cb19-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">peerAddress</span><span class="kw">:</span><span class="at"> </span><span class="fl">10.0.3.1</span></span></code></pre></div>
+<p>It needs an <code>IPAddressPool</code> and a <code>BGPAdvertisement</code> alongside it before anything is announced.</p>
+<p>The production gotcha is in the router, not in MetalLB. When the set of nodes announcing a /32 changes (a node drains, a pod moves), the router's ECMP group changes size. Most routers rehash many existing flows onto different next hops, and the new node has no conntrack state for them, so long-lived TCP connections reset. Resilient (consistent) hashing on the router limits the damage, where the hardware supports it. Otherwise expect connection resets on every rollout. MetalLB's documentation discusses this limitation directly.</p>
+<p><strong>Cilium</strong> has its own BGP control plane (built on GoBGP) that does the same jobs, announcing pod CIDRs and LoadBalancer IPs, configured through Cilium's CRDs.</p>
+<h3 id="m21-clouds-and-bgp">Clouds and BGP</h3>
+<p>You rarely run BGP inside a cloud VPC; the provider's SDN does the routing. You meet it at the edges: AWS Direct Connect and Site-to-Site VPN, Azure ExpressRoute and Google Cloud Router all bring up BGP sessions with your routers. Their limits are low. AWS, for example, accepts at most 100 prefixes from you on a Direct Connect private virtual interface and drops the session to idle beyond that, so aggregate first. Bring-your-own-IP works through RPKI: you publish a ROA authorising the cloud's ASN, and the cloud announces your prefix.</p>
+<h3 id="m21-the-internet-edge-in-2026">The internet edge in 2026</h3>
+<ul>
+<li><strong>RPKI ROV is the norm at large networks.</strong> Most large transit providers and many big access networks drop Invalids, and more than half of announced IPv4 prefixes are covered by ROAs. (NIST's RPKI Monitor and the MANRS observatory track the live numbers.) The practical consequence for you: a wrong or missing ROA is now an outage risk, not a hygiene item.</li>
+<li><strong>Leak prevention is moving into the protocol.</strong> RFC 9234 roles and the OTC attribute are implemented in BIRD, FRR and some commercial stacks, and ASPA is in standardisation with early validator and router support.</li>
+<li><strong>Anycast carries QUIC.</strong> HTTP/3 runs over UDP to anycast addresses, and a route change mid-connection can send a connection's packets to a PoP that has no state for it. QUIC's connection IDs let a large CDN route such packets internally to the right server, but only if the provider built for it. The BGP-level problem is the same one TCP always had.</li>
+<li><strong>Observability is public.</strong> bgp.tools, RIPE RIS Live (a real-time stream of BGP updates), Cloudflare Radar and RouteViews let anyone watch the global table change. Route monitoring for your own prefixes is a cheap, standard alert to have.</li>
+</ul>
+<h2 id="m21-deep-senior-interview-questions">Deep dive: senior interview questions</h2>
+<p><strong>Q1: Explain why MED can cause route oscillation, and what <code>deterministic-med</code> changes.</strong></p>
+<p>MED is only comparable between paths from the same neighbouring AS, so the "better than" relation over all paths is not transitive (§9, scenario 4). If a router compares paths pairwise in arrival order, its choice depends on that order. With route reflectors, which only pass on their own best path, different routers can see different subsets of paths and make choices that keep invalidating each other, so the AS oscillates forever (RFC 3345). <code>deterministic-med</code> groups paths by neighbour AS, picks the best within each group using MED, then compares the group winners without MED. That makes the result independent of arrival order. Add-path, which lets reflectors advertise more than one path, removes the hidden-path half of the problem.</p>
+<p><strong>Q2: Your prefix is being hijacked right now with a more-specific. Walk me through the first fifteen minutes.</strong></p>
+<p>Confirm and scope it: a looking glass and bgp.tools show the bogus prefix, its origin AS and the upstream carrying it. RIPEstat or your validator shows whether ROV networks already see it as Invalid. Then counter-announce the same more-specific yourself, if your ROA permits it, so the two announcements compete at equal length and ordinary best-path selection wins some networks back to you. A /24 is the floor in IPv4, since /25s won't propagate. In parallel, contact the offending AS's upstreams (PeeringDB and the RIR records give the NOC contacts) and ask them to filter. Afterwards: fix your ROA so the hijack is Invalid, and add route monitoring if you didn't have it.</p>
+<p><strong>Q3: Why does BGP use TCP, and what problems does that cause?</strong></p>
+<p>TCP gives BGP reliable, ordered delivery, so BGP can be incremental. It sends each route once and assumes the peer has it until it says otherwise, with no periodic refresh. The cost is that BGP inherits TCP's failure modes. Head-of-line blocking means a stuck segment stalls everything, including KEEPALIVEs (the MTU failure above). TCP's own retransmission timers delay failure detection, which is one reason BFD exists. And TCP is attackable: a spoofed RST can tear down a session. That's why GTSM (TTL 255) and TCP-AO (RFC 5925, replacing TCP MD5 from RFC 2385) are used on exposed sessions.</p>
+<p><strong>Q4: Why do large data centres run eBGP rather than OSPF in the fabric?</strong></p>
+<p>Failure scope, simplicity and scale. A link-state IGP floods every topology change to every router in an area and reruns SPF everywhere, so one flapping link costs the whole fabric CPU, and one bug can take down the whole flooding domain. eBGP keeps state per session and per prefix, and only advertises best paths. AS_PATH loop detection with shared spine ASNs gives loop-free multipath with no extra machinery. The policy tools are rich enough to drain a device for maintenance by prepending or by the graceful-shutdown community. RFC 7938 describes the design; BGP unnumbered removes the address-planning chore.</p>
+<p><strong>Q5: An anycast DNS service is up, but users in one country can't resolve. How do you debug it?</strong></p>
+<p>Find out which site those users actually reach. Many anycast DNS services answer <code>dig CH TXT id.server</code> or <code>hostname.bind</code> with a site identifier. Check from a vantage point in that country (a RIPE Atlas probe, a looking glass) what path its networks use to the anycast prefix. Common causes: a site that is up for BGP but broken behind (it should withdraw and didn't); a local network that accepts a more-specific or a leaked path to some distant site; or ROV dropping a site's announcement because one site uses a different origin ASN not in the ROA. Fix the health-check-to-withdrawal link, and keep the same origin ASN and ROA coverage across all sites.</p>
+<p><strong>Q6: A route is in the BGP table but packets don't follow it. List the places it can be lost.</strong></p>
+<p>Between Adj-RIB-In and forwarding there are five gates. Import policy can filter it (it shows only with soft-reconfiguration or as received-only). It can lose best-path to another path for the same prefix. Its next hop can be unresolvable through the RIB, making it ineligible. It can win in BGP but lose in the RIB to a route with lower administrative distance. Or it can fail to program into the FIB because of a full TCAM or a netlink error. And even when installed, a more-specific route from any source wins for the addresses it covers. Check <code>show bgp</code>, <code>show ip route</code>, and the hardware or kernel FIB in that order.</p>
+<hr />
+<p><em>Standards cited: RFC 4271 (BGP-4) · RFC 6793 (4-octet ASNs) · RFC 5398, 6996 (documentation and private ASNs) · RFC 4456 (route reflection) · RFC 5065 (confederations) · RFC 4760 (multiprotocol) · RFC 5492 (capabilities) · RFC 2918 (route refresh) · RFC 4724 (graceful restart) · RFC 7911 (add-path) · RFC 8654 (extended messages) · RFC 1997, 8092 (communities, large communities) · RFC 7999 (blackhole) · RFC 8326 (graceful shutdown) · RFC 7606 (error handling) · RFC 8212 (default eBGP policy) · RFC 5082 (GTSM) · RFC 5925 (TCP-AO) · RFC 5880 (BFD) · RFC 2439, 7196 (flap damping) · RFC 3345 (MED oscillation) · RFC 7908 (route leaks) · RFC 9234 (roles, OTC) · RFC 6480, 6482, 9582, 6811, 8210, 9319 (RPKI, ROAs, ROV, RTR, maxLength) · RFC 8205 (BGPsec) · RFC 7947 (route servers) · RFC 4786 (anycast) · RFC 7938 (BGP in data centres) · RFC 8950 (IPv4 over IPv6 next hop) · RFC 7432, 8365 (EVPN).</em></p>
 <h1 id="module-22--cloud-networking">Module 22 — Cloud Networking</h1>
 <p><em>Networking Mastery Guide · Module 22 of 23</em></p>
 <hr />
@@ -13146,7 +14534,7 @@ connections per unique destination ip:port:proto, per NAT IP):
 <p>They are different design choices for the same overlay idea. In AWS, the subnet is the unit you place in an AZ, so AZ-level resilience is expressed by having one subnet per AZ, and anything zonal (NAT gateways, route tables pointing at them) is usually duplicated per AZ. In GCP, a subnet spans every zone in its region, and Cloud NAT is implemented in each VM's host rather than as a zonal gateway, so there is no "NAT gateway in the wrong AZ" problem. What it changes is how you write designs: in AWS, you think in AZ-sized slices of the address space; in GCP, you think in regional ranges and let zones be a placement detail.</p>
 <hr />
 <p><em>Key terms: VPC, overlay, underlay, encapsulation, availability zone, AZ ID, subnet, reserved addresses, route table, local route, longest prefix match, internet gateway, 1:1 NAT, NAT gateway, port allocation, idle timeout, egress-only internet gateway, security group, connection tracking, network ACL, ephemeral ports, VPC peering, Transit Gateway, appliance mode, PrivateLink, interface endpoint, gateway endpoint, Route 53 Resolver, private hosted zone, Site-to-Site VPN, Direct Connect, virtual interface, BGP, VPC Flow Logs, Reachability Analyzer, Hyperplane, Nitro, Andromeda, VFP, Cloud NAT, NSG.</em></p>
-<h1 id="module-22--back-matter">Module 22 — Back Matter</h1>
+<h1 id="module-23--back-matter">Module 23 — Back Matter</h1>
 <p><em>Reference material for the whole guide: the glossary, the subnetting cheat sheet, the ports table, and the troubleshooting flowchart.</em></p>
 <hr />
 <h2 id="glossary">Glossary</h2>
