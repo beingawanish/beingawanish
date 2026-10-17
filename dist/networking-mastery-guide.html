@@ -310,7 +310,7 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li><a href="#how-to-use-this-guide" id="toc-how-to-use-this-guide">How to use this guide</a></li>
 <li><a href="#how-to-run-the-examples" id="toc-how-to-run-the-examples">How to run the examples</a></li>
 <li><a href="#conventions-used-in-this-guide" id="toc-conventions-used-in-this-guide">Conventions used in this guide</a></li>
-<li><a href="#the-eighteen-modules" id="toc-the-eighteen-modules">The twenty modules</a></li>
+<li><a href="#the-eighteen-modules" id="toc-the-eighteen-modules">The twenty-one modules</a></li>
 </ul></li>
 <li><a href="#module-01--think-like-a-network-engineer" id="toc-module-01--think-like-a-network-engineer">Module 01 — Think Like a Network Engineer</a> <ul> <li><a href="#1-why-it-matters" id="toc-1-why-it-matters">1. Why it matters</a></li>
 <li><a href="#2-the-mental-model" id="toc-2-the-mental-model">2. The mental model</a> <ul> <li><a href="#why-two-models-exist-osi-7-vs-tcpip-5" id="toc-why-two-models-exist-osi-7-vs-tcpip-5">Why two models exist: OSI 7 vs TCP/IP 5</a></li>
@@ -625,6 +625,24 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li><a href="#m19-deep-dive-2026-context" id="toc-m19-deep-dive-2026-context">Deep dive: 2026 context</a></li>
 <li><a href="#m19-deep-dive-senior-interview-questions" id="toc-m19-deep-dive-senior-interview-questions">Deep dive: senior interview questions</a></li>
 </ul></li>
+<li><a href="#module-20--quic--http3" id="toc-module-20--quic--http3">Module 20 — QUIC &amp; HTTP/3</a> <ul>
+<li><a href="#m20-1-why-it-matters" id="toc-m20-1-why-it-matters">1. Why it matters</a></li>
+<li><a href="#m20-2-the-mental-model" id="toc-m20-2-the-mental-model">2. The mental model</a></li>
+<li><a href="#m20-3-how-it-works" id="toc-m20-3-how-it-works">3. How it works</a></li>
+<li><a href="#m20-4-the-exact-structure" id="toc-m20-4-the-exact-structure">4. The exact structure</a></li>
+<li><a href="#m20-5-a-realistic-example" id="toc-m20-5-a-realistic-example">5. A realistic example</a></li>
+<li><a href="#m20-6-misconceptions--common-mistakes" id="toc-m20-6-misconceptions--common-mistakes">6. Misconceptions &amp; common mistakes</a></li>
+<li><a href="#m20-7-interview-qa" id="toc-m20-7-interview-qa">7. Interview Q&amp;A</a></li>
+<li><a href="#m20-8-try-it" id="toc-m20-8-try-it">8. Try it</a></li>
+<li><a href="#m20-9-code-quics-wire-format-initial-keys-and-head-of-line-blocking" id="toc-m20-9-code-quics-wire-format-initial-keys-and-head-of-line-blocking">9. Code: QUIC's wire format, Initial keys, and head-of-line blocking</a></li>
+<li><a href="#m20-deep-dive" id="toc-m20-deep-dive">Deep dive: what the overview hid</a></li>
+<li><a href="#m20-deep-dive-the-real-mental-model" id="toc-m20-deep-dive-the-real-mental-model">Deep dive: the real mental model</a></li>
+<li><a href="#m20-deep-dive-what-the-wire-and-the-kernel-actually-do" id="toc-m20-deep-dive-what-the-wire-and-the-kernel-actually-do">Deep dive: what the wire and the kernel actually do</a></li>
+<li><a href="#m20-deep-dive-by-the-numbers" id="toc-m20-deep-dive-by-the-numbers">Deep dive: by the numbers</a></li>
+<li><a href="#m20-deep-dive-production-failure-modes" id="toc-m20-deep-dive-production-failure-modes">Deep dive: production failure modes</a></li>
+<li><a href="#m20-deep-dive-2026-context" id="toc-m20-deep-dive-2026-context">Deep dive: 2026 context</a></li>
+<li><a href="#m20-deep-dive-senior-interview-questions" id="toc-m20-deep-dive-senior-interview-questions">Deep dive: senior interview questions</a></li>
+</ul></li>
 <li><a href="#module-22--cloud-networking" id="toc-module-22--cloud-networking">Module 22 — Cloud Networking</a> <ul>
 <li><a href="#m22-1-why-it-matters" id="toc-m22-1-why-it-matters">1. Why it matters</a></li>
 <li><a href="#m22-2-the-mental-model" id="toc-m22-2-the-mental-model">2. The mental model</a></li>
@@ -643,7 +661,7 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li><a href="#m22-deep-dive-2026-context" id="toc-m22-deep-dive-2026-context">Deep dive: 2026 context</a></li>
 <li><a href="#m22-deep-dive-senior-interview-questions" id="toc-m22-deep-dive-senior-interview-questions">Deep dive: senior interview questions</a></li>
 </ul></li>
-<li><a href="#module-21--back-matter" id="toc-module-21--back-matter">Module 21 — Back Matter</a> <ul> <li><a href="#glossary" id="toc-glossary">Glossary</a></li>
+<li><a href="#module-22--back-matter" id="toc-module-22--back-matter">Module 22 — Back Matter</a> <ul> <li><a href="#glossary" id="toc-glossary">Glossary</a></li>
 <li><a href="#subnetting-cheat-sheet" id="toc-subnetting-cheat-sheet">Subnetting cheat sheet</a></li>
 <li><a href="#common-ports" id="toc-common-ports">Common ports</a></li>
 <li><a href="#troubleshooting-flowchart" id="toc-troubleshooting-flowchart">Troubleshooting flowchart</a></li>
@@ -652,7 +670,7 @@ details.answer > p:last-child{ margin-bottom:14px; }
 </nav>
 <p><a id="orientation"></a></p>
 <h1 id="networking-mastery-guide">Networking Mastery Guide</h1>
-<p><em>From "packets go in, packets come out" to reading a network the way you read code — twenty modules, built for an engineer who thinks in systems.</em></p>
+<p><em>From "packets go in, packets come out" to reading a network the way you read code — twenty-one modules, built for an engineer who thinks in systems.</em></p>
 <h2 id="who-this-guide-is-for">Who this guide is for</h2>
 <p>You are a working engineer. You can reason about distributed systems, you read packet captures without flinching at hex, and you have been nodding along in design reviews when someone says "the LB terminates TLS and the edge caches it." This guide turns those nods into real understanding: what actually happens to your bytes between <code>send()</code> and the other side's <code>recv()</code>, and why networks are designed the way they are.</p>
 <p>No prior networking study is assumed. Python fluency helps — the runnable examples are Python — but every example is small and explained line by line.</p>
@@ -673,7 +691,7 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li><strong>Sample outputs from live commands</strong> (ping, dig, traceroute) are annotated illustrations, clearly labeled — your output will differ.</li>
 <li><strong>Diagrams</strong> are hand-drawn schematics, not packet captures. Bit widths and field orders are accurate; they are drawn to teach, not to scale.</li>
 </ul>
-<h2 id="the-eighteen-modules">The twenty modules</h2>
+<h2 id="the-eighteen-modules">The twenty-one modules</h2>
 <ol type="1">
 <li>Think Like a Network Engineer — layers, encapsulation, the end-to-end principle</li>
 <li>How Data Actually Moves — bits to frames to packets to segments</li>
@@ -698,11 +716,12 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <ol start="19">
 <li>Load Balancing — L4 vs L7, algorithms from round robin to Maglev, health checks, draining, global load balancing</li>
 <li>QUIC &amp; HTTP/3 — streams without head-of-line blocking, connection IDs and migration, 0-RTT, discovery and fallback</li>
+<li>BGP &amp; How the Internet Routes — autonomous systems, peering and transit, best-path selection, hijacks and RPKI</li>
 </ol>
 <p>Every module from 01 to 18 also ends with a set of <strong>Deep dive</strong> sections. They replace the analogy with the real machine: the state it keeps, what the wire and the kernel actually do, the numbers that matter, how it fails in production and how to prove it, and the questions a senior interviewer asks.</p>
 <p>Back matter: glossary, subnetting cheat sheet, common-ports table, troubleshooting flowchart.</p>
 <h1 id="module-01--think-like-a-network-engineer">Module 01 — Think Like a Network Engineer</h1>
-<p><em>Networking Mastery Guide · Module 1 of 20</em></p>
+<p><em>Networking Mastery Guide · Module 1 of 21</em></p>
 <hr />
 <h2 id="1-why-it-matters">1. Why it matters</h2>
 <p>Picture a 2 AM page. Checkout is failing for some customers but not all. The app logs look clean. The database is fine. Somewhere between the browser and the backend, something is dropping or mangling traffic — and nobody can say where.</p>
@@ -963,7 +982,7 @@ every layer below its own untouched -- that is the peer illusion.</code></pre>
 <hr />
 <p><em>Next: Module 2 — How Data Actually Moves. Encapsulation, byte by byte: what each header carries, what changes at every hop, and what stays untouched end to end.</em></p>
 <h1 id="module-02--how-data-actually-moves">Module 02 — How Data Actually Moves</h1>
-<p><em>Networking Mastery Guide · Module 2 of 20</em></p>
+<p><em>Networking Mastery Guide · Module 2 of 21</em></p>
 <hr />
 <h2 id="1-why-it-matters-1">1. Why it matters</h2>
 <p>Module 1 gave you the map: five layers, each wrapping the payload from above. This module walks the territory. You will see exactly what gets added at each layer, and how many bytes it costs. And — the part that surprises most people — what changes as a packet crosses each router, and what stays untouched from sender to receiver.</p>
@@ -1211,7 +1230,7 @@ a Linux server, and a router ASIC all read the same bytes.</code></pre>
 <hr />
 <p><em>Next: Module 3 — Ethernet &amp; Switching. MAC addresses, the frame layout, how switches learn, and why a loop at Layer 2 melts a network in seconds.</em></p>
 <h1 id="module-03--ethernet--switching">Module 03 — Ethernet &amp; Switching</h1>
-<p><em>Networking Mastery Guide · Module 3 of 20</em></p>
+<p><em>Networking Mastery Guide · Module 3 of 21</em></p>
 <hr />
 <h2 id="1-why-it-matters-2">1. Why it matters</h2>
 <p>Everything above the link layer assumes the link layer works. IP assumes it can hand a packet to a neighbor. TCP assumes segments arrive uncorrupted. When the link layer misbehaves, the symptoms show up everywhere else — as retransmissions, as "no route to host," as a gateway that answers ARP sometimes and not others.</p>
@@ -1409,7 +1428,7 @@ ff:ff:ff:ff:ff:ff  -- broadcast
 <hr />
 <p><em>Next: Module 4 — IPv4 + IPv6. Addressing, CIDR, the IPv4 header field by field, fragmentation, and the 128-bit redesign that fixed IPv4's regrets.</em></p>
 <h1 id="module-04--ipv4--ipv6">Module 04 — IPv4 + IPv6</h1>
-<p><em>Networking Mastery Guide · Module 4 of 20</em></p>
+<p><em>Networking Mastery Guide · Module 4 of 21</em></p>
 <hr />
 <h2 id="1-why-it-matters-3">1. Why it matters</h2>
 <p>IP is the narrow waist of the Internet — the one protocol everything converges on, from Module 1's diagram. Every routing decision, every firewall rule, every load-balancer target, every Kubernetes Service is ultimately an IP address and a prefix. If you are fuzzy on addressing, you are fuzzy on all of them.</p>
@@ -6855,6 +6874,1313 @@ nstat -az | grep -i -E &#39;TcpExtTW|ListenOverflows&#39;         # TIME_WAIT ch
 <p>When you need failover in seconds, when clients hold long-lived connections, or when the resolver's location is a poor proxy for the user's (large public resolvers without ECS). DNS answers are cached for at least the TTL and often longer, and connections never re-resolve. Anycast moves traffic at BGP speed instead and naturally reaches the nearest site. The usual design uses anycast to the edge, regional balancing inside, and DNS for deliberate whole-region moves.</p>
 <hr />
 <p><em>Key terms: L4/L7 load balancing, VIP, NAT mode, full proxy, direct server return (DSR), IP-in-IP, round robin, least connections, least request, power of two choices (P2C), consistent hashing, ring hash, Maglev, rendezvous hashing, bounded loads, active health checks, outlier detection, panic threshold, connection draining, GOAWAY, sticky sessions, TLS termination/passthrough, SNI, PROXY protocol, X-Forwarded-For, RFC 7239, anycast, EDNS Client Subnet (RFC 7871), ECMP, cross-zone load balancing, externalTrafficPolicy.</em></p>
+<h1 id="module-20--quic--http3">Module 20 — QUIC &amp; HTTP/3</h1>
+<p><em>Networking Mastery Guide · Module 20 of 23</em></p>
+<hr />
+<h2 id="m20-1-why-it-matters">1. Why it matters</h2>
+<p>Open the developer tools in any browser, load a large site, and add the "Protocol" column. A good share of the rows say <code>h3</code>. Those requests never touched TCP. They rode on UDP datagrams to port 443, inside a transport that lives in the browser and in the CDN's server process rather than in either kernel.</p>
+<p>That is a bigger change than the version number suggests. For thirty years, "reliable transport" meant TCP, and TCP meant the kernel. Your firewall rules, load balancers, packet captures, tuning knobs (<code>net.ipv4.tcp_*</code>), and mental models all assumed it. QUIC moves reliability, congestion control, encryption and multiplexing into a user-space library that speaks UDP. It encrypts almost everything a middlebox used to read.</p>
+<p>So the questions you get paged for change shape. "Why is this user on HTTP/2 when we enabled HTTP/3?" "Why do QUIC connections die every time a phone walks out of Wi-Fi range — and only behind our new load balancer?" "Why did CPU on the edge fleet go up 30% when we turned it on?" None of these are answered by <code>ss -ti</code>.</p>
+<p><strong>What this module covers:</strong> why TCP plus TLS hit a wall (head-of-line blocking and ossification), QUIC's packets, frames and streams, connection IDs and migration, the 1-RTT and 0-RTT handshakes with TLS 1.3 built in, loss recovery and congestion control in user space, QPACK, how clients discover HTTP/3 (Alt-Svc and HTTPS DNS records), what happens when UDP is blocked, and the operational realities: CPU cost, middleboxes, load balancing by connection ID, and debugging with qlog and <code>curl --http3</code>. The standards are RFC 9000 (QUIC transport), RFC 9001 (QUIC with TLS), RFC 9002 (loss detection and congestion control), RFC 9114 (HTTP/3) and RFC 9204 (QPACK).</p>
+<hr />
+<h2 id="m20-2-the-mental-model">2. The mental model</h2>
+<p>Module 10 described TCP as a reliable, ordered byte stream. Module 12 put TLS on top of it and HTTP on top of that. Each layer was designed separately, by different people, decades apart. Each one does its own handshake.</p>
+<p>QUIC collapses the transport and the security layer into one protocol. Hold this picture:</p>
+<p><strong>QUIC is a set of independent, reliable byte streams, multiplexed inside one encrypted connection, carried in UDP datagrams, and identified by connection IDs instead of by IP addresses and ports.</strong></p>
+<p>Every phrase in that sentence replaces something TCP did differently.</p>
+<p><em>A set of independent streams.</em> TCP gives you exactly one ordered stream per connection. HTTP/2 built many logical streams on top of it, but they all share TCP's single sequence space underneath. Lose one packet and every stream waits. QUIC gives each stream its own ordering, so a loss stalls only the stream whose bytes were in the lost packet.</p>
+<p><em>Inside one encrypted connection.</em> The TLS 1.3 handshake is not a separate layer that starts after the transport is up. QUIC carries the TLS handshake messages in its own frames, and the keys TLS produces protect QUIC's packets directly. Transport setup and crypto setup happen in the same round trip.</p>
+<p><em>Carried in UDP datagrams.</em> UDP is the thinnest thing you can put on IP and still get through the Internet. It gives QUIC port numbers and a checksum, nothing else. Everything interesting happens in user space. That is why QUIC can evolve at the speed of a browser release instead of the speed of a kernel upgrade.</p>
+<p><em>Identified by connection IDs.</em> A TCP connection <em>is</em> its 4-tuple: source IP, source port, destination IP, destination port. Change any of them and the connection is gone. A QUIC connection is identified by opaque connection IDs the endpoints choose. When a phone moves from Wi-Fi to cellular, its address changes, but the server still recognises the packets. The connection survives.</p>
+<p>And one property sits underneath all four: <strong>almost everything is encrypted, including most of the header.</strong> The network can see that a packet is QUIC, which connection ID it carries, and (for handshake packets) the version. It cannot see packet numbers, acknowledgements, stream IDs or window sizes. That was a deliberate choice, and it is the answer to ossification, which section 3 explains.</p>
+<div style="overflow-x:auto">
+<svg viewBox="0 0 720 470" style="min-width:720px;width:100%;height:auto;background:#f5f5f5;border:1px solid rgba(45,49,66,0.12);border-radius:6px" role="img" aria-labelledby="m20-stack-title m20-stack-desc">
+<title id="m20-stack-title">HTTP/2 over TCP versus HTTP/3 over QUIC</title>
+<desc id="m20-stack-desc">Two protocol stacks side by side. On the left, HTTP/2 and TLS run in user space over TCP in the kernel, with one ordered byte stream shared by all requests. On the right, HTTP/3 and QUIC run in user space, with TLS 1.3 inside QUIC, over a thin UDP layer in the kernel, with independent streams per request. A dashed line marks the kernel boundary; notes show what a middlebox can read in each.</desc>
+<text x="24" y="30" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" letter-spacing="2" fill="#4f5d75">HTTP/2 OVER TCP</text>
+<text x="376" y="30" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" letter-spacing="2" fill="#4f5d75">HTTP/3 OVER QUIC</text>
+<!-- left stack -->
+<rect x="24" y="46" width="320" height="56" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="40" y="70" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142">HTTP/2</text>
+<text x="40" y="90" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#5a6580">streams 1,3,5… framing · HPACK · flow ctl</text>
+<rect x="24" y="110" width="320" height="56" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="40" y="134" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142">TLS 1.3 records</text>
+<text x="40" y="154" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#5a6580">own handshake · 1 RTT after TCP</text>
+<rect x="24" y="198" width="320" height="76" rx="6" fill="rgba(191,69,32,0.06)" stroke="#bf4520" stroke-width="1.5"/>
+<text x="40" y="222" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142">TCP</text>
+<text x="40" y="242" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#5a6580">ONE ordered byte stream · loss recovery · CC</text>
+<text x="40" y="260" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#bf4520">a lost segment stalls every HTTP/2 stream</text>
+<rect x="24" y="282" width="320" height="40" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="40" y="307" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142">IP</text>
+<!-- right stack -->
+<rect x="376" y="46" width="320" height="56" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="392" y="70" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142">HTTP/3 + QPACK</text>
+<text x="392" y="90" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#5a6580">one QUIC stream per request · HEADERS, DATA</text>
+<rect x="376" y="110" width="320" height="164" rx="6" fill="rgba(191,69,32,0.06)" stroke="#bf4520" stroke-width="1.5"/>
+<text x="392" y="134" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142">QUIC</text>
+<text x="392" y="154" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#5a6580">streams · loss recovery · CC · flow ctl · CIDs</text>
+<rect x="392" y="164" width="140" height="40" rx="4" fill="#ececec" stroke="rgba(45,49,66,0.22)"/>
+<text x="462" y="182" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#2d3142" text-anchor="middle">TLS 1.3 handshake</text>
+<text x="462" y="196" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="middle">in CRYPTO frames</text>
+<rect x="544" y="164" width="136" height="40" rx="4" fill="#ececec" stroke="rgba(45,49,66,0.22)"/>
+<text x="612" y="182" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#2d3142" text-anchor="middle">packet protection</text>
+<text x="612" y="196" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="middle">keys from TLS</text>
+<!-- independent streams -->
+<rect x="392" y="216" width="88" height="14" rx="2" fill="#4f5d75"/>
+<rect x="488" y="216" width="40" height="14" rx="2" fill="#bf4520"/>
+<rect x="536" y="216" width="70" height="14" rx="2" fill="#4f5d75"/>
+<rect x="614" y="216" width="66" height="14" rx="2" fill="#4f5d75"/>
+<text x="392" y="250" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#bf4520">a loss stalls only its own stream</text>
+<text x="392" y="264" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">1 RTT for transport + crypto together</text>
+<rect x="376" y="282" width="152" height="40" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="392" y="307" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142">UDP</text>
+<text x="436" y="307" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">ports + checksum</text>
+<rect x="544" y="282" width="152" height="40" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="560" y="307" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142">IP</text>
+<!-- kernel boundary -->
+<line x1="12" y1="184" x2="352" y2="184" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="6,4"/>
+<line x1="368" y1="278" x2="708" y2="278" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="6,4"/>
+<text x="344" y="180" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" letter-spacing="1.5" fill="#4f5d75" text-anchor="end">USER SPACE ↑ · KERNEL ↓</text>
+<text x="700" y="342" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" letter-spacing="1.5" fill="#4f5d75" text-anchor="end">USER SPACE ABOVE DASHED LINE · KERNEL BELOW</text>
+<!-- middlebox notes -->
+<rect x="24" y="360" width="320" height="64" rx="4" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.22)"/>
+<text x="36" y="380" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" letter-spacing="1.5" fill="#4f5d75">A MIDDLEBOX CAN READ</text>
+<text x="36" y="398" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" fill="#2d3142">ports, seq/ack numbers, flags, window,</text>
+<text x="36" y="414" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" fill="#2d3142">options — and so it ossifies all of them</text>
+<rect x="376" y="360" width="320" height="64" rx="4" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.22)"/>
+<text x="388" y="380" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" letter-spacing="1.5" fill="#4f5d75">A MIDDLEBOX CAN READ</text>
+<text x="388" y="398" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" fill="#2d3142">ports, header-form bit, connection IDs,</text>
+<text x="388" y="414" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" fill="#2d3142">version (long headers) — the rest is encrypted</text>
+<text x="24" y="452" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" fill="#5a6580">Left: two handshakes, one shared ordering. Right: one handshake, per-stream ordering.</text>
+</svg>
+</div>
+<hr />
+<h2 id="m20-3-how-it-works">3. How it works</h2>
+<h3 id="m20-why-tcp-plus-tls-hit-a-wall">Why TCP plus TLS hit a wall</h3>
+<p>Two problems pushed the industry off TCP. Neither could be fixed inside TCP.</p>
+<p><strong>Head-of-line blocking.</strong> HTTP/2 multiplexes many requests over one TCP connection. That fixed HTTP/1.1's problem of one-request-at-a-time per connection. But TCP delivers bytes to the application strictly in order. If segment 7 is lost and segments 8 through 40 arrive, the kernel holds all 33 of them in the receive buffer until the retransmission of 7 lands. It does this even when segments 8 through 40 belong to completely different HTTP/2 streams, say a CSS file and three images that have nothing to do with the lost bytes.</p>
+<p>On a clean network that costs little. On a lossy one, such as mobile or congested Wi-Fi, it is brutal. A single loss freezes every resource on the page for at least one round trip. With 2% loss, HTTP/2's one connection can do worse than HTTP/1.1's six parallel connections, because six connections at least lose independently. The <code>m20_hol_sim.py</code> model in section 9 shows the effect with one lost packet: ten of twelve packets sit stuck behind it under TCP, three under QUIC.</p>
+<p><strong>Ossification.</strong> In principle, you fix TCP by changing TCP. In practice, the Internet won't let you. Firewalls, NATs, load balancers and "TCP accelerators" parse TCP headers. Many of them drop or rewrite packets with options or behaviours they don't recognise. Two real examples:</p>
+<ul>
+<li><strong>TCP Fast Open</strong> (RFC 7413) lets a client send data in the SYN, saving a round trip. It was standardised in 2014. Middleboxes that drop SYNs carrying data, or strip the option, made it unreliable enough that browsers stopped using it.</li>
+<li><strong>TLS 1.3 itself</strong> had to disguise itself as TLS 1.2. Its records carry the legacy version <code>0x0303</code>, and its "middlebox compatibility mode" sends a fake <code>ChangeCipherSpec</code> message — because during deployment testing, a measurable fraction of connections broke when the handshake looked new.</li>
+</ul>
+<p>Add the fact that TCP lives in the kernel. A change needs an OS update on billions of devices, some of which never get updates. The protocol is effectively frozen.</p>
+<p>QUIC answers both. Streams are independent at the transport, so no cross-stream head-of-line blocking. And the transport lives in user space and encrypts its own control information. Middleboxes cannot ossify what they cannot read, and a browser can ship a new congestion controller next month.</p>
+<h3 id="m20-packets-frames-and-streams">Packets, frames and streams</h3>
+<p>QUIC has three layers of structure, and confusing them is the most common mistake people make reading a qlog.</p>
+<p><strong>A UDP datagram</strong> carries one or more <strong>QUIC packets</strong> (several packets in one datagram is called <em>coalescing</em>; it happens during the handshake). <strong>A packet</strong> has a header, a packet number, and an encrypted payload. <strong>The payload</strong> is a sequence of <strong>frames</strong>. Frames are where the work happens: <code>STREAM</code> frames carry application bytes, <code>ACK</code> frames acknowledge packets, <code>CRYPTO</code> frames carry TLS handshake messages, <code>MAX_DATA</code> frames grant flow-control credit, and so on.</p>
+<p>This split is what makes QUIC's reliability different from TCP's. <strong>Packets are never retransmitted.</strong> Frames are. When a packet is declared lost, the sender looks at which frames it carried, decides which ones still matter, and puts them into <em>new</em> packets with <em>new</em> packet numbers. A lost <code>ACK</code> frame is usually not resent at all, because a fresher ACK will go out anyway. A lost <code>STREAM</code> frame's bytes are resent, possibly split differently, possibly mixed with other streams' data.</p>
+<p>Packet numbers only ever go up, so there is never a question of whether an ACK is for the original or the retransmission. TCP has exactly that ambiguity (Karn's problem), which is why it needs timestamps or must discard RTT samples from retransmitted segments. QUIC gets clean RTT samples for free.</p>
+<p><strong>Streams</strong> come in two kinds and two owners. The low two bits of the 62-bit stream ID say which:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Low bits</th>
+<th>Meaning</th>
+<th>HTTP/3 uses it for</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>0x0</code></td>
+<td>client-initiated, bidirectional</td>
+<td>every request/response pair (stream 0, 4, 8, …)</td>
+</tr>
+<tr class="even">
+<td><code>0x1</code></td>
+<td>server-initiated, bidirectional</td>
+<td>not used by HTTP/3</td>
+</tr>
+<tr class="odd">
+<td><code>0x2</code></td>
+<td>client-initiated, unidirectional</td>
+<td>client control stream, QPACK encoder/decoder streams</td>
+</tr>
+<tr class="even">
+<td><code>0x3</code></td>
+<td>server-initiated, unidirectional</td>
+<td>server control stream, QPACK streams, push</td>
+</tr>
+</tbody>
+</table>
+<p>Opening a stream needs no handshake. The sender just uses the next ID, up to the limit the peer granted with <code>MAX_STREAMS</code>. A stream's bytes carry offsets, so the receiver can reassemble them in order no matter how they arrive. Each stream can be ended cleanly (the FIN bit on its last <code>STREAM</code> frame) or aborted (<code>RESET_STREAM</code> from the sender, <code>STOP_SENDING</code> from the receiver) without touching any other stream.</p>
+<h3 id="m20-connection-ids-and-migration">Connection IDs and migration</h3>
+<p>Every QUIC packet carries a <strong>Destination Connection ID</strong> (DCID). Each endpoint picks the IDs it wants to <em>receive</em>, and the peer puts them in the DCID of packets it sends. So the client sends to the server's chosen ID and the server sends to the client's chosen ID. IDs are 0 to 20 bytes long in QUIC version 1.</p>
+<p>The server's job when a datagram arrives is: read the DCID, find the connection object with that ID, hand it the packet. The source address is secondary. That single lookup is what makes <strong>connection migration</strong> possible.</p>
+<p>Two different events change a client's address:</p>
+<ul>
+<li><strong>NAT rebinding.</strong> The client didn't move, but its NAT forgot the mapping (usually after an idle timeout) and picked a new external port. The client doesn't even know. The server just sees the same DCID from a new address.</li>
+<li><strong>Intentional migration.</strong> The phone switches from Wi-Fi to cellular. The client knows, and it deliberately starts sending from the new interface.</li>
+</ul>
+<p>In both cases the server sees a known DCID from an unknown address. It does not trust the new address blindly. An attacker could spoof a source address to aim traffic at a victim. So the server sends a <code>PATH_CHALLENGE</code> frame carrying 8 random bytes to the new address. The client echoes them in <code>PATH_RESPONSE</code>. Until the path validates, the server limits what it sends there. After it validates, the server resets its congestion controller for the new path, because the old path's window says nothing about the new one.</p>
+<p>There is a privacy wrinkle. If the client kept the same connection ID across networks, an observer on both networks could link them. So each endpoint hands its peer a pool of spare IDs in <code>NEW_CONNECTION_ID</code> frames, and a client that migrates on purpose switches to an unused ID at the same time. Only the endpoints know the IDs belong to one connection.</p>
+<p>Only the client migrates. Servers stay put (with one narrow exception, the <code>preferred_address</code> transport parameter, which lets a server ask clients to move once after the handshake). And a server that can't handle migration — say, because its load balancer hashes on the 4-tuple — can send the <code>disable_active_migration</code> transport parameter.</p>
+<h3 id="m20-the-handshake-tls-13-inside-the-transport">The handshake: TLS 1.3 inside the transport</h3>
+<p>Module 12 showed TLS 1.3 needing one round trip after TCP's own one round trip: two RTTs before the first HTTP request leaves the client. QUIC does both jobs in a single round trip.</p>
+<p>It works because QUIC does not use TLS records at all. TLS still runs the handshake state machine: ClientHello, ServerHello, certificate, Finished. But instead of wrapping those messages in TLS records and writing them to a TCP socket, the TLS library hands the raw handshake bytes to QUIC. QUIC puts them in <code>CRYPTO</code> frames. When TLS derives a new key, it hands the key to QUIC, and QUIC uses it to protect packets.</p>
+<p>QUIC's own parameters ride inside the TLS handshake too, in a TLS extension called <code>quic_transport_parameters</code>. That is how each side learns the other's flow-control limits, idle timeout, maximum packet size, and connection-ID limits — and because the extension is part of the signed handshake transcript, an attacker cannot tamper with them.</p>
+<p>There are four <strong>encryption levels</strong>, each with its own keys:</p>
+<ol type="1">
+<li><strong>Initial</strong> — keys derived from the client's first DCID and a fixed, public salt (RFC 9001 §5.2). Anyone who sees the first packet can derive them. They stop off-path attackers from injecting junk and stop middleboxes from casually parsing the handshake. They are <em>not</em> confidentiality.</li>
+<li><strong>0-RTT</strong> — keys from a previous session's resumption secret. Only on resumption, only from the client.</li>
+<li><strong>Handshake</strong> — keys from the (EC)DHE exchange. The certificate is encrypted under these.</li>
+<li><strong>1-RTT</strong> — the application keys, used for everything after the handshake.</li>
+</ol>
+<p>Packets are also grouped into three <strong>packet number spaces</strong>: Initial, Handshake, and Application Data (0-RTT and 1-RTT share this one). Each space has its own packet numbers starting at 0 and its own ACKs. An ACK in a Handshake packet can only acknowledge Handshake packets. This keeps the key changes clean: when an endpoint discards Initial keys, it discards the whole Initial space with them.</p>
+<div style="overflow-x:auto">
+<svg viewBox="0 0 720 620" style="min-width:720px;width:100%;height:auto;background:#f5f5f5;border:1px solid rgba(45,49,66,0.12);border-radius:6px" role="img" aria-labelledby="m20-hs-title m20-hs-desc">
+<title id="m20-hs-title">QUIC 1-RTT handshake, datagram by datagram</title>
+<desc id="m20-hs-desc">Sequence diagram of a QUIC v1 handshake. The client sends a 1,200-byte datagram with an Initial packet carrying the ClientHello. The server replies with up to 3,600 bytes: an Initial packet with ServerHello and Handshake packets with the encrypted certificate flight. The client sends its Finished in a Handshake packet and the HTTP request in a 1-RTT packet one round trip after starting. The server confirms with HANDSHAKE_DONE and sends the response. An optional 0-RTT path is shown below.</desc>
+<defs><marker id="m20-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4f5d75"/></marker><marker id="m20-arr-acc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#bf4520"/></marker></defs>
+<text x="24" y="28" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" letter-spacing="2" fill="#4f5d75">QUIC v1 HANDSHAKE — RFC 9000 / 9001 · 1-RTT</text>
+<rect x="60" y="44" width="120" height="44" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="120" y="62" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">CLIENT</text>
+<text x="120" y="78" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="middle">picks random DCID</text>
+<line x1="120" y1="88" x2="120" y2="470" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="5,4"/>
+<rect x="540" y="44" width="120" height="44" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="600" y="62" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">SERVER</text>
+<text x="600" y="78" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="middle">picks its own CID</text>
+<line x1="600" y1="88" x2="600" y2="470" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="5,4"/>
+<rect x="200" y="104" width="320" height="18" rx="3" fill="#ececec" stroke="#4f5d75" stroke-width="0.8"/>
+<text x="206" y="117" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">Initial · CRYPTO(ClientHello) · PADDING</text>
+<line x1="120" y1="132" x2="600" y2="132" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#m20-arr)"/>
+<text x="360" y="148" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580" text-anchor="middle">datagram padded to ≥ 1,200 bytes → server budget 3 × 1,200 = 3,600 bytes</text>
+<text x="112" y="136" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#2d3142" text-anchor="end">t = 0</text>
+<rect x="200" y="172" width="150" height="18" rx="3" fill="#ececec" stroke="#4f5d75" stroke-width="0.8"/>
+<text x="206" y="185" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">Initial · ServerHello, ACK</text>
+<rect x="356" y="172" width="164" height="18" rx="3" fill="rgba(79,93,117,0.22)" stroke="#4f5d75" stroke-width="0.8"/>
+<text x="362" y="185" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">Handshake · EE, Certificate…</text>
+<rect x="270" y="194" width="180" height="18" rx="3" fill="rgba(79,93,117,0.22)" stroke="#4f5d75" stroke-width="0.8"/>
+<text x="276" y="207" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">Handshake · …Cert, CV, Finished</text>
+<line x1="600" y1="222" x2="120" y2="222" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#m20-arr)"/>
+<text x="360" y="238" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580" text-anchor="middle">3 datagrams, 3,134 bytes — under the 3,600-byte limit</text>
+<rect x="150" y="262" width="130" height="18" rx="3" fill="#ececec" stroke="#4f5d75" stroke-width="0.8"/>
+<text x="156" y="275" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">Initial · ACK</text>
+<rect x="286" y="262" width="170" height="18" rx="3" fill="rgba(79,93,117,0.22)" stroke="#4f5d75" stroke-width="0.8"/>
+<text x="292" y="275" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">Handshake · ACK, Finished</text>
+<rect x="462" y="262" width="110" height="18" rx="3" fill="rgba(191,69,32,0.10)" stroke="#bf4520" stroke-width="0.8"/>
+<text x="468" y="275" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">1-RTT · HEADERS</text>
+<line x1="120" y1="290" x2="600" y2="290" stroke="#bf4520" stroke-width="1.5" marker-end="url(#m20-arr-acc)"/>
+<text x="112" y="294" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#bf4520" text-anchor="end">t = 1 RTT</text>
+<text x="360" y="306" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#bf4520" text-anchor="middle">request leaves one round trip after the first packet (TCP + TLS 1.3: two)</text>
+<rect x="200" y="330" width="320" height="18" rx="3" fill="rgba(191,69,32,0.10)" stroke="#bf4520" stroke-width="0.8"/>
+<text x="206" y="343" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">1-RTT · HANDSHAKE_DONE, NEW_TOKEN, SETTINGS, response</text>
+<line x1="600" y1="358" x2="120" y2="358" stroke="#bf4520" stroke-width="1.5" marker-end="url(#m20-arr-acc)"/>
+<text x="112" y="362" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#2d3142" text-anchor="end">t = 2 RTT</text>
+<text x="360" y="374" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580" text-anchor="middle">both sides discard Handshake keys; response arrives</text>
+<text x="24" y="410" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" letter-spacing="1.5" fill="#4f5d75">PACKET NUMBER SPACES · KEYS</text>
+<rect x="24" y="418" width="200" height="18" rx="3" fill="#ececec" stroke="#4f5d75" stroke-width="0.8"/>
+<text x="30" y="431" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">Initial — keys from DCID + salt</text>
+<rect x="232" y="418" width="226" height="18" rx="3" fill="rgba(79,93,117,0.22)" stroke="#4f5d75" stroke-width="0.8"/>
+<text x="238" y="431" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">Handshake — keys from (EC)DHE</text>
+<rect x="466" y="418" width="230" height="18" rx="3" fill="rgba(191,69,32,0.10)" stroke="#bf4520" stroke-width="0.8"/>
+<text x="472" y="431" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">Application — 0-RTT and 1-RTT keys</text>
+<text x="24" y="456" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580" text-anchor="start">Each space numbers its own packets from 0 and acknowledges only its own packets.</text>
+<rect x="24" y="478" width="672" height="120" rx="4" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.22)"/>
+<rect x="24" y="478" width="44" height="16" rx="2" fill="#f5f5f5" stroke="rgba(45,49,66,0.22)"/>
+<text x="46" y="490" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" letter-spacing="1.5" fill="#4f5d75" text-anchor="middle">OPT</text>
+<text x="80" y="491" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">[resumption: session ticket + remembered transport parameters]</text>
+<rect x="150" y="504" width="190" height="18" rx="3" fill="#ececec" stroke="#4f5d75" stroke-width="0.8"/>
+<text x="156" y="517" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">Initial · ClientHello (PSK)</text>
+<rect x="346" y="504" width="226" height="18" rx="3" fill="rgba(191,69,32,0.10)" stroke="#bf4520" stroke-width="0.8"/>
+<text x="352" y="517" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">0-RTT · HEADERS GET (replayable)</text>
+<line x1="120" y1="534" x2="600" y2="534" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#m20-arr)"/>
+<text x="360" y="556" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580" text-anchor="middle">request in the first flight — response after 1 RTT</text>
+<text x="360" y="574" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580" text-anchor="middle">safe methods only; servers answer 425 Too Early when unsure (RFC 8470)</text>
+</svg>
+</div>
+<p>Walk through the diagram.</p>
+<p><strong>Client flight (t = 0).</strong> The client picks a random DCID — at least 8 bytes — and derives Initial keys from it. It sends an Initial packet holding a <code>CRYPTO</code> frame with the ClientHello. The datagram must be <strong>padded to at least 1,200 bytes</strong>. That rule has two purposes: it proves the path can carry 1,200-byte datagrams, which QUIC requires, and it buys the server an amplification budget.</p>
+<p><strong>Server flight (t = ½ RTT at the server).</strong> Until the server has seen proof that the client really owns its source address, it may send at most <strong>three times</strong> the bytes it has received from that address (RFC 9000 §8.1). The padded 1,200-byte Initial gives it 3,600 bytes. Into that budget it packs an Initial packet (ServerHello and an ACK) and Handshake packets (EncryptedExtensions, Certificate, CertificateVerify, Finished), usually coalesced into the first datagram and spilling into one or two more.</p>
+<p><strong>Client again (t = 1 RTT).</strong> The client now holds Handshake and 1-RTT keys. It sends its Finished in a Handshake packet. In the <em>same datagram or the next one</em> it sends a 1-RTT packet carrying the HTTP request. The request leaves the client one round trip after the first packet. With TCP plus TLS 1.3 it leaves after two.</p>
+<p><strong>Server confirms.</strong> When the server receives the client's Finished, the handshake is complete. It sends a <code>HANDSHAKE_DONE</code> frame, and both sides throw away their Handshake keys. The response follows on the request's stream.</p>
+<p><strong>Retry: the server's escape hatch.</strong> Under load or attack, a server may not want to allocate any state, not even the 3× budget, for an address it hasn't validated. It can answer the first Initial with a <strong>Retry</strong> packet containing a token. The client repeats its Initial with the token, which proves it can receive at that address. It costs a full round trip, so servers use it when under pressure rather than by default. <code>NEW_TOKEN</code> frames let a server hand clients a token for their <em>next</em> connection, so a returning client can skip validation.</p>
+<h3 id="m20-0-rtt-and-what-it-costs">0-RTT and what it costs</h3>
+<p>A client that connected before holds a session ticket and remembers the server's transport parameters. On the next connection it can send <strong>0-RTT packets</strong> — long-header type <code>0x1</code> — in the same flight as its ClientHello. The HTTP request reaches the server half a round trip after the client starts, and the response comes back after one RTT total.</p>
+<p>The cost is the same as Module 12's TLS 0-RTT: <strong>early data can be replayed.</strong> The server cannot yet prove the packet is fresh. An attacker who captured the client's first flight can resend it, and the server may process the request twice. So the rules are:</p>
+<ul>
+<li>Only send requests that are safe to replay. Browsers send <code>GET</code> in 0-RTT, never <code>POST</code>.</li>
+<li>A server or proxy that is unsure can answer <strong><code>425 Too Early</code></strong> (RFC 8470), and the client retries after the handshake.</li>
+<li>A proxy that forwards early data to an origin adds the <code>Early-Data: 1</code> header so the origin can make that decision itself.</li>
+<li>A server may simply reject 0-RTT. The client then resends everything in 1-RTT packets. Nothing breaks; the client only loses the time saved.</li>
+</ul>
+<h3 id="m20-loss-recovery-and-congestion-control-in-user-space">Loss recovery and congestion control in user space</h3>
+<p>RFC 9002 describes how QUIC detects loss. The ideas are TCP's, cleaned up.</p>
+<p>A packet is declared lost when a packet sent <em>after</em> it has been acknowledged and either of two thresholds is crossed:</p>
+<ul>
+<li><strong>Packet threshold:</strong> three later packets have been acknowledged (<code>kPacketThreshold = 3</code>, the same intuition as TCP's three duplicate ACKs).</li>
+<li><strong>Time threshold:</strong> it has been outstanding for more than 9/8 of the larger of the smoothed RTT and the latest RTT sample.</li>
+</ul>
+<p>If nothing comes back at all — the tail of a transfer was lost, or the ACKs were — the <strong>probe timeout</strong> (PTO) fires. The sender then sends one or two <em>probe</em> packets to elicit an ACK. PTO replaces TCP's retransmission timeout, with one important difference: a PTO firing does not collapse the congestion window. Only real, confirmed loss does.</p>
+<p>ACKs are richer than TCP's. A QUIC <code>ACK</code> frame lists up to hundreds of acknowledged ranges, like TCP SACK without the 3–4 block limit of the TCP options field. It also reports the <strong>ACK delay</strong>: how long the receiver deliberately held the ACK. The sender subtracts it from the RTT sample, so delayed ACKs don't inflate the RTT estimate.</p>
+<p>For <strong>congestion control</strong>, RFC 9002 specifies a NewReno-style controller as a baseline, but implementations are free to use anything. Common choices are CUBIC and BBR. Because the controller is a library, a CDN can A/B test a new algorithm on 1% of connections and roll it back the same day. With TCP that requires a kernel change on the server and does nothing for the client's sending direction.</p>
+<p><strong>Flow control</strong> works at two levels at once: <code>MAX_STREAM_DATA</code> limits each stream, and <code>MAX_DATA</code> limits the whole connection. A third limit, <code>MAX_STREAMS</code>, caps how many streams the peer may open. All three start from transport parameters and are raised by frames as the application consumes data.</p>
+<h3 id="m20-http3-and-qpack">HTTP/3 and QPACK</h3>
+<p>HTTP/3 (RFC 9114) is HTTP's semantics — methods, status codes, headers, Module 12 unchanged — mapped onto QUIC streams.</p>
+<p><strong>Each request gets its own client-initiated bidirectional stream.</strong> The client writes a <code>HEADERS</code> frame, optionally <code>DATA</code> frames for a body, and closes its side. The server answers with <code>HEADERS</code>, <code>DATA</code>, maybe trailing <code>HEADERS</code>, and closes its side. There is no request ID in the frames; the stream <em>is</em> the request. Cancelling a request is a <code>RESET_STREAM</code> or <code>STOP_SENDING</code> on that stream.</p>
+<p><strong>Each side also opens a unidirectional control stream</strong> (stream type <code>0x00</code>) and sends <code>SETTINGS</code> first. <code>GOAWAY</code> travels there too, for graceful shutdown. Several jobs HTTP/2 did in its own framing layer have moved down into QUIC: flow control, stream limits, and stream reset. HTTP/3 doesn't duplicate them.</p>
+<p><strong>Prioritisation</strong> in HTTP/3 uses Extensible Priorities (RFC 9218): a <code>priority</code> header such as <code>priority: u=1, i</code> (urgency 0–7, plus "incremental") and a <code>PRIORITY_UPDATE</code> frame for changes. HTTP/2's dependency tree is gone. Server push exists in the spec, but browsers have effectively abandoned it; don't build on it.</p>
+<p><strong>QPACK</strong> (RFC 9204) is header compression. HTTP/2's HPACK keeps a <em>dynamic table</em> of recent headers that both sides update in lock-step as header blocks are processed. That works because TCP processes header blocks in order. On QUIC, the HEADERS for stream 8 can arrive before the HEADERS for stream 4. If stream 8's headers refer to a table entry that stream 4's headers were supposed to add, the decoder is stuck — head-of-line blocking again, reintroduced by the compressor.</p>
+<p>QPACK's fix is to take table updates off the request streams:</p>
+<ul>
+<li>The <strong>encoder stream</strong> (unidirectional, type <code>0x02</code>) carries instructions that insert entries into the dynamic table.</li>
+<li>Each header block starts with a <strong>Required Insert Count</strong>: "you need at least this many insertions before you can decode me."</li>
+<li>If the decoder hasn't received those insertions yet, that one stream blocks. Others continue. <code>SETTINGS_QPACK_BLOCKED_STREAMS</code> caps how many streams the encoder may put at risk.</li>
+<li>The <strong>decoder stream</strong> (type <code>0x03</code>) carries acknowledgements back, so the encoder knows which entries are safe to reference without any blocking risk.</li>
+</ul>
+<p>The <strong>static table</strong> has 99 entries (HPACK's had 61), chosen from real traffic. <code>:method GET</code> is index 17, <code>:scheme https</code> is 23, <code>:status 200</code> is 25. A server that sets the dynamic table capacity to 0 — the default — uses only the static table and literals, and never blocks. Many deployments run exactly that way, trading a little compression for simplicity.</p>
+<h3 id="m20-discovery-how-a-client-knows-to-try-http3">Discovery: how a client knows to try HTTP/3</h3>
+<p>A URL says <code>https://</code>. It doesn't say which protocol. A client has three ways to learn that a server speaks HTTP/3.</p>
+<p><strong>Alt-Svc (RFC 7838).</strong> The classic path. The client connects over TCP, and the response carries a header like:</p>
+<pre class="text"><code>alt-svc: h3=&quot;:443&quot;; ma=86400</code></pre>
+<p>That says: "the same origin is also available over HTTP/3 on UDP port 443, and you may remember this for 86,400 seconds." The client caches it per origin. Its <em>next</em> connection tries QUIC. The very first visit pays for TCP.</p>
+<p><strong>The HTTPS DNS record (RFC 9460).</strong> A DNS record type (<code>HTTPS</code>, type 65) that publishes connection hints before any connection exists:</p>
+<pre class="text"><code>example.com. 300 IN HTTPS 1 . alpn=&quot;h3,h2&quot; ipv4hint=192.0.2.10 ipv6hint=2001:db8::10</code></pre>
+<p><code>alpn="h3,h2"</code> tells the client it can try HTTP/3 on the first connection. The same record can carry an <code>ech</code> parameter with the keys for Encrypted Client Hello. Browser support depends on the browser, the OS, and which resolver path is in use, so treat it as an accelerator, not a guarantee.</p>
+<p><strong>Configuration.</strong> Clients told explicitly — <code>curl --http3</code>, an internal service mesh, an app that hard-codes it.</p>
+<h3 id="m20-udp-blocking-and-fallback">UDP blocking and fallback</h3>
+<p>Some networks block UDP 443. Enterprise firewalls do it on purpose, so all web traffic passes through their TCP inspection proxy. Some hotel and guest networks do it by accident, allowing only DNS on UDP. Chrome even has an enterprise policy, <code>QuicAllowed</code>, so administrators can turn QUIC off.</p>
+<p>A browser can't afford to hang when that happens. So in practice browsers <strong>race</strong>: when they have an h3 hint, they start the QUIC handshake and, after a short delay or in parallel, a TCP+TLS handshake. Whichever completes first wins. If QUIC fails, the browser marks HTTP/3 as broken for that origin for some minutes and uses TCP. Users on a UDP-blocking network get HTTP/2, a little slower, and never notice.</p>
+<p>The ugly case is a <em>silent</em> drop with a client that doesn't race. A CLI with <code>--http3-only</code> or an app that insists on QUIC waits for its handshake timeout. Then it either errors or falls back late. The rule for any service you run: <strong>HTTP/3 must always be an upgrade, never the only path.</strong> Keep TCP listening on the same name.</p>
+<hr />
+<h2 id="m20-4-the-exact-structure">4. The exact structure</h2>
+<h3 id="m20-long-header">Long header (Initial, 0-RTT, Handshake, Retry)</h3>
+<p>Long headers are used until the handshake completes. Their layout is partly fixed forever by RFC 8999 ("Version-Independent Properties of QUIC"): the first bit, the version, and the two connection IDs with their lengths. Everything else may change in future versions.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Field</th>
+<th>Size</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Header Form</td>
+<td>1 bit</td>
+<td><code>1</code> = long header</td>
+</tr>
+<tr class="even">
+<td>Fixed Bit</td>
+<td>1 bit</td>
+<td><code>1</code> in v1 (RFC 9287 lets peers agree to randomise it — "greasing")</td>
+</tr>
+<tr class="odd">
+<td>Long Packet Type</td>
+<td>2 bits</td>
+<td><code>00</code> Initial, <code>01</code> 0-RTT, <code>10</code> Handshake, <code>11</code> Retry</td>
+</tr>
+<tr class="even">
+<td>Type-specific bits</td>
+<td>4 bits</td>
+<td>2 reserved + 2 for packet-number length (protected)</td>
+</tr>
+<tr class="odd">
+<td>Version</td>
+<td>32 bits</td>
+<td><code>0x00000001</code> = QUIC v1; <code>0x6b3343cf</code> = QUIC v2 (RFC 9369); <code>0</code> = Version Negotiation</td>
+</tr>
+<tr class="even">
+<td>DCID Length + DCID</td>
+<td>8 bits + 0–20 bytes</td>
+<td>the ID the receiver chose</td>
+</tr>
+<tr class="odd">
+<td>SCID Length + SCID</td>
+<td>8 bits + 0–20 bytes</td>
+<td>the ID the sender wants to receive</td>
+</tr>
+<tr class="even">
+<td>Token Length + Token</td>
+<td>varint + bytes</td>
+<td>Initial only; from Retry or <code>NEW_TOKEN</code></td>
+</tr>
+<tr class="odd">
+<td>Length</td>
+<td>varint</td>
+<td>bytes remaining in this packet: packet number + payload</td>
+</tr>
+<tr class="even">
+<td>Packet Number</td>
+<td>1–4 bytes</td>
+<td>protected, truncated</td>
+</tr>
+<tr class="odd">
+<td>Payload</td>
+<td>rest</td>
+<td>AEAD-encrypted frames, ending in a 16-byte tag</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>Length</code> field is what makes coalescing possible: the receiver knows where this packet ends and the next one in the datagram begins.</p>
+<h3 id="m20-short-header">Short header (1-RTT)</h3>
+<p>After the handshake, every packet uses the short header. It is tiny.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Field</th>
+<th>Size</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Header Form</td>
+<td>1 bit</td>
+<td><code>0</code> = short header</td>
+</tr>
+<tr class="even">
+<td>Fixed Bit</td>
+<td>1 bit</td>
+<td><code>1</code></td>
+</tr>
+<tr class="odd">
+<td>Spin Bit</td>
+<td>1 bit</td>
+<td>optional passive RTT signal; may be disabled</td>
+</tr>
+<tr class="even">
+<td>Reserved</td>
+<td>2 bits</td>
+<td>protected</td>
+</tr>
+<tr class="odd">
+<td>Key Phase</td>
+<td>1 bit</td>
+<td>flips on each key update (protected)</td>
+</tr>
+<tr class="even">
+<td>Packet Number Length</td>
+<td>2 bits</td>
+<td>protected</td>
+</tr>
+<tr class="odd">
+<td>Destination Connection ID</td>
+<td>0–20 bytes</td>
+<td><strong>no length field</strong> — the receiver knows its own CID length</td>
+</tr>
+<tr class="even">
+<td>Packet Number</td>
+<td>1–4 bytes</td>
+<td>protected</td>
+</tr>
+<tr class="odd">
+<td>Payload</td>
+<td>rest</td>
+<td>encrypted frames + 16-byte tag</td>
+</tr>
+</tbody>
+</table>
+<p>Note what isn't there: no source CID, no version, no length. A short-header packet must be the last one in its datagram. And a load balancer that wants to read the DCID must know how long the server's CIDs are, because the packet doesn't say. Section "Deep dive: production failure modes" comes back to this.</p>
+<p><strong>Header protection.</strong> After the payload is encrypted, the sender takes a 16-byte sample of the ciphertext (starting 4 bytes after the packet number begins), encrypts it with a separate header-protection key, and XORs the result over the packet number bytes and the low bits of the first byte. An observer therefore can't read packet numbers or the key phase. This is what keeps middleboxes from building loss or RTT heuristics on QUIC's internals, the way they did with TCP sequence numbers.</p>
+<h3 id="m20-variable-length-integers">Variable-length integers</h3>
+<p>Almost every number on the wire — stream IDs, offsets, lengths, frame types, error codes — is a <strong>varint</strong> (RFC 9000 §16). The top two bits of the first byte give the length:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Prefix</th>
+<th>Length</th>
+<th>Usable bits</th>
+<th>Max value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>00</code></td>
+<td>1 byte</td>
+<td>6</td>
+<td>63</td>
+</tr>
+<tr class="even">
+<td><code>01</code></td>
+<td>2 bytes</td>
+<td>14</td>
+<td>16,383</td>
+</tr>
+<tr class="odd">
+<td><code>10</code></td>
+<td>4 bytes</td>
+<td>30</td>
+<td>1,073,741,823</td>
+</tr>
+<tr class="even">
+<td><code>11</code></td>
+<td>8 bytes</td>
+<td>62</td>
+<td>4,611,686,018,427,387,903</td>
+</tr>
+</tbody>
+</table>
+<p>That is why stream IDs and packet numbers are "62-bit". Section 9's <code>m20_wire.py</code> encodes and decodes these, checked against RFC 9000's test vectors.</p>
+<h3 id="m20-frame-types">Frame types (RFC 9000 §19)</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Type</th>
+<th>Frame</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>0x00</code></td>
+<td>PADDING</td>
+<td>fills space (the 1,200-byte rule, MTU probes)</td>
+</tr>
+<tr class="even">
+<td><code>0x01</code></td>
+<td>PING</td>
+<td>asks for an ACK; keepalive</td>
+</tr>
+<tr class="odd">
+<td><code>0x02</code>–<code>0x03</code></td>
+<td>ACK</td>
+<td>ranges of received packets + ACK delay (<code>0x03</code> adds ECN counts)</td>
+</tr>
+<tr class="even">
+<td><code>0x04</code></td>
+<td>RESET_STREAM</td>
+<td>sender abandons a stream</td>
+</tr>
+<tr class="odd">
+<td><code>0x05</code></td>
+<td>STOP_SENDING</td>
+<td>receiver asks the sender to abandon a stream</td>
+</tr>
+<tr class="even">
+<td><code>0x06</code></td>
+<td>CRYPTO</td>
+<td>TLS handshake bytes</td>
+</tr>
+<tr class="odd">
+<td><code>0x07</code></td>
+<td>NEW_TOKEN</td>
+<td>address-validation token for a future connection</td>
+</tr>
+<tr class="even">
+<td><code>0x08</code>–<code>0x0f</code></td>
+<td>STREAM</td>
+<td>application bytes; low 3 bits = OFF, LEN, FIN flags</td>
+</tr>
+<tr class="odd">
+<td><code>0x10</code></td>
+<td>MAX_DATA</td>
+<td>connection-level flow-control credit</td>
+</tr>
+<tr class="even">
+<td><code>0x11</code></td>
+<td>MAX_STREAM_DATA</td>
+<td>per-stream flow-control credit</td>
+</tr>
+<tr class="odd">
+<td><code>0x12</code>–<code>0x13</code></td>
+<td>MAX_STREAMS</td>
+<td>how many bidi/uni streams the peer may open</td>
+</tr>
+<tr class="even">
+<td><code>0x14</code>–<code>0x17</code></td>
+<td>DATA_BLOCKED, STREAM_DATA_BLOCKED, STREAMS_BLOCKED</td>
+<td>"I'm stuck on your limit" (diagnostic gold)</td>
+</tr>
+<tr class="odd">
+<td><code>0x18</code></td>
+<td>NEW_CONNECTION_ID</td>
+<td>a spare CID + its 16-byte stateless reset token</td>
+</tr>
+<tr class="even">
+<td><code>0x19</code></td>
+<td>RETIRE_CONNECTION_ID</td>
+<td>stop using a CID</td>
+</tr>
+<tr class="odd">
+<td><code>0x1a</code>–<code>0x1b</code></td>
+<td>PATH_CHALLENGE / PATH_RESPONSE</td>
+<td>8 bytes, echoed, to validate a path</td>
+</tr>
+<tr class="even">
+<td><code>0x1c</code>–<code>0x1d</code></td>
+<td>CONNECTION_CLOSE</td>
+<td>transport error / application error</td>
+</tr>
+<tr class="odd">
+<td><code>0x1e</code></td>
+<td>HANDSHAKE_DONE</td>
+<td>server confirms the handshake</td>
+</tr>
+</tbody>
+</table>
+<h3 id="m20-http3-on-top">HTTP/3 on top</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Thing</th>
+<th>Value</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>ALPN token</td>
+<td><code>h3</code></td>
+<td>negotiated in the TLS handshake; mandatory for QUIC</td>
+</tr>
+<tr class="even">
+<td>Frames</td>
+<td><code>DATA 0x00</code>, <code>HEADERS 0x01</code>, <code>SETTINGS 0x04</code>, <code>GOAWAY 0x07</code>, <code>CANCEL_PUSH 0x03</code>, <code>PUSH_PROMISE 0x05</code>, <code>MAX_PUSH_ID 0x0d</code></td>
+<td>each is type (varint) + length (varint) + payload</td>
+</tr>
+<tr class="odd">
+<td>Unidirectional stream types</td>
+<td>control <code>0x00</code>, push <code>0x01</code>, QPACK encoder <code>0x02</code>, QPACK decoder <code>0x03</code></td>
+<td>first varint on the stream</td>
+</tr>
+<tr class="even">
+<td>QPACK settings</td>
+<td><code>SETTINGS_QPACK_MAX_TABLE_CAPACITY 0x01</code>, <code>SETTINGS_QPACK_BLOCKED_STREAMS 0x07</code></td>
+<td>both default to 0: static table only</td>
+</tr>
+<tr class="odd">
+<td>Error codes</td>
+<td><code>H3_NO_ERROR 0x100</code>, <code>H3_INTERNAL_ERROR 0x102</code>, <code>H3_REQUEST_CANCELLED 0x10c</code>, <code>QPACK_DECOMPRESSION_FAILED 0x200</code></td>
+<td>sent in RESET_STREAM / CONNECTION_CLOSE</td>
+</tr>
+</tbody>
+</table>
+<p>Here is one complete request on the wire, built by <code>m20_wire.py</code>: <code>GET https://example.com/</code> encoded with the QPACK static table only.</p>
+<pre class="text"><code>QPACK field section (18 bytes): 00 00 d1 d7 c1 50 0b 65 78 61 6d 70 6c 65 2e 63 6f 6d
+  00 00          Required Insert Count = 0, Delta Base = 0  (no dynamic table needed)
+  d1             indexed, static[17]  :method GET
+  d7             indexed, static[23]  :scheme https
+  c1             indexed, static[1]   :path /
+  50 0b ...      literal value with static name static[0] :authority, 11 bytes &quot;example.com&quot;
+HTTP/3 HEADERS frame (20 bytes): 01 12 + field section      type 0x01, length 18
+QUIC STREAM frame (23 bytes): 0b 00 14 + HEADERS frame       type 0x0b = STREAM|LEN|FIN, stream 0, length 20</code></pre>
+<p>Twenty-three bytes for a whole request, and the FIN bit means "no body follows". Compare <code>GET / HTTP/1.1\r\nHost: example.com\r\n\r\n</code> at 37 bytes before any of the headers a browser actually sends.</p>
+<hr />
+<h2 id="m20-5-a-realistic-example">5. A realistic example</h2>
+<p>A client at <code>192.0.2.44</code> fetches <code>https://example.com/</code> from a server at <code>198.51.100.7</code> over a fresh QUIC connection. The path RTT is about 20 ms. This capture is <strong>constructed for teaching</strong>, but every length, address, ID and time is consistent with the protocol. It is shown in <code>tshark</code> style with a TLS key log loaded (<code>-o tls.keylog_file:keys.log</code>), so the frames inside Handshake and 1-RTT packets are visible.</p>
+<pre class="text"><code>No. Time       Source       Destination  Proto Len  Info
+ 1  0.000000   192.0.2.44   198.51.100.7 QUIC  1242 Initial, DCID=c1a5e0f39b2d4471, SCID=0b6e9d1f7c2a5e10, PKN: 0, CRYPTO, PADDING
+ 2  0.020410   198.51.100.7 192.0.2.44   QUIC  1242 Initial, DCID=0b6e9d1f7c2a5e10, SCID=5ad3e1040c9f22b7, PKN: 0, ACK, CRYPTO
+                                                    Handshake, DCID=0b6e9d1f7c2a5e10, SCID=5ad3e1040c9f22b7, PKN: 0, CRYPTO
+ 3  0.020421   198.51.100.7 192.0.2.44   QUIC  1242 Handshake, DCID=0b6e9d1f7c2a5e10, SCID=5ad3e1040c9f22b7, PKN: 1, CRYPTO
+ 4  0.020429   198.51.100.7 192.0.2.44   QUIC   776 Handshake, DCID=0b6e9d1f7c2a5e10, SCID=5ad3e1040c9f22b7, PKN: 2, CRYPTO
+ 5  0.021050   192.0.2.44   198.51.100.7 QUIC  1242 Initial, DCID=5ad3e1040c9f22b7, SCID=0b6e9d1f7c2a5e10, PKN: 1, ACK, PADDING
+                                                    Handshake, DCID=5ad3e1040c9f22b7, SCID=0b6e9d1f7c2a5e10, PKN: 0, ACK, CRYPTO
+ 6  0.021061   192.0.2.44   198.51.100.7 QUIC   235 Protected Payload (KP0), DCID=5ad3e1040c9f22b7, PKN: 0, STREAM(2), STREAM(6), STREAM(10), STREAM(0)
+ 7  0.041912   198.51.100.7 192.0.2.44   QUIC   290 Protected Payload (KP0), DCID=0b6e9d1f7c2a5e10, PKN: 0, ACK, HANDSHAKE_DONE, NEW_TOKEN, NEW_CONNECTION_ID, STREAM(3)
+ 8  0.041921   198.51.100.7 192.0.2.44   QUIC  1242 Protected Payload (KP0), DCID=0b6e9d1f7c2a5e10, PKN: 1, STREAM(0)
+ 9  0.042010   192.0.2.44   198.51.100.7 QUIC    75 Protected Payload (KP0), DCID=5ad3e1040c9f22b7, PKN: 1, ACK</code></pre>
+<p>Read it in order.</p>
+<p><strong>Frame 1</strong> is the client's first flight. The frame is 1,242 bytes on Ethernet: 14 (Ethernet) + 20 (IPv4) + 8 (UDP) + 1,200 (QUIC). The ClientHello itself is a few hundred bytes. The rest is <code>PADDING</code>, there only to meet the 1,200-byte minimum. The DCID <code>c1a5e0f39b2d4471</code> is random; the client made it up. The SCID <code>0b6e9d1f7c2a5e10</code> is the ID the client wants the server to use when replying.</p>
+<p><strong>Frames 2–4</strong> are the server's flight, all sent within 20 µs. Look at the DCIDs: the server now addresses the client by <code>0b6e…</code>, and offers its own ID <code>5ad3e1040c9f22b7</code> as SCID. Frame 2 coalesces an Initial packet (ServerHello plus an ACK of the client's PKN 0) with the first Handshake packet. The three datagrams carry 1,200 + 1,200 + 734 = 3,134 bytes of QUIC. That is under the 3 × 1,200 = 3,600-byte amplification limit, so the whole certificate chain fits in the first flight.</p>
+<p>Notice that the packet numbers restart. The server's Initial is PKN 0 and its first Handshake is also PKN 0. Different spaces, different counters.</p>
+<p><strong>Frame 5</strong> is the client completing the handshake: an Initial packet that just ACKs the server's Initial, plus a Handshake packet with an ACK and the client's Finished in a <code>CRYPTO</code> frame. Because it contains an Initial packet, the datagram is padded to 1,200 bytes again. The client's Initial keys are still the ones derived from <code>c1a5…</code>, the original DCID, even though the client now addresses the server as <code>5ad3…</code>.</p>
+<p><strong>Frame 6</strong> is 11 µs later, and it is the payoff: a short-header 1-RTT packet carrying the HTTP/3 request on stream 0 at <strong>t = 21 ms</strong>, one round trip after the first packet. Streams 2, 6 and 10 are the client's three unidirectional streams: control (with <code>SETTINGS</code>), QPACK encoder and QPACK decoder. "Protected Payload (KP0)" is how tshark labels a short-header packet; KP0 means key phase 0, the first set of 1-RTT keys.</p>
+<p><strong>Frame 7</strong> arrives one RTT after frame 6: <code>HANDSHAKE_DONE</code> (the server has the client's Finished; both sides drop Handshake keys), a <code>NEW_TOKEN</code> for the client's next visit, a spare connection ID, and the server's control stream (stream 3, server-initiated unidirectional) with its <code>SETTINGS</code>. <strong>Frame 8</strong> is the response on stream 0, and <strong>frame 9</strong> acknowledges it.</p>
+<p>Two things about this capture are worth carrying with you.</p>
+<p>First, <strong>without the key log</strong> tshark still decodes frames 1, 2 and 5 completely. Initial keys come from the DCID, which is in the packet. Everything else shows as encrypted. This is the honest way to describe Initial protection: integrity against off-path attackers, not secrecy.</p>
+<p>Second, the server's first datagram is the same size as the client's. A server that sent a 5 KB certificate chain would hit the 3,600-byte limit. It would then have to wait for frame 5's ACK before sending the rest — an extra round trip that shows up nowhere unless you look for it. "Deep dive: production failure modes" covers it.</p>
+<p>Here is the same kind of fetch from the client's side, using a curl build with HTTP/3 support. <strong>Run on your Mac — your output will differ</strong> (the exact lines depend on curl's version and its QUIC library: ngtcp2, quiche, or OpenSSL's own QUIC).</p>
+<pre class="text"><code>$ curl -sv --http3-only -o /dev/null https://example.com/
+*   Trying 198.51.100.7:443...
+* QUIC cipher selection: TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_CCM_SHA256
+* Server certificate:
+*  subject: CN=example.com
+*  issuer: C=US; O=Example CA; CN=Example Issuing CA E1
+* Connected to example.com (198.51.100.7) port 443
+* using HTTP/3
+* [HTTP/3] [0] OPENED stream for https://example.com/
+* [HTTP/3] [0] [:method: GET]
+* [HTTP/3] [0] [:scheme: https]
+* [HTTP/3] [0] [:authority: example.com]
+* [HTTP/3] [0] [:path: /]
+&gt; GET / HTTP/3
+&gt; Host: example.com
+&gt; User-Agent: curl/8.11.1
+&gt; Accept: */*
+&lt; HTTP/3 200
+&lt; content-type: text/html; charset=utf-8
+&lt; content-length: 1256
+&lt; alt-svc: h3=&quot;:443&quot;; ma=86400</code></pre>
+<p>The <code>[0]</code> is the QUIC stream ID: the first client-initiated bidirectional stream. <code>HTTP/3 200</code> has no reason phrase, because HTTP/3 (like HTTP/2) carries only <code>:status</code>.</p>
+<hr />
+<h2 id="m20-6-misconceptions--common-mistakes">6. Misconceptions &amp; common mistakes</h2>
+<p><strong>"QUIC is UDP, so it's unreliable."</strong> QUIC <em>uses</em> UDP the way TCP uses IP. It adds acknowledgements, retransmission, ordering per stream, flow control and congestion control. It is every bit as reliable as TCP. The optional unreliable extension (DATAGRAM frames, RFC 9221) is a separate, explicit feature.</p>
+<p><strong>"HTTP/3 removes head-of-line blocking completely."</strong> It removes <em>cross-stream</em> blocking at the transport. Within one stream, bytes are still delivered in order, so a loss still stalls that stream. And a QPACK decoder can block a stream waiting for a dynamic-table insertion, which is why <code>SETTINGS_QPACK_BLOCKED_STREAMS</code> exists.</p>
+<p><strong>"QUIC is always faster."</strong> On a clean, low-latency wired path, HTTP/2 and HTTP/3 perform about the same, and HTTP/3 can be slower if the stack is CPU-bound or has small socket buffers. The wins are on the handshake (one RTT saved, more with 0-RTT), on lossy paths (no cross-stream blocking), and on networks where addresses change (migration).</p>
+<p><strong>"0-RTT is just a faster handshake."</strong> It is a faster handshake with replayable data. Treat it the way Module 12 did: off by default for anything non-idempotent, <code>425 Too Early</code> when unsure.</p>
+<p><strong>"Encryption means firewalls can't see QUIC at all."</strong> They can see a lot: UDP port 443, the version and both connection IDs in long headers, the DCID in short headers, packet sizes and timing, and — because Initial keys are derivable — the full ClientHello, including SNI (unless Encrypted Client Hello is used). What they cannot see is the transport's internals: packet numbers, ACKs, windows, stream IDs.</p>
+<p><strong>"A connection ID is a session ID I can log and track users with."</strong> Endpoints rotate CIDs on purpose and switch CIDs on migration so that observers <em>can't</em> link paths. Server-side, a CID is a routing key. It is not a user identifier.</p>
+<p><strong>"If UDP 443 is blocked, HTTP/3 sites break."</strong> Browsers race or fall back to TCP, so the site works over HTTP/2. Sites break only if someone deploys HTTP/3 <em>without</em> keeping TCP, or if a client insists on QUIC.</p>
+<p><strong>"Enabling HTTP/3 on the server is enough."</strong> The server also needs UDP 443 open in every security group, firewall and load balancer on the path, and an <code>Alt-Svc</code> header or HTTPS record that clients actually receive. A missing UDP listener is the single most common reason "we enabled HTTP/3" shows zero <code>h3</code> traffic.</p>
+<hr />
+<h2 id="m20-7-interview-qa">7. Interview Q&amp;A</h2>
+<p><strong>Q1: HTTP/2 already multiplexes streams. What problem does HTTP/3 solve that HTTP/2 couldn't?</strong></p>
+<p>A: HTTP/2's streams are multiplexed <em>above</em> TCP, and TCP has one sequence space. A single lost segment stops the kernel from handing any later bytes to the application, whichever stream they belong to. That is transport-level head-of-line blocking. HTTP/2 can't fix it, because the ordering is enforced in the kernel below it. QUIC moves streams into the transport, each with its own ordering, so a loss only stalls the stream whose data was lost. HTTP/3 is HTTP mapped onto those streams. It also gets a one-RTT combined handshake and connection migration.</p>
+<p><strong>Q2: Why is QUIC built on UDP instead of being a new IP protocol number, like SCTP?</strong></p>
+<p>A: Deployability. NATs and firewalls pass TCP and UDP and very little else. SCTP is a fine protocol that almost never works across the Internet for exactly this reason. UDP is the minimal header that gets through, and running in user space means QUIC can ship and evolve with applications instead of waiting for kernel updates on every device.</p>
+<p><strong>Q3: How does a QUIC connection survive a client changing IP address?</strong></p>
+<p>A: The server identifies the connection by the Destination Connection ID in each packet, not the 4-tuple. When a known DCID arrives from a new address, the server validates the new path with <code>PATH_CHALLENGE</code>/<code>PATH_RESPONSE</code>, resets congestion state for it, and continues. A client that migrates deliberately also switches to a fresh CID from the pool its peer gave it, so observers can't link the two paths.</p>
+<p><strong>Q4: How does QUIC get to one round trip when TCP plus TLS 1.3 needs two?</strong></p>
+<p>A: It merges the transport and crypto handshakes. The TLS 1.3 handshake messages ride in QUIC <code>CRYPTO</code> frames from the very first packet, and QUIC's transport parameters ride inside the TLS handshake. There is no separate transport-only exchange like TCP's SYN/SYN-ACK. The client can send its request in a 1-RTT packet together with its Finished.</p>
+<p><strong>Q5: Why must the client pad its first Initial packet to 1,200 bytes?</strong></p>
+<p>A: Two reasons. It proves the path carries datagrams of QUIC's minimum size. And it bounds amplification: before a server validates the client's address, it may send at most three times what it received. A 1,200-byte Initial lets the server send 3,600 bytes. Without padding, a spoofed 300-byte Initial could make the server blast a large certificate chain at a victim.</p>
+<p><strong>Q6: You're asked to deploy HTTP/3. What has to be true end to end?</strong></p>
+<p>A: A QUIC-capable server or edge proxy listening on UDP 443. UDP 443 allowed through every firewall, security group, and load balancer on the path. A load balancer that either terminates QUIC or routes UDP by connection ID, not just by 4-tuple. Discovery: an <code>Alt-Svc: h3=":443"</code> header on TCP responses, and optionally an HTTPS DNS record with <code>alpn="h3,h2"</code>. TCP+TLS still available on the same name for clients that can't use UDP. And monitoring that splits metrics by protocol, so you can see whether h3 traffic is real and healthy.</p>
+<hr />
+<h2 id="m20-8-try-it">8. Try it</h2>
+<ul>
+<li><strong>Run on your Mac — your output will differ.</strong> Check whether your curl can speak HTTP/3: <code>curl -V | grep -i http3</code>. The curl that ships with macOS doesn't list it. A Homebrew or other third-party build may; check its <code>Features:</code> line. Then: <code>curl -sv --http3 -o /dev/null https://cloudflare-quic.com/ 2&gt;&amp;1 | grep -iE 'http/3|alt-svc'</code>. Add <code>-w '%{http_version}\n'</code> to print the protocol actually used.</li>
+<li><strong>Run on your Mac — your output will differ.</strong> See discovery in action without any QUIC support at all: <code>curl -sI https://www.cloudflare.com/ | grep -i alt-svc</code>. Then ask DNS for the HTTPS record: <code>dig +short cloudflare.com HTTPS</code>. If your <code>dig</code> is too old to know the type by name (the macOS one may be), use <code>dig +short cloudflare.com TYPE65</code>.</li>
+<li><strong>Run on your Mac — your output will differ.</strong> Watch a browser's choice: open the developer tools, Network tab, right-click the column header and enable "Protocol". Reload twice. The first load of a new origin often shows <code>h2</code>; later loads show <code>h3</code> once <code>Alt-Svc</code> is cached.</li>
+<li><strong>Run on your Mac — your output will differ.</strong> Capture a QUIC handshake you can read. Set <code>export SSLKEYLOGFILE=~/quic-keys.log</code>, start a capture with <code>sudo tcpdump -i en0 -w ~/quic.pcap udp port 443</code>, run an HTTP/3 curl in the same shell, stop the capture, and open it in Wireshark with that key log set under Preferences → Protocols → TLS. Filter with <code>quic</code>. Even without the key log, Initial packets decode fully.</li>
+<li><strong>Run on your Mac — your output will differ.</strong> Get a qlog. A curl built with ngtcp2 or quiche writes one per connection when you set <code>QLOGDIR=/tmp/qlog</code>. Load the file into the qvis visualiser to see packets, congestion window and RTT over time.</li>
+<li><strong>Runs anywhere, no network.</strong> The three scripts in section 9: <code>python3.13 code/m20/m20_wire.py</code>, <code>python3.13 code/m20/m20_initial_keys.py</code>, and <code>python3.13 code/m20/m20_hol_sim.py</code>.</li>
+</ul>
+<hr />
+<h2 id="m20-9-code-quics-wire-format-initial-keys-and-head-of-line-blocking">9. Code: QUIC's wire format, Initial keys, and head-of-line blocking</h2>
+<p>Three small scripts, standard library only. Every output below was pasted from a real run on CPython 3.13.</p>
+<h3 id="m20-varints-a-long-header-and-one-http3-request">Varints, a long header, and one HTTP/3 request</h3>
+<p><code>code/m20/m20_wire.py</code> implements the varint encoding, parses the unprotected header of the client Initial from RFC 9001 Appendix A.2, and builds the 23-byte request shown in section 4.</p>
+<div class="sourceCode" id="m20-cb6"><pre class="sourceCode python"><code class="sourceCode python"><span id="m20-cb6-1"><a href="#m20-cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;QUIC wire basics: variable-length integers (RFC 9000 §16) and a long-header parser.</span></span>
+<span id="m20-cb6-2"><a href="#m20-cb6-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-3"><a href="#m20-cb6-3" aria-hidden="true" tabindex="-1"></a><span class="co">Test vectors come from RFC 9000 Appendix A.1; the packet header is the</span></span>
+<span id="m20-cb6-4"><a href="#m20-cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co">unprotected client Initial from RFC 9001 Appendix A.2.</span></span>
+<span id="m20-cb6-5"><a href="#m20-cb6-5" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="m20-cb6-6"><a href="#m20-cb6-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-7"><a href="#m20-cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-8"><a href="#m20-cb6-8" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> encode_varint(v: <span class="bu">int</span>) <span class="op">-&gt;</span> <span class="bu">bytes</span>:</span>
+<span id="m20-cb6-9"><a href="#m20-cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> prefix, length <span class="kw">in</span> ((<span class="bn">0b00</span>, <span class="dv">1</span>), (<span class="bn">0b01</span>, <span class="dv">2</span>), (<span class="bn">0b10</span>, <span class="dv">4</span>), (<span class="bn">0b11</span>, <span class="dv">8</span>)):</span>
+<span id="m20-cb6-10"><a href="#m20-cb6-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> v <span class="op">&lt;</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> (<span class="dv">8</span> <span class="op">*</span> length <span class="op">-</span> <span class="dv">2</span>):</span>
+<span id="m20-cb6-11"><a href="#m20-cb6-11" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> ((prefix <span class="op">&lt;&lt;</span> (<span class="dv">8</span> <span class="op">*</span> length <span class="op">-</span> <span class="dv">2</span>)) <span class="op">|</span> v).to_bytes(length, <span class="st">&quot;big&quot;</span>)</span>
+<span id="m20-cb6-12"><a href="#m20-cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">raise</span> <span class="pp">ValueError</span>(<span class="st">&quot;varint max is 2**62 - 1&quot;</span>)</span>
+<span id="m20-cb6-13"><a href="#m20-cb6-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-14"><a href="#m20-cb6-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-15"><a href="#m20-cb6-15" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> decode_varint(buf: <span class="bu">bytes</span>, pos: <span class="bu">int</span> <span class="op">=</span> <span class="dv">0</span>) <span class="op">-&gt;</span> <span class="bu">tuple</span>[<span class="bu">int</span>, <span class="bu">int</span>]:</span>
+<span id="m20-cb6-16"><a href="#m20-cb6-16" aria-hidden="true" tabindex="-1"></a>    length <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> (buf[pos] <span class="op">&gt;&gt;</span> <span class="dv">6</span>)               <span class="co"># top two bits: 1, 2, 4 or 8 bytes</span></span>
+<span id="m20-cb6-17"><a href="#m20-cb6-17" aria-hidden="true" tabindex="-1"></a>    value <span class="op">=</span> buf[pos] <span class="op">&amp;</span> <span class="bn">0x3F</span></span>
+<span id="m20-cb6-18"><a href="#m20-cb6-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> b <span class="kw">in</span> buf[pos <span class="op">+</span> <span class="dv">1</span> : pos <span class="op">+</span> length]:</span>
+<span id="m20-cb6-19"><a href="#m20-cb6-19" aria-hidden="true" tabindex="-1"></a>        value <span class="op">=</span> (value <span class="op">&lt;&lt;</span> <span class="dv">8</span>) <span class="op">|</span> b</span>
+<span id="m20-cb6-20"><a href="#m20-cb6-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> value, pos <span class="op">+</span> length</span>
+<span id="m20-cb6-21"><a href="#m20-cb6-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-22"><a href="#m20-cb6-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-23"><a href="#m20-cb6-23" aria-hidden="true" tabindex="-1"></a>PACKET_TYPES <span class="op">=</span> {<span class="dv">0</span>: <span class="st">&quot;Initial&quot;</span>, <span class="dv">1</span>: <span class="st">&quot;0-RTT&quot;</span>, <span class="dv">2</span>: <span class="st">&quot;Handshake&quot;</span>, <span class="dv">3</span>: <span class="st">&quot;Retry&quot;</span>}</span>
+<span id="m20-cb6-24"><a href="#m20-cb6-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-25"><a href="#m20-cb6-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-26"><a href="#m20-cb6-26" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> parse_long_header(pkt: <span class="bu">bytes</span>) <span class="op">-&gt;</span> <span class="bu">list</span>[<span class="bu">tuple</span>[<span class="bu">str</span>, <span class="bu">str</span>]]:</span>
+<span id="m20-cb6-27"><a href="#m20-cb6-27" aria-hidden="true" tabindex="-1"></a>    first <span class="op">=</span> pkt[<span class="dv">0</span>]</span>
+<span id="m20-cb6-28"><a href="#m20-cb6-28" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> [(<span class="st">&quot;first byte&quot;</span>, <span class="ss">f&quot;0x</span><span class="sc">{</span>first<span class="sc">:02x}</span><span class="ss"> = </span><span class="sc">{</span>first<span class="sc">:08b}</span><span class="ss">&quot;</span>),</span>
+<span id="m20-cb6-29"><a href="#m20-cb6-29" aria-hidden="true" tabindex="-1"></a>           (<span class="st">&quot;  header form (bit 7)&quot;</span>, <span class="st">&quot;1 = long header&quot;</span> <span class="cf">if</span> first <span class="op">&amp;</span> <span class="bn">0x80</span> <span class="cf">else</span> <span class="st">&quot;0 = short header&quot;</span>),</span>
+<span id="m20-cb6-30"><a href="#m20-cb6-30" aria-hidden="true" tabindex="-1"></a>           (<span class="st">&quot;  fixed bit (bit 6)&quot;</span>, <span class="bu">str</span>((first <span class="op">&gt;&gt;</span> <span class="dv">6</span>) <span class="op">&amp;</span> <span class="dv">1</span>)),</span>
+<span id="m20-cb6-31"><a href="#m20-cb6-31" aria-hidden="true" tabindex="-1"></a>           (<span class="st">&quot;  packet type (bits 5-4)&quot;</span>, PACKET_TYPES[(first <span class="op">&gt;&gt;</span> <span class="dv">4</span>) <span class="op">&amp;</span> <span class="dv">3</span>]),</span>
+<span id="m20-cb6-32"><a href="#m20-cb6-32" aria-hidden="true" tabindex="-1"></a>           (<span class="st">&quot;  reserved (bits 3-2)&quot;</span>, <span class="bu">str</span>((first <span class="op">&gt;&gt;</span> <span class="dv">2</span>) <span class="op">&amp;</span> <span class="dv">3</span>)),</span>
+<span id="m20-cb6-33"><a href="#m20-cb6-33" aria-hidden="true" tabindex="-1"></a>           (<span class="st">&quot;  pn length (bits 1-0)&quot;</span>, <span class="ss">f&quot;</span><span class="sc">{</span>(first <span class="op">&amp;</span> <span class="dv">3</span>) <span class="op">+</span> <span class="dv">1</span><span class="sc">}</span><span class="ss"> bytes&quot;</span>)]</span>
+<span id="m20-cb6-34"><a href="#m20-cb6-34" aria-hidden="true" tabindex="-1"></a>    pos <span class="op">=</span> <span class="dv">1</span></span>
+<span id="m20-cb6-35"><a href="#m20-cb6-35" aria-hidden="true" tabindex="-1"></a>    out.append((<span class="st">&quot;version&quot;</span>, <span class="st">&quot;0x&quot;</span> <span class="op">+</span> pkt[pos : pos <span class="op">+</span> <span class="dv">4</span>].<span class="bu">hex</span>()))<span class="op">;</span> pos <span class="op">+=</span> <span class="dv">4</span></span>
+<span id="m20-cb6-36"><a href="#m20-cb6-36" aria-hidden="true" tabindex="-1"></a>    dl <span class="op">=</span> pkt[pos]<span class="op">;</span> pos <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="m20-cb6-37"><a href="#m20-cb6-37" aria-hidden="true" tabindex="-1"></a>    out.append((<span class="ss">f&quot;DCID (</span><span class="sc">{</span>dl<span class="sc">}</span><span class="ss"> bytes)&quot;</span>, pkt[pos : pos <span class="op">+</span> dl].<span class="bu">hex</span>()))<span class="op">;</span> pos <span class="op">+=</span> dl</span>
+<span id="m20-cb6-38"><a href="#m20-cb6-38" aria-hidden="true" tabindex="-1"></a>    sl <span class="op">=</span> pkt[pos]<span class="op">;</span> pos <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="m20-cb6-39"><a href="#m20-cb6-39" aria-hidden="true" tabindex="-1"></a>    out.append((<span class="ss">f&quot;SCID (</span><span class="sc">{</span>sl<span class="sc">}</span><span class="ss"> bytes)&quot;</span>, pkt[pos : pos <span class="op">+</span> sl].<span class="bu">hex</span>() <span class="kw">or</span> <span class="st">&quot;(empty)&quot;</span>))<span class="op">;</span> pos <span class="op">+=</span> sl</span>
+<span id="m20-cb6-40"><a href="#m20-cb6-40" aria-hidden="true" tabindex="-1"></a>    tok_len, pos <span class="op">=</span> decode_varint(pkt, pos)</span>
+<span id="m20-cb6-41"><a href="#m20-cb6-41" aria-hidden="true" tabindex="-1"></a>    out.append((<span class="st">&quot;token length&quot;</span>, <span class="bu">str</span>(tok_len)))<span class="op">;</span> pos <span class="op">+=</span> tok_len</span>
+<span id="m20-cb6-42"><a href="#m20-cb6-42" aria-hidden="true" tabindex="-1"></a>    start <span class="op">=</span> pos</span>
+<span id="m20-cb6-43"><a href="#m20-cb6-43" aria-hidden="true" tabindex="-1"></a>    length, pos <span class="op">=</span> decode_varint(pkt, pos)</span>
+<span id="m20-cb6-44"><a href="#m20-cb6-44" aria-hidden="true" tabindex="-1"></a>    out.append((<span class="ss">f&quot;length (varint </span><span class="sc">{</span>pkt[start:pos]<span class="sc">.</span><span class="bu">hex</span>()<span class="sc">}</span><span class="ss">)&quot;</span>, <span class="ss">f&quot;</span><span class="sc">{</span>length<span class="sc">}</span><span class="ss"> bytes follow (pn + payload + 16-byte tag)&quot;</span>))</span>
+<span id="m20-cb6-45"><a href="#m20-cb6-45" aria-hidden="true" tabindex="-1"></a>    pn_len <span class="op">=</span> (first <span class="op">&amp;</span> <span class="dv">3</span>) <span class="op">+</span> <span class="dv">1</span></span>
+<span id="m20-cb6-46"><a href="#m20-cb6-46" aria-hidden="true" tabindex="-1"></a>    out.append((<span class="st">&quot;packet number&quot;</span>, <span class="bu">str</span>(<span class="bu">int</span>.from_bytes(pkt[pos : pos <span class="op">+</span> pn_len], <span class="st">&quot;big&quot;</span>))))</span>
+<span id="m20-cb6-47"><a href="#m20-cb6-47" aria-hidden="true" tabindex="-1"></a>    out.append((<span class="st">&quot;header size&quot;</span>, <span class="ss">f&quot;</span><span class="sc">{</span>pos <span class="op">+</span> pn_len<span class="sc">}</span><span class="ss"> bytes&quot;</span>))</span>
+<span id="m20-cb6-48"><a href="#m20-cb6-48" aria-hidden="true" tabindex="-1"></a>    out.append((<span class="st">&quot;datagram size&quot;</span>, <span class="ss">f&quot;</span><span class="sc">{</span>pos <span class="op">+</span> length<span class="sc">}</span><span class="ss"> bytes&quot;</span>))</span>
+<span id="m20-cb6-49"><a href="#m20-cb6-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out</span>
+<span id="m20-cb6-50"><a href="#m20-cb6-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-51"><a href="#m20-cb6-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-52"><a href="#m20-cb6-52" aria-hidden="true" tabindex="-1"></a><span class="co"># QPACK static table entries used below (RFC 9204 Appendix A; 99 entries, 0-98)</span></span>
+<span id="m20-cb6-53"><a href="#m20-cb6-53" aria-hidden="true" tabindex="-1"></a>QPACK_STATIC <span class="op">=</span> {<span class="dv">0</span>: (<span class="st">&quot;:authority&quot;</span>, <span class="st">&quot;&quot;</span>), <span class="dv">1</span>: (<span class="st">&quot;:path&quot;</span>, <span class="st">&quot;/&quot;</span>), <span class="dv">17</span>: (<span class="st">&quot;:method&quot;</span>, <span class="st">&quot;GET&quot;</span>),</span>
+<span id="m20-cb6-54"><a href="#m20-cb6-54" aria-hidden="true" tabindex="-1"></a>                <span class="dv">23</span>: (<span class="st">&quot;:scheme&quot;</span>, <span class="st">&quot;https&quot;</span>), <span class="dv">25</span>: (<span class="st">&quot;:status&quot;</span>, <span class="st">&quot;200&quot;</span>)}</span>
+<span id="m20-cb6-55"><a href="#m20-cb6-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-56"><a href="#m20-cb6-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-57"><a href="#m20-cb6-57" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> qpack_get(authority: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="bu">bytes</span>:</span>
+<span id="m20-cb6-58"><a href="#m20-cb6-58" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;Encode GET https://&lt;authority&gt;/ using only the static table (no dynamic state).&quot;&quot;&quot;</span></span>
+<span id="m20-cb6-59"><a href="#m20-cb6-59" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> <span class="bu">bytes</span>([<span class="bn">0x00</span>, <span class="bn">0x00</span>])                     <span class="co"># Required Insert Count 0, Delta Base 0</span></span>
+<span id="m20-cb6-60"><a href="#m20-cb6-60" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> idx <span class="kw">in</span> (<span class="dv">17</span>, <span class="dv">23</span>, <span class="dv">1</span>):                       <span class="co"># Indexed Field Line: 1 T=1 index(6)</span></span>
+<span id="m20-cb6-61"><a href="#m20-cb6-61" aria-hidden="true" tabindex="-1"></a>        out <span class="op">+=</span> <span class="bu">bytes</span>([<span class="bn">0xC0</span> <span class="op">|</span> idx])</span>
+<span id="m20-cb6-62"><a href="#m20-cb6-62" aria-hidden="true" tabindex="-1"></a>    value <span class="op">=</span> authority.encode()                    <span class="co"># Literal with Name Reference: 01 N=0 T=1 index(4)</span></span>
+<span id="m20-cb6-63"><a href="#m20-cb6-63" aria-hidden="true" tabindex="-1"></a>    out <span class="op">+=</span> <span class="bu">bytes</span>([<span class="bn">0x50</span> <span class="op">|</span> <span class="dv">0</span>]) <span class="op">+</span> <span class="bu">bytes</span>([<span class="bu">len</span>(value)]) <span class="op">+</span> value   <span class="co"># H=0 (no Huffman), length(7)</span></span>
+<span id="m20-cb6-64"><a href="#m20-cb6-64" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out</span>
+<span id="m20-cb6-65"><a href="#m20-cb6-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-66"><a href="#m20-cb6-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-67"><a href="#m20-cb6-67" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> h3_frame(ftype: <span class="bu">int</span>, payload: <span class="bu">bytes</span>) <span class="op">-&gt;</span> <span class="bu">bytes</span>:</span>
+<span id="m20-cb6-68"><a href="#m20-cb6-68" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> encode_varint(ftype) <span class="op">+</span> encode_varint(<span class="bu">len</span>(payload)) <span class="op">+</span> payload</span>
+<span id="m20-cb6-69"><a href="#m20-cb6-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-70"><a href="#m20-cb6-70" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-71"><a href="#m20-cb6-71" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> quic_stream_frame(stream_id: <span class="bu">int</span>, data: <span class="bu">bytes</span>, fin: <span class="bu">bool</span>) <span class="op">-&gt;</span> <span class="bu">bytes</span>:</span>
+<span id="m20-cb6-72"><a href="#m20-cb6-72" aria-hidden="true" tabindex="-1"></a>    ftype <span class="op">=</span> <span class="bn">0x08</span> <span class="op">|</span> <span class="bn">0x02</span> <span class="op">|</span> (<span class="bn">0x01</span> <span class="cf">if</span> fin <span class="cf">else</span> <span class="dv">0</span>)   <span class="co"># STREAM with LEN bit, no OFF bit (offset 0)</span></span>
+<span id="m20-cb6-73"><a href="#m20-cb6-73" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> encode_varint(ftype) <span class="op">+</span> encode_varint(stream_id) <span class="op">+</span> encode_varint(<span class="bu">len</span>(data)) <span class="op">+</span> data</span>
+<span id="m20-cb6-74"><a href="#m20-cb6-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-75"><a href="#m20-cb6-75" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-76"><a href="#m20-cb6-76" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="m20-cb6-77"><a href="#m20-cb6-77" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;== varint test vectors (RFC 9000 A.1) ==&quot;</span>)</span>
+<span id="m20-cb6-78"><a href="#m20-cb6-78" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> hexstr <span class="kw">in</span> (<span class="st">&quot;c2197c5eff14e88c&quot;</span>, <span class="st">&quot;9d7f3e7d&quot;</span>, <span class="st">&quot;7bbd&quot;</span>, <span class="st">&quot;25&quot;</span>, <span class="st">&quot;4025&quot;</span>):</span>
+<span id="m20-cb6-79"><a href="#m20-cb6-79" aria-hidden="true" tabindex="-1"></a>        raw <span class="op">=</span> <span class="bu">bytes</span>.fromhex(hexstr)</span>
+<span id="m20-cb6-80"><a href="#m20-cb6-80" aria-hidden="true" tabindex="-1"></a>        value, _ <span class="op">=</span> decode_varint(raw)</span>
+<span id="m20-cb6-81"><a href="#m20-cb6-81" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span>hexstr<span class="sc">:&lt;18}</span><span class="ss"> -&gt; </span><span class="sc">{</span>value<span class="sc">:&gt;20,}</span><span class="ss">   re-encoded: </span><span class="sc">{</span>encode_varint(value)<span class="sc">.</span><span class="bu">hex</span>()<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m20-cb6-82"><a href="#m20-cb6-82" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">== varint size limits ==&quot;</span>)</span>
+<span id="m20-cb6-83"><a href="#m20-cb6-83" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> v <span class="kw">in</span> (<span class="dv">63</span>, <span class="dv">64</span>, <span class="dv">16383</span>, <span class="dv">16384</span>, <span class="dv">2</span><span class="op">**</span><span class="dv">30</span> <span class="op">-</span> <span class="dv">1</span>, <span class="dv">2</span><span class="op">**</span><span class="dv">30</span>, <span class="dv">2</span><span class="op">**</span><span class="dv">62</span> <span class="op">-</span> <span class="dv">1</span>):</span>
+<span id="m20-cb6-84"><a href="#m20-cb6-84" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span>v<span class="sc">:&gt;26,}</span><span class="ss"> -&gt; </span><span class="sc">{</span><span class="bu">len</span>(encode_varint(v))<span class="sc">}</span><span class="ss"> byte(s)&quot;</span>)</span>
+<span id="m20-cb6-85"><a href="#m20-cb6-85" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-86"><a href="#m20-cb6-86" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">== RFC 9001 A.2 client Initial, header before protection ==&quot;</span>)</span>
+<span id="m20-cb6-87"><a href="#m20-cb6-87" aria-hidden="true" tabindex="-1"></a>    hdr <span class="op">=</span> <span class="bu">bytes</span>.fromhex(<span class="st">&quot;c300000001088394c8f03e5157080000449e00000002&quot;</span>)</span>
+<span id="m20-cb6-88"><a href="#m20-cb6-88" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> name, value <span class="kw">in</span> parse_long_header(hdr):</span>
+<span id="m20-cb6-89"><a href="#m20-cb6-89" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span>name<span class="sc">:&lt;26}</span><span class="ss"> </span><span class="sc">{</span>value<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m20-cb6-90"><a href="#m20-cb6-90" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb6-91"><a href="#m20-cb6-91" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">== one HTTP/3 request, built bottom-up ==&quot;</span>)</span>
+<span id="m20-cb6-92"><a href="#m20-cb6-92" aria-hidden="true" tabindex="-1"></a>    block <span class="op">=</span> qpack_get(<span class="st">&quot;example.com&quot;</span>)</span>
+<span id="m20-cb6-93"><a href="#m20-cb6-93" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  QPACK field section (</span><span class="sc">{</span><span class="bu">len</span>(block)<span class="sc">}</span><span class="ss"> bytes): </span><span class="sc">{</span>block<span class="sc">.</span><span class="bu">hex</span>(<span class="st">&#39; &#39;</span>)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m20-cb6-94"><a href="#m20-cb6-94" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> (<span class="dv">17</span>, <span class="dv">23</span>, <span class="dv">1</span>, <span class="dv">0</span>):</span>
+<span id="m20-cb6-95"><a href="#m20-cb6-95" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;    static[</span><span class="sc">{</span>i<span class="sc">:&gt;2}</span><span class="ss">] = </span><span class="sc">{</span>QPACK_STATIC[i]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m20-cb6-96"><a href="#m20-cb6-96" aria-hidden="true" tabindex="-1"></a>    headers <span class="op">=</span> h3_frame(<span class="bn">0x01</span>, block)</span>
+<span id="m20-cb6-97"><a href="#m20-cb6-97" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  HTTP/3 HEADERS frame (</span><span class="sc">{</span><span class="bu">len</span>(headers)<span class="sc">}</span><span class="ss"> bytes): </span><span class="sc">{</span>headers[:<span class="dv">2</span>]<span class="sc">.</span><span class="bu">hex</span>(<span class="st">&#39; &#39;</span>)<span class="sc">}</span><span class="ss"> + field section&quot;</span>)</span>
+<span id="m20-cb6-98"><a href="#m20-cb6-98" aria-hidden="true" tabindex="-1"></a>    stream <span class="op">=</span> quic_stream_frame(<span class="dv">0</span>, headers, fin<span class="op">=</span><span class="va">True</span>)</span>
+<span id="m20-cb6-99"><a href="#m20-cb6-99" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  QUIC STREAM frame (</span><span class="sc">{</span><span class="bu">len</span>(stream)<span class="sc">}</span><span class="ss"> bytes): type 0x</span><span class="sc">{</span>stream[<span class="dv">0</span>]<span class="sc">:02x}</span><span class="ss"> (LEN|FIN), &quot;</span></span>
+<span id="m20-cb6-100"><a href="#m20-cb6-100" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;stream id </span><span class="sc">{</span>stream[<span class="dv">1</span>]<span class="sc">}</span><span class="ss">, length </span><span class="sc">{</span>stream[<span class="dv">2</span>]<span class="sc">}</span><span class="ss"> + HEADERS frame&quot;</span>)</span>
+<span id="m20-cb6-101"><a href="#m20-cb6-101" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> sid <span class="kw">in</span> (<span class="dv">0</span>, <span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>, <span class="dv">4</span>, <span class="dv">6</span>, <span class="dv">10</span>):</span>
+<span id="m20-cb6-102"><a href="#m20-cb6-102" aria-hidden="true" tabindex="-1"></a>        who <span class="op">=</span> <span class="st">&quot;client&quot;</span> <span class="cf">if</span> sid <span class="op">&amp;</span> <span class="dv">1</span> <span class="op">==</span> <span class="dv">0</span> <span class="cf">else</span> <span class="st">&quot;server&quot;</span></span>
+<span id="m20-cb6-103"><a href="#m20-cb6-103" aria-hidden="true" tabindex="-1"></a>        kind <span class="op">=</span> <span class="st">&quot;bidirectional&quot;</span> <span class="cf">if</span> sid <span class="op">&amp;</span> <span class="dv">2</span> <span class="op">==</span> <span class="dv">0</span> <span class="cf">else</span> <span class="st">&quot;unidirectional&quot;</span></span>
+<span id="m20-cb6-104"><a href="#m20-cb6-104" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;    stream id </span><span class="sc">{</span>sid<span class="sc">:&gt;2}</span><span class="ss">: </span><span class="sc">{</span>who<span class="sc">}</span><span class="ss">-initiated </span><span class="sc">{</span>kind<span class="sc">}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+<p>Output:</p>
+<pre class="text"><code>== varint test vectors (RFC 9000 A.1) ==
+  c2197c5eff14e88c   -&gt; 151,288,809,941,952,652   re-encoded: c2197c5eff14e88c
+  9d7f3e7d           -&gt;          494,878,333   re-encoded: 9d7f3e7d
+  7bbd               -&gt;               15,293   re-encoded: 7bbd
+  25                 -&gt;                   37   re-encoded: 25
+  4025               -&gt;                   37   re-encoded: 25
+
+== varint size limits ==
+                          63 -&gt; 1 byte(s)
+                          64 -&gt; 2 byte(s)
+                      16,383 -&gt; 2 byte(s)
+                      16,384 -&gt; 4 byte(s)
+               1,073,741,823 -&gt; 4 byte(s)
+               1,073,741,824 -&gt; 8 byte(s)
+   4,611,686,018,427,387,903 -&gt; 8 byte(s)
+
+== RFC 9001 A.2 client Initial, header before protection ==
+  first byte                 0xc3 = 11000011
+    header form (bit 7)      1 = long header
+    fixed bit (bit 6)        1
+    packet type (bits 5-4)   Initial
+    reserved (bits 3-2)      0
+    pn length (bits 1-0)     4 bytes
+  version                    0x00000001
+  DCID (8 bytes)             8394c8f03e515708
+  SCID (0 bytes)             (empty)
+  token length               0
+  length (varint 449e)       1182 bytes follow (pn + payload + 16-byte tag)
+  packet number              2
+  header size                22 bytes
+  datagram size              1200 bytes
+
+== one HTTP/3 request, built bottom-up ==
+  QPACK field section (18 bytes): 00 00 d1 d7 c1 50 0b 65 78 61 6d 70 6c 65 2e 63 6f 6d
+    static[17] = (&#39;:method&#39;, &#39;GET&#39;)
+    static[23] = (&#39;:scheme&#39;, &#39;https&#39;)
+    static[ 1] = (&#39;:path&#39;, &#39;/&#39;)
+    static[ 0] = (&#39;:authority&#39;, &#39;&#39;)
+  HTTP/3 HEADERS frame (20 bytes): 01 12 + field section
+  QUIC STREAM frame (23 bytes): type 0x0b (LEN|FIN), stream id 0, length 20 + HEADERS frame
+    stream id  0: client-initiated bidirectional
+    stream id  1: server-initiated bidirectional
+    stream id  2: client-initiated unidirectional
+    stream id  3: server-initiated unidirectional
+    stream id  4: client-initiated bidirectional
+    stream id  6: client-initiated unidirectional
+    stream id 10: client-initiated unidirectional</code></pre>
+<p>The header parse is the whole story of a client Initial in 22 bytes. The <code>Length</code> varint <code>449e</code> has prefix <code>01</code>, so it is two bytes, value <code>0x049e</code> = 1,182. Add the 18 bytes before the packet number and you get 1,200: exactly the padding minimum. The <code>4025</code> test vector is a reminder that varints don't have to be minimal. <code>0x4025</code> and <code>0x25</code> both mean 37, and decoders must accept either.</p>
+<h3 id="m20-initial-keys-anyone-can-derive">Initial keys anyone can derive</h3>
+<p><code>code/m20/m20_initial_keys.py</code> implements HKDF with <code>hmac</code> and <code>hashlib</code> and derives the Initial keys from a DCID, exactly as RFC 9001 §5.2 specifies.</p>
+<div class="sourceCode" id="m20-cb8"><pre class="sourceCode python"><code class="sourceCode python"><span id="m20-cb8-1"><a href="#m20-cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Derive QUIC v1 Initial keys from a Destination Connection ID (RFC 9001 §5.2).</span></span>
+<span id="m20-cb8-2"><a href="#m20-cb8-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb8-3"><a href="#m20-cb8-3" aria-hidden="true" tabindex="-1"></a><span class="co">Stdlib only: HKDF-Extract / HKDF-Expand-Label are a few lines of hmac + hashlib.</span></span>
+<span id="m20-cb8-4"><a href="#m20-cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co">The DCID below is the one used in RFC 9001 Appendix A, so the output can be</span></span>
+<span id="m20-cb8-5"><a href="#m20-cb8-5" aria-hidden="true" tabindex="-1"></a><span class="co">checked against the RFC&#39;s published test vectors.</span></span>
+<span id="m20-cb8-6"><a href="#m20-cb8-6" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="m20-cb8-7"><a href="#m20-cb8-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="m20-cb8-8"><a href="#m20-cb8-8" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hmac</span>
+<span id="m20-cb8-9"><a href="#m20-cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb8-10"><a href="#m20-cb8-10" aria-hidden="true" tabindex="-1"></a>INITIAL_SALT_V1 <span class="op">=</span> <span class="bu">bytes</span>.fromhex(<span class="st">&quot;38762cf7f55934b34d179ae6a4c80cadccbb7f0a&quot;</span>)</span>
+<span id="m20-cb8-11"><a href="#m20-cb8-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb8-12"><a href="#m20-cb8-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb8-13"><a href="#m20-cb8-13" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> hkdf_extract(salt: <span class="bu">bytes</span>, ikm: <span class="bu">bytes</span>) <span class="op">-&gt;</span> <span class="bu">bytes</span>:</span>
+<span id="m20-cb8-14"><a href="#m20-cb8-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> hmac.new(salt, ikm, hashlib.sha256).digest()</span>
+<span id="m20-cb8-15"><a href="#m20-cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb8-16"><a href="#m20-cb8-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb8-17"><a href="#m20-cb8-17" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> hkdf_expand_label(secret: <span class="bu">bytes</span>, label: <span class="bu">str</span>, length: <span class="bu">int</span>) <span class="op">-&gt;</span> <span class="bu">bytes</span>:</span>
+<span id="m20-cb8-18"><a href="#m20-cb8-18" aria-hidden="true" tabindex="-1"></a>    <span class="co"># TLS 1.3 HkdfLabel: uint16 length, opaque label&lt;7..255&gt; = &quot;tls13 &quot; + label, context&lt;0..255&gt; = &quot;&quot;</span></span>
+<span id="m20-cb8-19"><a href="#m20-cb8-19" aria-hidden="true" tabindex="-1"></a>    full <span class="op">=</span> <span class="st">b&quot;tls13 &quot;</span> <span class="op">+</span> label.encode()</span>
+<span id="m20-cb8-20"><a href="#m20-cb8-20" aria-hidden="true" tabindex="-1"></a>    info <span class="op">=</span> length.to_bytes(<span class="dv">2</span>, <span class="st">&quot;big&quot;</span>) <span class="op">+</span> <span class="bu">bytes</span>([<span class="bu">len</span>(full)]) <span class="op">+</span> full <span class="op">+</span> <span class="st">b&quot;</span><span class="ch">\x00</span><span class="st">&quot;</span></span>
+<span id="m20-cb8-21"><a href="#m20-cb8-21" aria-hidden="true" tabindex="-1"></a>    out, block, i <span class="op">=</span> <span class="st">b&quot;&quot;</span>, <span class="st">b&quot;&quot;</span>, <span class="dv">1</span></span>
+<span id="m20-cb8-22"><a href="#m20-cb8-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="bu">len</span>(out) <span class="op">&lt;</span> length:  <span class="co"># HKDF-Expand (RFC 5869)</span></span>
+<span id="m20-cb8-23"><a href="#m20-cb8-23" aria-hidden="true" tabindex="-1"></a>        block <span class="op">=</span> hmac.new(secret, block <span class="op">+</span> info <span class="op">+</span> <span class="bu">bytes</span>([i]), hashlib.sha256).digest()</span>
+<span id="m20-cb8-24"><a href="#m20-cb8-24" aria-hidden="true" tabindex="-1"></a>        out <span class="op">+=</span> block</span>
+<span id="m20-cb8-25"><a href="#m20-cb8-25" aria-hidden="true" tabindex="-1"></a>        i <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="m20-cb8-26"><a href="#m20-cb8-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out[:length]</span>
+<span id="m20-cb8-27"><a href="#m20-cb8-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb8-28"><a href="#m20-cb8-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb8-29"><a href="#m20-cb8-29" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> initial_keys(dcid: <span class="bu">bytes</span>) <span class="op">-&gt;</span> <span class="bu">dict</span>[<span class="bu">str</span>, <span class="bu">dict</span>[<span class="bu">str</span>, <span class="bu">str</span>]]:</span>
+<span id="m20-cb8-30"><a href="#m20-cb8-30" aria-hidden="true" tabindex="-1"></a>    initial_secret <span class="op">=</span> hkdf_extract(INITIAL_SALT_V1, dcid)</span>
+<span id="m20-cb8-31"><a href="#m20-cb8-31" aria-hidden="true" tabindex="-1"></a>    result <span class="op">=</span> {}</span>
+<span id="m20-cb8-32"><a href="#m20-cb8-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> side <span class="kw">in</span> (<span class="st">&quot;client in&quot;</span>, <span class="st">&quot;server in&quot;</span>):</span>
+<span id="m20-cb8-33"><a href="#m20-cb8-33" aria-hidden="true" tabindex="-1"></a>        secret <span class="op">=</span> hkdf_expand_label(initial_secret, side, <span class="dv">32</span>)</span>
+<span id="m20-cb8-34"><a href="#m20-cb8-34" aria-hidden="true" tabindex="-1"></a>        result[side.split()[<span class="dv">0</span>]] <span class="op">=</span> {</span>
+<span id="m20-cb8-35"><a href="#m20-cb8-35" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;secret&quot;</span>: secret.<span class="bu">hex</span>(),</span>
+<span id="m20-cb8-36"><a href="#m20-cb8-36" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;key (AES-128-GCM)&quot;</span>: hkdf_expand_label(secret, <span class="st">&quot;quic key&quot;</span>, <span class="dv">16</span>).<span class="bu">hex</span>(),</span>
+<span id="m20-cb8-37"><a href="#m20-cb8-37" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;iv&quot;</span>: hkdf_expand_label(secret, <span class="st">&quot;quic iv&quot;</span>, <span class="dv">12</span>).<span class="bu">hex</span>(),</span>
+<span id="m20-cb8-38"><a href="#m20-cb8-38" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;hp (header protection)&quot;</span>: hkdf_expand_label(secret, <span class="st">&quot;quic hp&quot;</span>, <span class="dv">16</span>).<span class="bu">hex</span>(),</span>
+<span id="m20-cb8-39"><a href="#m20-cb8-39" aria-hidden="true" tabindex="-1"></a>        }</span>
+<span id="m20-cb8-40"><a href="#m20-cb8-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> result</span>
+<span id="m20-cb8-41"><a href="#m20-cb8-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb8-42"><a href="#m20-cb8-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb8-43"><a href="#m20-cb8-43" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="m20-cb8-44"><a href="#m20-cb8-44" aria-hidden="true" tabindex="-1"></a>    dcid <span class="op">=</span> <span class="bu">bytes</span>.fromhex(<span class="st">&quot;8394c8f03e515708&quot;</span>)</span>
+<span id="m20-cb8-45"><a href="#m20-cb8-45" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;client-chosen DCID : </span><span class="sc">{</span>dcid<span class="sc">.</span><span class="bu">hex</span>()<span class="sc">}</span><span class="ss">  (</span><span class="sc">{</span><span class="bu">len</span>(dcid)<span class="sc">}</span><span class="ss"> bytes)&quot;</span>)</span>
+<span id="m20-cb8-46"><a href="#m20-cb8-46" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;initial_salt (v1)  : </span><span class="sc">{</span>INITIAL_SALT_V1<span class="sc">.</span><span class="bu">hex</span>()<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m20-cb8-47"><a href="#m20-cb8-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> side, vals <span class="kw">in</span> initial_keys(dcid).items():</span>
+<span id="m20-cb8-48"><a href="#m20-cb8-48" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="ss">[</span><span class="sc">{</span>side<span class="sc">}</span><span class="ss"> Initial]&quot;</span>)</span>
+<span id="m20-cb8-49"><a href="#m20-cb8-49" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> name, value <span class="kw">in</span> vals.items():</span>
+<span id="m20-cb8-50"><a href="#m20-cb8-50" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span>name<span class="sc">:&lt;24}{</span>value<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m20-cb8-51"><a href="#m20-cb8-51" aria-hidden="true" tabindex="-1"></a>    expected_client_key <span class="op">=</span> <span class="st">&quot;1f369613dd76d5467730efcbe3b1a22d&quot;</span></span>
+<span id="m20-cb8-52"><a href="#m20-cb8-52" aria-hidden="true" tabindex="-1"></a>    got <span class="op">=</span> initial_keys(dcid)[<span class="st">&quot;client&quot;</span>][<span class="st">&quot;key (AES-128-GCM)&quot;</span>]</span>
+<span id="m20-cb8-53"><a href="#m20-cb8-53" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="ss">matches RFC 9001 A.1 client key: </span><span class="sc">{</span>got <span class="op">==</span> expected_client_key<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m20-cb8-54"><a href="#m20-cb8-54" aria-hidden="true" tabindex="-1"></a>    <span class="co"># A different DCID gives completely different keys -- but anyone who sees</span></span>
+<span id="m20-cb8-55"><a href="#m20-cb8-55" aria-hidden="true" tabindex="-1"></a>    <span class="co"># the packet sees the DCID too, so anyone can derive them.</span></span>
+<span id="m20-cb8-56"><a href="#m20-cb8-56" aria-hidden="true" tabindex="-1"></a>    other <span class="op">=</span> initial_keys(<span class="bu">bytes</span>.fromhex(<span class="st">&quot;0000000000000001&quot;</span>))[<span class="st">&quot;client&quot;</span>][<span class="st">&quot;key (AES-128-GCM)&quot;</span>]</span>
+<span id="m20-cb8-57"><a href="#m20-cb8-57" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;key for DCID 0000000000000001  : </span><span class="sc">{</span>other<span class="sc">}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+<p>Output:</p>
+<pre class="text"><code>client-chosen DCID : 8394c8f03e515708  (8 bytes)
+initial_salt (v1)  : 38762cf7f55934b34d179ae6a4c80cadccbb7f0a
+
+[client Initial]
+  secret                  c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea
+  key (AES-128-GCM)       1f369613dd76d5467730efcbe3b1a22d
+  iv                      fa044b2f42a3fd3b46fb255c
+  hp (header protection)  9f50449e04a0e810283a1e9933adedd2
+
+[server Initial]
+  secret                  3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b
+  key (AES-128-GCM)       cf3a5331653c364c88f0f379b6067e37
+  iv                      0ac1493ca1905853b0bba03e
+  hp (header protection)  c206b8d9b9f0f37644430b490eeaa314
+
+matches RFC 9001 A.1 client key: True
+key for DCID 0000000000000001  : cd7d29036200129f9ddbad73b2fa9105</code></pre>
+<p>Every value matches RFC 9001 Appendix A.1. The point of running it is the last line: change the DCID and the keys change completely, but the DCID is in cleartext in the packet header. Any on-path observer can do what this script does. That is why the certificate travels in Handshake packets, under keys that come from the Diffie-Hellman exchange.</p>
+<p>You can take one more step with <code>openssl</code>. RFC 9001 A.2 gives the 16-byte ciphertext sample from that packet as <code>d1b1c98dd7689fb8ec11d242b123dc9b</code>. Encrypting it with the client <code>hp</code> key in AES-ECB gives the header-protection mask:</p>
+<pre class="text"><code>$ printf &#39;d1b1c98dd7689fb8ec11d242b123dc9b&#39; | python3 -c &#39;import sys;sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read()))&#39; \
+    | openssl enc -aes-128-ecb -K 9f50449e04a0e810283a1e9933adedd2 -nopad | od -An -tx1
+ 43 7b 9a ec 36 be 42 34 00 cd d1 15 d9 db 32 41</code></pre>
+<p>The first byte <code>c3</code> is XORed with the low 4 bits of <code>43</code>, giving <code>c0</code>: the packet-number length bits are now hidden. The packet number <code>00000002</code> is XORed with the next four bytes <code>7b9aec36</code>, giving <code>7b9aec34</code>. That is what actually goes on the wire, and it is what RFC 9001 A.2's protected packet shows.</p>
+<h3 id="m20-head-of-line-blocking-measured">Head-of-line blocking, measured</h3>
+<p><code>code/m20/m20_hol_sim.py</code> is a small deterministic model: three responses interleaved over one connection, one lost packet, and the same loss-detection rule (three later packets acknowledged) for both protocols. The only difference is what "in order" means.</p>
+<div class="sourceCode" id="m20-cb11"><pre class="sourceCode python"><code class="sourceCode python"><span id="m20-cb11-1"><a href="#m20-cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Head-of-line blocking: one ordered byte stream (TCP) vs independent streams (QUIC).</span></span>
+<span id="m20-cb11-2"><a href="#m20-cb11-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb11-3"><a href="#m20-cb11-3" aria-hidden="true" tabindex="-1"></a><span class="co">A deliberately small, deterministic model. Three responses (A, B, C) of four</span></span>
+<span id="m20-cb11-4"><a href="#m20-cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co">packets each are interleaved round-robin, one packet per millisecond, over a</span></span>
+<span id="m20-cb11-5"><a href="#m20-cb11-5" aria-hidden="true" tabindex="-1"></a><span class="co">path with a 20 ms one-way delay (40 ms RTT). One packet is lost. The sender</span></span>
+<span id="m20-cb11-6"><a href="#m20-cb11-6" aria-hidden="true" tabindex="-1"></a><span class="co">notices the loss when the ACK for the third later packet arrives (packet</span></span>
+<span id="m20-cb11-7"><a href="#m20-cb11-7" aria-hidden="true" tabindex="-1"></a><span class="co">threshold = 3, as in RFC 9002 and TCP&#39;s fast retransmit) and resends it at once.</span></span>
+<span id="m20-cb11-8"><a href="#m20-cb11-8" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="m20-cb11-9"><a href="#m20-cb11-9" aria-hidden="true" tabindex="-1"></a>ONE_WAY <span class="op">=</span> <span class="dv">20</span>      <span class="co"># ms</span></span>
+<span id="m20-cb11-10"><a href="#m20-cb11-10" aria-hidden="true" tabindex="-1"></a>THRESHOLD <span class="op">=</span> <span class="dv">3</span>     <span class="co"># packets</span></span>
+<span id="m20-cb11-11"><a href="#m20-cb11-11" aria-hidden="true" tabindex="-1"></a>STREAMS <span class="op">=</span> <span class="st">&quot;ABC&quot;</span></span>
+<span id="m20-cb11-12"><a href="#m20-cb11-12" aria-hidden="true" tabindex="-1"></a>PER_STREAM <span class="op">=</span> <span class="dv">4</span></span>
+<span id="m20-cb11-13"><a href="#m20-cb11-13" aria-hidden="true" tabindex="-1"></a>LOST <span class="op">=</span> <span class="dv">1</span>          <span class="co"># index of the lost packet in send order (B1)</span></span>
+<span id="m20-cb11-14"><a href="#m20-cb11-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb11-15"><a href="#m20-cb11-15" aria-hidden="true" tabindex="-1"></a>order <span class="op">=</span> [<span class="ss">f&quot;</span><span class="sc">{</span>s<span class="sc">}{</span>n<span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> n <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1</span>, PER_STREAM <span class="op">+</span> <span class="dv">1</span>) <span class="cf">for</span> s <span class="kw">in</span> STREAMS]</span>
+<span id="m20-cb11-16"><a href="#m20-cb11-16" aria-hidden="true" tabindex="-1"></a>arrival <span class="op">=</span> {p: i <span class="op">+</span> ONE_WAY <span class="cf">for</span> i, p <span class="kw">in</span> <span class="bu">enumerate</span>(order)}</span>
+<span id="m20-cb11-17"><a href="#m20-cb11-17" aria-hidden="true" tabindex="-1"></a><span class="co"># ACK of packet LOST+THRESHOLD reaches the sender at (LOST+THRESHOLD) + 2*ONE_WAY;</span></span>
+<span id="m20-cb11-18"><a href="#m20-cb11-18" aria-hidden="true" tabindex="-1"></a><span class="co"># the retransmission then needs another ONE_WAY to arrive.</span></span>
+<span id="m20-cb11-19"><a href="#m20-cb11-19" aria-hidden="true" tabindex="-1"></a>retx_arrival <span class="op">=</span> (LOST <span class="op">+</span> THRESHOLD) <span class="op">+</span> <span class="dv">2</span> <span class="op">*</span> ONE_WAY <span class="op">+</span> ONE_WAY</span>
+<span id="m20-cb11-20"><a href="#m20-cb11-20" aria-hidden="true" tabindex="-1"></a>arrival[order[LOST]] <span class="op">=</span> retx_arrival</span>
+<span id="m20-cb11-21"><a href="#m20-cb11-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb11-22"><a href="#m20-cb11-22" aria-hidden="true" tabindex="-1"></a><span class="co"># TCP: the kernel hands bytes to the app strictly in send order.</span></span>
+<span id="m20-cb11-23"><a href="#m20-cb11-23" aria-hidden="true" tabindex="-1"></a>tcp_deliver, horizon <span class="op">=</span> {}, <span class="dv">0</span></span>
+<span id="m20-cb11-24"><a href="#m20-cb11-24" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> p <span class="kw">in</span> order:</span>
+<span id="m20-cb11-25"><a href="#m20-cb11-25" aria-hidden="true" tabindex="-1"></a>    horizon <span class="op">=</span> <span class="bu">max</span>(horizon, arrival[p])</span>
+<span id="m20-cb11-26"><a href="#m20-cb11-26" aria-hidden="true" tabindex="-1"></a>    tcp_deliver[p] <span class="op">=</span> horizon</span>
+<span id="m20-cb11-27"><a href="#m20-cb11-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb11-28"><a href="#m20-cb11-28" aria-hidden="true" tabindex="-1"></a><span class="co"># QUIC: each stream is ordered only against itself.</span></span>
+<span id="m20-cb11-29"><a href="#m20-cb11-29" aria-hidden="true" tabindex="-1"></a>quic_deliver <span class="op">=</span> {}</span>
+<span id="m20-cb11-30"><a href="#m20-cb11-30" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> s <span class="kw">in</span> STREAMS:</span>
+<span id="m20-cb11-31"><a href="#m20-cb11-31" aria-hidden="true" tabindex="-1"></a>    horizon <span class="op">=</span> <span class="dv">0</span></span>
+<span id="m20-cb11-32"><a href="#m20-cb11-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> n <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1</span>, PER_STREAM <span class="op">+</span> <span class="dv">1</span>):</span>
+<span id="m20-cb11-33"><a href="#m20-cb11-33" aria-hidden="true" tabindex="-1"></a>        p <span class="op">=</span> <span class="ss">f&quot;</span><span class="sc">{</span>s<span class="sc">}{</span>n<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="m20-cb11-34"><a href="#m20-cb11-34" aria-hidden="true" tabindex="-1"></a>        horizon <span class="op">=</span> <span class="bu">max</span>(horizon, arrival[p])</span>
+<span id="m20-cb11-35"><a href="#m20-cb11-35" aria-hidden="true" tabindex="-1"></a>        quic_deliver[p] <span class="op">=</span> horizon</span>
+<span id="m20-cb11-36"><a href="#m20-cb11-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb11-37"><a href="#m20-cb11-37" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;send order : </span><span class="sc">{</span><span class="st">&#39; &#39;</span><span class="sc">.</span>join(order)<span class="sc">}</span><span class="ss">   (1 packet/ms, lost: </span><span class="sc">{</span>order[LOST]<span class="sc">}</span><span class="ss">)&quot;</span>)</span>
+<span id="m20-cb11-38"><a href="#m20-cb11-38" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;retransmitted </span><span class="sc">{</span>order[LOST]<span class="sc">}</span><span class="ss"> arrives at t=</span><span class="sc">{</span>retx_arrival<span class="sc">}</span><span class="ss"> ms</span><span class="ch">\n</span><span class="ss">&quot;</span>)</span>
+<span id="m20-cb11-39"><a href="#m20-cb11-39" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;pkt&#39;</span><span class="sc">:&lt;5}{</span><span class="st">&#39;arrives&#39;</span><span class="sc">:&gt;9}{</span><span class="st">&#39;TCP: app gets it&#39;</span><span class="sc">:&gt;18}{</span><span class="st">&#39;QUIC: app gets it&#39;</span><span class="sc">:&gt;19}</span><span class="ss">&quot;</span>)</span>
+<span id="m20-cb11-40"><a href="#m20-cb11-40" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> p <span class="kw">in</span> order:</span>
+<span id="m20-cb11-41"><a href="#m20-cb11-41" aria-hidden="true" tabindex="-1"></a>    mark <span class="op">=</span> <span class="st">&quot;  &lt;- lost, resent&quot;</span> <span class="cf">if</span> p <span class="op">==</span> order[LOST] <span class="cf">else</span> <span class="st">&quot;&quot;</span></span>
+<span id="m20-cb11-42"><a href="#m20-cb11-42" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>p<span class="sc">:&lt;5}{</span>arrival[p]<span class="sc">:&gt;7}</span><span class="ss"> ms</span><span class="sc">{</span>tcp_deliver[p]<span class="sc">:&gt;15}</span><span class="ss"> ms</span><span class="sc">{</span>quic_deliver[p]<span class="sc">:&gt;16}</span><span class="ss"> ms</span><span class="sc">{</span>mark<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m20-cb11-43"><a href="#m20-cb11-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m20-cb11-44"><a href="#m20-cb11-44" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">stream complete (last byte handed to the app):&quot;</span>)</span>
+<span id="m20-cb11-45"><a href="#m20-cb11-45" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> s <span class="kw">in</span> STREAMS:</span>
+<span id="m20-cb11-46"><a href="#m20-cb11-46" aria-hidden="true" tabindex="-1"></a>    last <span class="op">=</span> <span class="ss">f&quot;</span><span class="sc">{</span>s<span class="sc">}{</span>PER_STREAM<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="m20-cb11-47"><a href="#m20-cb11-47" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span>s<span class="sc">}</span><span class="ss">:  TCP </span><span class="sc">{</span>tcp_deliver[last]<span class="sc">:&gt;3}</span><span class="ss"> ms   QUIC </span><span class="sc">{</span>quic_deliver[last]<span class="sc">:&gt;3}</span><span class="ss"> ms&quot;</span>)</span>
+<span id="m20-cb11-48"><a href="#m20-cb11-48" aria-hidden="true" tabindex="-1"></a>stalled <span class="op">=</span> <span class="bu">sum</span>(<span class="dv">1</span> <span class="cf">for</span> p <span class="kw">in</span> order <span class="cf">if</span> tcp_deliver[p] <span class="op">&gt;</span> arrival[p])</span>
+<span id="m20-cb11-49"><a href="#m20-cb11-49" aria-hidden="true" tabindex="-1"></a>stalled_q <span class="op">=</span> <span class="bu">sum</span>(<span class="dv">1</span> <span class="cf">for</span> p <span class="kw">in</span> order <span class="cf">if</span> quic_deliver[p] <span class="op">&gt;</span> arrival[p])</span>
+<span id="m20-cb11-50"><a href="#m20-cb11-50" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="ss">packets that sat in a receive buffer waiting for </span><span class="sc">{</span>order[LOST]<span class="sc">}</span><span class="ss">: TCP </span><span class="sc">{</span>stalled<span class="sc">}</span><span class="ss">, QUIC </span><span class="sc">{</span>stalled_q<span class="sc">}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+<p>Output:</p>
+<pre class="text"><code>send order : A1 B1 C1 A2 B2 C2 A3 B3 C3 A4 B4 C4   (1 packet/ms, lost: B1)
+retransmitted B1 arrives at t=64 ms
+
+pkt    arrives  TCP: app gets it  QUIC: app gets it
+A1        20 ms             20 ms              20 ms
+B1        64 ms             64 ms              64 ms  &lt;- lost, resent
+C1        22 ms             64 ms              22 ms
+A2        23 ms             64 ms              23 ms
+B2        24 ms             64 ms              64 ms
+C2        25 ms             64 ms              25 ms
+A3        26 ms             64 ms              26 ms
+B3        27 ms             64 ms              64 ms
+C3        28 ms             64 ms              28 ms
+A4        29 ms             64 ms              29 ms
+B4        30 ms             64 ms              64 ms
+C4        31 ms             64 ms              31 ms
+
+stream complete (last byte handed to the app):
+  A:  TCP  64 ms   QUIC  29 ms
+  B:  TCP  64 ms   QUIC  64 ms
+  C:  TCP  64 ms   QUIC  31 ms
+
+packets that sat in a receive buffer waiting for B1: TCP 10, QUIC 3</code></pre>
+<p>Stream B finishes at 64 ms either way. The lost bytes were B's, and nothing can deliver them sooner. The difference is A and C. Under TCP they finish at 64 ms, held hostage by B's loss. Under QUIC they finish at 29 and 31 ms, as soon as their own last packet arrives. The model ignores congestion-window effects, which hit both protocols alike, so it isolates exactly the ordering difference.</p>
+<hr />
+<h2 id="m20-deep-dive">Deep dive: what the overview hid</h2>
+<p>The nine sections above describe QUIC the way the RFCs present it. What they hide is where the machine actually runs and what it costs. A TCP connection is a kernel object you can list with <code>ss</code>. A QUIC connection is a struct inside a process, keyed by a byte string the process invented. The kernel sees one UDP socket and a stream of datagrams. That shift — from kernel state to user-space state — drives almost every operational difference that follows.</p>
+<h2 id="m20-deep-dive-the-real-mental-model">Deep dive: the real mental model</h2>
+<p>Picture a QUIC server process — an edge proxy, say — on Linux.</p>
+<p><strong>In the kernel there is almost nothing.</strong> One UDP socket bound to <code>:443</code>, or one per worker with <code>SO_REUSEPORT</code>. No connection table. No per-connection timers. No retransmission queue. Here is what <code>ss</code> shows on a server with tens of thousands of active QUIC connections (<strong>illustrative</strong>):</p>
+<pre class="text"><code>$ ss -uanp &#39;sport = :443&#39;
+State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  Process
+UNCONN  0       0             0.0.0.0:443        0.0.0.0:*      users:((&quot;edge&quot;,pid=812,fd=9))
+UNCONN  0       0             0.0.0.0:443        0.0.0.0:*      users:((&quot;edge&quot;,pid=813,fd=9))
+UNCONN  0       0                [::]:443           [::]:*      users:((&quot;edge&quot;,pid=812,fd=10))
+UNCONN  0       0                [::]:443           [::]:*      users:((&quot;edge&quot;,pid=813,fd=10))</code></pre>
+<p>Four lines, whether there are ten connections or a hundred thousand. Compare <code>ss -tan state established '( sport = :443 )' | wc -l</code> on the same box for TCP. Every TCP connection is a kernel socket; no QUIC connection is.</p>
+<p><strong>In user space there is everything.</strong> Each worker holds a hash table from connection ID to connection object. Each connection object holds:</p>
+<ul>
+<li><strong>Per packet number space</strong> (Initial, Handshake, Application): the next packet number to send; a map of sent-but-unacknowledged packets, each remembering its send time, size, and the frames it carried; the received packet numbers as a set of ranges, to build ACK frames; the largest acknowledged; the keys for that space.</li>
+<li><strong>Connection-wide recovery state:</strong> <code>smoothed_rtt</code>, <code>rttvar</code>, <code>min_rtt</code>, <code>latest_rtt</code>; <code>congestion_window</code>, <code>bytes_in_flight</code>, <code>ssthresh</code>; the loss-detection timer (which doubles as the PTO timer), and the PTO backoff count.</li>
+<li><strong>Streams:</strong> a map from stream ID to a send buffer (bytes not yet acknowledged, plus which ranges are in flight), a receive buffer with an out-of-order reassembly structure, and per-stream flow-control credit both ways.</li>
+<li><strong>Connection-level flow control:</strong> bytes consumed versus <code>MAX_DATA</code> in each direction.</li>
+<li><strong>Identity and paths:</strong> the CIDs this side has issued (with sequence numbers and stateless-reset tokens), the CIDs the peer has issued, the current path's 4-tuple, whether it is validated, and — before validation — the anti-amplification counters: bytes received and bytes sent on that path.</li>
+<li><strong>Timers:</strong> idle timeout, the ACK delay timer, the pacing timer.</li>
+</ul>
+<p>Each arriving datagram drives the machine: split it into packets; for each, read the DCID and find the connection; remove header protection; decrypt with the right space's keys; record the packet number in that space's received ranges; process each frame. An <code>ACK</code> frame removes packets from the sent map, produces an RTT sample, grows the congestion window, and may declare older packets lost. Their frames go back into the "to send" queues. A <code>STREAM</code> frame inserts bytes into a stream's reassembly buffer and wakes the reader if a contiguous prefix is ready.</p>
+<div style="overflow-x:auto">
+<svg viewBox="0 0 720 600" style="min-width:720px;width:100%;height:auto;background:#f5f5f5;border:1px solid rgba(45,49,66,0.12);border-radius:6px" role="img" aria-labelledby="m20-ep-title m20-ep-desc">
+<title id="m20-ep-title">Where QUIC connection state lives</title>
+<desc id="m20-ep-desc">A client whose address can change sends to a load balancer that routes on the destination connection ID. On the server host, the kernel holds only UDP sockets bound to port 443, one per worker, with no per-connection state. In user space, a table maps connection IDs to connection objects. Each connection object holds three packet number spaces, recovery and congestion state, streams with buffers and flow-control credit, connection-level flow control, timers, and path and connection-ID state including the anti-amplification counters.</desc>
+<defs><marker id="m20-ep-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4f5d75"/></marker><marker id="m20-ep-arr-acc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#bf4520"/></marker></defs>
+<text x="24" y="28" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" letter-spacing="2" fill="#4f5d75">ONE QUIC SERVER — WHERE THE STATE LIVES</text>
+<rect x="24" y="44" width="170" height="60" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="36" y="66" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" fill="#2d3142" text-anchor="start" font-weight="600">Client</text>
+<text x="36" y="84" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">192.0.2.44:53122</text>
+<text x="36" y="97" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#bf4520" text-anchor="start">→ 203.0.113.9:40011 (NAT)</text>
+<rect x="266" y="44" width="200" height="60" rx="6" fill="rgba(191,69,32,0.06)" stroke="#bf4520" stroke-width="1.5"/>
+<text x="278" y="66" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" fill="#2d3142" text-anchor="start" font-weight="600">L4 load balancer</text>
+<text x="278" y="84" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">reads DCID, decodes server id</text>
+<text x="278" y="97" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#bf4520" text-anchor="start">(not a 4-tuple hash)</text>
+<rect x="538" y="44" width="158" height="60" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="550" y="66" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" fill="#2d3142" text-anchor="start" font-weight="600">Server host</text>
+<text x="550" y="84" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">backend id 0x5a</text>
+<text x="550" y="97" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">encoded in its CIDs</text>
+<line x1="194" y1="74" x2="262" y2="74" stroke="#4f5d75" stroke-width="1.4" marker-end="url(#m20-ep-arr)"/>
+<line x1="466" y1="74" x2="534" y2="74" stroke="#4f5d75" stroke-width="1.4" marker-end="url(#m20-ep-arr)"/>
+<rect x="24" y="122" width="672" height="454" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.22)"/>
+<rect x="36" y="132" width="64" height="16" rx="2" fill="#ececec" stroke="rgba(45,49,66,0.12)"/>
+<text x="68.0" y="144" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" letter-spacing="1.5" fill="#4f5d75" text-anchor="middle">KERNEL</text>
+<rect x="40" y="156" width="150" height="44" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="52" y="176" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#2d3142" text-anchor="start">NIC + UDP GRO</text>
+<text x="52" y="191" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">datagrams in</text>
+<rect x="214" y="156" width="150" height="44" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="226" y="176" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#2d3142" text-anchor="start">udp *:443</text>
+<text x="226" y="191" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">worker 1 (REUSEPORT)</text>
+<rect x="388" y="156" width="150" height="44" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="400" y="176" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#2d3142" text-anchor="start">udp *:443</text>
+<text x="400" y="191" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">worker 2 (REUSEPORT)</text>
+<text x="552" y="174" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#bf4520" text-anchor="start">no connection</text>
+<text x="552" y="189" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#bf4520" text-anchor="start">table, no timers</text>
+<line x1="190" y1="178" x2="210" y2="178" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#m20-ep-arr)"/>
+<line x1="36" y1="214" x2="684" y2="214" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="6,4"/>
+<text x="684" y="210" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#4f5d75" text-anchor="end">KERNEL ↑ · USER SPACE ↓</text>
+<rect x="36" y="224" width="96" height="16" rx="2" fill="#ececec" stroke="rgba(45,49,66,0.12)"/>
+<text x="84.0" y="236" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" letter-spacing="1.5" fill="#4f5d75" text-anchor="middle">USER SPACE</text>
+<rect x="40" y="250" width="184" height="150" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="52" y="270" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" fill="#2d3142" text-anchor="start" font-weight="600">CID table (worker 1)</text>
+<text x="52" y="292" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142" text-anchor="start">5ad3e104…</text>
+<text x="212" y="292" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="end">→ conn A</text>
+<text x="52" y="314" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142" text-anchor="start">5a91c0e7…</text>
+<text x="212" y="314" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="end">→ conn A (spare)</text>
+<text x="52" y="336" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142" text-anchor="start">5a0b7712…</text>
+<text x="212" y="336" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="end">→ conn B</text>
+<text x="52" y="358" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142" text-anchor="start">5a66d2f3…</text>
+<text x="212" y="358" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="end">→ conn C</text>
+<text x="52" y="386" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#bf4520" text-anchor="start">lookup by DCID, not by address</text>
+<line x1="224" y1="292" x2="244" y2="292" stroke="#bf4520" stroke-width="1.4" marker-end="url(#m20-ep-arr-acc)"/>
+<rect x="248" y="250" width="436" height="314" rx="6" fill="rgba(191,69,32,0.06)" stroke="#bf4520" stroke-width="1.5"/>
+<text x="260" y="270" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="12" fill="#2d3142" text-anchor="start" font-weight="600">Connection A</text>
+<rect x="260" y="280" width="132" height="82" rx="6" fill="#ececec" stroke="#bfc0c0"/>
+<text x="268" y="296" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142" text-anchor="start" font-weight="600">Initial space</text>
+<text x="268" y="314" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">next pn · keys</text>
+<text x="268" y="329" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">sent map: pn → frames</text>
+<text x="268" y="344" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">recv ranges → ACK</text>
+<rect x="400" y="280" width="132" height="82" rx="6" fill="#ececec" stroke="#bfc0c0"/>
+<text x="408" y="296" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142" text-anchor="start" font-weight="600">Handshake space</text>
+<text x="408" y="314" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">next pn · keys</text>
+<text x="408" y="329" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">sent map: pn → frames</text>
+<text x="408" y="344" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">recv ranges → ACK</text>
+<rect x="540" y="280" width="132" height="82" rx="6" fill="#ececec" stroke="#bfc0c0"/>
+<text x="548" y="296" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142" text-anchor="start" font-weight="600">Application space</text>
+<text x="548" y="314" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">next pn · keys</text>
+<text x="548" y="329" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">sent map: pn → frames</text>
+<text x="548" y="344" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">recv ranges → ACK</text>
+<rect x="260" y="372" width="200" height="86" rx="6" fill="#ececec" stroke="#bfc0c0"/>
+<text x="268" y="388" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142" text-anchor="start" font-weight="600">Recovery + congestion</text>
+<text x="268" y="404" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">smoothed_rtt, rttvar, min_rtt</text>
+<text x="268" y="418" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">cwnd, bytes_in_flight</text>
+<text x="268" y="432" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">loss/PTO timer, backoff</text>
+<text x="268" y="446" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">pacing timer</text>
+<rect x="472" y="372" width="200" height="86" rx="6" fill="#ececec" stroke="#bfc0c0"/>
+<text x="480" y="388" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142" text-anchor="start" font-weight="600">Streams</text>
+<text x="480" y="404" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">id → send buf (unacked ranges)</text>
+<text x="480" y="418" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">id → recv reassembly</text>
+<text x="480" y="432" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">per-stream credit both ways</text>
+<text x="480" y="446" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">MAX_STREAMS limits</text>
+<rect x="260" y="468" width="200" height="86" rx="6" fill="#ececec" stroke="#bfc0c0"/>
+<text x="268" y="484" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142" text-anchor="start" font-weight="600">Path + CIDs</text>
+<text x="268" y="500" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">peer 4-tuple · validated?</text>
+<text x="268" y="514" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">amp: bytes recv / sent (≤ 3×)</text>
+<text x="268" y="528" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">CIDs issued + reset tokens</text>
+<text x="268" y="542" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">CIDs from peer (spares)</text>
+<rect x="472" y="468" width="200" height="86" rx="6" fill="#ececec" stroke="#bfc0c0"/>
+<text x="480" y="484" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142" text-anchor="start" font-weight="600">Connection-wide</text>
+<text x="480" y="500" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">MAX_DATA used / granted</text>
+<text x="480" y="514" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">idle timer, ACK-delay timer</text>
+<text x="480" y="528" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">TLS state, ALPN = h3</text>
+<text x="480" y="542" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="start">QPACK tables (HTTP/3)</text>
+<text x="40" y="430" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#2d3142" text-anchor="start" font-weight="600">Every arriving datagram:</text>
+<text x="40" y="450" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">1. split into packets</text>
+<text x="40" y="466" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">2. DCID → connection</text>
+<text x="40" y="482" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">3. remove header protection</text>
+<text x="40" y="498" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">4. decrypt with space keys</text>
+<text x="40" y="514" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">5. record pn, process frames</text>
+<text x="40" y="530" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580" text-anchor="start">6. ACKs → RTT, cwnd, loss</text>
+</svg>
+</div>
+<p>The diagram's last row is the one most people forget: <strong>the load balancer in front.</strong> A stateless L4 load balancer hashes the 4-tuple to pick a backend. That works for TCP, whose 4-tuple never changes. For QUIC it works only until the client's address changes — which is exactly the case QUIC was built to survive. The fix is to route by connection ID, which requires the server to encode something routable into the CIDs it issues.</p>
+<h2 id="m20-deep-dive-what-the-wire-and-the-kernel-actually-do">Deep dive: what the wire and the kernel actually do</h2>
+<p>At the IP layer, a QUIC packet looks like any UDP datagram. This is frame 1 from section 5 as <code>tcpdump -nn -v</code> would print it (<strong>constructed, consistent with section 5</strong>):</p>
+<pre class="text"><code>IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto UDP (17), length 1228)
+    192.0.2.44.53122 &gt; 198.51.100.7.443: UDP, length 1200</code></pre>
+<p>Three details to read. <code>flags [DF]</code>: RFC 9000 §14 requires QUIC to set Don't Fragment on IPv4 where it can. QUIC must never be fragmented; it finds the path MTU itself. <code>length 1228</code> is 20 bytes of IP header plus 8 of UDP plus 1,200 of QUIC. And <code>UDP, length 1200</code> is all tcpdump knows unless your build has a QUIC dissector — some newer builds print a short QUIC summary instead.</p>
+<p><strong>Path MTU without ICMP.</strong> TCP relies (poorly) on ICMP "fragmentation needed" messages to learn the path MTU. QUIC uses DPLPMTUD (RFC 8899): it sends a probe packet of <code>PING</code> plus <code>PADDING</code> at a larger size. If the probe is acknowledged, that size works. If it is lost, it doesn't, and — crucially — a lost probe is <em>not</em> counted as congestion. Many stacks start at 1,200–1,350 bytes and probe upward; some never probe and stay conservative.</p>
+<p><strong>Where the CPU goes.</strong> For TCP on Linux, the kernel does segmentation and checksums, and with TSO the NIC splits a 64 KB buffer into wire-size segments. With kTLS, even encryption can move into the kernel or NIC. A QUIC sender has to build and encrypt each ~1,200–1,450-byte packet itself, in user space, and push it across the syscall boundary. The tools that close the gap on Linux:</p>
+<ul>
+<li><code>sendmmsg()</code> / <code>recvmmsg()</code>: many datagrams per syscall.</li>
+<li><strong>UDP GSO</strong> (<code>UDP_SEGMENT</code> socket option, kernel 4.18+): hand the kernel one large buffer of equal-sized packets and let it (or the NIC) split them.</li>
+<li><strong>UDP GRO</strong> (kernel 5.0+): coalesce received datagrams of the same flow into one receive call.</li>
+<li>Pacing in the stack or via <code>SO_TXTIME</code>, so bursts don't overflow queues.</li>
+</ul>
+<p><strong>Socket buffers.</strong> The kernel still queues datagrams between the NIC and the process. If the process falls behind, the queue overflows and packets drop <em>before QUIC ever sees them</em>. To QUIC, that looks exactly like network loss, and it cuts the congestion window. Linux's default receive buffer cap is small (<code>net.core.rmem_max</code> is commonly 208 KB). Here is quic-go's real startup warning, which tells you precisely this:</p>
+<pre class="text"><code>failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB).
+See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.</code></pre>
+<p>Prove the drops with the kernel's own counters. <strong>Linux:</strong> <code>nstat -az | grep -E 'UdpRcvbufErrors|UdpSndbufErrors'</code> — a rising <code>UdpRcvbufErrors</code> means the socket buffer overflowed. <strong>macOS:</strong> <code>netstat -s -p udp</code> and look for the "dropped due to full socket buffers" line. The fix on Linux is <code>sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000</code> (persist it in <code>/etc/sysctl.d/</code>), and an application that actually requests the bigger buffer with <code>SO_RCVBUF</code>.</p>
+<p><strong>What a qlog shows that a pcap can't.</strong> A pcap of encrypted QUIC shows sizes and timing. A qlog is the endpoint narrating its own state: <code>packet_sent</code>, <code>packet_received</code>, <code>packets_acked</code>, <code>packet_lost</code> with the trigger (<code>reordering_threshold</code>, <code>time_threshold</code>, <code>pto_expired</code>), <code>metrics_updated</code> with <code>congestion_window</code>, <code>bytes_in_flight</code> and <code>smoothed_rtt</code>. An abridged, <strong>illustrative</strong> excerpt in JSON-SEQ form (the event names follow the IETF qlog drafts; exact schemas vary between implementations and draft versions):</p>
+<pre class="text"><code>{&quot;time&quot;:0.0,   &quot;name&quot;:&quot;transport:packet_sent&quot;, &quot;data&quot;:{&quot;header&quot;:{&quot;packet_type&quot;:&quot;initial&quot;,&quot;packet_number&quot;:0},&quot;raw&quot;:{&quot;length&quot;:1200}}}
+{&quot;time&quot;:20.4,  &quot;name&quot;:&quot;transport:packet_received&quot;, &quot;data&quot;:{&quot;header&quot;:{&quot;packet_type&quot;:&quot;initial&quot;,&quot;packet_number&quot;:0}}}
+{&quot;time&quot;:20.4,  &quot;name&quot;:&quot;recovery:metrics_updated&quot;, &quot;data&quot;:{&quot;smoothed_rtt&quot;:20.4,&quot;latest_rtt&quot;:20.4,&quot;congestion_window&quot;:12000,&quot;bytes_in_flight&quot;:0}}
+{&quot;time&quot;:21.1,  &quot;name&quot;:&quot;transport:packet_sent&quot;, &quot;data&quot;:{&quot;header&quot;:{&quot;packet_type&quot;:&quot;1RTT&quot;,&quot;packet_number&quot;:0},&quot;frames&quot;:[{&quot;frame_type&quot;:&quot;stream&quot;,&quot;stream_id&quot;:0,&quot;fin&quot;:true}]}}
+{&quot;time&quot;:412.8, &quot;name&quot;:&quot;recovery:packet_lost&quot;, &quot;data&quot;:{&quot;header&quot;:{&quot;packet_type&quot;:&quot;1RTT&quot;,&quot;packet_number&quot;:118},&quot;trigger&quot;:&quot;time_threshold&quot;}}</code></pre>
+<p>The <code>congestion_window</code> of 12,000 is not a guess. It is RFC 9002's initial window for a 1,200-byte maximum datagram size, worked out in the next section.</p>
+<h2 id="m20-deep-dive-by-the-numbers">Deep dive: by the numbers</h2>
+<p><strong>Round trips to the first response byte</strong>, from a cold start (DNS already resolved):</p>
+<table>
+<thead>
+<tr class="header">
+<th>Stack</th>
+<th>Request leaves client</th>
+<th>Response arrives</th>
+<th>At 100 ms RTT</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>TCP + TLS 1.2</td>
+<td>3 RTT</td>
+<td>4 RTT</td>
+<td>400 ms</td>
+</tr>
+<tr class="even">
+<td>TCP + TLS 1.3</td>
+<td>2 RTT</td>
+<td>3 RTT</td>
+<td>300 ms</td>
+</tr>
+<tr class="odd">
+<td>QUIC (1-RTT)</td>
+<td>1 RTT</td>
+<td>2 RTT</td>
+<td>200 ms</td>
+</tr>
+<tr class="even">
+<td>QUIC resumed with 0-RTT</td>
+<td>0 RTT</td>
+<td>1 RTT</td>
+<td>100 ms</td>
+</tr>
+</tbody>
+</table>
+<p>Add one more RTT to the QUIC rows if the server sends Retry, and one more if the server's first flight exceeds the amplification limit.</p>
+<p><strong>The amplification budget.</strong> A padded client Initial of 1,200 bytes gives the server 3 × 1,200 = <strong>3,600 bytes</strong> before validation. Roughly what the server must fit (sizes vary): ServerHello about 90–130 bytes, EncryptedExtensions about 50–150 (transport parameters, ALPN), CertificateVerify about 80 bytes (ECDSA P-256) or 260 (RSA-2048), Finished 36, plus about 40–60 bytes per packet of QUIC header, packet number and AEAD tag. That leaves roughly 3,100–3,200 bytes for the certificate chain. A leaf and one intermediate with ECDSA keys typically fit. An RSA chain with a long intermediate, or extra unneeded certificates, may not. TLS certificate compression (RFC 8879) is the main lever. Post-quantum signatures, when they arrive in certificates, will make this budget much tighter.</p>
+<p><strong>Initial congestion window</strong> (RFC 9002 §7.2): <code>min(10 × max_datagram_size, max(14,720, 2 × max_datagram_size))</code>. At a 1,200-byte datagram size: <code>min(12,000, max(14,720, 2,400))</code> = <strong>12,000 bytes</strong>. At 1,472 (a full IPv4 1,500-byte MTU): <code>min(14,720, max(14,720, 2,944))</code> = <strong>14,720 bytes</strong>. The minimum window after a loss is 2 × <code>max_datagram_size</code>.</p>
+<p><strong>Initial PTO before any RTT sample</strong> (RFC 9002 §6.2.2): the initial RTT is 333 ms, so <code>smoothed_rtt</code> = 333 and <code>rttvar</code> = 333 / 2 = 166.5. In the Initial and Handshake spaces, <code>max_ack_delay</code> counts as 0. PTO = 333 + 4 × 166.5 = <strong>999 ms</strong>. Each consecutive PTO without progress doubles it: about 1 s, 2 s, 4 s. A lost first Initial therefore costs a full second, the same ballpark as TCP's 1 s initial RTO (RFC 6298) for a lost SYN.</p>
+<p><strong>Loss detection at 40 ms RTT.</strong> Time threshold = 9/8 × 40 = <strong>45 ms</strong> after sending, if a later packet has been acknowledged. Packet threshold = 3 packets. The timer granularity floor (<code>kGranularity</code>) is 1 ms.</p>
+<p><strong>ACK pacing.</strong> The default <code>max_ack_delay</code> transport parameter is <strong>25 ms</strong>. Receivers should acknowledge at least every second ack-eliciting packet. ACKs themselves are not ack-eliciting, so two idle peers don't ACK each other's ACKs forever.</p>
+<p><strong>Per-packet overhead</strong> in steady state, IPv4, 8-byte CIDs, 2-byte packet numbers:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Part</th>
+<th>Bytes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>IPv4 + UDP</td>
+<td>20 + 8 = 28</td>
+</tr>
+<tr class="even">
+<td>Short header: first byte + DCID + packet number</td>
+<td>1 + 8 + 2 = 11</td>
+</tr>
+<tr class="odd">
+<td>AEAD tag</td>
+<td>16</td>
+</tr>
+<tr class="even">
+<td>STREAM frame header (type, stream ID, offset, length)</td>
+<td>about 4–8</td>
+</tr>
+<tr class="odd">
+<td><strong>Total</strong></td>
+<td><strong>about 59–63</strong></td>
+</tr>
+</tbody>
+</table>
+<p>On a 1,500-byte MTU that leaves about 1,437–1,441 bytes of application data per packet. TCP with timestamps plus TLS records is in the same range; the overheads are comparable, the CPU costs are not.</p>
+<p><strong>Limits you will meet.</strong> CIDs: 0–20 bytes in v1. <code>active_connection_id_limit</code> default 2 (the minimum). Stateless reset token: 16 bytes, and a stateless reset packet is at least 21 bytes so it can pass as a short-header packet. Stream IDs and packet numbers: 62 bits. Varint maximum: 2^62 − 1.</p>
+<p><strong>NAT timeouts versus idle timeouts.</strong> RFC 4787 recommends NATs keep UDP mappings at least 2 minutes, but many home routers and carrier NATs use 30–60 seconds, and some less. QUIC's <code>max_idle_timeout</code> is often 30 seconds or more. If the NAT forgets the mapping first, server-to-client packets are dropped until the client sends something. Implementations that want to hold an idle connection open send a <code>PING</code> every 15–25 seconds. These are typical values that vary by device and implementation; measure your own clients.</p>
+<p><strong>CPU.</strong> Early large deployments reported QUIC using roughly two to three times the server CPU of TCP+TLS for the same bytes. GSO, GRO, <code>sendmmsg</code>, batching and better crypto paths have closed much of that gap, but not all of it. Whether HTTP/3 costs you 5% or 50% more CPU depends on the stack, the kernel, the NIC, and the traffic mix. Benchmark your own.</p>
+<h2 id="m20-deep-dive-production-failure-modes">Deep dive: production failure modes</h2>
+<h3 id="m20-failure-nobody-uses-it">"We enabled HTTP/3 and nobody uses it"</h3>
+<p><strong>Symptom.</strong> Server config says <code>listen 443 quic</code>, but dashboards show 0% <code>h3</code>.</p>
+<p><strong>Mechanism.</strong> Usually one of three. No UDP listener reachable: the security group, firewall, or load balancer only allows TCP 443. Or no discovery: the <code>Alt-Svc</code> header is missing because a proxy or CDN in front strips it, or it advertises the wrong port. Or clients try, fail, and mark h3 broken, so they stay on TCP.</p>
+<p><strong>Prove it.</strong></p>
+<pre class="text"><code>$ curl -sI https://example.com/ | grep -i alt-svc          # is it advertised?
+alt-svc: h3=&quot;:443&quot;; ma=86400
+$ curl -sv --http3-only -o /dev/null https://example.com/   # can QUIC actually connect?
+*   Trying 198.51.100.7:443...
+* QUIC connect to 198.51.100.7 port 443 failed: Timeout was reached</code></pre>
+<p>The exact error text depends on the curl build; the meaning is the same. Then check the path: from a host outside the network, capture <code>udp port 443</code> on the server (<code>sudo tcpdump -ni any udp port 443</code>). Initials arriving with no reply means the server isn't listening or isn't bound to that address. Nothing arriving means a filter upstream drops UDP.</p>
+<p><strong>Fix.</strong> Open UDP 443 at every hop. Make sure the load balancer has a UDP listener. Emit <code>Alt-Svc</code> from whatever actually faces clients. Publish an HTTPS record with <code>alpn="h3,h2"</code> if your DNS supports it.</p>
+<h3 id="m20-failure-lb-migration">Connections die when phones change networks — only behind the new load balancer</h3>
+<p><strong>Symptom.</strong> Mobile clients see periodic request failures and reconnects. The old setup (one server) never did this. The new setup (L4 load balancer, many backends) does.</p>
+<p><strong>Mechanism.</strong> The load balancer hashes the 4-tuple. A NAT rebinding or a network switch gives the client a new address and port. The same DCID now hashes to a different backend, which has never heard of that connection. That backend either drops the packet (the client times out) or, if it can, sends a <strong>stateless reset</strong>: a packet that looks like a short-header packet and ends in the 16-byte reset token tied to that CID. The client sees the reset and tears the connection down.</p>
+<p><strong>Prove it.</strong> Server logs or qlogs show <code>stateless_reset</code> sent, or unknown-CID packets dropped. Client qlogs show the connection closed by a stateless reset right after a path change. Correlate with client address changes in the access logs.</p>
+<p><strong>Fix.</strong> Route on the connection ID. The server encodes a backend identifier in every CID it issues — in the clear, or encrypted with a key shared with the load balancer — and the load balancer reads the DCID from each packet to pick the backend. The IETF QUIC-LB draft standardises this; several load balancers implement their own variants. Within one host, the same problem exists between worker processes. nginx's <code>quic_bpf on;</code>, for example, installs an eBPF program that steers each packet to the worker owning its CID. Short headers carry no CID length, so the load balancer must be told the length the servers use. If you can't route by CID, send <code>disable_active_migration</code> and accept that NAT rebinding still breaks connections.</p>
+<h3 id="m20-failure-amplification">The handshake takes two round trips, but only for some sites</h3>
+<p><strong>Symptom.</strong> QUIC time-to-first-byte is one RTT worse than expected for one hostname, normal for others on the same servers.</p>
+<p><strong>Mechanism.</strong> That hostname's certificate chain doesn't fit in 3,600 bytes. The server sends what it can, then waits: it may not send more until the client's next packet arrives and raises the budget.</p>
+<p><strong>Prove it.</strong> In the server's qlog, the server stops sending after about 3,600 bytes with data still queued; some stacks log an explicit "amplification limited" state. In a pcap, the server's first flight totals about 3,600 bytes of UDP payload, then pauses one RTT until the client's next datagram. Check the chain size: <code>openssl s_client -connect example.com:443 -servername example.com -showcerts &lt;/dev/null 2&gt;/dev/null | openssl crl2pkcs7 -nocrl -certfile /dev/stdin | openssl pkcs7 -outform DER | wc -c</code> gives a close approximation of the DER chain size.</p>
+<p><strong>Fix.</strong> Serve only the leaf and the necessary intermediates (never the root). Prefer ECDSA certificates. Enable certificate compression if your stack supports it.</p>
+<h3 id="m20-failure-throughput">Throughput on HTTP/3 is worse than on HTTP/2</h3>
+<p><strong>Symptom.</strong> Large downloads are slower over h3 than h2 from the same server. CPU on the server is higher.</p>
+<p><strong>Mechanism.</strong> Usually the kernel dropping datagrams that the process didn't read fast enough (small socket buffers), which QUIC treats as congestion loss. Sometimes CPU saturation in the QUIC stack itself, with no GSO and one syscall per packet.</p>
+<p><strong>Prove it.</strong> <code>nstat -az | grep UdpRcvbufErrors</code> rising during the transfer on Linux; <code>netstat -s -p udp</code> "dropped due to full socket buffers" on macOS. The quic-go warning shown earlier. In a qlog, losses with no matching drop on the network path. <code>perf top</code> showing time in crypto and <code>sendmsg</code>.</p>
+<p><strong>Fix.</strong> Raise <code>net.core.rmem_max</code>/<code>wmem_max</code> and make sure the application requests large buffers. Enable GSO/GRO in the stack. Scale out workers with <code>SO_REUSEPORT</code> plus CID-aware steering.</p>
+<h3 id="m20-failure-0rtt">Duplicate side effects from 0-RTT</h3>
+<p><strong>Symptom.</strong> Rare duplicated actions — two password-reset emails, a doubled counter — clustered around client reconnects.</p>
+<p><strong>Mechanism.</strong> 0-RTT is enabled at the edge and forwards early data to origins that assume each request arrives once. A replayed or retransmitted early-data flight executes twice.</p>
+<p><strong>Prove it.</strong> Edge logs that mark early data (many proxies can log whether a request arrived in 0-RTT), joined with the duplicated requests. Look for <code>Early-Data: 1</code> at the origin.</p>
+<p><strong>Fix.</strong> Allow 0-RTT only for safe methods, have the edge answer <code>425 Too Early</code> for anything else, and make non-idempotent endpoints use idempotency keys regardless.</p>
+<h3 id="m20-failure-nat-idle">Long-lived idle connections silently stop receiving</h3>
+<p><strong>Symptom.</strong> A client holding an idle HTTP/3 connection (a dashboard, a push-like stream) stops getting server messages after about 30–60 seconds of silence. Sending a request "wakes it up".</p>
+<p><strong>Mechanism.</strong> The client's NAT dropped the UDP mapping. Server packets to the old external port are dropped. When the client next sends, the NAT creates a new mapping, the server sees the known DCID from a new port, validates the path, and the connection continues — QUIC survived the rebinding, but anything the server sent in between was lost and has to be recovered.</p>
+<p><strong>Prove it.</strong> Client and server qlogs show a path change (new peer port) right after an idle gap. A pcap on the client's LAN side shows no inbound traffic during the gap.</p>
+<p><strong>Fix.</strong> Keepalive <code>PING</code> frames more often than the shortest NAT timeout you need to support, typically every 15–25 seconds, for connections that must stay reachable. Keep <code>max_idle_timeout</code> and the keepalive interval consistent with each other.</p>
+<h3 id="m20-failure-crypto-error">Handshake fails with a crypto error</h3>
+<p><strong>Symptom.</strong> <code>curl --http3-only</code> fails immediately; the server logs a <code>CONNECTION_CLOSE</code> with error <code>0x178</code>.</p>
+<p><strong>Mechanism.</strong> QUIC maps TLS alerts to transport error codes as <code>0x100</code> + alert number. <code>0x178</code> = <code>0x100</code> + 120 = <code>no_application_protocol</code>: the ALPN didn't match. The client offered <code>h3</code>; the server only accepted something else (a test server configured for <code>hq-interop</code>, or a draft version token). Other common ones: <code>0x128</code> (alert 40, <code>handshake_failure</code>), <code>0x12a</code> (alert 42, <code>bad_certificate</code>).</p>
+<p><strong>Prove it.</strong> qlog <code>connection_closed</code> event, or <code>curl -v</code> showing the close reason.</p>
+<p><strong>Fix.</strong> Align the ALPN lists. In 2026 the only token you want is <code>h3</code>; draft tokens like <code>h3-29</code> are long obsolete.</p>
+<h2 id="m20-deep-dive-2026-context">Deep dive: 2026 context</h2>
+<p><strong>Where QUIC actually runs.</strong> In most deployments QUIC is a <em>last-mile</em> protocol. Browsers and mobile apps speak HTTP/3 to a CDN or cloud edge. The edge speaks HTTP/1.1 or HTTP/2 over TCP to the origin, inside a data centre or over a private backbone where loss is rare and HTTP/3's advantages are small. Major CDNs carry a large share of their request volume as HTTP/3. Origins and service meshes mostly don't use it yet.</p>
+<p><strong>Cloud load balancers and Kubernetes.</strong> The question to ask any load balancer is: does it <em>terminate</em> QUIC (it runs the QUIC stack and you get HTTP on the inside), <em>pass through</em> UDP routed by connection ID, <em>pass through</em> UDP hashed by 4-tuple (which breaks migration), or not support UDP 443 at all? Answers differ by provider and product and change frequently, so check current documentation. In Kubernetes, a Service of type <code>LoadBalancer</code> exposing both TCP 443 and UDP 443 needs mixed-protocol support, which has been stable since v1.26 but must also be supported by your cloud's load-balancer controller. Ingress controllers and gateways (Envoy-based ones, nginx, HAProxy and others) can terminate HTTP/3, each with its own maturity and configuration.</p>
+<p><strong>MASQUE: QUIC as a tunnel.</strong> HTTP/3 can carry UDP (CONNECT-UDP, RFC 9298) and IP packets (CONNECT-IP, RFC 9484), using HTTP Datagrams (RFC 9297) over QUIC DATAGRAM frames (RFC 9221). This is how several privacy relays and some zero-trust access clients now build their tunnels: the traffic looks like ordinary HTTP/3 to port 443. For network teams, it means "block UDP 443" increasingly blocks VPN-like products as well as web traffic.</p>
+<p><strong>WebTransport</strong> gives browsers bidirectional streams and datagrams over HTTP/3, the successor to WebSockets for latency-sensitive apps. It depends on the extended CONNECT mechanism (RFC 9220).</p>
+<p><strong>Post-quantum key exchange.</strong> Browsers and major servers now negotiate hybrid key exchange (X25519 combined with ML-KEM-768). An ML-KEM-768 public key is 1,184 bytes, so the ClientHello no longer fits in one 1,200-byte Initial packet; it spans two. QUIC handles that cleanly — <code>CRYPTO</code> frames have offsets — but it is one reason you will see two client Initial datagrams in 2026 captures where older captures had one. It also means the client sends 2,400 bytes or more before the server replies, so the server's amplification budget grows to 7,200 bytes or more.</p>
+<p><strong>Versions and greasing.</strong> QUIC v2 (RFC 9369) is functionally identical to v1 but uses different constants (a new version number, salt, and packet-type encoding). Its main purpose is to keep middleboxes from hard-coding v1. Compatible version negotiation (RFC 9368) lets a connection upgrade versions without an extra round trip. RFC 9287 lets endpoints randomise the "fixed" bit. All of it is the same anti-ossification strategy: exercise every degree of freedom so nobody can assume it's constant.</p>
+<p><strong>Visibility for operators.</strong> RFC 9312 (QUIC manageability) is the honest guide to what network operators can and cannot observe. The spin bit is the main deliberate concession: an optional bit that flips once per RTT, so an on-path observer can estimate RTT. Implementations may disable it, and many do on some or all connections. Expect to measure QUIC performance from endpoint telemetry — qlog, server metrics, client RUM — not from taps in the middle.</p>
+<p><strong>In-kernel QUIC.</strong> Work to add a QUIC implementation to the Linux kernel has been under way, aiming at in-kernel users (such as SMB over QUIC) and hardware offload. Treat its availability as version-specific; most production QUIC in 2026 still runs in user space.</p>
+<h2 id="m20-deep-dive-senior-interview-questions">Deep dive: senior interview questions</h2>
+<p><strong>Q1: QUIC encrypts its packets. So why can Wireshark decode the ClientHello without any keys?</strong></p>
+<p>A: Initial packets are protected with keys derived from the client's first Destination Connection ID and a public salt published in RFC 9001. The DCID is in cleartext, so anyone can derive the keys. Initial protection defends against off-path injection and casual middlebox parsing, not against an on-path observer. Real secrecy starts with Handshake keys, derived from the (EC)DHE exchange, and the certificate travels under those.</p>
+<p><strong>Q2: QUIC retransmits frames, not packets. What does that buy?</strong></p>
+<p>A: Every transmission gets a new, monotonically increasing packet number, so an ACK always identifies exactly which transmission arrived. RTT samples are never ambiguous, unlike TCP's retransmissions (Karn's problem). It also lets the sender drop stale information — an old ACK or a superseded <code>MAX_DATA</code> — instead of resending it, and repack lost data with other streams' data.</p>
+<p><strong>Q3: Why does QUIC have three packet number spaces instead of one?</strong></p>
+<p>A: Each encryption level's packets are protected with different keys, and they're discarded at different times. If one space spanned levels, an ACK for an Initial packet could arrive in a 1-RTT packet, or packet numbers would have gaps as keys were dropped. Separate spaces keep acknowledgement, loss detection and key discard per level clean. 0-RTT and 1-RTT share the Application space because they carry the same kind of data.</p>
+<p><strong>Q4: Your L4 load balancer hashes on the 5-tuple. What breaks with QUIC, and how do you fix it without giving up migration?</strong></p>
+<p>A: Any client address change — NAT rebinding or a real network switch — rehashes the connection to a backend with no state for it, which drops the packets or sends a stateless reset. The fix is routing by connection ID: servers encode a routable backend identifier into the CIDs they issue (plain or encrypted, as in the QUIC-LB draft), and the balancer extracts it from the DCID. Since short headers carry no CID length, the length must be agreed in configuration. The same steering is needed between worker processes on one host.</p>
+<p><strong>Q5: Why couldn't HTTP/3 reuse HPACK?</strong></p>
+<p>A: HPACK's dynamic table is updated inline by header blocks and assumes they are processed in the order sent. QUIC streams are independent and arrive in any order, so a header block could reference an entry whose insertion is on a stream that hasn't arrived — head-of-line blocking reintroduced by the compressor, or outright corruption. QPACK moves insertions to a dedicated encoder stream, makes each header block declare the insert count it needs, caps the number of streams allowed to block, and acknowledges via a decoder stream so the encoder can choose references that never block.</p>
+<p><strong>Q6: What exactly limits how much a QUIC server sends before it knows the client's address is real?</strong></p>
+<p>A: The anti-amplification limit: three times the bytes received from that address, until the address is validated. Validation happens when the server successfully processes a Handshake packet from the client, when the client presents a valid Retry or <code>NEW_TOKEN</code> token, or through path validation. That's why client Initials are padded to 1,200 bytes, and why oversized certificate chains add a round trip.</p>
+<p><strong>Q7: A PTO fires. How is that different from a TCP RTO?</strong></p>
+<p>A: A PTO means "I haven't heard anything for longer than expected", not "packets are definitely lost". The sender sends one or two probe packets — new data if it has any, otherwise retransmitted data or a <code>PING</code> — to elicit an ACK, and backs off exponentially on repeated PTOs. It doesn't collapse the congestion window. Packets are only declared lost by the ACK-based thresholds, and congestion response follows real loss (with persistent congestion handling for long blackouts). A classic TCP RTO resets cwnd to one segment.</p>
+<p><strong>Q8: How would you prove that an HTTP/3 performance problem is in the host rather than the network?</strong></p>
+<p>A: Compare what the endpoint thinks happened with what the network did. In the qlog, find the losses and their triggers. On the same host, check kernel UDP drop counters (<code>UdpRcvbufErrors</code> with <code>nstat</code>, or <code>netstat -s -p udp</code> on macOS) over the same interval. If the kernel dropped datagrams that QUIC then counted as lost, the problem is socket buffers or a process that isn't reading fast enough. Confirm with CPU profiles of the QUIC worker. A capture on the host's NIC showing the packets arrived settles it.</p>
+<p><strong>Q9: When would you deliberately not enable HTTP/3?</strong></p>
+<p>A: Internal east-west traffic in a low-loss data centre, where it adds CPU and operational complexity for little gain. Paths where you can't route UDP by connection ID and clients change addresses often — you'd get the cost without migration. Environments where UDP 443 is filtered for most clients. And any deployment where you can't keep TCP as a fallback. Wherever you do enable it, measure h3 against h2 per client network before declaring a win.</p>
+<p><strong>Standards cited:</strong> RFC 9000 (QUIC transport), RFC 9001 (TLS for QUIC), RFC 9002 (loss detection and congestion control), RFC 9114 (HTTP/3), RFC 9204 (QPACK), RFC 8999 (version-independent properties), RFC 9218 (Extensible Priorities), RFC 9220 (extended CONNECT for HTTP/3), RFC 9221 (DATAGRAM frames), RFC 9287 (greasing the QUIC bit), RFC 9297 (HTTP Datagrams), RFC 9298 (CONNECT-UDP), RFC 9312 (QUIC manageability), RFC 9368 (compatible version negotiation), RFC 9369 (QUIC v2), RFC 9460 (SVCB and HTTPS records), RFC 9484 (CONNECT-IP), RFC 7838 (Alt-Svc), RFC 8470 (425 Too Early), RFC 8879 (TLS certificate compression), RFC 8899 (DPLPMTUD), RFC 4787 (NAT UDP behaviour), RFC 7413 (TCP Fast Open), RFC 6298 (TCP RTO).</p>
 <h1 id="module-22--cloud-networking">Module 22 — Cloud Networking</h1>
 <p><em>Networking Mastery Guide · Module 22 of 23</em></p>
 <hr />
@@ -7998,7 +9324,7 @@ connections per unique destination ip:port:proto, per NAT IP):
 <p>They are different design choices for the same overlay idea. In AWS, the subnet is the unit you place in an AZ, so AZ-level resilience is expressed by having one subnet per AZ, and anything zonal (NAT gateways, route tables pointing at them) is usually duplicated per AZ. In GCP, a subnet spans every zone in its region, and Cloud NAT is implemented in each VM's host rather than as a zonal gateway, so there is no "NAT gateway in the wrong AZ" problem. What it changes is how you write designs: in AWS, you think in AZ-sized slices of the address space; in GCP, you think in regional ranges and let zones be a placement detail.</p>
 <hr />
 <p><em>Key terms: VPC, overlay, underlay, encapsulation, availability zone, AZ ID, subnet, reserved addresses, route table, local route, longest prefix match, internet gateway, 1:1 NAT, NAT gateway, port allocation, idle timeout, egress-only internet gateway, security group, connection tracking, network ACL, ephemeral ports, VPC peering, Transit Gateway, appliance mode, PrivateLink, interface endpoint, gateway endpoint, Route 53 Resolver, private hosted zone, Site-to-Site VPN, Direct Connect, virtual interface, BGP, VPC Flow Logs, Reachability Analyzer, Hyperplane, Nitro, Andromeda, VFP, Cloud NAT, NSG.</em></p>
-<h1 id="module-21--back-matter">Module 21 — Back Matter</h1>
+<h1 id="module-22--back-matter">Module 22 — Back Matter</h1>
 <p><em>Reference material for the whole guide: the glossary, the subnetting cheat sheet, the ports table, and the troubleshooting flowchart.</em></p>
 <hr />
 <h2 id="glossary">Glossary</h2>
