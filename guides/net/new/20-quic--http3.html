@@ -411,7 +411,7 @@
 </tr>
 </tbody>
 </table>
-<p>Note what isn't there: no source CID, no version, no length. A short-header packet must be the last one in its datagram. And a load balancer that wants to read the DCID must know how long the server's CIDs are, because the packet doesn't say. Section "Deep dive: production failure modes" comes back to this.</p>
+<p>Note what isn't there: no source CID, no version, no length. A short-header packet must be the last one in its datagram. And a load balancer that wants to read the DCID must know how long the server's CIDs are, because the packet doesn't say. <a href="#m20-failure-lb-migration">Deep dive: production failure modes</a> comes back to this.</p>
 <p><strong>Header protection.</strong> After the payload is encrypted, the sender takes a 16-byte sample of the ciphertext (starting 4 bytes after the packet number begins), encrypts it with a separate header-protection key, and XORs the result over the packet number bytes and the low bits of the first byte. An observer therefore can't read packet numbers or the key phase. This is what keeps middleboxes from building loss or RTT heuristics on QUIC's internals, the way they did with TCP sequence numbers.</p>
 <h3 id="m20-variable-length-integers">Variable-length integers</h3>
 <p>Almost every number on the wire — stream IDs, offsets, lengths, frame types, error codes — is a <strong>varint</strong> (RFC 9000 §16). The top two bits of the first byte give the length:</p>
@@ -630,7 +630,7 @@ QUIC STREAM frame (23 bytes): 0b 00 14 + HEADERS frame       type 0x0b = STREAM|
 <p><strong>Frame 7</strong> arrives one RTT after frame 6: <code>HANDSHAKE_DONE</code> (the server has the client's Finished; both sides drop Handshake keys), a <code>NEW_TOKEN</code> for the client's next visit, a spare connection ID, and the server's control stream (stream 3, server-initiated unidirectional) with its <code>SETTINGS</code>. <strong>Frame 8</strong> is the response on stream 0, and <strong>frame 9</strong> acknowledges it.</p>
 <p>Two things about this capture are worth carrying with you.</p>
 <p>First, <strong>without the key log</strong> tshark still decodes frames 1, 2 and 5 completely. Initial keys come from the DCID, which is in the packet. Everything else shows as encrypted. This is the honest way to describe Initial protection: integrity against off-path attackers, not secrecy.</p>
-<p>Second, the server's first datagram is the same size as the client's. A server that sent a 5 KB certificate chain would hit the 3,600-byte limit. It would then have to wait for frame 5's ACK before sending the rest — an extra round trip that shows up nowhere unless you look for it. "Deep dive: production failure modes" covers it.</p>
+<p>Second, the amplification budget was enough here only because the chain is small. A server that sent a 5 KB certificate chain would hit the 3,600-byte limit. It would then have to wait for frame 5's ACK before sending the rest — an extra round trip that shows up nowhere unless you look for it. <a href="#m20-failure-amplification">Deep dive: production failure modes</a> covers it.</p>
 <p>Here is the same kind of fetch from the client's side, using a curl build with HTTP/3 support. <strong>Run on your Mac — your output will differ</strong> (the exact lines depend on curl's version and its QUIC library: ngtcp2, quiche, or OpenSSL's own QUIC).</p>
 <pre class="text"><code>$ curl -sv --http3-only -o /dev/null https://example.com/
 *   Trying 198.51.100.7:443...

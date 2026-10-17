@@ -589,6 +589,13 @@ details.answer > p:last-child{ margin-bottom:14px; }
 <li><a href="#6-misconceptions--common-mistakes-14" id="toc-6-misconceptions--common-mistakes-14">6. Misconceptions &amp; common mistakes</a></li>
 <li><a href="#7-interview-qa-14" id="toc-7-interview-qa-14">7. Interview Q&amp;A</a></li>
 <li><a href="#8-try-it-10" id="toc-8-try-it-10">8. Try it</a></li>
+<li><a href="#d17-deep-dive" id="toc-d17-deep-dive">Deep dive: what the submarine hid</a></li>
+<li><a href="#d17-mental-model" id="toc-d17-mental-model">Deep dive: the real mental model</a></li>
+<li><a href="#d17-wire" id="toc-d17-wire">Deep dive: what the wire and the kernel actually show</a></li>
+<li><a href="#d17-numbers" id="toc-d17-numbers">Deep dive: by the numbers</a></li>
+<li><a href="#d17-failures" id="toc-d17-failures">Deep dive: production failure modes</a></li>
+<li><a href="#d17-2026" id="toc-d17-2026">Deep dive: 2026 context</a></li>
+<li><a href="#d17-interview" id="toc-d17-interview">Deep dive: senior interview questions</a></li>
 </ul></li>
 <li><a href="#module-18--troubleshooting-like-a-pro" id="toc-module-18--troubleshooting-like-a-pro">Module 18 — Troubleshooting Like a Pro</a> <ul> <li><a href="#1-why-it-matters-17" id="toc-1-why-it-matters-17">1. Why it matters</a></li>
 <li><a href="#2-the-mental-model-17" id="toc-2-the-mental-model-17">2. The mental model</a></li>
@@ -5716,6 +5723,488 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb77-1"><a href=
 <p>And a thought exercise, no command needed: pick your Mac as the "compromised host." List everything it can initiate a connection to — your LAN, the internet, your office VPN. Now ask which of those are <em>necessary</em>. That gap, between reachable and necessary, is the blast radius you would close with segmentation. It is the same exercise, scaled up, that enterprise architects run on data centers. Do it once for your home network and the abstraction stops being abstract.</p>
 <hr />
 <p><em>Key terms: defense in depth, assume breach, segmentation, VLAN (IEEE 802.1Q), firewall zone, DMZ, microsegmentation, zero trust (NIST SP 800-207), identity-aware access, workload identity, least privilege, IDS/IPS, WAF, EDR, SYN flood (RFC 4987), SYN cookies, UDP amplification, BCP 38, scrubbing, anycast, L7 flood, slowloris, RFC 4732.</em></p>
+<h2 id="d17-deep-dive">Deep dive: what the submarine hid</h2>
+<p>The submarine is a good picture of <em>architecture</em>. Compartments, hatches, hull plating. What it can't show you is the machinery inside each hatch, and that's where attacks actually land.</p>
+<p>A SYN flood is not "a storm of packets." It's an attack on one specific kernel data structure, and SYN cookies beat it by doing arithmetic on a 32-bit sequence number. Amplification is a ratio of bytes, and you can compute it. BCP 38 is a lookup in a forwarding table. Zero trust, once you strip the slides away, is a certificate check plus a policy lookup on every connection. Microsegmentation is a set of maps in a kernel or hypervisor that something has to keep in sync with a cluster that changes every second.</p>
+<p>This deep dive goes under the module's analogies to that machinery. It covers the state each attack targets and the exact packets involved. It also covers the numbers that decide whether a defence holds, and how each control fails in production.</p>
+<h2 id="d17-mental-model">Deep dive: the real mental model</h2>
+<p>Every attack in this module is an attempt to make a defender spend a scarce resource faster than it refills. The resource is always concrete: entries in a queue, bytes on a link, CPU cycles per packet, or trust attached to an attribute the attacker can forge. Defences work by moving that resource somewhere bigger, or by refusing to spend it until the sender has proved something.</p>
+<p>Hold that frame and the module's topics line up.</p>
+<ul>
+<li><strong>SYN flood</strong> targets the listener's queue of half-open connections. SYN cookies stop spending queue entries at all.</li>
+<li><strong>Amplification</strong> targets your link's bandwidth, using someone else's server to multiply the attacker's bytes. The defence is to absorb it somewhere bigger (anycast, scrubbing) or to make spoofing impossible at the source (BCP 38).</li>
+<li><strong>Spoofing</strong> targets trust in the source address. uRPF refuses packets whose source doesn't match the routing table.</li>
+<li><strong>Zero trust</strong> targets the same weakness from the other side. It stops granting trust based on the address at all and asks for a cryptographic identity instead.</li>
+<li><strong>Microsegmentation</strong> limits the <em>reach</em> of any identity that does get compromised.</li>
+</ul>
+<h3 id="d17-two-queues">The listener: two queues, not one</h3>
+<p>On Linux, a listening TCP socket owns two separate structures. People blur them all the time. Don't.</p>
+<p>The <strong>SYN queue</strong> holds <em>request sockets</em>: small records for connections where the server has received a SYN and sent a SYN-ACK, but hasn't yet seen the final ACK. These are the connections <code>ss</code> shows in state <code>SYN-RECV</code>. Each one remembers the client's initial sequence number, its options (MSS, window scale, SACK, timestamps), and a retransmit timer. If the ACK never comes, the kernel resends the SYN-ACK. With <code>net.ipv4.tcp_synack_retries = 5</code> (the Linux default) that is five retransmits with exponential backoff, about a minute of holding the slot.</p>
+<p>The <strong>accept queue</strong> holds fully established connections that the application hasn't yet picked up with <code>accept()</code>. Its limit is the <code>backlog</code> argument to <code>listen()</code>, capped by <code>net.core.somaxconn</code> (4096 by default since Linux 5.4; it used to be 128).</p>
+<p>A SYN flood fills the first queue. A slow application fills the second. The symptoms look similar from the client — new connections hang — but the counters, the causes and the fixes are completely different.</p>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="d17-q-title d17-q-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
+<title id="d17-q-title">A Linux listening socket: SYN queue, accept queue, and the SYN-cookie bypass</title>
+<desc id="d17-q-desc">Real clients' SYNs create request sockets in the SYN queue; their ACK moves the connection to the accept queue, where the application's accept() takes it. When the SYN queue is full, SYNs take a stateless cookie path: the SYN-ACK sequence number encodes the state, nothing is stored, and a valid ACK creates the socket directly in the accept queue. Spoofed SYNs never return an ACK. Counters at the bottom show which queue is under pressure.</desc>
+<defs>
+<marker id="d17-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M 0 1 L 9 5 L 0 9 z" fill="#6b7280"/>
+</marker>
+<marker id="d17-arr-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M 0 1 L 9 5 L 0 9 z" fill="#bf4520"/>
+</marker>
+</defs>
+<text x="24" y="28" font-size="12" fill="#6b7280" letter-spacing="2">ONE LISTENING SOCKET, TWO QUEUES, ONE STATELESS BYPASS</text>
+<rect x="24" y="90" width="136" height="60" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="92" y="116" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">Real clients</text>
+<text x="92" y="136" font-size="11" fill="#6b7280" text-anchor="middle">SYN, then ACK</text>
+<rect x="24" y="320" width="136" height="60" rx="6" fill="none" stroke="#bf4520" stroke-width="2"/>
+<text x="92" y="346" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">Spoofed SYNs</text>
+<text x="92" y="366" font-size="11" fill="#6b7280" text-anchor="middle">never ACK</text>
+<rect x="190" y="44" width="380" height="368" rx="8" fill="none" stroke="#6b7280" stroke-width="1" stroke-dasharray="5,4"/>
+<text x="380" y="62" font-size="11" fill="#6b7280" text-anchor="middle" letter-spacing="1">KERNEL · LISTENING SOCKET 0.0.0.0:443</text>
+<rect x="210" y="76" width="340" height="88" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="226" y="98" font-size="13" fill="#2d3142" font-weight="600">SYN queue · request socks (SYN-RECV)</text>
+<text x="226" y="118" font-size="11" fill="#6b7280">client ISN, MSS, wscale, SACK, timestamps</text>
+<text x="226" y="136" font-size="11" fill="#6b7280">SYN-ACK retransmit timer (tcp_synack_retries = 5)</text>
+<text x="226" y="154" font-size="11" fill="#6b7280">bounded by the listen backlog · see: ss state syn-recv</text>
+<rect x="210" y="192" width="340" height="80" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="226" y="214" font-size="13" fill="#2d3142" font-weight="600">Accept queue · ESTABLISHED, not accepted</text>
+<text x="226" y="234" font-size="11" fill="#6b7280">limit = min(backlog, net.core.somaxconn)</text>
+<text x="226" y="252" font-size="11" fill="#6b7280">ss -lnt: Recv-Q = queued now, Send-Q = limit</text>
+<rect x="210" y="300" width="340" height="96" rx="6" fill="none" stroke="#bf4520" stroke-width="2"/>
+<text x="226" y="322" font-size="13" fill="#2d3142" font-weight="600">Cookie path · used when the SYN queue is full</text>
+<text x="226" y="342" font-size="11" fill="#6b7280" font-family="ui-monospace, Menlo, monospace">seq = H1(4-tuple) + ISN + minute&lt;&lt;24</text>
+<text x="226" y="358" font-size="11" fill="#6b7280" font-family="ui-monospace, Menlo, monospace">      + (H2(4-tuple, minute) + mss_idx)</text>
+<text x="226" y="380" font-size="11" fill="#6b7280">nothing stored · no retransmits · SYN-ACK only</text>
+<rect x="600" y="192" width="136" height="80" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="668" y="220" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">Application</text>
+<text x="668" y="240" font-size="11" fill="#6b7280" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">accept()</text>
+<text x="668" y="258" font-size="11" fill="#6b7280" text-anchor="middle">drains the queue</text>
+<line x1="160" y1="112" x2="206" y2="112" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d17-arr)"/>
+<text x="183" y="104" font-size="10" fill="#6b7280" text-anchor="middle">SYN</text>
+<line x1="380" y1="164" x2="380" y2="188" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d17-arr)"/>
+<text x="390" y="181" font-size="10" fill="#6b7280">ACK</text>
+<line x1="550" y1="232" x2="596" y2="232" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d17-arr)"/>
+<line x1="160" y1="350" x2="206" y2="350" stroke="#bf4520" stroke-width="1.5" marker-end="url(#d17-arr-acc)"/>
+<text x="183" y="342" font-size="10" fill="#bf4520" text-anchor="middle">flood</text>
+<line x1="500" y1="300" x2="500" y2="276" stroke="#bf4520" stroke-width="1.5" marker-end="url(#d17-arr-acc)"/>
+<text x="452" y="292" font-size="10" fill="#bf4520" text-anchor="end">valid ACK (cookie + 1) → socket built here</text>
+<line x1="24" y1="428" x2="736" y2="428" stroke="#6b7280" stroke-width="1" stroke-dasharray="5,4"/>
+<text x="24" y="452" font-size="13" fill="#2d3142" font-weight="600">Same client symptom, different queue:</text>
+<text x="24" y="474" font-size="12" fill="#6b7280">flood → SYN queue full → TcpExtSyncookiesSent, TcpExtTCPReqQFullDoCookies climb</text>
+<text x="24" y="492" font-size="12" fill="#6b7280">slow app → accept queue full → TcpExtListenOverflows, TcpExtListenDrops climb; Recv-Q = Send-Q</text>
+</svg>
+
+<h3 id="d17-syn-cookies">SYN cookies: state folded into a sequence number</h3>
+<p>When the SYN queue is full and <code>net.ipv4.tcp_syncookies = 1</code> (the Linux default), the kernel stops allocating request sockets. It still answers every SYN with a SYN-ACK. But the server's initial sequence number in that SYN-ACK is no longer random. It is a <em>cookie</em>: a keyed hash of the connection's 4-tuple, a coarse clock, and an index that encodes the client's MSS. Then the server forgets the connection completely.</p>
+<p>A real client answers with an ACK whose acknowledgement number is cookie + 1. The server subtracts one, recomputes the hash from the 4-tuple in that ACK, and checks two things. Was the cookie minted in the last couple of minutes? Does the hash match? If both hold, the server rebuilds the connection from the cookie and creates a full socket directly in the accept queue. A spoofed source never receives the SYN-ACK, so it can never produce the right ACK. The flood costs the server CPU and outbound bandwidth, but no memory.</p>
+<p>Linux packs the cookie like this (from <code>net/ipv4/syncookies.c</code>): the top 8 bits are a minute counter, and the low 24 bits hold a second keyed hash plus the MSS index. A first keyed hash and the client's ISN are added on top so the cookie looks random. The MSS has to fit in two bits, so it is rounded down to one of four values: 536, 1300, 1440 or 1460 for IPv4.</p>
+<p>What does the server lose? Everything else from the SYN. Window scaling, SACK and ECN don't fit into 32 bits. Linux gets them back only when the client also sent TCP timestamps: it hides those options in the low bits of its own timestamp value, and the client echoes the timestamp in every ACK. Without timestamps, a cookie connection runs with no window scaling, which caps the window at 64 KB. That is fine for an emergency, and it's why cookies are a fallback, not the normal path.</p>
+<p>The simulation below follows the same layout. Linux uses SipHash with a random boot-time secret; this uses HMAC-SHA256 so it runs on the standard library.</p>
+<p><code>d17_syncookie.py</code>:</p>
+<div class="sourceCode" id="d17-cb1"><pre class="sourceCode python"><code class="sourceCode python"><span id="d17-cb1-1"><a href="#d17-cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;SYN cookies, Linux-style layout: stateless SYN-ACK, state rebuilt from the ACK.</span></span>
+<span id="d17-cb1-2"><a href="#d17-cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb1-3"><a href="#d17-cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">Linux uses siphash with a boot-time secret; this demo uses HMAC-SHA256.</span></span>
+<span id="d17-cb1-4"><a href="#d17-cb1-4" aria-hidden="true" tabindex="-1"></a><span class="co">The bit layout (8-bit minute counter on top, 24-bit keyed hash + MSS index</span></span>
+<span id="d17-cb1-5"><a href="#d17-cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co">below) follows net/ipv4/syncookies.c.</span></span>
+<span id="d17-cb1-6"><a href="#d17-cb1-6" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d17-cb1-7"><a href="#d17-cb1-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="d17-cb1-8"><a href="#d17-cb1-8" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hmac</span>
+<span id="d17-cb1-9"><a href="#d17-cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb1-10"><a href="#d17-cb1-10" aria-hidden="true" tabindex="-1"></a>SECRET <span class="op">=</span> <span class="bu">bytes</span>.fromhex(<span class="st">&quot;5e&quot;</span> <span class="op">*</span> <span class="dv">32</span>)         <span class="co"># per-boot random secret in real life</span></span>
+<span id="d17-cb1-11"><a href="#d17-cb1-11" aria-hidden="true" tabindex="-1"></a>MSS_TABLE <span class="op">=</span> [<span class="dv">536</span>, <span class="dv">1300</span>, <span class="dv">1440</span>, <span class="dv">1460</span>]       <span class="co"># IPv4 table in syncookies.c</span></span>
+<span id="d17-cb1-12"><a href="#d17-cb1-12" aria-hidden="true" tabindex="-1"></a>COOKIEBITS <span class="op">=</span> <span class="dv">24</span></span>
+<span id="d17-cb1-13"><a href="#d17-cb1-13" aria-hidden="true" tabindex="-1"></a>COOKIEMASK <span class="op">=</span> (<span class="dv">1</span> <span class="op">&lt;&lt;</span> COOKIEBITS) <span class="op">-</span> <span class="dv">1</span></span>
+<span id="d17-cb1-14"><a href="#d17-cb1-14" aria-hidden="true" tabindex="-1"></a>MAX_AGE <span class="op">=</span> <span class="dv">2</span>                               <span class="co"># minutes a cookie stays valid</span></span>
+<span id="d17-cb1-15"><a href="#d17-cb1-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb1-16"><a href="#d17-cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb1-17"><a href="#d17-cb1-17" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> h(<span class="op">*</span>parts) <span class="op">-&gt;</span> <span class="bu">int</span>:</span>
+<span id="d17-cb1-18"><a href="#d17-cb1-18" aria-hidden="true" tabindex="-1"></a>    msg <span class="op">=</span> <span class="st">&quot;|&quot;</span>.join(<span class="bu">map</span>(<span class="bu">str</span>, parts)).encode()</span>
+<span id="d17-cb1-19"><a href="#d17-cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">int</span>.from_bytes(hmac.digest(SECRET, msg, hashlib.sha256)[:<span class="dv">4</span>], <span class="st">&quot;big&quot;</span>)</span>
+<span id="d17-cb1-20"><a href="#d17-cb1-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb1-21"><a href="#d17-cb1-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb1-22"><a href="#d17-cb1-22" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> make_cookie(four_tuple, client_isn, minute, client_mss):</span>
+<span id="d17-cb1-23"><a href="#d17-cb1-23" aria-hidden="true" tabindex="-1"></a>    idx <span class="op">=</span> <span class="bu">max</span>(i <span class="cf">for</span> i, m <span class="kw">in</span> <span class="bu">enumerate</span>(MSS_TABLE) <span class="cf">if</span> m <span class="op">&lt;=</span> client_mss)</span>
+<span id="d17-cb1-24"><a href="#d17-cb1-24" aria-hidden="true" tabindex="-1"></a>    low <span class="op">=</span> (h(<span class="op">*</span>four_tuple, minute, <span class="dv">2</span>) <span class="op">+</span> idx) <span class="op">&amp;</span> COOKIEMASK</span>
+<span id="d17-cb1-25"><a href="#d17-cb1-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> (h(<span class="op">*</span>four_tuple, <span class="dv">1</span>) <span class="op">+</span> client_isn <span class="op">+</span> (minute <span class="op">&lt;&lt;</span> COOKIEBITS) <span class="op">+</span> low) <span class="op">%</span> <span class="dv">2</span><span class="op">**</span><span class="dv">32</span></span>
+<span id="d17-cb1-26"><a href="#d17-cb1-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb1-27"><a href="#d17-cb1-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb1-28"><a href="#d17-cb1-28" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> check_cookie(four_tuple, ack_minus_1, client_isn, now_minute):</span>
+<span id="d17-cb1-29"><a href="#d17-cb1-29" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;Return the MSS the client asked for, or None if the cookie is bad.&quot;&quot;&quot;</span></span>
+<span id="d17-cb1-30"><a href="#d17-cb1-30" aria-hidden="true" tabindex="-1"></a>    c <span class="op">=</span> (ack_minus_1 <span class="op">-</span> h(<span class="op">*</span>four_tuple, <span class="dv">1</span>) <span class="op">-</span> client_isn) <span class="op">%</span> <span class="dv">2</span><span class="op">**</span><span class="dv">32</span></span>
+<span id="d17-cb1-31"><a href="#d17-cb1-31" aria-hidden="true" tabindex="-1"></a>    minute <span class="op">=</span> c <span class="op">&gt;&gt;</span> COOKIEBITS</span>
+<span id="d17-cb1-32"><a href="#d17-cb1-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (now_minute <span class="op">-</span> minute) <span class="op">%</span> <span class="dv">256</span> <span class="op">&gt;</span> MAX_AGE:</span>
+<span id="d17-cb1-33"><a href="#d17-cb1-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">None</span></span>
+<span id="d17-cb1-34"><a href="#d17-cb1-34" aria-hidden="true" tabindex="-1"></a>    idx <span class="op">=</span> ((c <span class="op">&amp;</span> COOKIEMASK) <span class="op">-</span> h(<span class="op">*</span>four_tuple, minute, <span class="dv">2</span>)) <span class="op">&amp;</span> COOKIEMASK</span>
+<span id="d17-cb1-35"><a href="#d17-cb1-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> MSS_TABLE[idx] <span class="cf">if</span> idx <span class="op">&lt;</span> <span class="bu">len</span>(MSS_TABLE) <span class="cf">else</span> <span class="va">None</span></span>
+<span id="d17-cb1-36"><a href="#d17-cb1-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb1-37"><a href="#d17-cb1-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb1-38"><a href="#d17-cb1-38" aria-hidden="true" tabindex="-1"></a>tup <span class="op">=</span> (<span class="st">&quot;192.0.2.44&quot;</span>, <span class="dv">51544</span>, <span class="st">&quot;203.0.113.10&quot;</span>, <span class="dv">443</span>)</span>
+<span id="d17-cb1-39"><a href="#d17-cb1-39" aria-hidden="true" tabindex="-1"></a>isn, now <span class="op">=</span> <span class="dv">1_829_441_017</span>, <span class="dv">117</span></span>
+<span id="d17-cb1-40"><a href="#d17-cb1-40" aria-hidden="true" tabindex="-1"></a>cookie <span class="op">=</span> make_cookie(tup, isn, now, client_mss<span class="op">=</span><span class="dv">1460</span>)</span>
+<span id="d17-cb1-41"><a href="#d17-cb1-41" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;SYN    seq=</span><span class="sc">{</span>isn<span class="sc">}</span><span class="ss">  mss=1460   -&gt; server stores NOTHING&quot;</span>)</span>
+<span id="d17-cb1-42"><a href="#d17-cb1-42" aria-hidden="true" tabindex="-1"></a>minute <span class="op">=</span> (cookie <span class="op">-</span> h(<span class="op">*</span>tup, <span class="dv">1</span>) <span class="op">-</span> isn) <span class="op">%</span> <span class="dv">2</span><span class="op">**</span><span class="dv">32</span> <span class="op">&gt;&gt;</span> COOKIEBITS</span>
+<span id="d17-cb1-43"><a href="#d17-cb1-43" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;SYN-ACK seq=</span><span class="sc">{</span>cookie<span class="sc">}</span><span class="ss">  &lt;- the cookie (minute counter </span><span class="sc">{</span>minute<span class="sc">}</span><span class="ss">)&quot;</span>)</span>
+<span id="d17-cb1-44"><a href="#d17-cb1-44" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;ACK    ack=</span><span class="sc">{</span>(cookie <span class="op">+</span> <span class="dv">1</span>) <span class="op">%</span> <span class="dv">2</span><span class="op">**</span><span class="dv">32</span><span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d17-cb1-45"><a href="#d17-cb1-45" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;  valid ACK, same minute     -&gt;&quot;</span>, check_cookie(tup, cookie, isn, now))</span>
+<span id="d17-cb1-46"><a href="#d17-cb1-46" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;  valid ACK, 2 minutes later -&gt;&quot;</span>, check_cookie(tup, cookie, isn, now <span class="op">+</span> <span class="dv">2</span>))</span>
+<span id="d17-cb1-47"><a href="#d17-cb1-47" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;  valid ACK, 3 minutes later -&gt;&quot;</span>, check_cookie(tup, cookie, isn, now <span class="op">+</span> <span class="dv">3</span>))</span>
+<span id="d17-cb1-48"><a href="#d17-cb1-48" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;  guessed ack (cookie+999)   -&gt;&quot;</span>, check_cookie(tup, (cookie <span class="op">+</span> <span class="dv">999</span>) <span class="op">%</span> <span class="dv">2</span><span class="op">**</span><span class="dv">32</span>, isn, now))</span>
+<span id="d17-cb1-49"><a href="#d17-cb1-49" aria-hidden="true" tabindex="-1"></a>spoof <span class="op">=</span> (<span class="st">&quot;192.0.2.99&quot;</span>, <span class="dv">51544</span>, <span class="st">&quot;203.0.113.10&quot;</span>, <span class="dv">443</span>)</span>
+<span id="d17-cb1-50"><a href="#d17-cb1-50" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;  same ack, other source IP  -&gt;&quot;</span>, check_cookie(spoof, cookie, isn, now))</span>
+<span id="d17-cb1-51"><a href="#d17-cb1-51" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> mss <span class="kw">in</span> (<span class="dv">1400</span>, <span class="dv">1220</span>, <span class="dv">9001</span>):</span>
+<span id="d17-cb1-52"><a href="#d17-cb1-52" aria-hidden="true" tabindex="-1"></a>    c <span class="op">=</span> make_cookie(tup, isn, now, client_mss<span class="op">=</span>mss)</span>
+<span id="d17-cb1-53"><a href="#d17-cb1-53" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;client mss </span><span class="sc">{</span>mss<span class="sc">:&gt;4}</span><span class="ss"> -&gt; recovered </span><span class="sc">{</span>check_cookie(tup, c, isn, now)<span class="sc">}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+<p>Real output:</p>
+<pre class="text"><code>SYN    seq=1829441017  mss=1460   -&gt; server stores NOTHING
+SYN-ACK seq=2017476689  &lt;- the cookie (minute counter 117)
+ACK    ack=2017476690
+  valid ACK, same minute     -&gt; 1460
+  valid ACK, 2 minutes later -&gt; 1460
+  valid ACK, 3 minutes later -&gt; None
+  guessed ack (cookie+999)   -&gt; None
+  same ack, other source IP  -&gt; None
+client mss 1400 -&gt; recovered 1300
+client mss 1220 -&gt; recovered 536
+client mss 9001 -&gt; recovered 1460</code></pre>
+<p>Read the last three lines carefully. A client advertising MSS 1400 gets 1300, because 1400 isn't in the table and the cookie rounds <em>down</em>. That's a little throughput lost per segment, and it's the price of statelessness. A jumbo-frame client asking for 9001 gets 1460. The forged and replayed ACKs fail because the attacker would have to guess a 24-bit keyed value bound to the exact 4-tuple. A random guess passes about 4 times in 16.7 million.</p>
+<h2 id="d17-wire">Deep dive: what the wire and the kernel actually show</h2>
+<h3 id="d17-syn-flood-capture">A SYN flood, packet by packet</h3>
+<p>Here is a capture on the server during a flood. The addresses are documentation ranges; the field values are what Linux and typical flood tools produce. The <code>-S</code> flag prints absolute sequence numbers, so the cookie arithmetic is visible.</p>
+<pre class="text"><code>$ sudo tcpdump -nn -v -S -i eth0 &#39;tcp port 443 and tcp[tcpflags] &amp; tcp-syn != 0&#39;
+
+# 1. Spoofed SYN from a flood tool: no options, odd window, high TTL.
+09:41:07.112301 IP (tos 0x0, ttl 243, id 54321, offset 0, flags [none], proto TCP (6), length 40)
+    198.51.100.77.4012 &gt; 203.0.113.10.443: Flags [S], seq 1520004417, win 1024, length 0
+# 2. Server answers with a cookie. No options came in, so only MSS goes out.
+09:41:07.112330 IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto TCP (6), length 44)
+    203.0.113.10.443 &gt; 198.51.100.77.4012: Flags [S.], seq 2741190876, ack 1520004418, win 64240, options [mss 1460], length 0
+#    ...198.51.100.77 never sent that SYN, so nobody ever ACKs. Nothing to clean up.
+
+# 3. A real client (Linux): full options, including timestamps.
+09:41:07.118802 IP (tos 0x0, ttl 52, id 18823, offset 0, flags [DF], proto TCP (6), length 60)
+    192.0.2.44.51544 &gt; 203.0.113.10.443: Flags [S], seq 1829441017, win 64240, options [mss 1460,sackOK,TS val 401922 ecr 0,nop,wscale 7], length 0
+# 4. Cookie SYN-ACK. The TS val carries wscale/SACK/ECN in its low bits.
+09:41:07.118829 IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto TCP (6), length 60)
+    203.0.113.10.443 &gt; 192.0.2.44.51544: Flags [S.], seq 2017476689, ack 1829441018, win 65160, options [mss 1460,sackOK,TS val 2391842113 ecr 401922,nop,wscale 7], length 0</code></pre>
+<p>The filter only matches SYN and SYN-ACK, so the client's ACK isn't shown. It carries <code>ack 2017476690</code>: cookie + 1. (The cookie value matches the simulation above, which used the same 4-tuple and ISN.) Three things in this capture say "attack," not "busy." The flood SYNs carry no TCP options, and every real operating system sends at least an MSS. Their TTL is 243, meaning the sender started at 255; Linux, macOS and Windows start at 64 or 128. And when you look across thousands of these packets, the TTL and IP ID barely vary while the source addresses are all different. That's one machine wearing many addresses.</p>
+<p>The kernel tells you the rest through counters. <code>nstat</code> prints deltas since its last run; <code>-az</code> prints absolute values including zeros.</p>
+<pre class="text"><code>$ nstat -az | grep -E &#39;Syncookies|ListenOverflows|ListenDrops|ReqQFull&#39;
+TcpExtSyncookiesSent            1843220            0.0
+TcpExtSyncookiesRecv            3914               0.0
+TcpExtSyncookiesFailed          112                0.0
+TcpExtListenOverflows           0                  0.0
+TcpExtListenDrops               0                  0.0
+TcpExtTCPReqQFullDoCookies      1843220            0.0
+TcpExtTCPReqQFullDrop           0                  0.0
+
+$ dmesg | grep -i &#39;syn flood&#39;
+TCP: request_sock_TCP: Possible SYN flooding on port 443. Sending cookies.  Check SNMP counters.
+
+$ ss -lnt &#39;sport = :443&#39;
+State   Recv-Q  Send-Q   Local Address:Port   Peer Address:Port
+LISTEN  0       4096           0.0.0.0:443         0.0.0.0:*</code></pre>
+<p>(The exact <code>dmesg</code> wording varies by kernel version; newer kernels include the bound address.)</p>
+<p>Here is how to read those numbers together. 1.8 million cookies went out. About 3,900 came back valid: those are real clients who connected <em>during</em> the flood and never noticed. The 112 failures are late or forged ACKs. <code>ListenOverflows</code> is zero, so the <em>accept</em> queue never filled — the application kept up. On a listening socket, <code>ss</code> shows the accept queue's current length in <code>Recv-Q</code> and its limit in <code>Send-Q</code>. Zero out of 4096 is healthy.</p>
+<p>Now compare a different incident with the same client symptom. There, <code>ListenOverflows</code> and <code>ListenDrops</code> climb and <code>Recv-Q</code> sits at 4096, while the cookie counters stay at zero. That isn't an attack. The application stopped calling <code>accept()</code> fast enough — a stuck event loop, a thread pool at its limit. No firewall setting helps. Two queues, two fixes.</p>
+<h3 id="d17-amplification-capture">Amplification on the victim's wire</h3>
+<p>Reflection looks strange from the victim's side: answers to questions you never asked.</p>
+<pre class="text"><code>$ sudo tcpdump -nn -i eth0 &#39;udp src port 53 or (ip[6:2] &amp; 0x1fff != 0)&#39;
+10:03:41.220114 IP 192.0.2.53.53 &gt; 203.0.113.10.47212: 4823 28/0/1 TXT &quot;v=spf1 ...&quot;, ... (3410)
+10:03:41.220119 IP 192.0.2.53 &gt; 203.0.113.10: ip-proto-17
+10:03:41.220131 IP 198.51.100.8.53 &gt; 203.0.113.10.47212: 4823 28/0/1 TXT &quot;v=spf1 ...&quot;, ... (3410)
+10:03:41.220135 IP 198.51.100.8 &gt; 203.0.113.10: ip-proto-17</code></pre>
+<p>The DNS responses arrive at port 47212 from hundreds of resolvers. Every one carries the same query ID, because the attacker forged one query and sprayed it. They are 3,410 bytes, so each one shows up as a first fragment plus a trailing fragment (<code>ip-proto-17</code> is tcpdump's name for a non-first UDP fragment, which has no port numbers). Your own resolver logs show no matching outbound query. That mismatch — inbound responses with no outbound request — is the signature of reflection.</p>
+<p>Fragments matter for the defence. A filter that matches "UDP source port 53" misses every trailing fragment, because those carry no UDP header. Scrubbing gear handles this by tracking fragments or by dropping non-initial UDP fragments to the target outright, which is safe for most services.</p>
+<h3 id="d17-urpf">Spoofing and the reverse-path check</h3>
+<p>BCP 38 (RFC 2827) says an edge network should drop outbound packets whose source address it doesn't own. The usual implementation is <strong>unicast reverse-path forwarding</strong> (uRPF), described in RFC 3704. For each arriving packet, the router looks up the <em>source</em> address in its forwarding table as if it were a destination. Then it applies one of two tests.</p>
+<ul>
+<li><strong>Strict mode.</strong> The best route back to the source must point out the same interface the packet came in on. If a customer port receives a packet from 8.8.8.8, the route to 8.8.8.8 points upstream, not to the customer, so the packet is dropped.</li>
+<li><strong>Loose mode.</strong> Any route to the source is enough, through any interface. This only drops sources that aren't routable at all: bogons, unallocated space.</li>
+</ul>
+<p>Strict mode is the one that stops spoofing, and it breaks on asymmetric paths. A multihomed customer can legitimately send traffic out link A while your route back to them prefers link B. Strict uRPF drops that traffic. So operators fall back to loose mode on such links, and loose mode lets nearly every spoofed packet through, because nearly every address is routable somewhere. RFC 8704 ("enhanced feasible-path uRPF") tries to fix this by also accepting sources that the customer <em>could</em> legitimately use, based on all the BGP routes the customer announced, not only the best ones.</p>
+<p>Linux has the same check in miniature as <code>net.ipv4.conf.*.rp_filter</code>: 0 is off, 1 is strict, 2 is loose. Many distributions ship with 1 or 2; the test container this guide was built on had 0. Drops show up in one counter:</p>
+<pre class="text"><code>$ nstat -az TcpExtIPReversePathFilter
+TcpExtIPReversePathFilter       2291               0.0</code></pre>
+<p>Remember that counter. Module 18's deep dive comes back to it, because strict <code>rp_filter</code> on a host with two interfaces causes one of the most confusing incidents in Linux networking.</p>
+<h3 id="d17-tls-interception">TLS interception, seen from the client</h3>
+<p>A TLS-inspecting proxy runs two TLS sessions. It accepts your ClientHello, reads the SNI to learn which site you want, and opens its own TLS connection to that site. Then it mints a certificate for the same hostname on the fly, signed by an issuing CA whose root your company's device management installed on your laptop. Your browser validates that chain against the installed root and is satisfied. The proxy now has the plaintext of both sides.</p>
+<p>Here is the same host seen from a managed laptop on the corporate network (constructed, with names changed):</p>
+<pre class="text"><code>$ openssl s_client -connect www.example.com:443 -servername www.example.com &lt;/dev/null 2&gt;/dev/null \
+    | grep -E &#39;^ *[0-9] s:|^ *i:&#39;
+ 0 s:CN = www.example.com
+   i:C = US, O = Corp IT, CN = Corp TLS Inspection Issuing CA 2026
+ 1 s:C = US, O = Corp IT, CN = Corp TLS Inspection Issuing CA 2026
+   i:C = US, O = Corp IT, CN = Corp Root CA</code></pre>
+<p>From a phone on cellular, the issuer is a public CA. That difference is the whole test: compare the issuer, or the certificate's SHA-256 fingerprint (<code>openssl x509 -noout -fingerprint -sha256</code>), from two vantage points.</p>
+<p>Interception has precise, predictable breakages. Knowing them is what separates someone who has run it from someone who has read about it.</p>
+<ul>
+<li><strong>Client certificates (mTLS) cannot pass through.</strong> In the handshake, the client signs the handshake transcript with its private key. The proxy's transcript with the server is a different transcript, and the proxy doesn't hold your key. So mTLS destinations must be on a bypass list, or the proxy has to present <em>its own</em> client certificate, which means the server authenticates the proxy, not you.</li>
+<li><strong>Certificate pinning breaks.</strong> Apps that pin a public key or a specific CA reject the minted certificate. Mobile apps and some CLIs fail with errors that look like network faults.</li>
+<li><strong>Encrypted Client Hello hides the SNI.</strong> With ECH, the visible SNI names only the provider's shared front end. The proxy can no longer choose a policy per site. Enterprise deployments usually respond by making sure managed clients never receive ECH configurations, or by blocking it.</li>
+<li><strong>The proxy becomes the weakest validator.</strong> Your browser is no longer checking the origin's certificate; the proxy is. Measurement studies have repeatedly found inspection products that accept weaker ciphers or validate upstream certificates less strictly than the browsers behind them.</li>
+</ul>
+<p>There's also a history lesson hidden in every TLS 1.3 handshake. Early TLS 1.3 drafts failed in the field because middleboxes dropped anything that didn't look like TLS 1.2. So RFC 8446 Appendix D.4 defines a "middlebox compatibility mode." The ClientHello still claims version 0x0303 (TLS 1.2) and carries the real version in the <code>supported_versions</code> extension. It sends a non-empty legacy session ID and a dummy ChangeCipherSpec message. A TLS 1.3 handshake on the wire is dressed up as a TLS 1.2 resumption so that broken inspection boxes leave it alone.</p>
+<h3 id="d17-mtls-code">mTLS and identity-aware access, as code</h3>
+<p>Zero trust between services usually means mutual TLS with a workload identity in the certificate. SPIFFE standardises the format: the identity is a URI such as <code>spiffe://prod.example/ns/payments/sa/api</code>, carried as a URI subject alternative name in a short-lived X.509 certificate called an SVID. Two separate checks happen, and conflating them is the most common design bug.</p>
+<ol type="1">
+<li><strong>Authentication</strong>, inside the TLS handshake: the peer's certificate chains to the trust domain's CA, it's within its validity window, and the peer proved it holds the matching private key.</li>
+<li><strong>Authorization</strong>, after the handshake: <em>this</em> identity may call <em>this</em> service. TLS libraries do not do this for you. "Any valid certificate from our CA" is authentication only, and it lets every workload in the trust domain talk to every other one. That is a flat network rebuilt in cryptography.</li>
+</ol>
+<p>The demo issues certificates with <code>openssl</code> (the standard library can't create certificates). Then a Python server requires a client certificate and checks the SPIFFE ID against an allowlist.</p>
+<div class="sourceCode" id="d17-cb8"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d17-cb8-1"><a href="#d17-cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># d17_mk_pki.sh — a trust-domain CA, three workload certs, and a forged one</span></span>
+<span id="d17-cb8-2"><a href="#d17-cb8-2" aria-hidden="true" tabindex="-1"></a><span class="bu">set</span> <span class="at">-e</span></span>
+<span id="d17-cb8-3"><a href="#d17-cb8-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Trust-domain CA (in production: SPIRE, Istio, or a cloud CA)</span></span>
+<span id="d17-cb8-4"><a href="#d17-cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> req <span class="at">-x509</span> <span class="at">-newkey</span> ec <span class="at">-pkeyopt</span> ec_paramgen_curve:P-256 <span class="at">-nodes</span> <span class="at">-days</span> 7 <span class="dt">\</span></span>
+<span id="d17-cb8-5"><a href="#d17-cb8-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-keyout</span> ca.key <span class="at">-out</span> ca.pem <span class="at">-subj</span> <span class="st">&quot;/O=prod.example/CN=prod.example workload CA&quot;</span> <span class="at">-addext</span> <span class="st">&quot;keyUsage=critical,keyCertSign,cRLSign&quot;</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="d17-cb8-6"><a href="#d17-cb8-6" aria-hidden="true" tabindex="-1"></a><span class="fu">leaf()</span> <span class="kw">{</span>  <span class="co"># name, URI SAN, signing CA prefix</span></span>
+<span id="d17-cb8-7"><a href="#d17-cb8-7" aria-hidden="true" tabindex="-1"></a>  <span class="ex">openssl</span> req <span class="at">-newkey</span> ec <span class="at">-pkeyopt</span> ec_paramgen_curve:P-256 <span class="at">-nodes</span> <span class="at">-keyout</span> <span class="va">$1</span>.key <span class="dt">\</span></span>
+<span id="d17-cb8-8"><a href="#d17-cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">-subj</span> <span class="st">&quot;/O=prod.example&quot;</span> <span class="at">-out</span> <span class="va">$1</span>.csr <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="d17-cb8-9"><a href="#d17-cb8-9" aria-hidden="true" tabindex="-1"></a>  <span class="bu">printf</span> <span class="st">&quot;subjectAltName=%s\nextendedKeyUsage=serverAuth,clientAuth\nkeyUsage=critical,digitalSignature\nauthorityKeyIdentifier=keyid\n&quot;</span> <span class="st">&quot;</span><span class="va">$2</span><span class="st">&quot;</span> <span class="op">&gt;</span> <span class="va">$1</span>.ext</span>
+<span id="d17-cb8-10"><a href="#d17-cb8-10" aria-hidden="true" tabindex="-1"></a>  <span class="ex">openssl</span> x509 <span class="at">-req</span> <span class="at">-in</span> <span class="va">$1</span>.csr <span class="at">-CA</span> <span class="va">$3</span>.pem <span class="at">-CAkey</span> <span class="va">$3</span>.key <span class="at">-CAcreateserial</span> <span class="at">-days</span> 1 <span class="dt">\</span></span>
+<span id="d17-cb8-11"><a href="#d17-cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">-extfile</span> <span class="va">$1</span>.ext <span class="at">-out</span> <span class="va">$1</span>.pem <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="d17-cb8-12"><a href="#d17-cb8-12" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="d17-cb8-13"><a href="#d17-cb8-13" aria-hidden="true" tabindex="-1"></a><span class="ex">leaf</span> db     <span class="st">&quot;URI:spiffe://prod.example/ns/data/sa/payments-db,DNS:payments-db&quot;</span> ca</span>
+<span id="d17-cb8-14"><a href="#d17-cb8-14" aria-hidden="true" tabindex="-1"></a><span class="ex">leaf</span> api    <span class="st">&quot;URI:spiffe://prod.example/ns/payments/sa/api&quot;</span> ca</span>
+<span id="d17-cb8-15"><a href="#d17-cb8-15" aria-hidden="true" tabindex="-1"></a><span class="ex">leaf</span> report <span class="st">&quot;URI:spiffe://prod.example/ns/analytics/sa/report&quot;</span> ca</span>
+<span id="d17-cb8-16"><a href="#d17-cb8-16" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> req <span class="at">-x509</span> <span class="at">-newkey</span> ec <span class="at">-pkeyopt</span> ec_paramgen_curve:P-256 <span class="at">-nodes</span> <span class="at">-days</span> 7 <span class="dt">\</span></span>
+<span id="d17-cb8-17"><a href="#d17-cb8-17" aria-hidden="true" tabindex="-1"></a>  <span class="at">-keyout</span> rogue.key <span class="at">-out</span> rogue.pem <span class="at">-subj</span> <span class="st">&quot;/CN=attacker CA&quot;</span> <span class="at">-addext</span> <span class="st">&quot;keyUsage=critical,keyCertSign,cRLSign&quot;</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="d17-cb8-18"><a href="#d17-cb8-18" aria-hidden="true" tabindex="-1"></a><span class="ex">leaf</span> forged <span class="st">&quot;URI:spiffe://prod.example/ns/payments/sa/api&quot;</span> rogue</span></code></pre></div>
+<p><code>d17_mtls_authz.py</code>:</p>
+<div class="sourceCode" id="d17-cb9"><pre class="sourceCode python"><code class="sourceCode python"><span id="d17-cb9-1"><a href="#d17-cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;mTLS + identity authorization: the server trusts a CA, then a SPIFFE ID.</span></span>
+<span id="d17-cb9-2"><a href="#d17-cb9-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb9-3"><a href="#d17-cb9-3" aria-hidden="true" tabindex="-1"></a><span class="co">Authentication = &quot;the certificate chains to our CA and the peer holds the key.&quot;</span></span>
+<span id="d17-cb9-4"><a href="#d17-cb9-4" aria-hidden="true" tabindex="-1"></a><span class="co">Authorization  = &quot;this identity may call this service.&quot; Two separate checks.</span></span>
+<span id="d17-cb9-5"><a href="#d17-cb9-5" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d17-cb9-6"><a href="#d17-cb9-6" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> socket</span>
+<span id="d17-cb9-7"><a href="#d17-cb9-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> ssl</span>
+<span id="d17-cb9-8"><a href="#d17-cb9-8" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> threading</span>
+<span id="d17-cb9-9"><a href="#d17-cb9-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb9-10"><a href="#d17-cb9-10" aria-hidden="true" tabindex="-1"></a>ALLOWED <span class="op">=</span> {<span class="st">&quot;spiffe://prod.example/ns/payments/sa/api&quot;</span>}   <span class="co"># the policy</span></span>
+<span id="d17-cb9-11"><a href="#d17-cb9-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb9-12"><a href="#d17-cb9-12" aria-hidden="true" tabindex="-1"></a>srv_ctx <span class="op">=</span> ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)</span>
+<span id="d17-cb9-13"><a href="#d17-cb9-13" aria-hidden="true" tabindex="-1"></a>srv_ctx.minimum_version <span class="op">=</span> ssl.TLSVersion.TLSv1_3</span>
+<span id="d17-cb9-14"><a href="#d17-cb9-14" aria-hidden="true" tabindex="-1"></a>srv_ctx.load_cert_chain(<span class="st">&quot;db.pem&quot;</span>, <span class="st">&quot;db.key&quot;</span>)</span>
+<span id="d17-cb9-15"><a href="#d17-cb9-15" aria-hidden="true" tabindex="-1"></a>srv_ctx.load_verify_locations(<span class="st">&quot;ca.pem&quot;</span>)</span>
+<span id="d17-cb9-16"><a href="#d17-cb9-16" aria-hidden="true" tabindex="-1"></a>srv_ctx.verify_mode <span class="op">=</span> ssl.CERT_REQUIRED                   <span class="co"># the &quot;m&quot; in mTLS</span></span>
+<span id="d17-cb9-17"><a href="#d17-cb9-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb9-18"><a href="#d17-cb9-18" aria-hidden="true" tabindex="-1"></a>listener <span class="op">=</span> socket.create_server((<span class="st">&quot;127.0.0.1&quot;</span>, <span class="dv">0</span>))</span>
+<span id="d17-cb9-19"><a href="#d17-cb9-19" aria-hidden="true" tabindex="-1"></a>port <span class="op">=</span> listener.getsockname()[<span class="dv">1</span>]</span>
+<span id="d17-cb9-20"><a href="#d17-cb9-20" aria-hidden="true" tabindex="-1"></a>log <span class="op">=</span> []</span>
+<span id="d17-cb9-21"><a href="#d17-cb9-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb9-22"><a href="#d17-cb9-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb9-23"><a href="#d17-cb9-23" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> serve_one():</span>
+<span id="d17-cb9-24"><a href="#d17-cb9-24" aria-hidden="true" tabindex="-1"></a>    raw, _ <span class="op">=</span> listener.accept()</span>
+<span id="d17-cb9-25"><a href="#d17-cb9-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="d17-cb9-26"><a href="#d17-cb9-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> srv_ctx.wrap_socket(raw, server_side<span class="op">=</span><span class="va">True</span>) <span class="im">as</span> tls:</span>
+<span id="d17-cb9-27"><a href="#d17-cb9-27" aria-hidden="true" tabindex="-1"></a>            sans <span class="op">=</span> tls.getpeercert().get(<span class="st">&quot;subjectAltName&quot;</span>, ())</span>
+<span id="d17-cb9-28"><a href="#d17-cb9-28" aria-hidden="true" tabindex="-1"></a>            ids <span class="op">=</span> [v <span class="cf">for</span> k, v <span class="kw">in</span> sans <span class="cf">if</span> k <span class="op">==</span> <span class="st">&quot;URI&quot;</span>]</span>
+<span id="d17-cb9-29"><a href="#d17-cb9-29" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> ids <span class="kw">and</span> ids[<span class="dv">0</span>] <span class="kw">in</span> ALLOWED:                 <span class="co"># authorization</span></span>
+<span id="d17-cb9-30"><a href="#d17-cb9-30" aria-hidden="true" tabindex="-1"></a>                tls.sendall(<span class="ss">f&quot;200 hello </span><span class="sc">{</span>ids[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">&quot;</span>.encode())</span>
+<span id="d17-cb9-31"><a href="#d17-cb9-31" aria-hidden="true" tabindex="-1"></a>            <span class="cf">else</span>:</span>
+<span id="d17-cb9-32"><a href="#d17-cb9-32" aria-hidden="true" tabindex="-1"></a>                tls.sendall(<span class="ss">f&quot;403 </span><span class="sc">{</span>ids[<span class="dv">0</span>] <span class="cf">if</span> ids <span class="cf">else</span> <span class="st">&#39;?&#39;</span><span class="sc">}</span><span class="ss"> not allowed&quot;</span>.encode())</span>
+<span id="d17-cb9-33"><a href="#d17-cb9-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">except</span> ssl.SSLError <span class="im">as</span> e:</span>
+<span id="d17-cb9-34"><a href="#d17-cb9-34" aria-hidden="true" tabindex="-1"></a>        log.append(<span class="ss">f&quot;  server: rejected handshake: </span><span class="sc">{</span>e<span class="sc">.</span>reason<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d17-cb9-35"><a href="#d17-cb9-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb9-36"><a href="#d17-cb9-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb9-37"><a href="#d17-cb9-37" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> call(label, cert<span class="op">=</span><span class="va">None</span>):</span>
+<span id="d17-cb9-38"><a href="#d17-cb9-38" aria-hidden="true" tabindex="-1"></a>    ctx <span class="op">=</span> ssl.create_default_context(cafile<span class="op">=</span><span class="st">&quot;ca.pem&quot;</span>)</span>
+<span id="d17-cb9-39"><a href="#d17-cb9-39" aria-hidden="true" tabindex="-1"></a>    ctx.check_hostname <span class="op">=</span> <span class="va">True</span></span>
+<span id="d17-cb9-40"><a href="#d17-cb9-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> cert:</span>
+<span id="d17-cb9-41"><a href="#d17-cb9-41" aria-hidden="true" tabindex="-1"></a>        ctx.load_cert_chain(<span class="ss">f&quot;</span><span class="sc">{</span>cert<span class="sc">}</span><span class="ss">.pem&quot;</span>, <span class="ss">f&quot;</span><span class="sc">{</span>cert<span class="sc">}</span><span class="ss">.key&quot;</span>)</span>
+<span id="d17-cb9-42"><a href="#d17-cb9-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="d17-cb9-43"><a href="#d17-cb9-43" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> socket.create_connection((<span class="st">&quot;127.0.0.1&quot;</span>, port)) <span class="im">as</span> raw:</span>
+<span id="d17-cb9-44"><a href="#d17-cb9-44" aria-hidden="true" tabindex="-1"></a>            <span class="cf">with</span> ctx.wrap_socket(raw, server_hostname<span class="op">=</span><span class="st">&quot;payments-db&quot;</span>) <span class="im">as</span> tls:</span>
+<span id="d17-cb9-45"><a href="#d17-cb9-45" aria-hidden="true" tabindex="-1"></a>                log.append(<span class="ss">f&quot;  client: handshake complete (</span><span class="sc">{</span>tls<span class="sc">.</span>version()<span class="sc">}</span><span class="ss">)&quot;</span>)</span>
+<span id="d17-cb9-46"><a href="#d17-cb9-46" aria-hidden="true" tabindex="-1"></a>                log.append(<span class="ss">f&quot;  client: reply = </span><span class="sc">{</span>tls<span class="sc">.</span>recv(<span class="dv">200</span>)<span class="sc">.</span>decode()<span class="sc">!r}</span><span class="ss">&quot;</span>)</span>
+<span id="d17-cb9-47"><a href="#d17-cb9-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">except</span> (ssl.SSLError, <span class="pp">ConnectionResetError</span>) <span class="im">as</span> e:</span>
+<span id="d17-cb9-48"><a href="#d17-cb9-48" aria-hidden="true" tabindex="-1"></a>        log.append(<span class="ss">f&quot;  client: first read fails: </span><span class="sc">{</span><span class="bu">getattr</span>(e, <span class="st">&#39;reason&#39;</span>, e)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d17-cb9-49"><a href="#d17-cb9-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb9-50"><a href="#d17-cb9-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb9-51"><a href="#d17-cb9-51" aria-hidden="true" tabindex="-1"></a>cases <span class="op">=</span> [(<span class="st">&quot;no client certificate&quot;</span>, <span class="va">None</span>), (<span class="st">&quot;cert from attacker CA&quot;</span>, <span class="st">&quot;forged&quot;</span>),</span>
+<span id="d17-cb9-52"><a href="#d17-cb9-52" aria-hidden="true" tabindex="-1"></a>         (<span class="st">&quot;payments/api (valid, allowed)&quot;</span>, <span class="st">&quot;api&quot;</span>),</span>
+<span id="d17-cb9-53"><a href="#d17-cb9-53" aria-hidden="true" tabindex="-1"></a>         (<span class="st">&quot;analytics/report (valid, denied)&quot;</span>, <span class="st">&quot;report&quot;</span>)]</span>
+<span id="d17-cb9-54"><a href="#d17-cb9-54" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> label, cert <span class="kw">in</span> cases:</span>
+<span id="d17-cb9-55"><a href="#d17-cb9-55" aria-hidden="true" tabindex="-1"></a>    t <span class="op">=</span> threading.Thread(target<span class="op">=</span>serve_one)</span>
+<span id="d17-cb9-56"><a href="#d17-cb9-56" aria-hidden="true" tabindex="-1"></a>    t.start()</span>
+<span id="d17-cb9-57"><a href="#d17-cb9-57" aria-hidden="true" tabindex="-1"></a>    call(label, cert)</span>
+<span id="d17-cb9-58"><a href="#d17-cb9-58" aria-hidden="true" tabindex="-1"></a>    t.join()</span>
+<span id="d17-cb9-59"><a href="#d17-cb9-59" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(label)</span>
+<span id="d17-cb9-60"><a href="#d17-cb9-60" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">&quot;</span>.join(<span class="bu">sorted</span>(log, key<span class="op">=</span><span class="kw">lambda</span> x: <span class="st">&quot;server&quot;</span> <span class="kw">in</span> x)))</span>
+<span id="d17-cb9-61"><a href="#d17-cb9-61" aria-hidden="true" tabindex="-1"></a>    log.clear()</span></code></pre></div>
+<p>Real output:</p>
+<pre class="text"><code>no client certificate
+  client: handshake complete (TLSv1.3)
+  client: first read fails: TLSV13_ALERT_CERTIFICATE_REQUIRED
+  server: rejected handshake: PEER_DID_NOT_RETURN_A_CERTIFICATE
+cert from attacker CA
+  client: handshake complete (TLSv1.3)
+  client: first read fails: TLSV1_ALERT_UNKNOWN_CA
+  server: rejected handshake: CERTIFICATE_VERIFY_FAILED
+payments/api (valid, allowed)
+  client: handshake complete (TLSv1.3)
+  client: reply = &#39;200 hello spiffe://prod.example/ns/payments/sa/api&#39;
+analytics/report (valid, denied)
+  client: handshake complete (TLSv1.3)
+  client: reply = &#39;403 spiffe://prod.example/ns/analytics/sa/report not allowed&#39;</code></pre>
+<p>Look at the first two cases. The <em>client</em> reports "handshake complete" and only fails on its first read. That isn't a bug in the demo. In TLS 1.3 the client sends its certificate in its final flight and considers the handshake finished. The server validates it afterwards and replies with an alert. So a client without a valid certificate sees success from <code>connect()</code> and then an error on its first <code>recv()</code>. Expect this when you debug mTLS: the client logs say "connected," the server logs say "rejected," and both are telling the truth.</p>
+<p>The fourth case is the one zero-trust designs exist for. The analytics workload holds a perfectly valid certificate from the right CA, and it is still refused, because policy names identities, not CAs.</p>
+<h2 id="d17-numbers">Deep dive: by the numbers</h2>
+<h3 id="d17-flood-math">Packet rates and amplification</h3>
+<p>A flood is measured in two units, and they stress different things. Bits per second fill links. Packets per second exhaust CPUs, interrupt budgets and lookup tables. A minimum-size Ethernet frame is 64 bytes, and the preamble and inter-frame gap occupy another 20 byte-times on the wire, so a 10 Gbps link carries at most 14.88 million minimum-size packets per second.</p>
+<p>Bandwidth amplification factors come from US-CERT alert TA14-017A, with memcached added after the 2018 attacks. They measure UDP payload out divided by UDP payload in. Real reflectors vary widely, and many NTP servers no longer answer <code>monlist</code> at all.</p>
+<p><code>d17_flood_math.py</code>:</p>
+<div class="sourceCode" id="d17-cb11"><pre class="sourceCode python"><code class="sourceCode python"><span id="d17-cb11-1"><a href="#d17-cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Back-of-envelope DDoS numbers: packet rates and reflection output.&quot;&quot;&quot;</span></span>
+<span id="d17-cb11-2"><a href="#d17-cb11-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb11-3"><a href="#d17-cb11-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Smallest Ethernet frame is 64 bytes; preamble+SFD (8) and the</span></span>
+<span id="d17-cb11-4"><a href="#d17-cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co"># inter-frame gap (12) also occupy the wire, so 84 byte-times per packet.</span></span>
+<span id="d17-cb11-5"><a href="#d17-cb11-5" aria-hidden="true" tabindex="-1"></a>WIRE_BYTES_MIN <span class="op">=</span> <span class="dv">64</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">12</span></span>
+<span id="d17-cb11-6"><a href="#d17-cb11-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb11-7"><a href="#d17-cb11-7" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> gbps <span class="kw">in</span> (<span class="dv">1</span>, <span class="dv">10</span>, <span class="dv">100</span>):</span>
+<span id="d17-cb11-8"><a href="#d17-cb11-8" aria-hidden="true" tabindex="-1"></a>    pps <span class="op">=</span> gbps <span class="op">*</span> <span class="fl">1e9</span> <span class="op">/</span> (WIRE_BYTES_MIN <span class="op">*</span> <span class="dv">8</span>)</span>
+<span id="d17-cb11-9"><a href="#d17-cb11-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>gbps<span class="sc">:&gt;3}</span><span class="ss"> Gbps of minimum-size SYNs = </span><span class="sc">{</span>pps <span class="op">/</span> <span class="fl">1e6</span><span class="sc">:6.2f}</span><span class="ss"> Mpps&quot;</span>)</span>
+<span id="d17-cb11-10"><a href="#d17-cb11-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb11-11"><a href="#d17-cb11-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Bandwidth amplification factor = UDP payload out / UDP payload in.</span></span>
+<span id="d17-cb11-12"><a href="#d17-cb11-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Ranges from US-CERT TA14-017A (memcached added 2018). Real servers vary.</span></span>
+<span id="d17-cb11-13"><a href="#d17-cb11-13" aria-hidden="true" tabindex="-1"></a>factors <span class="op">=</span> {</span>
+<span id="d17-cb11-14"><a href="#d17-cb11-14" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;DNS (open resolver, ANY)&quot;</span>: <span class="dv">54</span>,</span>
+<span id="d17-cb11-15"><a href="#d17-cb11-15" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;NTP (monlist)&quot;</span>: <span class="fl">556.9</span>,</span>
+<span id="d17-cb11-16"><a href="#d17-cb11-16" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;CLDAP&quot;</span>: <span class="dv">70</span>,</span>
+<span id="d17-cb11-17"><a href="#d17-cb11-17" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;SSDP&quot;</span>: <span class="fl">30.8</span>,</span>
+<span id="d17-cb11-18"><a href="#d17-cb11-18" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;memcached (UDP 11211)&quot;</span>: <span class="dv">51_000</span>,</span>
+<span id="d17-cb11-19"><a href="#d17-cb11-19" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="d17-cb11-20"><a href="#d17-cb11-20" aria-hidden="true" tabindex="-1"></a>attacker_gbps <span class="op">=</span> <span class="fl">1.0</span></span>
+<span id="d17-cb11-21"><a href="#d17-cb11-21" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="ss">attacker sends </span><span class="sc">{</span>attacker_gbps<span class="sc">}</span><span class="ss"> Gbps of spoofed requests:&quot;</span>)</span>
+<span id="d17-cb11-22"><a href="#d17-cb11-22" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> name, f <span class="kw">in</span> factors.items():</span>
+<span id="d17-cb11-23"><a href="#d17-cb11-23" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> attacker_gbps <span class="op">*</span> f</span>
+<span id="d17-cb11-24"><a href="#d17-cb11-24" aria-hidden="true" tabindex="-1"></a>    unit <span class="op">=</span> <span class="ss">f&quot;</span><span class="sc">{</span>out <span class="op">/</span> <span class="dv">1000</span><span class="sc">:,.1f}</span><span class="ss"> Tbps&quot;</span> <span class="cf">if</span> out <span class="op">&gt;=</span> <span class="dv">1000</span> <span class="cf">else</span> <span class="ss">f&quot;</span><span class="sc">{</span>out<span class="sc">:,.1f}</span><span class="ss"> Gbps&quot;</span></span>
+<span id="d17-cb11-25"><a href="#d17-cb11-25" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span>name<span class="sc">:&lt;26}</span><span class="ss"> x</span><span class="sc">{</span>f<span class="sc">:&gt;9,}</span><span class="ss">  -&gt; </span><span class="sc">{</span>unit<span class="sc">}</span><span class="ss"> at the victim (if reflectors can send it)&quot;</span>)</span>
+<span id="d17-cb11-26"><a href="#d17-cb11-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d17-cb11-27"><a href="#d17-cb11-27" aria-hidden="true" tabindex="-1"></a><span class="co"># The cap in practice is the reflectors&#39; own uplinks, not the factor.</span></span>
+<span id="d17-cb11-28"><a href="#d17-cb11-28" aria-hidden="true" tabindex="-1"></a>reflectors, uplink_mbps <span class="op">=</span> <span class="dv">20_000</span>, <span class="dv">100</span></span>
+<span id="d17-cb11-29"><a href="#d17-cb11-29" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="sc">{</span>reflectors<span class="sc">:,}</span><span class="ss"> DNS reflectors x </span><span class="sc">{</span>uplink_mbps<span class="sc">}</span><span class="ss"> Mbps usable each &quot;</span></span>
+<span id="d17-cb11-30"><a href="#d17-cb11-30" aria-hidden="true" tabindex="-1"></a>      <span class="ss">f&quot;= </span><span class="sc">{</span>reflectors <span class="op">*</span> uplink_mbps <span class="op">/</span> <span class="fl">1e3</span><span class="sc">:,.0f}</span><span class="ss"> Gbps ceiling&quot;</span>)</span></code></pre></div>
+<p>Real output:</p>
+<pre class="text"><code>  1 Gbps of minimum-size SYNs =   1.49 Mpps
+ 10 Gbps of minimum-size SYNs =  14.88 Mpps
+100 Gbps of minimum-size SYNs = 148.81 Mpps
+
+attacker sends 1.0 Gbps of spoofed requests:
+  DNS (open resolver, ANY)   x       54  -&gt; 54.0 Gbps at the victim (if reflectors can send it)
+  NTP (monlist)              x    556.9  -&gt; 556.9 Gbps at the victim (if reflectors can send it)
+  CLDAP                      x       70  -&gt; 70.0 Gbps at the victim (if reflectors can send it)
+  SSDP                       x     30.8  -&gt; 30.8 Gbps at the victim (if reflectors can send it)
+  memcached (UDP 11211)      x   51,000  -&gt; 51.0 Tbps at the victim (if reflectors can send it)
+
+20,000 DNS reflectors x 100 Mbps usable each = 2,000 Gbps ceiling</code></pre>
+<p>The memcached line is deliberately absurd. No attacker gets 51 Tbps from a 1 Gbps uplink, because the factor is only an upper bound: each reflector can send only what <em>its</em> uplink allows. The largest memcached attacks of 2018 measured in the low terabits. The binding constraint is the population of reflectors and their combined capacity, which is why cleaning up open resolvers and exposed memcached servers mattered as much as any filter.</p>
+<h3 id="d17-numbers-table">The numbers worth memorising</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Typical value</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>tcp_syncookies</code></td>
+<td>1</td>
+<td>Linux default: cookies only when the SYN queue overflows. 2 forces them always.</td>
+</tr>
+<tr class="even">
+<td><code>tcp_synack_retries</code></td>
+<td>5</td>
+<td>About 63 s of SYN-ACK retransmits per half-open slot (1+2+4+8+16+32 s). Cookie SYN-ACKs are never retransmitted.</td>
+</tr>
+<tr class="odd">
+<td><code>tcp_max_syn_backlog</code></td>
+<td>128 to 1024+</td>
+<td>Scales with RAM at boot. On current kernels the SYN queue is also bounded by the listen backlog.</td>
+</tr>
+<tr class="even">
+<td><code>somaxconn</code></td>
+<td>4096</td>
+<td>Linux 5.4 and later (was 128). macOS: <code>kern.ipc.somaxconn</code>, 128 by default.</td>
+</tr>
+<tr class="odd">
+<td>Cookie MSS values (IPv4)</td>
+<td>536, 1300, 1440, 1460</td>
+<td>Two bits of state; the client's MSS is rounded down.</td>
+</tr>
+<tr class="even">
+<td>Cookie lifetime</td>
+<td>about 2 minutes</td>
+<td>ACKs carrying an older cookie are rejected.</td>
+</tr>
+<tr class="odd">
+<td>Min-size packets per Gbps</td>
+<td>1.49 Mpps</td>
+<td>84 byte-times per 64-byte frame on the wire.</td>
+</tr>
+<tr class="even">
+<td>DNS / NTP / memcached factor</td>
+<td>up to 54 / 556.9 / 51,000</td>
+<td>TA14-017A ranges; real servers vary.</td>
+</tr>
+<tr class="odd">
+<td>SPIFFE SVID lifetime</td>
+<td>about an hour to a day</td>
+<td>Depends on deployment; short lifetimes replace revocation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="d17-cert-lifetime">Why short-lived certificates beat revocation</h3>
+<p>Here's a calculation that settles a design debate. Suppose a workload certificate leaks. With a 90-day certificate and no working revocation, the attacker's window is up to 90 days. With a one-hour certificate rotated every 30 minutes, the window is at most an hour, and nobody had to build or check a revocation list. That is why service meshes and SPIRE issue short-lived certificates by default. The cost moves to the issuing CA: a cluster with 5,000 workloads rotating every 30 minutes signs about 2.8 certificates per second, around the clock. The CA becomes a tier-zero dependency. If it's down for longer than a certificate's remaining lifetime, workloads stop being able to talk to each other.</p>
+<h2 id="d17-failures">Deep dive: production failure modes</h2>
+<p><strong>The flood that isn't a SYN flood.</strong> Symptom: new connections hang, CPU is fine, and someone turns on more cookies. Mechanism: the <em>accept</em> queue is full because the application is slow; SYN cookies do nothing for that queue. Proof: <code>nstat -az TcpExtListenOverflows</code> rising while <code>TcpExtSyncookiesSent</code> stays flat, and <code>ss -lnt</code> showing <code>Recv-Q</code> equal to <code>Send-Q</code> on the listener. Fix: find what blocks the accept loop, and raise the backlog only as a buffer.</p>
+<p><strong>SYN-ACK retransmits as an amplifier.</strong> Symptom: a server with cookies disabled (some appliances and tuned hosts do this) becomes part of an attack on someone else. Mechanism: each spoofed SYN creates a request socket, and the server retransmits the SYN-ACK five more times to the spoofed victim. That's six packets out for one in. Proof: outbound SYN-ACK packet rate far above inbound SYN rate in <code>tcpdump</code> or NetFlow. Fix: leave <code>tcp_syncookies</code> at 1, which never retransmits cookie SYN-ACKs because it holds no state to retransmit from.</p>
+<p><strong>Strict uRPF on an asymmetric edge.</strong> Symptom: after a routing change, some customers lose connectivity, and only in one direction. Mechanism: strict uRPF drops their packets because the best return route now points out a different interface. Proof: the router's uRPF drop counters on that interface; on Linux, <code>TcpExtIPReversePathFilter</code>. Fix: feasible-path uRPF (RFC 8704) or loose mode on that link, with explicit ACLs for the customer's prefixes so you don't give up BCP 38 entirely.</p>
+<p><strong>The identity-aware proxy with an open side door.</strong> Symptom: a penetration test reaches an internal app without logging in. Mechanism: the app trusted an identity header (such as <code>X-User</code> or the proxy's signed assertion) but also accepted connections that didn't come through the proxy. An attacker who can reach the backend directly just sets the header. Proof: <code>curl -H 'X-User: admin' http://backend:8080/</code> from inside the network. Fix, both halves: verify the proxy's signed assertion (a JWT: check signature, audience, issuer and expiry) on every request, <em>and</em> allow backend ingress only from the proxy — by mTLS between proxy and backend, or at minimum by firewall.</p>
+<p><strong>Default-deny that broke DNS.</strong> Symptom: you apply a Kubernetes default-deny egress policy to a namespace, and every pod starts failing with name-resolution timeouts, even to allowed services. Mechanism: DNS is egress too. Pods talk to CoreDNS on UDP and TCP 53, and the policy now denies it. Proof: <code>kubectl exec</code> into a pod and run <code>getent hosts kubernetes.default</code>; it hangs. Fix: an explicit egress rule to the DNS pods on both protocols, applied <em>before</em> the deny.</p>
+<pre class="text"><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny-plus-dns, namespace: payments}
+spec:
+  podSelector: {}                 # every pod in the namespace
+  policyTypes: [Ingress, Egress]  # nothing in, nothing out, except:
+  egress:
+  - to:
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+      podSelector: {matchLabels: {k8s-app: kube-dns}}
+    ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]</code></pre>
+<p><strong>Policy changes that don't cut existing flows.</strong> Symptom: you tighten a rule during an incident, and the attacker's session keeps working. Mechanism: most enforcement is stateful. The allow decision was made on the first packet and cached as a connection-tracking entry; later packets match the entry, not the rule. Whether a policy change flushes existing entries depends on the implementation. Proof: <code>conntrack -L -s &lt;attacker-ip&gt;</code> on the node (or the vendor's flow table) still shows the session. Fix: delete the tracked flows explicitly (<code>conntrack -D -s &lt;ip&gt;</code>), or kill the workload. Put this step in the incident runbook, because nobody remembers it at 3 AM.</p>
+<p><strong>The IP-based policy that lags pod churn.</strong> Symptom: brief, random connection failures right after deployments; sometimes a pod briefly reaches something it shouldn't. Mechanism: the enforcement layer compiles label-based policy into IP sets. A new pod gets an IP before every node has updated its sets, and a recycled IP briefly carries the previous pod's permissions. Proof: correlate the drops with pod creation times; check the CNI agent's sync latency metrics. Fix: identity-based enforcement where the data path checks a security identity rather than a raw IP, and readiness gates that wait for policy to be programmed.</p>
+<h2 id="d17-2026">Deep dive: 2026 context</h2>
+<p><strong>Microsegmentation is maps, not rules.</strong> In current Kubernetes networking the enforcement point is usually eBPF. Cilium, for example, gives each distinct set of pod labels a numeric security identity, keeps an IP-to-identity map on every node, and looks up policy by (identity, port, protocol) in an eBPF map on each packet. Calico can run as eBPF or iptables. Either way, the scaling question is the same: how fast does a change in the cluster reach every node's map? Policy correctness is now partly a distributed-systems problem.</p>
+<p><strong>Cloud security groups are hypervisor microsegmentation.</strong> On AWS, security groups are enforced outside the instance, in the virtualisation layer, and they are stateful, so the hypervisor keeps its own connection-tracking table per network interface. It has a limit, and on Nitro instances the ENA driver exposes a <code>conntrack_allowance_exceeded</code> counter in <code>ethtool -S</code>. That table is separate from the Linux kernel's. Module 18's deep dive shows how both can fill up.</p>
+<p><strong>DDoS moved to layer 7 and to protocol abuse.</strong> The largest attacks of recent years have been HTTP/2 request floods rather than raw bandwidth. The 2023 "Rapid Reset" attack (CVE-2023-44487) opened and immediately cancelled streams, so one connection could generate huge request rates while staying under the concurrent-stream limit. The defence was in HTTP/2 implementations — counting resets and closing abusive connections — not in any packet filter. It's the module's "match the tool to the layer" rule, one layer up.</p>
+<p><strong>QUIC brings its own anti-amplification rule.</strong> QUIC runs over UDP, so a QUIC server could become a reflector. RFC 9000 forbids that: until the client's address is validated, a server may send at most three times the bytes it has received. It can also send a Retry packet carrying an address-validation token — SYN cookies again, in a new protocol.</p>
+<p><strong>Zero trust is now mostly identity plumbing.</strong> NIST SP 800-207's policy engine and enforcement points show up as an identity-aware proxy for people (single sign-on plus device posture, often with a device certificate held in a TPM or Secure Enclave) and as a mesh or SPIFFE-based mTLS for workloads. The hard problems are the boring ones. You have to inventory every workload's identity, write least-privilege policy, and keep the issuing CA highly available.</p>
+<p><strong>ECH and DNS encryption shrink the network's view.</strong> With ECH and encrypted DNS spreading, network-based security tools see less: no SNI, no plaintext DNS. Network inspection is shifting toward the endpoint (EDR, managed browsers) and toward the identity layer, which is where zero trust said the decisions belonged anyway.</p>
+<h2 id="d17-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: The server's SYN queue is full. Explain exactly how SYN cookies let a real client still connect.</strong></p>
+<p>The server answers each SYN with a SYN-ACK whose sequence number is a keyed hash of the 4-tuple, a minute counter and an MSS index, and it stores nothing. A real client ACKs with cookie + 1. The server recomputes the hash from that ACK, checks the counter is recent, recovers the MSS, and creates the socket straight into the accept queue. Spoofed sources never see the SYN-ACK, so they can't produce the ACK. The cost is lost options: MSS is rounded to one of four values, and window scaling and SACK survive only if the client used timestamps.</p>
+<p><strong>Q2: Connections are timing out under load. How do you tell a SYN flood from a slow application, using only the server?</strong></p>
+<p>Look at the two queues separately. A SYN flood shows <code>SyncookiesSent</code> and <code>TCPReqQFullDoCookies</code> climbing and a large <code>SYN-RECV</code> population, while the accept queue stays empty. A slow application shows <code>ListenOverflows</code> and <code>ListenDrops</code> climbing, with <code>ss -lnt</code> showing the listener's <code>Recv-Q</code> at its <code>Send-Q</code> limit, and no cookies at all. Different queue, different fix.</p>
+<p><strong>Q3: Amplification factor for DNS is around 50. Why don't attackers with 1 Gbps get 50 Gbps?</strong></p>
+<p>The factor is per-request. The output is capped by the reflectors' own uplinks and how many open reflectors the attacker can find. It's also capped by the fact that many resolvers rate-limit responses or refuse ANY queries now. Attack size is the sum of reflector capacity, not the attacker's bandwidth times a constant.</p>
+<p><strong>Q4: Why is strict uRPF rarely deployed at peering and transit edges?</strong></p>
+<p>Because paths there are routinely asymmetric. Strict mode requires the best route back to the source to use the arrival interface, and multihomed networks legitimately violate that, so strict mode drops real traffic. Loose mode doesn't drop anything routable, so it barely prevents spoofing. That gap is why BCP 38 is most effective at the customer edge, where a single-homed customer's prefixes are known exactly, and why RFC 8704 exists.</p>
+<p><strong>Q5: Your company runs TLS inspection. A team's mTLS integration with a partner fails only on the office network. Why?</strong></p>
+<p>mTLS requires the client to sign the handshake transcript with its private key. The proxy terminates TLS, so the partner sees the proxy's handshake, and the proxy doesn't have the client's key. The partner either gets no client certificate or the proxy's own. The fix is a bypass rule for that destination. Proof: compare <code>openssl s_client -showcerts</code> issuers from the office and from outside.</p>
+<p><strong>Q6: You've deployed mTLS everywhere. Have you implemented zero trust?</strong></p>
+<p>Only authentication. mTLS proves which workload is on the other end. If every service accepts any certificate from the cluster CA, any compromised workload can still call everything. Zero trust also needs per-identity authorization policy, least privilege, and a fast way to revoke or stop issuing an identity, plus device and user context where people are involved.</p>
+<p><strong>Q7: An identity-aware proxy fronts an internal app. What's the classic bypass, and what are the two halves of the fix?</strong></p>
+<p>The backend trusts an identity header but is also reachable without going through the proxy, so an attacker inside the network calls it directly and forges the header. The fix is to verify the proxy's signed assertion on every request (signature, audience, expiry), and to accept backend connections only from the proxy, ideally over mTLS.</p>
+<p><strong>Q8: You apply a stricter NetworkPolicy during an incident, but the suspicious connection stays up. Why, and what do you do?</strong></p>
+<p>Enforcement is stateful. The connection was allowed at its first packet, and later packets match the tracked flow rather than re-evaluating policy. Depending on the implementation, policy changes may not flush existing entries. Delete the flow from the tracking table (<code>conntrack -D</code> on iptables-based nodes, the CNI's own tooling otherwise) or restart the workload, then confirm with a capture that packets stop.</p>
 <h1 id="module-18--troubleshooting-like-a-pro">Module 18 — Troubleshooting Like a Pro</h1>
 <p><em>The capstone: a methodology for finding the broken layer, and one fully worked outage.</em></p>
 <hr />
@@ -7287,7 +7776,7 @@ nstat -az | grep -i -E &#39;TcpExtTW|ListenOverflows&#39;         # TIME_WAIT ch
 </tr>
 </tbody>
 </table>
-<p>Note what isn't there: no source CID, no version, no length. A short-header packet must be the last one in its datagram. And a load balancer that wants to read the DCID must know how long the server's CIDs are, because the packet doesn't say. Section "Deep dive: production failure modes" comes back to this.</p>
+<p>Note what isn't there: no source CID, no version, no length. A short-header packet must be the last one in its datagram. And a load balancer that wants to read the DCID must know how long the server's CIDs are, because the packet doesn't say. <a href="#m20-failure-lb-migration">Deep dive: production failure modes</a> comes back to this.</p>
 <p><strong>Header protection.</strong> After the payload is encrypted, the sender takes a 16-byte sample of the ciphertext (starting 4 bytes after the packet number begins), encrypts it with a separate header-protection key, and XORs the result over the packet number bytes and the low bits of the first byte. An observer therefore can't read packet numbers or the key phase. This is what keeps middleboxes from building loss or RTT heuristics on QUIC's internals, the way they did with TCP sequence numbers.</p>
 <h3 id="m20-variable-length-integers">Variable-length integers</h3>
 <p>Almost every number on the wire — stream IDs, offsets, lengths, frame types, error codes — is a <strong>varint</strong> (RFC 9000 §16). The top two bits of the first byte give the length:</p>
@@ -7506,7 +7995,7 @@ QUIC STREAM frame (23 bytes): 0b 00 14 + HEADERS frame       type 0x0b = STREAM|
 <p><strong>Frame 7</strong> arrives one RTT after frame 6: <code>HANDSHAKE_DONE</code> (the server has the client's Finished; both sides drop Handshake keys), a <code>NEW_TOKEN</code> for the client's next visit, a spare connection ID, and the server's control stream (stream 3, server-initiated unidirectional) with its <code>SETTINGS</code>. <strong>Frame 8</strong> is the response on stream 0, and <strong>frame 9</strong> acknowledges it.</p>
 <p>Two things about this capture are worth carrying with you.</p>
 <p>First, <strong>without the key log</strong> tshark still decodes frames 1, 2 and 5 completely. Initial keys come from the DCID, which is in the packet. Everything else shows as encrypted. This is the honest way to describe Initial protection: integrity against off-path attackers, not secrecy.</p>
-<p>Second, the server's first datagram is the same size as the client's. A server that sent a 5 KB certificate chain would hit the 3,600-byte limit. It would then have to wait for frame 5's ACK before sending the rest — an extra round trip that shows up nowhere unless you look for it. "Deep dive: production failure modes" covers it.</p>
+<p>Second, the amplification budget was enough here only because the chain is small. A server that sent a 5 KB certificate chain would hit the 3,600-byte limit. It would then have to wait for frame 5's ACK before sending the rest — an extra round trip that shows up nowhere unless you look for it. <a href="#m20-failure-amplification">Deep dive: production failure modes</a> covers it.</p>
 <p>Here is the same kind of fetch from the client's side, using a curl build with HTTP/3 support. <strong>Run on your Mac — your output will differ</strong> (the exact lines depend on curl's version and its QUIC library: ngtcp2, quiche, or OpenSSL's own QUIC).</p>
 <pre class="text"><code>$ curl -sv --http3-only -o /dev/null https://example.com/
 *   Trying 198.51.100.7:443...
