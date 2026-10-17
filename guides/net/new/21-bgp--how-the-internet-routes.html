@@ -21,11 +21,6 @@
 <h3 id="m21-31-autonomous-systems-and-as-numbers">3.1 Autonomous systems and AS numbers</h3>
 <p>Each AS gets an <strong>AS number</strong> (ASN) from a regional internet registry (ARIN, RIPE NCC, APNIC, LACNIC, AFRINIC). ASNs were 16 bits until RFC 4893 (now RFC 6793) widened them to 32 bits. The ranges you need to recognise:</p>
 <table>
-<colgroup>
-<col style="width: 33%" />
-<col style="width: 33%" />
-<col style="width: 33%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>Range</th>
@@ -120,13 +115,6 @@
 
 <p>The rules in the diagram are two tables in every border router's config:</p>
 <table>
-<colgroup>
-<col style="width: 20%" />
-<col style="width: 20%" />
-<col style="width: 20%" />
-<col style="width: 20%" />
-<col style="width: 20%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>Route learned from</th>
@@ -189,10 +177,6 @@
 <p>A BGP session is one ordinary TCP connection to port 179. BGP has no discovery and no multicast hellos, unlike OSPF. You configure each neighbour by address and ASN, and the routers connect. Running over TCP is a deliberate choice: BGP gets reliable, ordered delivery for free, so it never has to retransmit or sequence its own messages. Once a route is sent, it stays valid until it is explicitly withdrawn or the session dies.</p>
 <p>Each session runs a finite state machine defined in RFC 4271 §8:</p>
 <table>
-<colgroup>
-<col style="width: 50%" />
-<col style="width: 50%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>State</th>
@@ -231,11 +215,6 @@
 <h3 id="m21-36-four-messages-and-a-fifth">3.6 Four messages (and a fifth)</h3>
 <p>Every BGP message starts with the same 19-byte header: a 16-byte marker of all ones, a 2-byte length and a 1-byte type. The maximum message size is 4,096 bytes, unless both sides negotiate extended messages (RFC 8654, up to 65,535).</p>
 <table>
-<colgroup>
-<col style="width: 33%" />
-<col style="width: 33%" />
-<col style="width: 33%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>Type</th>
@@ -275,12 +254,6 @@
 <h3 id="m21-37-path-attributes">3.7 Path attributes</h3>
 <p>An UPDATE carries a set of <strong>path attributes</strong> that apply to every prefix in that UPDATE. The attributes are the raw material of every BGP decision. Here are the ones that matter:</p>
 <table>
-<colgroup>
-<col style="width: 25%" />
-<col style="width: 25%" />
-<col style="width: 25%" />
-<col style="width: 25%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>Code</th>
@@ -351,12 +324,6 @@
 <h3 id="m21-38-best-path-selection-the-order-that-decides-everything">3.8 Best-path selection: the order that decides everything</h3>
 <p>A router often learns the same prefix from several neighbours. It installs exactly one of them as best (or several, if multipath is configured and they tie far enough down the list). It decides by walking a fixed list of tie-breakers, stopping at the first one that separates the candidates. RFC 4271 §9.1 defines the core; vendors add steps. This is the order most implementations share, with vendor-specific steps marked:</p>
 <table>
-<colgroup>
-<col style="width: 25%" />
-<col style="width: 25%" />
-<col style="width: 25%" />
-<col style="width: 25%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>Step</th>
@@ -473,11 +440,6 @@
 <p>Both are worst when they involve more-specifics, because §3.9's rule means the bad route wins outright wherever it is accepted.</p>
 <p>The main defence deployed today is <strong>RPKI</strong> (Resource Public Key Infrastructure, RFC 6480) with <strong>Route Origin Validation</strong> (ROV, RFC 6811). The holder of an address block signs a <strong>Route Origin Authorization</strong> (ROA, RFC 6482, now RFC 9582) through its regional registry: "AS 64511 may originate <code>203.0.112.0/22</code>, with prefixes up to length /24." Validators such as Routinator, rpki-client and FORT download and verify every ROA in the world and feed the result to routers over the RPKI-to-Router protocol (RFC 8210). Each route then gets one of three states:</p>
 <table>
-<colgroup>
-<col style="width: 33%" />
-<col style="width: 33%" />
-<col style="width: 33%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>ROV state</th>
@@ -545,11 +507,6 @@ c0 08 04 fb ff 00 64                              COMMUNITIES flags 0xc0 (option
 <p>An UPDATE with no withdrawn routes, no attributes and no NLRI is 23 bytes long. Graceful restart (RFC 4724) gives that empty message a meaning: <strong>End-of-RIB</strong>, "I have now sent you my whole table."</p>
 <p><strong>NOTIFICATION body:</strong> error code (1 byte), subcode (1 byte), optional data. The codes you'll see in logs:</p>
 <table>
-<colgroup>
-<col style="width: 33%" />
-<col style="width: 33%" />
-<col style="width: 33%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>Code</th>
@@ -1171,11 +1128,6 @@ message sizes (bytes): OPEN=45, KEEPALIVE=19, UPDATE(announce)=54, UPDATE(End-of
 <h2 id="m21-deep-by-the-numbers">Deep dive: by the numbers</h2>
 <p>Treat these as orders of magnitude. The table numbers change daily, and timer defaults differ by vendor and release.</p>
 <table>
-<colgroup>
-<col style="width: 33%" />
-<col style="width: 33%" />
-<col style="width: 33%" />
-</colgroup>
 <thead>
 <tr class="header">
 <th>Quantity</th>
