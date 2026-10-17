@@ -1,0 +1,863 @@
+<h1 id="module-19--load-balancing">Module 19 — Load Balancing</h1>
+<p><em>Networking Mastery Guide · Module 19 of 23</em></p>
+<hr />
+<h2 id="m19-1-why-it-matters">1. Why it matters</h2>
+<p>Every service you have ever called at scale had a load balancer in front of it. Usually several. A request to a large site might cross an anycast edge, a DNS-based global balancer, a cloud network load balancer, an HTTP proxy, and a sidecar before it reaches a process that does any work. Each one made a choice about where your bytes should go.</p>
+<p>Most engineers treat the load balancer as a box that "spreads traffic." That model holds right up until the first incident. Then the questions get specific. Why does one pod get half the traffic after a deploy? Why did the backend log the load balancer's IP instead of the customer's? Why do 0.1% of requests fail with a 502 that nobody can reproduce? Why did removing one cache node wipe out the hit rate on all of them?</p>
+<p>Each of those has a precise answer. The answers live in four places: which layer the balancer works at, how it forwards packets, which algorithm it uses to pick a backend, and how it learns that a backend is sick. This module covers all four, then the global and cloud versions you will meet in practice.</p>
+<p>It is also one of the most reliable topics in system-design interviews. "Put a load balancer in front" is the most common sentence in those interviews. The follow-up — "which kind, doing what, and how does it fail?" — is where people separate.</p>
+<hr />
+<h2 id="m19-2-the-mental-model">2. The mental model</h2>
+<p>Picture a restaurant host at the door. Guests arrive. The host looks at the floor, picks a table, and walks the guest over. A good host notices that one waiter is drowning and stops seating his section. A good host also stops seating a section whose waiter has gone home sick.</p>
+<p>That is the whole job: <strong>pick a backend, keep picking well, stop picking dead ones.</strong> The analogy is fine for the first ten minutes. Then you need the real thing.</p>
+<p>The real thing is a function plus some state. On every new connection (or every new request), the load balancer computes:</p>
+<pre><code>backend = choose(flow_or_request, healthy_backends, algorithm_state)</code></pre>
+<p>The interesting parts are the arguments.</p>
+<p><strong>What it can see.</strong> A layer-4 balancer sees IP addresses, ports, and the protocol. That is all. A layer-7 balancer has parsed the HTTP request, so it sees the method, path, host, headers, and cookies. What you can see decides what you can route on.</p>
+<p><strong>What state it keeps.</strong> A connection table mapping each flow's 5-tuple to the backend it chose, so every later packet of that flow goes to the same place. A backend table with addresses, weights, health status, and counters such as active connections. Algorithm state: a round-robin cursor, or a precomputed hash table.</p>
+<p><strong>How the packet physically gets there.</strong> The balancer can rewrite the destination address (NAT), open a second connection of its own (proxy), or hand the packet on untouched and let the backend reply directly to the client (direct server return). This one choice decides whether the backend sees the client's IP, whether replies flow back through the balancer, and how much traffic the balancer can carry.</p>
+<p><strong>How it learns about health.</strong> Active probes it sends on a timer, and passive observation of real traffic: resets, timeouts, 5xx responses.</p>
+<p>Hold those four pieces and almost every load-balancing question becomes answerable. The rest of this module fills them in.</p>
+<hr />
+<h2 id="m19-3-how-it-works">3. How it works</h2>
+<h3 id="m19-l4-vs-l7-what-each-one-can-see">L4 vs L7: what each one can see</h3>
+<p>A <strong>layer-4 load balancer</strong> decides per connection (per flow, for UDP). It looks at the first packet — a TCP SYN, say — picks a backend, records the choice, and sends every later packet of that 5-tuple the same way. It never reassembles the byte stream. It does not know whether the bytes are HTTP, Postgres, or TLS.</p>
+<p>A <strong>layer-7 load balancer</strong> terminates the client's TCP connection (and usually TLS), reads the request, and decides per request. Two requests on the same client connection can go to two different backends. It opens its own connections to the backends, usually from a pool it keeps warm.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th></th>
+<th>Layer 4</th>
+<th>Layer 7</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Unit of decision</td>
+<td>connection / flow</td>
+<td>request (or stream, for HTTP/2 and gRPC)</td>
+</tr>
+<tr class="even">
+<td>Sees</td>
+<td>src/dst IP, src/dst port, protocol, TCP flags</td>
+<td>everything in L4, plus method, path, Host, headers, cookies, gRPC method</td>
+</tr>
+<tr class="odd">
+<td>Can route on</td>
+<td>5-tuple hash, client IP</td>
+<td>path, host, header, cookie, weight per route</td>
+</tr>
+<tr class="even">
+<td>TLS</td>
+<td>passes it through (may peek at SNI)</td>
+<td>terminates it, or re-encrypts to the backend</td>
+</tr>
+<tr class="odd">
+<td>Client IP at backend</td>
+<td>preserved (NAT/DSR modes) or via PROXY protocol</td>
+<td>via <code>X-Forwarded-For</code> / <code>Forwarded</code> header</td>
+</tr>
+<tr class="even">
+<td>Per-connection cost</td>
+<td>a table entry</td>
+<td>two TCP connections, buffers, TLS state, a parser</td>
+</tr>
+<tr class="odd">
+<td>Typical throughput</td>
+<td>millions of packets/s per core in kernel/XDP</td>
+<td>tens of thousands of requests/s per core</td>
+</tr>
+<tr class="even">
+<td>Examples</td>
+<td>Linux IPVS, Katran, Maglev, AWS NLB, kube-proxy</td>
+<td>Envoy, HAProxy (http mode), NGINX, AWS ALB</td>
+</tr>
+</tbody>
+</table>
+<p>The table hides one important point. An L4 balancer that balances <em>connections</em> is blind to how much work each connection carries. One HTTP/2 or gRPC connection can carry thousands of requests per second for hours. Balance those connections perfectly and the requests can still be badly skewed. That single fact explains a whole class of Kubernetes incidents; section 5 walks through one.</p>
+<h3 id="m19-forwarding-modes-nat-proxy-and-direct-server-return">Forwarding modes: NAT, proxy, and direct server return</h3>
+<p>How the packet reaches the backend matters as much as which backend is chosen. There are three common modes, and they differ in exactly what each hop rewrites.</p>
+<div style="overflow-x:auto">
+<svg width="100%" viewBox="0 0 760 545" role="img" aria-labelledby="m19-modes-title m19-modes-desc" style="min-width:760px; background:#f5f5f5; border:1px solid #d8d4cc; border-radius:6px;">
+<title id="m19-modes-title">Three forwarding modes: NAT, full proxy, direct server return</title>
+<desc id="m19-modes-desc">Three rows, each with a client, a load balancer and a backend. In NAT mode the balancer rewrites the destination to the backend and the reply must return through it. In proxy mode the balancer opens a second TCP connection from its own address. In DSR mode the balancer forwards the packet still addressed to the VIP and the backend replies directly to the client.</desc>
+<defs>
+<marker id="m19-modes-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 9 5 L 0 9 z" fill="#6b6f7e"/></marker>
+<marker id="m19-modes-arrow-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 9 5 L 0 9 z" fill="#bf4520"/></marker>
+</defs>
+<text x="380" y="30" text-anchor="middle" font-family="Georgia, serif" font-size="20" fill="#2d3142">How the packet reaches the backend</text>
+<text x="380" y="50" text-anchor="middle" font-family="monospace" font-size="11" fill="#6b6f7e">C = client 198.51.100.23 · VIP = 203.0.113.10 · LB = 10.0.1.17 · B = backend 10.0.2.41</text>
+<!-- Row 1: NAT -->
+<text x="20" y="80" font-family="monospace" font-size="12" fill="#bf4520" letter-spacing="1.5">1 · NAT MODE (DNAT)</text>
+<rect x="20" y="90" width="150" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="95" y="123" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="600" fill="#2d3142">Client</text>
+<rect x="305" y="90" width="150" height="56" rx="6" fill="#ffffff" stroke="#bf4520" stroke-width="2"/>
+<text x="380" y="123" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="600" fill="#2d3142">Load balancer</text>
+<rect x="590" y="90" width="150" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="665" y="123" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="600" fill="#2d3142">Backend</text>
+<line x1="172" y1="104" x2="301" y2="104" stroke="#6b6f7e" stroke-width="1.5" marker-end="url(#m19-modes-arrow)"/>
+<text x="237" y="98" text-anchor="middle" font-family="monospace" font-size="11" fill="#2d3142">C → VIP</text>
+<line x1="459" y1="104" x2="586" y2="104" stroke="#bf4520" stroke-width="2" marker-end="url(#m19-modes-arrow-acc)"/>
+<text x="522" y="98" text-anchor="middle" font-family="monospace" font-size="11" fill="#bf4520">C → B  (dst rewritten)</text>
+<line x1="586" y1="134" x2="459" y2="134" stroke="#6b6f7e" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#m19-modes-arrow)"/>
+<text x="522" y="128" text-anchor="middle" font-family="monospace" font-size="11" fill="#2d3142">B → C</text>
+<line x1="301" y1="134" x2="172" y2="134" stroke="#6b6f7e" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#m19-modes-arrow)"/>
+<text x="237" y="128" text-anchor="middle" font-family="monospace" font-size="11" fill="#bf4520">VIP → C  (src restored)</text>
+<text x="20" y="170" font-family="sans-serif" font-size="12" fill="#6b6f7e">Backend sees the real client IP. Replies must route back through the LB (backend's gateway = LB).</text>
+<!-- Row 2: proxy -->
+<text x="20" y="215" font-family="monospace" font-size="12" fill="#bf4520" letter-spacing="1.5">2 · FULL PROXY (TWO TCP CONNECTIONS)</text>
+<rect x="20" y="225" width="150" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="95" y="258" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="600" fill="#2d3142">Client</text>
+<rect x="305" y="225" width="150" height="56" rx="6" fill="#ffffff" stroke="#bf4520" stroke-width="2"/>
+<text x="380" y="258" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="600" fill="#2d3142">Load balancer</text>
+<rect x="590" y="225" width="150" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="665" y="258" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="600" fill="#2d3142">Backend</text>
+<line x1="172" y1="239" x2="301" y2="239" stroke="#6b6f7e" stroke-width="1.5" marker-end="url(#m19-modes-arrow)"/>
+<text x="237" y="233" text-anchor="middle" font-family="monospace" font-size="11" fill="#2d3142">C → VIP</text>
+<line x1="459" y1="239" x2="586" y2="239" stroke="#bf4520" stroke-width="2" marker-end="url(#m19-modes-arrow-acc)"/>
+<text x="522" y="233" text-anchor="middle" font-family="monospace" font-size="11" fill="#bf4520">LB → B  (new conn)</text>
+<line x1="586" y1="269" x2="459" y2="269" stroke="#6b6f7e" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#m19-modes-arrow)"/>
+<text x="522" y="263" text-anchor="middle" font-family="monospace" font-size="11" fill="#2d3142">B → LB</text>
+<line x1="301" y1="269" x2="172" y2="269" stroke="#6b6f7e" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#m19-modes-arrow)"/>
+<text x="237" y="263" text-anchor="middle" font-family="monospace" font-size="11" fill="#2d3142">VIP → C</text>
+<text x="20" y="305" font-family="sans-serif" font-size="12" fill="#6b6f7e">Backend sees the LB's address. Client IP travels in X-Forwarded-For (L7) or a PROXY protocol line (L4).</text>
+<!-- Row 3: DSR -->
+<text x="20" y="350" font-family="monospace" font-size="12" fill="#bf4520" letter-spacing="1.5">3 · DIRECT SERVER RETURN (MAC REWRITE OR IP-IN-IP)</text>
+<rect x="20" y="360" width="150" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="95" y="393" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="600" fill="#2d3142">Client</text>
+<rect x="305" y="360" width="150" height="56" rx="6" fill="#ffffff" stroke="#bf4520" stroke-width="2"/>
+<text x="380" y="393" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="600" fill="#2d3142">Load balancer</text>
+<rect x="590" y="360" width="150" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="665" y="386" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="600" fill="#2d3142">Backend</text>
+<text x="665" y="405" text-anchor="middle" font-family="monospace" font-size="11" fill="#6b6f7e">VIP on lo</text>
+<line x1="172" y1="388" x2="301" y2="388" stroke="#6b6f7e" stroke-width="1.5" marker-end="url(#m19-modes-arrow)"/>
+<text x="237" y="382" text-anchor="middle" font-family="monospace" font-size="11" fill="#2d3142">C → VIP</text>
+<line x1="459" y1="388" x2="586" y2="388" stroke="#bf4520" stroke-width="2" marker-end="url(#m19-modes-arrow-acc)"/>
+<text x="522" y="374" text-anchor="middle" font-family="monospace" font-size="11" fill="#bf4520">[LB → B]</text>
+<text x="522" y="404" text-anchor="middle" font-family="monospace" font-size="11" fill="#bf4520">C → VIP unchanged</text>
+<path d="M 665 418 L 665 446 L 95 446 L 95 422" fill="none" stroke="#bf4520" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#m19-modes-arrow-acc)"/>
+<text x="380" y="440" text-anchor="middle" font-family="monospace" font-size="11" fill="#bf4520">VIP → C  (reply skips the LB)</text>
+<text x="20" y="476" font-family="sans-serif" font-size="12" fill="#6b6f7e">Backend sees the real client IP and replies from the VIP. The LB carries only the inbound half,</text>
+<text x="20" y="494" font-family="sans-serif" font-size="12" fill="#6b6f7e">so it never sees responses: no TLS termination, no L7 features. [LB → B] = outer IP header (IPIP/GUE).</text>
+<text x="20" y="524" font-family="sans-serif" font-size="12" fill="#6b6f7e">Solid = client-to-server direction. Dashed = replies. Orange marks the hop where each mode differs.</text>
+</svg>
+</div>
+<p><strong>NAT mode</strong> (IPVS calls it "masquerading"). The balancer rewrites the destination address from the virtual IP (VIP) to the chosen backend. The source stays the client's address, so the backend sees the real client IP. The catch: the backend's reply goes to the client's address, and it must pass back through the balancer to have its source rewritten from the backend's address to the VIP. If the reply takes any other path, the client receives a SYN-ACK from an address it never contacted and drops it — the same failure as hairpin NAT in Module 15. In practice the backends' default gateway must be the balancer, and the balancer carries both directions of traffic.</p>
+<p><strong>Proxy mode</strong> (also "full proxy" or "SNAT mode"). The balancer accepts the client's connection and opens a brand-new one to the backend from its own address. There are two TCP connections with two sets of sequence numbers, two congestion windows, and two sets of timeouts. Every L7 balancer works this way, and many L4 ones do too (HAProxy in <code>mode tcp</code>, AWS NLB for some target types). The backend sees the balancer's address as the client. The real client IP has to travel some other way: an HTTP header for L7, or a PROXY protocol line prepended to the stream for L4. Replies return naturally, because the backend is replying to the balancer.</p>
+<p><strong>Direct server return (DSR).</strong> The balancer forwards the client's packet <em>without</em> changing its destination IP — it is still addressed to the VIP. There are two ways to get it to the backend. The balancer can rewrite only the destination MAC address; IPVS calls this "direct routing", and it needs the balancer and backend on the same L2 segment. Or it can wrap the packet in an outer IP header (IP-in-IP or GUE), which works across routed networks. The backend has the VIP configured on a loopback interface, so it accepts the packet. It replies <em>from the VIP straight to the client</em>, skipping the balancer entirely.</p>
+<p>DSR exists because traffic is asymmetric. A web request is a few hundred bytes. The response can be megabytes. With DSR, the balancer handles only the small inbound half. That is why the largest software L4 balancers — Google's Maglev, Meta's Katran, GitHub's GLB — all use DSR with encapsulation. The cost: the balancer never sees replies, so it cannot do anything that depends on them. No TLS termination, no response-based health signals, no L7 features at all.</p>
+<h3 id="m19-choosing-a-backend-the-algorithms">Choosing a backend: the algorithms</h3>
+<p><strong>Round robin.</strong> Hand out backends in order: 1, 2, 3, 1, 2, 3. One integer of state. Perfectly fair <em>by count</em>, which is the problem: it assumes every request costs the same and every backend is equally fast. Neither holds in production. <strong>Weighted round robin</strong> gives a backend with weight 3 three turns per cycle. NGINX uses a "smooth" variant that interleaves the turns (A A B A, not A A A B) so a heavy backend doesn't get bursts.</p>
+<p><strong>Random.</strong> Pick uniformly at random. Statistically the same as round robin over many requests, with one advantage: many independent balancer instances need no shared state to be fair.</p>
+<p><strong>Least connections.</strong> Send the new connection to the backend with the fewest active ones. This is the first algorithm that <em>reacts</em>. A slow backend holds its connections longer, its count rises, and it gets fewer new ones. "Least request" is the L7 version, counting outstanding requests rather than connections. The weakness shows up with many balancer instances: each only knows its own counts, and if they all see the same "least loaded" backend at the same moment they all pile onto it. That is the herd effect.</p>
+<p><strong>Power of two choices (P2C).</strong> Pick two backends at random and send to the less loaded of the two. It sounds like a hack. It is one of the best-understood results in load balancing (Mitzenmacher's work in the 1990s). With purely random placement of n jobs into n bins, the fullest bin grows like log n / log log n. With two choices, it drops to about log log n — an exponential improvement from one extra comparison. P2C also defeats the herd: two balancers rarely draw the same pair. Envoy's <code>LEAST_REQUEST</code> policy is P2C by default, NGINX offers <code>random two least_conn</code>, and HAProxy has <code>balance random(2)</code>.</p>
+<p><strong>Hashing.</strong> Compute a hash of some key — client IP, 5-tuple, a header, a user ID — and map it to a backend. The same key always lands on the same backend, which matters for caches and for any L4 balancer fleet where several balancer nodes must agree without talking to each other. The naive version, <code>hash(key) mod N</code>, has a fatal flaw: change N by one and nearly every key moves. Removing one backend out of ten remaps about 90% of keys. For a cache tier, that is a full cold start.</p>
+<p><strong>Consistent hashing</strong> fixes that. The <strong>ring hash</strong> (Karger et al., 1997) places each backend at many points ("virtual nodes") on a circle of hash values. A key goes to the next backend clockwise from its own hash. Remove a backend and only the keys it owned move; everything else stays put. <strong>Maglev hashing</strong> (Google, NSDI 2016) builds a lookup table — 65,537 slots is the common size, a prime — where each backend fills slots in its own pseudo-random order until the table is full. Lookup is one array index, the load spread is near-perfect, and removing a backend moves only slightly more keys than the theoretical minimum. <strong>Rendezvous hashing</strong> (highest random weight) scores each backend as <code>hash(key, backend)</code> and picks the highest score; it is simple and also minimally disruptive, at O(N) per lookup.</p>
+<p>Consistent hashing has a weakness the module's simulation makes vivid: it balances <em>keys</em>, not <em>load</em>. One hot key — a celebrity's profile, a big tenant — sends all its traffic to one backend no matter how good the hash is. <strong>Consistent hashing with bounded loads</strong> (Mirrokni, Thorup and Zadimoghaddam, 2017) caps each backend at <code>c ×</code> the average load (c = 1.25 is a typical choice). When a key's home is over the cap, the key walks clockwise to the next backend with room. HAProxy exposes this as <code>hash-balance-factor</code>.</p>
+<h3 id="m19-health-checks-and-outlier-detection">Health checks and outlier detection</h3>
+<p>A balancer that keeps sending traffic to a dead backend is worse than no balancer. There are two ways to find out a backend is sick.</p>
+<p><strong>Active health checks.</strong> The balancer probes each backend on a timer: a TCP connect, an HTTP <code>GET /healthz</code> expecting a 2xx, or a gRPC <code>grpc.health.v1.Health/Check</code>. A backend is marked down after <code>fall</code> consecutive failures and back up after <code>rise</code> consecutive successes. The thresholds are there for hysteresis, so one dropped probe doesn't flap a backend in and out. HAProxy's defaults are a 2 s interval, <code>rise 2</code>, <code>fall 3</code>. AWS ALB target groups default to a 30 s interval, 5 s timeout, 5 healthy and 2 unhealthy checks. These defaults vary by product and version, so check yours.</p>
+<p><strong>Passive health checks / outlier detection.</strong> The balancer watches real traffic. If a backend returns five 5xx responses in a row (Envoy's default <code>consecutive_5xx</code>), it is ejected for a base time (30 s by default), and the ejection time grows each time the same host is ejected again. Passive detection reacts in milliseconds under load, needs no extra probe traffic, and catches failures a <code>/healthz</code> endpoint can't see. It also needs traffic to work: an idle backend never fails a request.</p>
+<p>Two safety valves matter more than any threshold. <strong>Max ejection percent</strong> (Envoy defaults to 10%) stops outlier detection from ejecting most of the fleet when the real problem is downstream. <strong>Panic mode</strong> (Envoy's threshold is 50% healthy by default) makes the balancer ignore health status and spread across <em>all</em> hosts once too few are healthy. The reasoning: if half your fleet looks dead, the health check is more likely wrong than the fleet. Concentrating all traffic on the "healthy" half would kill it too.</p>
+<h3 id="m19-connection-draining">Connection draining</h3>
+<p>Removing a backend cleanly is a two-step move. First, stop sending it <em>new</em> connections or requests. Second, let existing ones finish, up to a deadline, and only then remove it. AWS calls this the deregistration delay (300 s by default); others call it draining or graceful shutdown.</p>
+<p>L4 and L7 drain differently. An L4 balancer can only stop assigning new flows; existing flows run until they close or the deadline cuts them off. An L7 balancer can do better, because it can tell the client to go elsewhere. In HTTP/1.1 it sends <code>Connection: close</code> on the next response. In HTTP/2 it sends a <code>GOAWAY</code> frame naming the last stream it will process, and the client opens a new connection for the rest.</p>
+<p>In Kubernetes there is a race worth knowing by heart. When a pod is deleted, two things happen in parallel: the kubelet sends the container SIGTERM, and the endpoint removal propagates to every kube-proxy, ingress controller, and cloud balancer. Propagation takes time — often a few seconds. A process that exits on SIGTERM immediately will refuse connections that balancers are still sending it. The standard fix is a <code>preStop</code> hook that sleeps for a few seconds before the shutdown begins, plus an app that stops accepting new work and finishes in-flight requests within <code>terminationGracePeriodSeconds</code> (30 s by default).</p>
+<h3 id="m19-sticky-sessions">Sticky sessions</h3>
+<p>Session affinity sends the same client to the same backend. It exists because some applications keep per-user state in process memory: a shopping cart, a WebSocket subscription, a server-side session.</p>
+<p>There are three ways to do it. <strong>Source-IP affinity</strong> hashes the client IP. It is available at L4, and it breaks badly behind carrier-grade NAT, where thousands of users share one address and all land on one backend. <strong>Cookie affinity</strong> is L7: the balancer sets a cookie naming the backend (AWS ALB's is <code>AWSALB</code>, duration-based stickiness defaults to one day) or honours an application cookie. <strong>Hash on a header or user ID</strong> gives affinity without a cookie, and with consistent hashing it survives scaling events reasonably well.</p>
+<p>Stickiness costs you three things. Load becomes uneven, because a heavy user stays on one host. Draining gets slow, because sessions pin clients to the host you want to remove. And when a sticky backend dies, its users lose their state anyway. Treat affinity as a performance optimisation (warm caches) rather than a correctness mechanism. State that must survive belongs in a shared store.</p>
+<h3 id="m19-tls-termination-passthrough-re-encryption">TLS: termination, passthrough, re-encryption</h3>
+<p><strong>Termination.</strong> The balancer holds the certificate and private key, completes the TLS handshake, and sees plaintext. This is required for any L7 routing on HTTPS, and it centralises certificate management. Traffic to the backend is then plain HTTP — fine inside a trusted network, not fine under zero trust.</p>
+<p><strong>Re-encryption</strong> (also "TLS bridging"). Terminate, inspect, then open a new TLS connection to the backend. You keep L7 features and encrypt every hop. The cost is a second handshake (amortised by connection pooling) and the backend's own certificate to manage. Service meshes do this with mutual TLS by default.</p>
+<p><strong>Passthrough.</strong> The balancer never decrypts. It forwards the TCP stream as-is, so the backend holds the key and does the handshake. The balancer can still peek at one thing: the <strong>SNI</strong> (Server Name Indication) field in the unencrypted ClientHello, which names the hostname the client wants. HAProxy does this with <code>tcp-request inspect-delay</code> and <code>req.ssl_sni</code>. That gives you hostname-based routing without holding any keys. Encrypted Client Hello (ECH) hides the real SNI inside an encrypted extension, so as ECH spreads, SNI-based passthrough routing only sees the outer, public name.</p>
+<h3 id="m19-global-load-balancing-dns-and-anycast">Global load balancing: DNS and anycast</h3>
+<p>Everything so far balances inside one site. Spreading users across regions uses two different tools.</p>
+<p><strong>DNS-based global load balancing.</strong> The authoritative DNS server answers differently depending on who asks: the nearest healthy region's address, weighted answers for a migration, or only the regions that pass health checks. It is cheap and works with any protocol. It is also coarse in two ways. The server sees the <em>recursive resolver's</em> address, not the user's, so "nearest" means nearest to the resolver. EDNS Client Subnet (RFC 7871) lets resolvers pass a truncated client prefix to fix that, though not every resolver sends it. And failover is only as fast as caches expire. A 60 s TTL means most clients move within a minute or two. Some clients and middleboxes hold records longer, and long-lived connections never re-resolve at all.</p>
+<p><strong>Anycast.</strong> Announce the same IP prefix over BGP from many sites. Each user's packets follow BGP to the topologically nearest announcing site (Module 13 covers this for CDNs; RFC 4786 is the operational guide). Failover is a BGP withdrawal, which converges in seconds rather than waiting on DNS caches. The risk is that a routing change can move a flow from one site to another mid-connection. The new site has no state for that TCP connection and resets it. For short connections this almost never matters. For long-lived ones it can, and it is why anycast front ends pair with stateless or consistently hashed L4 tiers.</p>
+<p>Large providers combine both: anycast to reach the nearest edge, then an L4 tier and an L7 tier inside it, with DNS steering for whole-region traffic moves.</p>
+<h3 id="m19-cloud-load-balancers">Cloud load balancers</h3>
+<p>Cloud balancers are the same machinery with a product wrapper. The behaviours that bite are worth knowing by name. The examples use AWS terms because they are the most common; GCP and Azure have equivalents.</p>
+<p><strong>Network Load Balancer (NLB style)</strong>: L4, TCP/UDP/TLS. It picks a target per flow with a hash over the 5-tuple, so a flow stays on one target. It preserves the client IP by default for instance targets, and supports PROXY protocol v2 when it doesn't. It gets one static IP per availability zone, which matters for allow-lists. The TCP idle timeout defaults to 350 s, after which the flow entry is silently dropped (newer NLBs let you configure it). Cross-zone balancing is off by default, so each zone's balancer node only sends to targets in its own zone. A zone with 2 targets and a zone with 8 targets each get half the traffic, and the 2 targets in the small zone carry four times the per-target load of the others.</p>
+<p><strong>Application Load Balancer (ALB style)</strong>: L7 full proxy. HTTP/1.1, HTTP/2, gRPC, and WebSockets; routing on host, path, header, and query string. It adds <code>X-Forwarded-For</code>, <code>X-Forwarded-Proto</code>, and <code>X-Forwarded-Port</code>. The idle timeout defaults to 60 s. Its node IPs change as it scales, so you point DNS at its name and never pin its addresses. Cross-zone balancing is on.</p>
+<p><strong>Google Cloud</strong>'s external passthrough network load balancer is built on Maglev; its global application load balancer runs on Google Front Ends behind a single anycast IP. The pattern is the same everywhere: an L4 layer that scales by hashing, and an L7 layer that terminates.</p>
+<p><strong>Kubernetes Services</strong> are an L4 balancer distributed onto every node. In iptables mode, kube-proxy writes a chain per Service that picks an endpoint with the <code>statistic</code> match in random mode: the first rule matches with probability 1/n, the next with 1/(n−1), and so on, which makes the overall choice uniform. IPVS mode uses real IPVS schedulers (rr, lc, sh, mh and others). Either way it is DNAT in the kernel, decided per connection, at connect time. One setting decides the client IP story: <code>externalTrafficPolicy: Cluster</code> (the default) lets any node forward to any pod, which SNATs the packet and loses the client IP. <code>Local</code> only sends to pods on the receiving node, which keeps the client IP but can unbalance traffic when pods are unevenly spread across nodes.</p>
+<hr />
+<h2 id="m19-4-the-exact-structure">4. The exact structure</h2>
+<h3 id="m19-the-connection-table-entry">The connection table entry</h3>
+<p>Every stateful L4 balancer keeps a table keyed on the flow. On Linux IPVS you can read it directly:</p>
+<pre class="text"><code>$ sudo ipvsadm -Lnc          # run on a Linux IPVS director — your output will differ
+IPVS connection entries
+pro expire state       source               virtual            destination
+TCP 14:58  ESTABLISHED 198.51.100.23:51514  203.0.113.10:80    10.0.2.41:80
+TCP 01:52  FIN_WAIT    198.51.100.77:60212  203.0.113.10:80    10.0.2.42:80
+TCP 00:57  SYN_RECV    192.0.2.140:44310    203.0.113.10:80    10.0.2.43:80</code></pre>
+<p>Each row is the decision, remembered: this 5-tuple goes to that backend, and the entry expires after a state-dependent idle timer. IPVS's defaults are 900 s for an established TCP flow, 120 s after a FIN, and 300 s for UDP (<code>ipvsadm -L --timeout</code> shows yours). Those timers are why <code>expire 14:58</code> appears two seconds after the last packet. The <code>state</code> column is the balancer's <em>guess</em> at the TCP state, built from the flags it has seen. In DSR mode it never sees the backend's packets, so the guess is based on one direction only.</p>
+<p>The service and backend table sits beside it:</p>
+<pre class="text"><code>$ sudo ipvsadm -Ln           # run on a Linux IPVS director — your output will differ
+IP Virtual Server version 1.2.1 (size=4096)
+Prot LocalAddress:Port Scheduler Flags
+  -&gt; RemoteAddress:Port           Forward Weight ActiveConn InActConn
+TCP  203.0.113.10:80 mh
+  -&gt; 10.0.2.41:80                 Tunnel  1      1834       2210
+  -&gt; 10.0.2.42:80                 Tunnel  1      1791       2187
+  -&gt; 10.0.2.43:80                 Tunnel  0      412        96</code></pre>
+<p><code>mh</code> is the Maglev-hashing scheduler (in the kernel since 4.18). <code>Tunnel</code> is IP-in-IP DSR; the other values are <code>Masq</code> (NAT) and <code>Route</code> (DSR by MAC rewrite). <code>ActiveConn</code> counts established flows and <code>InActConn</code> counts everything else, mostly TIME_WAIT and FIN states. The third backend has weight 0: it is draining. It gets no new flows while its 412 existing ones finish.</p>
+<h3 id="m19-the-backend-health-state-machine">The backend health state machine</h3>
+<p>Each backend has a small state machine driven by probe results:</p>
+<pre class="text"><code>           fail (count &lt; fall)         ok (count &lt; rise)
+             ┌──────────┐               ┌──────────┐
+             ▼          │               ▼          │
+  ┌──────────────┐  fall consecutive  ┌──────────────┐
+  │     UP       │ ─────────────────▶ │    DOWN      │
+  │ gets traffic │ ◀───────────────── │  no traffic  │
+  └──────────────┘  rise consecutive  └──────────────┘
+         │                ok                  ▲
+         │ admin drain / weight 0             │
+         ▼                                    │
+  ┌──────────────┐  deadline or last conn  ──┘
+  │  DRAINING    │  closes → removed
+  │ old flows    │
+  │ only         │
+  └──────────────┘</code></pre>
+<p>Detection time is roughly <code>interval × fall + timeout</code>. With HAProxy defaults (2 s, fall 3) that is about 6 s. With ALB defaults (30 s, 2 unhealthy) it is about a minute. Recovery takes <code>interval × rise</code>: 4 s for HAProxy, 150 s for ALB. Those defaults suit very different worlds, and you should set them deliberately.</p>
+<h3 id="m19-carrying-the-client-address-headers-and-proxy-protocol">Carrying the client address: headers and PROXY protocol</h3>
+<p>A full proxy hides the client's address from the backend. Three formats carry it across.</p>
+<p><code>X-Forwarded-For</code> is a de facto HTTP header. Each proxy <em>appends</em> the address it received the connection from:</p>
+<pre class="text"><code>X-Forwarded-For: 198.51.100.23, 10.0.1.17
+                 └ client as seen   └ added by the second proxy (the first proxy&#39;s address)
+                   by the first proxy</code></pre>
+<p>The leftmost value is whatever the client sent, and a client can send anything. Trust only the entries added by proxies you control, counting from the right.</p>
+<p><code>Forwarded</code> (RFC 7239) is the standardised version: <code>Forwarded: for=198.51.100.23;proto=https;by=10.0.1.17</code>. It is cleaner and less widely used.</p>
+<p><strong>PROXY protocol</strong> (HAProxy's specification) does the same job for L4 proxies, where there are no headers. The proxy writes one preamble before the client's first byte. Version 1 is a single text line of at most 107 bytes:</p>
+<pre class="text"><code>PROXY TCP4 198.51.100.23 203.0.113.10 51514 443\r\n
+      │    │             │            │     └ destination port
+      │    │             │            └ source port
+      │    │             └ destination address (the VIP)
+      │    └ source address (the real client)
+      └ TCP4, TCP6 or UNKNOWN</code></pre>
+<p>Version 2 is binary. It starts with a fixed 12-byte signature (<code>0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A</code>), then a version/command byte, an address-family byte, a 2-byte length, the addresses, and optional TLVs (AWS uses one to carry the VPC endpoint ID). The backend must be configured to expect it. A server that isn't will treat <code>PROXY TCP4 …</code> as the start of the request and fail it. A server that <em>requires</em> it will reject health checks that don't send it.</p>
+<h3 id="m19-the-maglev-lookup-table">The Maglev lookup table</h3>
+<p>The Maglev table is an array of M slots (M prime, 65,537 by default in IPVS and Envoy). To build it, each backend gets two hashes of its name: an <code>offset</code> in [0, M) and a <code>skip</code> in [1, M). Its preference list is <code>(offset + j × skip) mod M</code> for j = 0, 1, 2…; because M is prime, that visits every slot exactly once. Backends take turns. Each claims the next slot on its own list that is still empty, until all M slots are full. Each backend ends up with ⌊M/N⌋ or ⌈M/N⌉ slots.</p>
+<p>Lookup is <code>table[hash(5-tuple) mod M]</code>. When a backend leaves, the table is rebuilt from the remaining backends. Most slots keep their owner, because each surviving backend walks the same preference list as before. The paper recommends M larger than 100 × N to keep load imbalance under about 1%.</p>
+<hr />
+<h2 id="m19-5-a-realistic-example">5. A realistic example</h2>
+<p>A team runs a gRPC service on Kubernetes: 6 pods behind a plain ClusterIP Service, called by 40 client pods. Each client opens one HTTP/2 connection to the Service at startup and multiplexes every call onto it. That is gRPC's default behaviour, and it is efficient.</p>
+<p>The service is scaled from 6 to 12 pods for a launch. The dashboards are odd. Six pods are at 85% CPU. The six new ones are at 2%. Latency is up. Nothing is unhealthy.</p>
+<p>Here is the mechanism. kube-proxy balances <em>connections</em>, and it chose a backend once — when each client connected, back when there were only 6 pods. The 40 connections are still open, because HTTP/2 connections live for hours. No new connections means no new decisions, so the 6 new pods only ever see the occasional reconnect.</p>
+<p>You prove it on one of the busy pods by counting established connections from clients:</p>
+<pre class="text"><code>$ kubectl exec orders-7d9c-abcde -- ss -tn state established &#39;( sport = :50051 )&#39; | wc -l
+# run in your cluster — your output will differ
+8</code></pre>
+<p>The new pods show 0 or 1. The load is per request, but the balancing was per connection.</p>
+<p>There are three fixes, from least to most invasive:</p>
+<ul>
+<li><strong>Cap connection age on the server.</strong> gRPC servers support <code>MAX_CONNECTION_AGE</code> (for example, 5 minutes plus a grace period). The server sends <code>GOAWAY</code> when the age is reached, the client reconnects, and kube-proxy makes a fresh choice. Load converges within one age period.</li>
+<li><strong>Balance per request in the client.</strong> gRPC's client-side <code>round_robin</code> policy, pointed at a headless Service (which returns every pod IP in DNS), opens a connection to each pod and spreads calls across them. Proxyless gRPC with xDS takes this further.</li>
+<li><strong>Put an L7 balancer in the path.</strong> A mesh sidecar or an Envoy-based gateway terminates HTTP/2 and balances each stream with least-request P2C.</li>
+</ul>
+<p>The team ships the first fix the same day and the second the next sprint. The lesson they wrote down: <em>an L4 balancer cannot balance work that it never sees as separate connections.</em></p>
+<hr />
+<h2 id="m19-6-misconceptions--common-mistakes">6. Misconceptions &amp; common mistakes</h2>
+<p><strong>"Round robin is fair."</strong> It is fair by request count, which is not what you care about. One slow backend gets exactly the same share as a fast one, and its queue grows until requests time out. The simulation in section 9 shows round robin pushing a backend that is three times slower into unbounded queueing at 75% overall load.</p>
+<p><strong>"Least connections is always best."</strong> It is good in a single balancer. In a fleet of balancers it herds: every instance sees the same idle backend and sends to it at once. And when a new or recovered backend joins with zero connections, least-connections floods it while its caches and JIT are cold. Use slow start (ramp its weight over 30–60 s) or P2C.</p>
+<p><strong>"The balancer sees the client IP."</strong> Only in NAT or DSR mode. A full proxy — every L7 balancer and many L4 ones — replaces it with its own address. You get it back from <code>X-Forwarded-For</code>, <code>Forwarded</code>, or PROXY protocol, and only if you configure the backend to read them and trust the right hop.</p>
+<p><strong>"Health check passing means the service works."</strong> A <code>/healthz</code> that returns 200 from a process that can't reach its database tells the balancer nothing useful. The opposite mistake is just as bad. A deep health check that fails whenever a shared dependency is slow marks <em>every</em> backend down at once, and your outage gets larger. Check what the backend itself controls. Let outlier detection catch the rest.</p>
+<p><strong>"Consistent hashing balances load."</strong> It balances keys. A hot key still lands on one backend. Use bounded loads, or split hot keys deliberately.</p>
+<p><strong>"Sticky sessions keep user state safe."</strong> They keep it <em>convenient</em>. When the backend dies or is drained, the state goes with it.</p>
+<p><strong>"DNS failover is instant."</strong> It is bounded below by TTLs and above by whatever clients and resolvers actually do. Long-lived connections never re-resolve.</p>
+<p><strong>"The cloud balancer has infinite capacity."</strong> Managed balancers scale by adding nodes, and that takes minutes. A sudden 10× spike can see errors while it happens. Some providers offer pre-warming or capacity reservations for exactly this reason.</p>
+<hr />
+<h2 id="m19-7-interview-qa">7. Interview Q&amp;A</h2>
+<p><strong>Q1: What's the difference between an L4 and an L7 load balancer, and when would you choose each?</strong></p>
+<p>An L4 balancer decides per connection using addresses, ports and protocol. It never parses the payload, so it is fast, protocol-agnostic, and can preserve the client IP. An L7 balancer terminates the connection, parses HTTP, and decides per request on path, host, headers or cookies. Choose L4 for raw throughput, non-HTTP protocols, TLS passthrough, or as the scalable first tier. Choose L7 when you need content routing, per-request balancing of multiplexed protocols like HTTP/2 and gRPC, retries, or header manipulation. Large systems use both: L4 in front, scaling the L7 fleet behind it.</p>
+<p><strong>Q2: How does direct server return work, and why would you use it?</strong></p>
+<p>The balancer forwards the client's packet with its destination still set to the VIP, either by rewriting only the MAC address or by encapsulating it in an outer IP header. The backend has the VIP on a loopback interface, accepts the packet, and replies from the VIP directly to the client. The balancer only carries the inbound direction. Responses are usually far larger than requests, so this multiplies the balancer's capacity. The cost is that the balancer never sees replies, so no TLS termination or L7 features.</p>
+<p><strong>Q3: Why do we need consistent hashing? Why not <code>hash mod N</code>?</strong></p>
+<p>With <code>hash mod N</code>, changing N by one moves almost every key: removing one of ten backends moves about 90% of keys. For caches or sharded state that means a near-total miss storm. Consistent hashing (ring, Maglev, rendezvous) moves only the keys that belonged to the changed backend, about 1/N of them.</p>
+<p><strong>Q4: What is the power of two choices?</strong></p>
+<p>Pick two backends at random and send to the less loaded one. It needs no global state, avoids the herding that pure least-connections suffers across many balancers, and cuts the worst-case load dramatically compared with random choice. Envoy's least-request balancer uses it by default.</p>
+<p><strong>Q5: A user reports that their session keeps getting lost. You use sticky sessions. What could be wrong?</strong></p>
+<p>Several things. The sticky backend was drained or failed, so the client was re-routed. Cookie stickiness can break if the cookie isn't returned (cross-site cookie rules, a client that drops cookies). Source-IP stickiness breaks when the client's IP changes, for example on mobile networks or behind rotating carrier-grade NAT. And an L4 tier in front with no affinity can send the client to a different L7 node with different sticky state. The real fix is to move session state to a shared store and keep stickiness only for cache warmth.</p>
+<hr />
+<h2 id="m19-8-try-it">8. Try it</h2>
+<p>Many large sites return several addresses for one name. That is the simplest load balancing there is: DNS round robin, with the client choosing.</p>
+<div class="sourceCode" id="m19-cb8"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="m19-cb8-1"><a href="#m19-cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># run on your Mac — your output will differ (needs internet)</span></span>
+<span id="m19-cb8-2"><a href="#m19-cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">dig</span> +short A www.wikipedia.org</span>
+<span id="m19-cb8-3"><a href="#m19-cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">dig</span> +short A github.com</span>
+<span id="m19-cb8-4"><a href="#m19-cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Run each twice. Do the answers rotate? Different names use different strategies.</span></span>
+<span id="m19-cb8-5"><a href="#m19-cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb8-6"><a href="#m19-cb8-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Anycast vs DNS steering: the same name may resolve to the same IP everywhere (anycast),</span></span>
+<span id="m19-cb8-7"><a href="#m19-cb8-7" aria-hidden="true" tabindex="-1"></a><span class="co"># or to different IPs from different resolvers (DNS-based steering).</span></span>
+<span id="m19-cb8-8"><a href="#m19-cb8-8" aria-hidden="true" tabindex="-1"></a><span class="ex">dig</span> +short A www.cloudflare.com @1.1.1.1</span>
+<span id="m19-cb8-9"><a href="#m19-cb8-9" aria-hidden="true" tabindex="-1"></a><span class="ex">dig</span> +short A www.cloudflare.com @8.8.8.8</span>
+<span id="m19-cb8-10"><a href="#m19-cb8-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb8-11"><a href="#m19-cb8-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Which backend served you? Many CDNs and LBs expose it in a response header.</span></span>
+<span id="m19-cb8-12"><a href="#m19-cb8-12" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sI</span> https://www.wikipedia.org <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-iE</span> <span class="st">&#39;^(server|x-cache|via|age|x-served-by)&#39;</span></span></code></pre></div>
+<p>On a Linux box with IPVS available (not macOS — macOS has no IPVS), you can build a two-backend virtual service and watch the tables:</p>
+<div class="sourceCode" id="m19-cb9"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="m19-cb9-1"><a href="#m19-cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># run on a Linux test VM as root — your output will differ</span></span>
+<span id="m19-cb9-2"><a href="#m19-cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">modprobe</span> ip_vs</span>
+<span id="m19-cb9-3"><a href="#m19-cb9-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ipvsadm</span> <span class="at">-A</span> <span class="at">-t</span> 192.0.2.10:80 <span class="at">-s</span> rr                       <span class="co"># virtual service, round robin</span></span>
+<span id="m19-cb9-4"><a href="#m19-cb9-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ipvsadm</span> <span class="at">-a</span> <span class="at">-t</span> 192.0.2.10:80 <span class="at">-r</span> 10.0.0.11:80 <span class="at">-m</span> <span class="at">-w</span> 1     <span class="co"># -m = masquerade (NAT)</span></span>
+<span id="m19-cb9-5"><a href="#m19-cb9-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ipvsadm</span> <span class="at">-a</span> <span class="at">-t</span> 192.0.2.10:80 <span class="at">-r</span> 10.0.0.12:80 <span class="at">-m</span> <span class="at">-w</span> 1</span>
+<span id="m19-cb9-6"><a href="#m19-cb9-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ipvsadm</span> <span class="at">-Ln</span> <span class="at">--stats</span></span>
+<span id="m19-cb9-7"><a href="#m19-cb9-7" aria-hidden="true" tabindex="-1"></a><span class="ex">ipvsadm</span> <span class="at">-Lnc</span>                                            <span class="co"># live connection table</span></span>
+<span id="m19-cb9-8"><a href="#m19-cb9-8" aria-hidden="true" tabindex="-1"></a><span class="ex">ipvsadm</span> <span class="at">-e</span> <span class="at">-t</span> 192.0.2.10:80 <span class="at">-r</span> 10.0.0.12:80 <span class="at">-m</span> <span class="at">-w</span> 0     <span class="co"># drain backend 2</span></span>
+<span id="m19-cb9-9"><a href="#m19-cb9-9" aria-hidden="true" tabindex="-1"></a><span class="ex">ipvsadm</span> <span class="at">-C</span>                                              <span class="co"># clear everything when done</span></span></code></pre></div>
+<p>And see what a backend actually receives behind each kind of proxy. This script starts a backend, an L4 proxy, an L4 proxy that sends PROXY protocol, and an L7 proxy, all on localhost, and has the backend report what it saw. It is <code>code/m19/l4_vs_l7.py</code>:</p>
+<div class="sourceCode" id="m19-cb10"><pre class="sourceCode python"><code class="sourceCode python"><span id="m19-cb10-1"><a href="#m19-cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;What does the backend see behind an L4 proxy vs an L7 proxy? Python 3.13 stdlib, localhost only.&quot;&quot;&quot;</span></span>
+<span id="m19-cb10-2"><a href="#m19-cb10-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> asyncio</span>
+<span id="m19-cb10-3"><a href="#m19-cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-4"><a href="#m19-cb10-4" aria-hidden="true" tabindex="-1"></a>BACKEND, L4, L4_PROXYPROTO, L7 <span class="op">=</span> <span class="dv">9001</span>, <span class="dv">9101</span>, <span class="dv">9102</span>, <span class="dv">9103</span></span>
+<span id="m19-cb10-5"><a href="#m19-cb10-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-6"><a href="#m19-cb10-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-7"><a href="#m19-cb10-7" aria-hidden="true" tabindex="-1"></a><span class="cf">async</span> <span class="kw">def</span> backend(reader, writer):</span>
+<span id="m19-cb10-8"><a href="#m19-cb10-8" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Reports what it saw: the TCP peer, plus whatever bytes arrived first.</span></span>
+<span id="m19-cb10-9"><a href="#m19-cb10-9" aria-hidden="true" tabindex="-1"></a>    peer <span class="op">=</span> writer.get_extra_info(<span class="st">&quot;peername&quot;</span>)</span>
+<span id="m19-cb10-10"><a href="#m19-cb10-10" aria-hidden="true" tabindex="-1"></a>    head <span class="op">=</span> <span class="cf">await</span> reader.readuntil(<span class="st">b&quot;</span><span class="ch">\r\n\r\n</span><span class="st">&quot;</span>)</span>
+<span id="m19-cb10-11"><a href="#m19-cb10-11" aria-hidden="true" tabindex="-1"></a>    lines <span class="op">=</span> head.decode().split(<span class="st">&quot;</span><span class="ch">\r\n</span><span class="st">&quot;</span>)</span>
+<span id="m19-cb10-12"><a href="#m19-cb10-12" aria-hidden="true" tabindex="-1"></a>    report <span class="op">=</span> [<span class="ss">f&quot;TCP peer      : </span><span class="sc">{</span>peer[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>peer[<span class="dv">1</span>]<span class="sc">}</span><span class="ss">&quot;</span>]</span>
+<span id="m19-cb10-13"><a href="#m19-cb10-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> lines[<span class="dv">0</span>].startswith(<span class="st">&quot;PROXY &quot;</span>):</span>
+<span id="m19-cb10-14"><a href="#m19-cb10-14" aria-hidden="true" tabindex="-1"></a>        report.append(<span class="ss">f&quot;PROXY v1 line : </span><span class="sc">{</span>lines[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m19-cb10-15"><a href="#m19-cb10-15" aria-hidden="true" tabindex="-1"></a>        lines <span class="op">=</span> lines[<span class="dv">1</span>:]</span>
+<span id="m19-cb10-16"><a href="#m19-cb10-16" aria-hidden="true" tabindex="-1"></a>    report.append(<span class="ss">f&quot;request line  : </span><span class="sc">{</span>lines[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m19-cb10-17"><a href="#m19-cb10-17" aria-hidden="true" tabindex="-1"></a>    report <span class="op">+=</span> [<span class="ss">f&quot;header        : </span><span class="sc">{</span>l<span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> l <span class="kw">in</span> lines[<span class="dv">1</span>:] <span class="cf">if</span> l.lower().startswith((<span class="st">&quot;x-forwarded&quot;</span>, <span class="st">&quot;host&quot;</span>))]</span>
+<span id="m19-cb10-18"><a href="#m19-cb10-18" aria-hidden="true" tabindex="-1"></a>    body <span class="op">=</span> <span class="st">&quot;</span><span class="ch">\n</span><span class="st">&quot;</span>.join(report).encode()</span>
+<span id="m19-cb10-19"><a href="#m19-cb10-19" aria-hidden="true" tabindex="-1"></a>    writer.write(<span class="st">b&quot;HTTP/1.1 200 OK</span><span class="ch">\r\n</span><span class="st">Content-Length: %d</span><span class="ch">\r\n</span><span class="st">Connection: close</span><span class="ch">\r\n\r\n</span><span class="st">&quot;</span> <span class="op">%</span> <span class="bu">len</span>(body) <span class="op">+</span> body)</span>
+<span id="m19-cb10-20"><a href="#m19-cb10-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">await</span> writer.drain()<span class="op">;</span> writer.close()</span>
+<span id="m19-cb10-21"><a href="#m19-cb10-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-22"><a href="#m19-cb10-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-23"><a href="#m19-cb10-23" aria-hidden="true" tabindex="-1"></a><span class="cf">async</span> <span class="kw">def</span> pipe(r, w):</span>
+<span id="m19-cb10-24"><a href="#m19-cb10-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="m19-cb10-25"><a href="#m19-cb10-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> data <span class="op">:=</span> <span class="cf">await</span> r.read(<span class="dv">65536</span>):</span>
+<span id="m19-cb10-26"><a href="#m19-cb10-26" aria-hidden="true" tabindex="-1"></a>            w.write(data)<span class="op">;</span> <span class="cf">await</span> w.drain()</span>
+<span id="m19-cb10-27"><a href="#m19-cb10-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">finally</span>:</span>
+<span id="m19-cb10-28"><a href="#m19-cb10-28" aria-hidden="true" tabindex="-1"></a>        w.close()</span>
+<span id="m19-cb10-29"><a href="#m19-cb10-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-30"><a href="#m19-cb10-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-31"><a href="#m19-cb10-31" aria-hidden="true" tabindex="-1"></a><span class="cf">async</span> <span class="kw">def</span> l4_proxy(reader, writer, proxy_protocol<span class="op">=</span><span class="va">False</span>):</span>
+<span id="m19-cb10-32"><a href="#m19-cb10-32" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Layer 4: opens its own TCP connection to the backend and copies bytes blindly.</span></span>
+<span id="m19-cb10-33"><a href="#m19-cb10-33" aria-hidden="true" tabindex="-1"></a>    up_r, up_w <span class="op">=</span> <span class="cf">await</span> asyncio.open_connection(<span class="st">&quot;127.0.0.1&quot;</span>, BACKEND)</span>
+<span id="m19-cb10-34"><a href="#m19-cb10-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> proxy_protocol:   <span class="co"># HAProxy PROXY protocol v1: one text line before the client&#39;s bytes</span></span>
+<span id="m19-cb10-35"><a href="#m19-cb10-35" aria-hidden="true" tabindex="-1"></a>        c, s <span class="op">=</span> writer.get_extra_info(<span class="st">&quot;peername&quot;</span>), writer.get_extra_info(<span class="st">&quot;sockname&quot;</span>)</span>
+<span id="m19-cb10-36"><a href="#m19-cb10-36" aria-hidden="true" tabindex="-1"></a>        up_w.write(<span class="ss">f&quot;PROXY TCP4 </span><span class="sc">{</span>c[<span class="dv">0</span>]<span class="sc">}</span><span class="ss"> </span><span class="sc">{</span>s[<span class="dv">0</span>]<span class="sc">}</span><span class="ss"> </span><span class="sc">{</span>c[<span class="dv">1</span>]<span class="sc">}</span><span class="ss"> </span><span class="sc">{</span>s[<span class="dv">1</span>]<span class="sc">}</span><span class="ch">\r\n</span><span class="ss">&quot;</span>.encode())</span>
+<span id="m19-cb10-37"><a href="#m19-cb10-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">await</span> asyncio.gather(pipe(reader, up_w), pipe(up_r, writer))</span>
+<span id="m19-cb10-38"><a href="#m19-cb10-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-39"><a href="#m19-cb10-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-40"><a href="#m19-cb10-40" aria-hidden="true" tabindex="-1"></a><span class="cf">async</span> <span class="kw">def</span> l7_proxy(reader, writer):</span>
+<span id="m19-cb10-41"><a href="#m19-cb10-41" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Layer 7: parses the HTTP request, can route on it, and rewrites headers.</span></span>
+<span id="m19-cb10-42"><a href="#m19-cb10-42" aria-hidden="true" tabindex="-1"></a>    head <span class="op">=</span> <span class="cf">await</span> reader.readuntil(<span class="st">b&quot;</span><span class="ch">\r\n\r\n</span><span class="st">&quot;</span>)</span>
+<span id="m19-cb10-43"><a href="#m19-cb10-43" aria-hidden="true" tabindex="-1"></a>    client <span class="op">=</span> writer.get_extra_info(<span class="st">&quot;peername&quot;</span>)[<span class="dv">0</span>]</span>
+<span id="m19-cb10-44"><a href="#m19-cb10-44" aria-hidden="true" tabindex="-1"></a>    lines <span class="op">=</span> head.decode().split(<span class="st">&quot;</span><span class="ch">\r\n</span><span class="st">&quot;</span>)[:<span class="op">-</span><span class="dv">2</span>]</span>
+<span id="m19-cb10-45"><a href="#m19-cb10-45" aria-hidden="true" tabindex="-1"></a>    lines.append(<span class="ss">f&quot;X-Forwarded-For: </span><span class="sc">{</span>client<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="m19-cb10-46"><a href="#m19-cb10-46" aria-hidden="true" tabindex="-1"></a>    lines.append(<span class="st">&quot;X-Forwarded-Proto: http&quot;</span>)</span>
+<span id="m19-cb10-47"><a href="#m19-cb10-47" aria-hidden="true" tabindex="-1"></a>    up_r, up_w <span class="op">=</span> <span class="cf">await</span> asyncio.open_connection(<span class="st">&quot;127.0.0.1&quot;</span>, BACKEND)</span>
+<span id="m19-cb10-48"><a href="#m19-cb10-48" aria-hidden="true" tabindex="-1"></a>    up_w.write((<span class="st">&quot;</span><span class="ch">\r\n</span><span class="st">&quot;</span>.join(lines) <span class="op">+</span> <span class="st">&quot;</span><span class="ch">\r\n\r\n</span><span class="st">&quot;</span>).encode())</span>
+<span id="m19-cb10-49"><a href="#m19-cb10-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">await</span> asyncio.gather(pipe(reader, up_w), pipe(up_r, writer))</span>
+<span id="m19-cb10-50"><a href="#m19-cb10-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-51"><a href="#m19-cb10-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-52"><a href="#m19-cb10-52" aria-hidden="true" tabindex="-1"></a><span class="cf">async</span> <span class="kw">def</span> client(port, label):</span>
+<span id="m19-cb10-53"><a href="#m19-cb10-53" aria-hidden="true" tabindex="-1"></a>    r, w <span class="op">=</span> <span class="cf">await</span> asyncio.open_connection(<span class="st">&quot;127.0.0.1&quot;</span>, port)</span>
+<span id="m19-cb10-54"><a href="#m19-cb10-54" aria-hidden="true" tabindex="-1"></a>    mine <span class="op">=</span> w.get_extra_info(<span class="st">&quot;sockname&quot;</span>)</span>
+<span id="m19-cb10-55"><a href="#m19-cb10-55" aria-hidden="true" tabindex="-1"></a>    w.write(<span class="st">b&quot;GET /api/cart HTTP/1.1</span><span class="ch">\r\n</span><span class="st">Host: shop.example</span><span class="ch">\r\n</span><span class="st">Connection: close</span><span class="ch">\r\n\r\n</span><span class="st">&quot;</span>)</span>
+<span id="m19-cb10-56"><a href="#m19-cb10-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">await</span> w.drain()</span>
+<span id="m19-cb10-57"><a href="#m19-cb10-57" aria-hidden="true" tabindex="-1"></a>    resp <span class="op">=</span> (<span class="cf">await</span> r.read()).decode().split(<span class="st">&quot;</span><span class="ch">\r\n\r\n</span><span class="st">&quot;</span>, <span class="dv">1</span>)[<span class="dv">1</span>]</span>
+<span id="m19-cb10-58"><a href="#m19-cb10-58" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;--- </span><span class="sc">{</span>label<span class="sc">}</span><span class="ss"> (client is </span><span class="sc">{</span>mine[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>mine[<span class="dv">1</span>]<span class="sc">}</span><span class="ss">)</span><span class="ch">\n</span><span class="sc">{</span>resp<span class="sc">}</span><span class="ch">\n</span><span class="ss">&quot;</span>)</span>
+<span id="m19-cb10-59"><a href="#m19-cb10-59" aria-hidden="true" tabindex="-1"></a>    w.close()</span>
+<span id="m19-cb10-60"><a href="#m19-cb10-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-61"><a href="#m19-cb10-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-62"><a href="#m19-cb10-62" aria-hidden="true" tabindex="-1"></a><span class="cf">async</span> <span class="kw">def</span> main():</span>
+<span id="m19-cb10-63"><a href="#m19-cb10-63" aria-hidden="true" tabindex="-1"></a>    servers <span class="op">=</span> [</span>
+<span id="m19-cb10-64"><a href="#m19-cb10-64" aria-hidden="true" tabindex="-1"></a>        <span class="cf">await</span> asyncio.start_server(backend, <span class="st">&quot;127.0.0.1&quot;</span>, BACKEND),</span>
+<span id="m19-cb10-65"><a href="#m19-cb10-65" aria-hidden="true" tabindex="-1"></a>        <span class="cf">await</span> asyncio.start_server(l4_proxy, <span class="st">&quot;127.0.0.1&quot;</span>, L4),</span>
+<span id="m19-cb10-66"><a href="#m19-cb10-66" aria-hidden="true" tabindex="-1"></a>        <span class="cf">await</span> asyncio.start_server(<span class="kw">lambda</span> r, w: l4_proxy(r, w, <span class="va">True</span>), <span class="st">&quot;127.0.0.1&quot;</span>, L4_PROXYPROTO),</span>
+<span id="m19-cb10-67"><a href="#m19-cb10-67" aria-hidden="true" tabindex="-1"></a>        <span class="cf">await</span> asyncio.start_server(l7_proxy, <span class="st">&quot;127.0.0.1&quot;</span>, L7),</span>
+<span id="m19-cb10-68"><a href="#m19-cb10-68" aria-hidden="true" tabindex="-1"></a>    ]</span>
+<span id="m19-cb10-69"><a href="#m19-cb10-69" aria-hidden="true" tabindex="-1"></a>    <span class="cf">await</span> client(BACKEND, <span class="st">&quot;direct to backend&quot;</span>)</span>
+<span id="m19-cb10-70"><a href="#m19-cb10-70" aria-hidden="true" tabindex="-1"></a>    <span class="cf">await</span> client(L4, <span class="st">&quot;through L4 proxy&quot;</span>)</span>
+<span id="m19-cb10-71"><a href="#m19-cb10-71" aria-hidden="true" tabindex="-1"></a>    <span class="cf">await</span> client(L4_PROXYPROTO, <span class="st">&quot;through L4 proxy + PROXY protocol&quot;</span>)</span>
+<span id="m19-cb10-72"><a href="#m19-cb10-72" aria-hidden="true" tabindex="-1"></a>    <span class="cf">await</span> client(L7, <span class="st">&quot;through L7 proxy&quot;</span>)</span>
+<span id="m19-cb10-73"><a href="#m19-cb10-73" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> s <span class="kw">in</span> servers:</span>
+<span id="m19-cb10-74"><a href="#m19-cb10-74" aria-hidden="true" tabindex="-1"></a>        s.close()</span>
+<span id="m19-cb10-75"><a href="#m19-cb10-75" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb10-76"><a href="#m19-cb10-76" aria-hidden="true" tabindex="-1"></a>asyncio.run(main())</span></code></pre></div>
+<p>Real output (ephemeral ports differ on every run):</p>
+<pre class="text"><code>--- direct to backend (client is 127.0.0.1:41440)
+TCP peer      : 127.0.0.1:41440
+request line  : GET /api/cart HTTP/1.1
+header        : Host: shop.example
+
+--- through L4 proxy (client is 127.0.0.1:57008)
+TCP peer      : 127.0.0.1:41452
+request line  : GET /api/cart HTTP/1.1
+header        : Host: shop.example
+
+--- through L4 proxy + PROXY protocol (client is 127.0.0.1:55496)
+TCP peer      : 127.0.0.1:41462
+PROXY v1 line : PROXY TCP4 127.0.0.1 127.0.0.1 55496 9102
+request line  : GET /api/cart HTTP/1.1
+header        : Host: shop.example
+
+--- through L7 proxy (client is 127.0.0.1:55324)
+TCP peer      : 127.0.0.1:41476
+request line  : GET /api/cart HTTP/1.1
+header        : Host: shop.example
+header        : X-Forwarded-For: 127.0.0.1
+header        : X-Forwarded-Proto: http</code></pre>
+<p>Look at the port numbers, because on localhost every address is 127.0.0.1. Direct, the backend's TCP peer <em>is</em> the client (41440 on both sides). Through the L4 proxy, the peer is the proxy's own outbound socket (41452), not the client's (57008): the backend has lost the client. The PROXY protocol line puts it back (55496). The L7 proxy restores it in a header instead, and it could have routed on <code>/api/cart</code> or <code>Host</code> before choosing a backend.</p>
+<hr />
+<h2 id="m19-9-code-comparing-algorithms-under-skewed-load">9. Code: comparing algorithms under skewed load</h2>
+<p>This simulation puts six balancing policies (plus one fix) against the same workload, built to look like production rather than a textbook:</p>
+<ul>
+<li>10 backends with 4 workers each and a FIFO queue. Backend <code>b3</code> runs <strong>3× slower</strong> than the rest — a noisy neighbour, a bad disk, an older instance type.</li>
+<li>Service times are <strong>lognormal</strong>: median 10 ms, mean about 20.5 ms, with a long tail.</li>
+<li>Requests come from 50,000 users with <strong>Zipf-skewed</strong> popularity (exponent 1.1). The hottest user sends 13.9% of all requests; the top ten send 37%.</li>
+<li>Arrivals are Poisson at 75% of total capacity. 200,000 requests, fixed seed, deterministic.</li>
+</ul>
+<p>Least-connections here has perfect, instant knowledge of in-flight counts. That is the best case. P2C only looks at two random backends. The hash policies key on the user ID.</p>
+<p><code>code/m19/lb_sim.py</code>:</p>
+<div class="sourceCode" id="m19-cb12"><pre class="sourceCode python"><code class="sourceCode python"><span id="m19-cb12-1"><a href="#m19-cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Compare load-balancing algorithms under skewed load. Python 3.13 stdlib only.</span></span>
+<span id="m19-cb12-2"><a href="#m19-cb12-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-3"><a href="#m19-cb12-3" aria-hidden="true" tabindex="-1"></a><span class="co">Ten backends, one of them three times slower (a noisy neighbour).</span></span>
+<span id="m19-cb12-4"><a href="#m19-cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co">Request service times are heavy-tailed (most are fast, a few are huge).</span></span>
+<span id="m19-cb12-5"><a href="#m19-cb12-5" aria-hidden="true" tabindex="-1"></a><span class="co">Each backend runs 4 workers with a FIFO queue. Offered load is ~75% of capacity.</span></span>
+<span id="m19-cb12-6"><a href="#m19-cb12-6" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="m19-cb12-7"><a href="#m19-cb12-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="m19-cb12-8"><a href="#m19-cb12-8" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> heapq</span>
+<span id="m19-cb12-9"><a href="#m19-cb12-9" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> random</span>
+<span id="m19-cb12-10"><a href="#m19-cb12-10" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> statistics</span>
+<span id="m19-cb12-11"><a href="#m19-cb12-11" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> bisect <span class="im">import</span> bisect</span>
+<span id="m19-cb12-12"><a href="#m19-cb12-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-13"><a href="#m19-cb12-13" aria-hidden="true" tabindex="-1"></a>N_BACKENDS <span class="op">=</span> <span class="dv">10</span></span>
+<span id="m19-cb12-14"><a href="#m19-cb12-14" aria-hidden="true" tabindex="-1"></a>WORKERS <span class="op">=</span> <span class="dv">4</span></span>
+<span id="m19-cb12-15"><a href="#m19-cb12-15" aria-hidden="true" tabindex="-1"></a>SLOW <span class="op">=</span> <span class="dv">3</span>                 <span class="co"># backend index that runs 3x slower</span></span>
+<span id="m19-cb12-16"><a href="#m19-cb12-16" aria-hidden="true" tabindex="-1"></a>N_REQ <span class="op">=</span> <span class="dv">200_000</span></span>
+<span id="m19-cb12-17"><a href="#m19-cb12-17" aria-hidden="true" tabindex="-1"></a>SEED <span class="op">=</span> <span class="dv">7</span></span>
+<span id="m19-cb12-18"><a href="#m19-cb12-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-19"><a href="#m19-cb12-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-20"><a href="#m19-cb12-20" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> h64(s: <span class="bu">str</span>, salt: <span class="bu">str</span> <span class="op">=</span> <span class="st">&quot;&quot;</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:</span>
+<span id="m19-cb12-21"><a href="#m19-cb12-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">int</span>.from_bytes(hashlib.blake2b((salt <span class="op">+</span> s).encode(), digest_size<span class="op">=</span><span class="dv">8</span>).digest(), <span class="st">&quot;big&quot;</span>)</span>
+<span id="m19-cb12-22"><a href="#m19-cb12-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-23"><a href="#m19-cb12-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-24"><a href="#m19-cb12-24" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Backend:</span>
+<span id="m19-cb12-25"><a href="#m19-cb12-25" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="fu">__init__</span>(<span class="va">self</span>, idx: <span class="bu">int</span>):</span>
+<span id="m19-cb12-26"><a href="#m19-cb12-26" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.idx <span class="op">=</span> idx</span>
+<span id="m19-cb12-27"><a href="#m19-cb12-27" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.speed <span class="op">=</span> <span class="dv">1</span> <span class="op">/</span> <span class="dv">3</span> <span class="cf">if</span> idx <span class="op">==</span> SLOW <span class="cf">else</span> <span class="fl">1.0</span></span>
+<span id="m19-cb12-28"><a href="#m19-cb12-28" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.free <span class="op">=</span> [<span class="fl">0.0</span>] <span class="op">*</span> WORKERS          <span class="co"># heap: when each worker frees up</span></span>
+<span id="m19-cb12-29"><a href="#m19-cb12-29" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.done <span class="op">=</span> []                      <span class="co"># heap: finish times of accepted requests</span></span>
+<span id="m19-cb12-30"><a href="#m19-cb12-30" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.served <span class="op">=</span> <span class="dv">0</span></span>
+<span id="m19-cb12-31"><a href="#m19-cb12-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-32"><a href="#m19-cb12-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> inflight(<span class="va">self</span>, now: <span class="bu">float</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:</span>
+<span id="m19-cb12-33"><a href="#m19-cb12-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="va">self</span>.done <span class="kw">and</span> <span class="va">self</span>.done[<span class="dv">0</span>] <span class="op">&lt;=</span> now:</span>
+<span id="m19-cb12-34"><a href="#m19-cb12-34" aria-hidden="true" tabindex="-1"></a>            heapq.heappop(<span class="va">self</span>.done)</span>
+<span id="m19-cb12-35"><a href="#m19-cb12-35" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="bu">len</span>(<span class="va">self</span>.done)</span>
+<span id="m19-cb12-36"><a href="#m19-cb12-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-37"><a href="#m19-cb12-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> accept(<span class="va">self</span>, now: <span class="bu">float</span>, work: <span class="bu">float</span>) <span class="op">-&gt;</span> <span class="bu">float</span>:</span>
+<span id="m19-cb12-38"><a href="#m19-cb12-38" aria-hidden="true" tabindex="-1"></a>        start <span class="op">=</span> <span class="bu">max</span>(now, heapq.heappop(<span class="va">self</span>.free))</span>
+<span id="m19-cb12-39"><a href="#m19-cb12-39" aria-hidden="true" tabindex="-1"></a>        finish <span class="op">=</span> start <span class="op">+</span> work <span class="op">/</span> <span class="va">self</span>.speed</span>
+<span id="m19-cb12-40"><a href="#m19-cb12-40" aria-hidden="true" tabindex="-1"></a>        heapq.heappush(<span class="va">self</span>.free, finish)</span>
+<span id="m19-cb12-41"><a href="#m19-cb12-41" aria-hidden="true" tabindex="-1"></a>        heapq.heappush(<span class="va">self</span>.done, finish)</span>
+<span id="m19-cb12-42"><a href="#m19-cb12-42" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.served <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="m19-cb12-43"><a href="#m19-cb12-43" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> finish <span class="op">-</span> now</span>
+<span id="m19-cb12-44"><a href="#m19-cb12-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-45"><a href="#m19-cb12-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-46"><a href="#m19-cb12-46" aria-hidden="true" tabindex="-1"></a><span class="co"># ---------- hashing tables ----------</span></span>
+<span id="m19-cb12-47"><a href="#m19-cb12-47" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> build_ring(names, vnodes<span class="op">=</span><span class="dv">100</span>):</span>
+<span id="m19-cb12-48"><a href="#m19-cb12-48" aria-hidden="true" tabindex="-1"></a>    pts <span class="op">=</span> <span class="bu">sorted</span>((h64(<span class="ss">f&quot;</span><span class="sc">{</span>n<span class="sc">}</span><span class="ss">#</span><span class="sc">{</span>v<span class="sc">}</span><span class="ss">&quot;</span>), n) <span class="cf">for</span> n <span class="kw">in</span> names <span class="cf">for</span> v <span class="kw">in</span> <span class="bu">range</span>(vnodes))</span>
+<span id="m19-cb12-49"><a href="#m19-cb12-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> [p <span class="cf">for</span> p, _ <span class="kw">in</span> pts], [n <span class="cf">for</span> _, n <span class="kw">in</span> pts]</span>
+<span id="m19-cb12-50"><a href="#m19-cb12-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-51"><a href="#m19-cb12-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-52"><a href="#m19-cb12-52" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> ring_lookup(ring, key):</span>
+<span id="m19-cb12-53"><a href="#m19-cb12-53" aria-hidden="true" tabindex="-1"></a>    keys, owners <span class="op">=</span> ring</span>
+<span id="m19-cb12-54"><a href="#m19-cb12-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> owners[bisect(keys, h64(key)) <span class="op">%</span> <span class="bu">len</span>(keys)]</span>
+<span id="m19-cb12-55"><a href="#m19-cb12-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-56"><a href="#m19-cb12-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-57"><a href="#m19-cb12-57" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> build_maglev(names, m<span class="op">=</span><span class="dv">65537</span>):</span>
+<span id="m19-cb12-58"><a href="#m19-cb12-58" aria-hidden="true" tabindex="-1"></a>    perms <span class="op">=</span> []</span>
+<span id="m19-cb12-59"><a href="#m19-cb12-59" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> n <span class="kw">in</span> names:</span>
+<span id="m19-cb12-60"><a href="#m19-cb12-60" aria-hidden="true" tabindex="-1"></a>        offset <span class="op">=</span> h64(n, <span class="st">&quot;off&quot;</span>) <span class="op">%</span> m</span>
+<span id="m19-cb12-61"><a href="#m19-cb12-61" aria-hidden="true" tabindex="-1"></a>        skip <span class="op">=</span> h64(n, <span class="st">&quot;skip&quot;</span>) <span class="op">%</span> (m <span class="op">-</span> <span class="dv">1</span>) <span class="op">+</span> <span class="dv">1</span></span>
+<span id="m19-cb12-62"><a href="#m19-cb12-62" aria-hidden="true" tabindex="-1"></a>        perms.append((offset, skip))</span>
+<span id="m19-cb12-63"><a href="#m19-cb12-63" aria-hidden="true" tabindex="-1"></a>    table <span class="op">=</span> [<span class="va">None</span>] <span class="op">*</span> m</span>
+<span id="m19-cb12-64"><a href="#m19-cb12-64" aria-hidden="true" tabindex="-1"></a>    nxt <span class="op">=</span> [<span class="dv">0</span>] <span class="op">*</span> <span class="bu">len</span>(names)</span>
+<span id="m19-cb12-65"><a href="#m19-cb12-65" aria-hidden="true" tabindex="-1"></a>    filled <span class="op">=</span> <span class="dv">0</span></span>
+<span id="m19-cb12-66"><a href="#m19-cb12-66" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="va">True</span>:</span>
+<span id="m19-cb12-67"><a href="#m19-cb12-67" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> i, n <span class="kw">in</span> <span class="bu">enumerate</span>(names):</span>
+<span id="m19-cb12-68"><a href="#m19-cb12-68" aria-hidden="true" tabindex="-1"></a>            offset, skip <span class="op">=</span> perms[i]</span>
+<span id="m19-cb12-69"><a href="#m19-cb12-69" aria-hidden="true" tabindex="-1"></a>            c <span class="op">=</span> (offset <span class="op">+</span> nxt[i] <span class="op">*</span> skip) <span class="op">%</span> m</span>
+<span id="m19-cb12-70"><a href="#m19-cb12-70" aria-hidden="true" tabindex="-1"></a>            <span class="cf">while</span> table[c] <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span>:</span>
+<span id="m19-cb12-71"><a href="#m19-cb12-71" aria-hidden="true" tabindex="-1"></a>                nxt[i] <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="m19-cb12-72"><a href="#m19-cb12-72" aria-hidden="true" tabindex="-1"></a>                c <span class="op">=</span> (offset <span class="op">+</span> nxt[i] <span class="op">*</span> skip) <span class="op">%</span> m</span>
+<span id="m19-cb12-73"><a href="#m19-cb12-73" aria-hidden="true" tabindex="-1"></a>            table[c] <span class="op">=</span> n</span>
+<span id="m19-cb12-74"><a href="#m19-cb12-74" aria-hidden="true" tabindex="-1"></a>            nxt[i] <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="m19-cb12-75"><a href="#m19-cb12-75" aria-hidden="true" tabindex="-1"></a>            filled <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="m19-cb12-76"><a href="#m19-cb12-76" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> filled <span class="op">==</span> m:</span>
+<span id="m19-cb12-77"><a href="#m19-cb12-77" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> table</span>
+<span id="m19-cb12-78"><a href="#m19-cb12-78" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-79"><a href="#m19-cb12-79" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-80"><a href="#m19-cb12-80" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> maglev_lookup(table, key):</span>
+<span id="m19-cb12-81"><a href="#m19-cb12-81" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> table[h64(key) <span class="op">%</span> <span class="bu">len</span>(table)]</span>
+<span id="m19-cb12-82"><a href="#m19-cb12-82" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-83"><a href="#m19-cb12-83" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-84"><a href="#m19-cb12-84" aria-hidden="true" tabindex="-1"></a><span class="co"># ---------- workload ----------</span></span>
+<span id="m19-cb12-85"><a href="#m19-cb12-85" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> workload(rng):</span>
+<span id="m19-cb12-86"><a href="#m19-cb12-86" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Lognormal service times (median 10 ms, long tail) at ~75% utilisation.</span></span>
+<span id="m19-cb12-87"><a href="#m19-cb12-87" aria-hidden="true" tabindex="-1"></a>    mean_work <span class="op">=</span> <span class="dv">10</span> <span class="op">*</span> (<span class="fl">2.718281828</span> <span class="op">**</span> (<span class="fl">1.2</span> <span class="op">**</span> <span class="dv">2</span> <span class="op">/</span> <span class="dv">2</span>))       <span class="co"># mean of lognormal(ln10, 1.2)</span></span>
+<span id="m19-cb12-88"><a href="#m19-cb12-88" aria-hidden="true" tabindex="-1"></a>    capacity <span class="op">=</span> WORKERS <span class="op">*</span> (N_BACKENDS <span class="op">-</span> <span class="dv">1</span> <span class="op">+</span> <span class="dv">1</span> <span class="op">/</span> <span class="dv">3</span>) <span class="op">/</span> mean_work   <span class="co"># req per ms</span></span>
+<span id="m19-cb12-89"><a href="#m19-cb12-89" aria-hidden="true" tabindex="-1"></a>    rate <span class="op">=</span> <span class="fl">0.75</span> <span class="op">*</span> capacity</span>
+<span id="m19-cb12-90"><a href="#m19-cb12-90" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Zipf-ish users: user k has weight 1/k^1.1 over 50,000 users</span></span>
+<span id="m19-cb12-91"><a href="#m19-cb12-91" aria-hidden="true" tabindex="-1"></a>    users <span class="op">=</span> <span class="dv">50_000</span></span>
+<span id="m19-cb12-92"><a href="#m19-cb12-92" aria-hidden="true" tabindex="-1"></a>    weights <span class="op">=</span> [<span class="dv">1</span> <span class="op">/</span> (k <span class="op">**</span> <span class="fl">1.1</span>) <span class="cf">for</span> k <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1</span>, users <span class="op">+</span> <span class="dv">1</span>)]</span>
+<span id="m19-cb12-93"><a href="#m19-cb12-93" aria-hidden="true" tabindex="-1"></a>    user_ids <span class="op">=</span> rng.choices(<span class="bu">range</span>(users), weights<span class="op">=</span>weights, k<span class="op">=</span>N_REQ)</span>
+<span id="m19-cb12-94"><a href="#m19-cb12-94" aria-hidden="true" tabindex="-1"></a>    t <span class="op">=</span> <span class="fl">0.0</span></span>
+<span id="m19-cb12-95"><a href="#m19-cb12-95" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(N_REQ):</span>
+<span id="m19-cb12-96"><a href="#m19-cb12-96" aria-hidden="true" tabindex="-1"></a>        t <span class="op">+=</span> rng.expovariate(rate)</span>
+<span id="m19-cb12-97"><a href="#m19-cb12-97" aria-hidden="true" tabindex="-1"></a>        <span class="cf">yield</span> t, rng.lognormvariate(<span class="fl">2.302585</span>, <span class="fl">1.2</span>), <span class="ss">f&quot;user-</span><span class="sc">{</span>user_ids[i]<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="m19-cb12-98"><a href="#m19-cb12-98" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-99"><a href="#m19-cb12-99" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-100"><a href="#m19-cb12-100" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> run(policy, seed<span class="op">=</span>SEED):</span>
+<span id="m19-cb12-101"><a href="#m19-cb12-101" aria-hidden="true" tabindex="-1"></a>    rng <span class="op">=</span> random.Random(seed)</span>
+<span id="m19-cb12-102"><a href="#m19-cb12-102" aria-hidden="true" tabindex="-1"></a>    pick_rng <span class="op">=</span> random.Random(seed <span class="op">+</span> <span class="dv">1</span>)</span>
+<span id="m19-cb12-103"><a href="#m19-cb12-103" aria-hidden="true" tabindex="-1"></a>    backends <span class="op">=</span> [Backend(i) <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(N_BACKENDS)]</span>
+<span id="m19-cb12-104"><a href="#m19-cb12-104" aria-hidden="true" tabindex="-1"></a>    names <span class="op">=</span> [<span class="ss">f&quot;b</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(N_BACKENDS)]</span>
+<span id="m19-cb12-105"><a href="#m19-cb12-105" aria-hidden="true" tabindex="-1"></a>    by_name <span class="op">=</span> <span class="bu">dict</span>(<span class="bu">zip</span>(names, backends))</span>
+<span id="m19-cb12-106"><a href="#m19-cb12-106" aria-hidden="true" tabindex="-1"></a>    ring <span class="op">=</span> build_ring(names)</span>
+<span id="m19-cb12-107"><a href="#m19-cb12-107" aria-hidden="true" tabindex="-1"></a>    maglev <span class="op">=</span> build_maglev(names)</span>
+<span id="m19-cb12-108"><a href="#m19-cb12-108" aria-hidden="true" tabindex="-1"></a>    rr <span class="op">=</span> <span class="dv">0</span></span>
+<span id="m19-cb12-109"><a href="#m19-cb12-109" aria-hidden="true" tabindex="-1"></a>    lat <span class="op">=</span> []</span>
+<span id="m19-cb12-110"><a href="#m19-cb12-110" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> now, work, key <span class="kw">in</span> workload(rng):</span>
+<span id="m19-cb12-111"><a href="#m19-cb12-111" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> policy <span class="op">==</span> <span class="st">&quot;round-robin&quot;</span>:</span>
+<span id="m19-cb12-112"><a href="#m19-cb12-112" aria-hidden="true" tabindex="-1"></a>            b <span class="op">=</span> backends[rr <span class="op">%</span> N_BACKENDS]<span class="op">;</span> rr <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="m19-cb12-113"><a href="#m19-cb12-113" aria-hidden="true" tabindex="-1"></a>        <span class="cf">elif</span> policy <span class="op">==</span> <span class="st">&quot;random&quot;</span>:</span>
+<span id="m19-cb12-114"><a href="#m19-cb12-114" aria-hidden="true" tabindex="-1"></a>            b <span class="op">=</span> pick_rng.choice(backends)</span>
+<span id="m19-cb12-115"><a href="#m19-cb12-115" aria-hidden="true" tabindex="-1"></a>        <span class="cf">elif</span> policy <span class="op">==</span> <span class="st">&quot;least-conn&quot;</span>:</span>
+<span id="m19-cb12-116"><a href="#m19-cb12-116" aria-hidden="true" tabindex="-1"></a>            b <span class="op">=</span> <span class="bu">min</span>(backends, key<span class="op">=</span><span class="kw">lambda</span> x: (x.inflight(now), pick_rng.random()))</span>
+<span id="m19-cb12-117"><a href="#m19-cb12-117" aria-hidden="true" tabindex="-1"></a>        <span class="cf">elif</span> policy <span class="op">==</span> <span class="st">&quot;p2c&quot;</span>:</span>
+<span id="m19-cb12-118"><a href="#m19-cb12-118" aria-hidden="true" tabindex="-1"></a>            a, c <span class="op">=</span> pick_rng.sample(backends, <span class="dv">2</span>)</span>
+<span id="m19-cb12-119"><a href="#m19-cb12-119" aria-hidden="true" tabindex="-1"></a>            b <span class="op">=</span> a <span class="cf">if</span> a.inflight(now) <span class="op">&lt;=</span> c.inflight(now) <span class="cf">else</span> c</span>
+<span id="m19-cb12-120"><a href="#m19-cb12-120" aria-hidden="true" tabindex="-1"></a>        <span class="cf">elif</span> policy <span class="op">==</span> <span class="st">&quot;ring-hash&quot;</span>:</span>
+<span id="m19-cb12-121"><a href="#m19-cb12-121" aria-hidden="true" tabindex="-1"></a>            b <span class="op">=</span> by_name[ring_lookup(ring, key)]</span>
+<span id="m19-cb12-122"><a href="#m19-cb12-122" aria-hidden="true" tabindex="-1"></a>        <span class="cf">elif</span> policy <span class="op">==</span> <span class="st">&quot;ring-bounded&quot;</span>:</span>
+<span id="m19-cb12-123"><a href="#m19-cb12-123" aria-hidden="true" tabindex="-1"></a>            <span class="co"># Consistent hashing with bounded loads (Mirrokni et al., 2017), c = 1.25:</span></span>
+<span id="m19-cb12-124"><a href="#m19-cb12-124" aria-hidden="true" tabindex="-1"></a>            <span class="co"># walk clockwise past any backend already above 1.25x the average in-flight.</span></span>
+<span id="m19-cb12-125"><a href="#m19-cb12-125" aria-hidden="true" tabindex="-1"></a>            total <span class="op">=</span> <span class="bu">sum</span>(x.inflight(now) <span class="cf">for</span> x <span class="kw">in</span> backends) <span class="op">+</span> <span class="dv">1</span></span>
+<span id="m19-cb12-126"><a href="#m19-cb12-126" aria-hidden="true" tabindex="-1"></a>            cap <span class="op">=</span> <span class="op">-</span>(<span class="op">-</span><span class="fl">1.25</span> <span class="op">*</span> total <span class="op">//</span> N_BACKENDS)</span>
+<span id="m19-cb12-127"><a href="#m19-cb12-127" aria-hidden="true" tabindex="-1"></a>            keys, owners <span class="op">=</span> ring</span>
+<span id="m19-cb12-128"><a href="#m19-cb12-128" aria-hidden="true" tabindex="-1"></a>            i <span class="op">=</span> bisect(keys, h64(key))</span>
+<span id="m19-cb12-129"><a href="#m19-cb12-129" aria-hidden="true" tabindex="-1"></a>            <span class="cf">while</span> <span class="va">True</span>:</span>
+<span id="m19-cb12-130"><a href="#m19-cb12-130" aria-hidden="true" tabindex="-1"></a>                b <span class="op">=</span> by_name[owners[i <span class="op">%</span> <span class="bu">len</span>(keys)]]</span>
+<span id="m19-cb12-131"><a href="#m19-cb12-131" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> b.inflight(now) <span class="op">&lt;</span> cap:</span>
+<span id="m19-cb12-132"><a href="#m19-cb12-132" aria-hidden="true" tabindex="-1"></a>                    <span class="cf">break</span></span>
+<span id="m19-cb12-133"><a href="#m19-cb12-133" aria-hidden="true" tabindex="-1"></a>                i <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="m19-cb12-134"><a href="#m19-cb12-134" aria-hidden="true" tabindex="-1"></a>        <span class="cf">elif</span> policy <span class="op">==</span> <span class="st">&quot;maglev&quot;</span>:</span>
+<span id="m19-cb12-135"><a href="#m19-cb12-135" aria-hidden="true" tabindex="-1"></a>            b <span class="op">=</span> by_name[maglev_lookup(maglev, key)]</span>
+<span id="m19-cb12-136"><a href="#m19-cb12-136" aria-hidden="true" tabindex="-1"></a>        lat.append(b.accept(now, work))</span>
+<span id="m19-cb12-137"><a href="#m19-cb12-137" aria-hidden="true" tabindex="-1"></a>    lat.sort()</span>
+<span id="m19-cb12-138"><a href="#m19-cb12-138" aria-hidden="true" tabindex="-1"></a>    q <span class="op">=</span> <span class="kw">lambda</span> p: lat[<span class="bu">int</span>(p <span class="op">*</span> <span class="bu">len</span>(lat)) <span class="op">-</span> <span class="dv">1</span>]</span>
+<span id="m19-cb12-139"><a href="#m19-cb12-139" aria-hidden="true" tabindex="-1"></a>    share <span class="op">=</span> [x.served <span class="op">/</span> N_REQ <span class="op">*</span> <span class="dv">100</span> <span class="cf">for</span> x <span class="kw">in</span> backends]</span>
+<span id="m19-cb12-140"><a href="#m19-cb12-140" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> q(<span class="fl">0.50</span>), q(<span class="fl">0.99</span>), q(<span class="fl">0.999</span>), share[SLOW], <span class="bu">max</span>(share)</span>
+<span id="m19-cb12-141"><a href="#m19-cb12-141" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-142"><a href="#m19-cb12-142" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-143"><a href="#m19-cb12-143" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> remap_fraction():</span>
+<span id="m19-cb12-144"><a href="#m19-cb12-144" aria-hidden="true" tabindex="-1"></a>    names <span class="op">=</span> [<span class="ss">f&quot;b</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(N_BACKENDS)]</span>
+<span id="m19-cb12-145"><a href="#m19-cb12-145" aria-hidden="true" tabindex="-1"></a>    fewer <span class="op">=</span> [n <span class="cf">for</span> n <span class="kw">in</span> names <span class="cf">if</span> n <span class="op">!=</span> <span class="st">&quot;b3&quot;</span>]</span>
+<span id="m19-cb12-146"><a href="#m19-cb12-146" aria-hidden="true" tabindex="-1"></a>    keys <span class="op">=</span> [<span class="ss">f&quot;user-</span><span class="sc">{</span>k<span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> k <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">20_000</span>)]</span>
+<span id="m19-cb12-147"><a href="#m19-cb12-147" aria-hidden="true" tabindex="-1"></a>    mod <span class="op">=</span> <span class="kw">lambda</span> ns, k: ns[h64(k) <span class="op">%</span> <span class="bu">len</span>(ns)]</span>
+<span id="m19-cb12-148"><a href="#m19-cb12-148" aria-hidden="true" tabindex="-1"></a>    r1, r2 <span class="op">=</span> build_ring(names), build_ring(fewer)</span>
+<span id="m19-cb12-149"><a href="#m19-cb12-149" aria-hidden="true" tabindex="-1"></a>    m1, m2 <span class="op">=</span> build_maglev(names), build_maglev(fewer)</span>
+<span id="m19-cb12-150"><a href="#m19-cb12-150" aria-hidden="true" tabindex="-1"></a>    res <span class="op">=</span> {}</span>
+<span id="m19-cb12-151"><a href="#m19-cb12-151" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> label, f <span class="kw">in</span> ((<span class="st">&quot;hash mod N&quot;</span>, <span class="kw">lambda</span>: [mod(names, k) <span class="op">!=</span> mod(fewer, k) <span class="cf">for</span> k <span class="kw">in</span> keys]),</span>
+<span id="m19-cb12-152"><a href="#m19-cb12-152" aria-hidden="true" tabindex="-1"></a>                     (<span class="st">&quot;ring-hash&quot;</span>, <span class="kw">lambda</span>: [ring_lookup(r1, k) <span class="op">!=</span> ring_lookup(r2, k) <span class="cf">for</span> k <span class="kw">in</span> keys]),</span>
+<span id="m19-cb12-153"><a href="#m19-cb12-153" aria-hidden="true" tabindex="-1"></a>                     (<span class="st">&quot;maglev&quot;</span>, <span class="kw">lambda</span>: [maglev_lookup(m1, k) <span class="op">!=</span> maglev_lookup(m2, k) <span class="cf">for</span> k <span class="kw">in</span> keys])):</span>
+<span id="m19-cb12-154"><a href="#m19-cb12-154" aria-hidden="true" tabindex="-1"></a>        res[label] <span class="op">=</span> <span class="bu">sum</span>(f()) <span class="op">/</span> <span class="bu">len</span>(keys) <span class="op">*</span> <span class="dv">100</span></span>
+<span id="m19-cb12-155"><a href="#m19-cb12-155" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Spread of the key space before removal</span></span>
+<span id="m19-cb12-156"><a href="#m19-cb12-156" aria-hidden="true" tabindex="-1"></a>    ring_share <span class="op">=</span> [<span class="bu">sum</span>(ring_lookup(r1, k) <span class="op">==</span> n <span class="cf">for</span> k <span class="kw">in</span> keys) <span class="op">/</span> <span class="bu">len</span>(keys) <span class="op">*</span> <span class="dv">100</span> <span class="cf">for</span> n <span class="kw">in</span> names]</span>
+<span id="m19-cb12-157"><a href="#m19-cb12-157" aria-hidden="true" tabindex="-1"></a>    mag_share <span class="op">=</span> [m1.count(n) <span class="op">/</span> <span class="bu">len</span>(m1) <span class="op">*</span> <span class="dv">100</span> <span class="cf">for</span> n <span class="kw">in</span> names]</span>
+<span id="m19-cb12-158"><a href="#m19-cb12-158" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> res, ring_share, mag_share</span>
+<span id="m19-cb12-159"><a href="#m19-cb12-159" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-160"><a href="#m19-cb12-160" aria-hidden="true" tabindex="-1"></a></span>
+<span id="m19-cb12-161"><a href="#m19-cb12-161" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="m19-cb12-162"><a href="#m19-cb12-162" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>N_BACKENDS<span class="sc">}</span><span class="ss"> backends x </span><span class="sc">{</span>WORKERS<span class="sc">}</span><span class="ss"> workers, b</span><span class="sc">{</span>SLOW<span class="sc">}</span><span class="ss"> is 3x slower, &quot;</span></span>
+<span id="m19-cb12-163"><a href="#m19-cb12-163" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;</span><span class="sc">{</span>N_REQ<span class="sc">:,}</span><span class="ss"> requests, ~75% load</span><span class="ch">\n</span><span class="ss">&quot;</span>)</span>
+<span id="m19-cb12-164"><a href="#m19-cb12-164" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;policy&#39;</span><span class="sc">:&lt;12}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;p50 ms&#39;</span><span class="sc">:&gt;8}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;p99 ms&#39;</span><span class="sc">:&gt;9}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;p99.9 ms&#39;</span><span class="sc">:&gt;10}</span><span class="ss"> &quot;</span></span>
+<span id="m19-cb12-165"><a href="#m19-cb12-165" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;slow b3 %&#39;</span><span class="sc">:&gt;10}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;busiest %&#39;</span><span class="sc">:&gt;10}</span><span class="ss">&quot;</span>)</span>
+<span id="m19-cb12-166"><a href="#m19-cb12-166" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> p <span class="kw">in</span> (<span class="st">&quot;round-robin&quot;</span>, <span class="st">&quot;random&quot;</span>, <span class="st">&quot;least-conn&quot;</span>, <span class="st">&quot;p2c&quot;</span>, <span class="st">&quot;ring-hash&quot;</span>, <span class="st">&quot;ring-bounded&quot;</span>, <span class="st">&quot;maglev&quot;</span>):</span>
+<span id="m19-cb12-167"><a href="#m19-cb12-167" aria-hidden="true" tabindex="-1"></a>        p50, p99, p999, slow, top <span class="op">=</span> run(p)</span>
+<span id="m19-cb12-168"><a href="#m19-cb12-168" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>p<span class="sc">:&lt;12}</span><span class="ss"> </span><span class="sc">{</span>p50<span class="sc">:&gt;8.1f}</span><span class="ss"> </span><span class="sc">{</span>p99<span class="sc">:&gt;9.1f}</span><span class="ss"> </span><span class="sc">{</span>p999<span class="sc">:&gt;10.1f}</span><span class="ss"> </span><span class="sc">{</span>slow<span class="sc">:&gt;10.1f}</span><span class="ss"> </span><span class="sc">{</span>top<span class="sc">:&gt;10.1f}</span><span class="ss">&quot;</span>)</span>
+<span id="m19-cb12-169"><a href="#m19-cb12-169" aria-hidden="true" tabindex="-1"></a>    res, ring_share, mag_share <span class="op">=</span> remap_fraction()</span>
+<span id="m19-cb12-170"><a href="#m19-cb12-170" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">Remove backend b3: share of 20,000 keys that move to a different backend&quot;</span>)</span>
+<span id="m19-cb12-171"><a href="#m19-cb12-171" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> k, v <span class="kw">in</span> res.items():</span>
+<span id="m19-cb12-172"><a href="#m19-cb12-172" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span>k<span class="sc">:&lt;11}</span><span class="ss"> </span><span class="sc">{</span>v<span class="sc">:5.1f}</span><span class="ss">%   (ideal: </span><span class="sc">{</span><span class="dv">100</span> <span class="op">/</span> N_BACKENDS<span class="sc">:.1f}</span><span class="ss">%)&quot;</span>)</span>
+<span id="m19-cb12-173"><a href="#m19-cb12-173" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">Key-space share per backend before removal (min / max %)&quot;</span>)</span>
+<span id="m19-cb12-174"><a href="#m19-cb12-174" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  ring-hash   </span><span class="sc">{</span><span class="bu">min</span>(ring_share)<span class="sc">:5.2f}</span><span class="ss"> / </span><span class="sc">{</span><span class="bu">max</span>(ring_share)<span class="sc">:5.2f}</span><span class="ss">   (100 vnodes each)&quot;</span>)</span>
+<span id="m19-cb12-175"><a href="#m19-cb12-175" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  maglev      </span><span class="sc">{</span><span class="bu">min</span>(mag_share)<span class="sc">:5.2f}</span><span class="ss"> / </span><span class="sc">{</span><span class="bu">max</span>(mag_share)<span class="sc">:5.2f}</span><span class="ss">   (table size 65537)&quot;</span>)</span></code></pre></div>
+<p>Real output:</p>
+<pre class="text"><code>10 backends x 4 workers, b3 is 3x slower, 200,000 requests, ~75% load
+
+policy         p50 ms    p99 ms   p99.9 ms  slow b3 %  busiest %
+round-robin      16.9  143493.4   157859.7       10.0       10.0
+random           21.2  143995.8   157460.2       10.0       10.1
+least-conn       10.6     183.3      470.2        3.9       10.8
+p2c              12.1     189.5      472.6        4.5       10.8
+ring-hash        37.1   66283.6    74255.8        7.3       18.7
+ring-bounded     12.7     190.0      483.9        4.4       12.6
+maglev           35.9  135379.9   139537.9        5.6       28.4
+
+Remove backend b3: share of 20,000 keys that move to a different backend
+  hash mod N   90.3%   (ideal: 10.0%)
+  ring-hash     8.9%   (ideal: 10.0%)
+  maglev       10.5%   (ideal: 10.0%)
+
+Key-space share per backend before removal (min / max %)
+  ring-hash    8.77 / 12.46   (100 vnodes each)
+  maglev      10.00 / 10.00   (table size 65537)</code></pre>
+<p>Read the first table top to bottom.</p>
+<p><strong>Round robin and random collapse.</strong> They give the slow backend its 10% share regardless of speed. <code>b3</code> has a third of a normal backend's capacity, and at 75% overall load 10% of the traffic is about twice what it can serve. Its queue grows for the whole run. The p99 of over 140 seconds is that queue, measured at the end of the run. In production it would be timeouts and 503s for one request in ten, while every dashboard average looks fine.</p>
+<p><strong>Least-connections and P2C both fix it</strong>, by sending <code>b3</code> only 3.9% and 4.5% of requests. Notice how close P2C comes to the omniscient version (p99 189.5 ms vs 183.3 ms) while looking at only two backends per decision. That gap is the price of not needing global state, and it is small.</p>
+<p><strong>Plain consistent hashing suffers twice.</strong> It cannot avoid <code>b3</code> — whichever users hash there stay there. And it cannot split a hot key: Maglev happened to place several of the heaviest users on one backend, which took 28.4% of all traffic. The ring did somewhat better only by luck of placement. Neither number says Maglev is worse than ring hashing; they say <em>any</em> pure hash is at the mercy of the key distribution.</p>
+<p><strong>Bounded loads repair hashing.</strong> With c = 1.25, <code>ring-bounded</code> keeps most keys at home but spills overflow clockwise. Its tail (190 ms p99) matches P2C while still keeping keys sticky. This is the right tool when you need affinity <em>and</em> balance, which is the common case for cache tiers.</p>
+<p>The second table is the reason consistent hashing exists. Removing one backend out of ten moves 90.3% of keys under <code>hash mod N</code>, 8.9% under ring hashing (exactly the keys <code>b3</code> owned), and 10.5% under Maglev, slightly above the 10% ideal. The last table shows Maglev's other strength: every backend owns 10.00% of the key space, where 100 virtual nodes per backend still leaves the ring between 8.77% and 12.46%.</p>
+<hr />
+<h2 id="m19-deep-dive">Deep dive: what the box diagram hid</h2>
+<p>The sections above describe load balancing as choices: which layer, which mode, which algorithm. Under them sits a machine with real limits. A balancer is a packet processor with a flow table that can fill, a proxy with a finite set of source ports, a set of timers that must agree with the timers on both sides of it, and a fleet of nodes that must reach the same answer without talking. The rest of this module is about that machine.</p>
+<h2 id="m19-deep-dive-the-real-mental-model">Deep dive: the real mental model</h2>
+<p>A production L4 tier is not one box. It is several identical nodes behind a router, all announcing the same VIP.</p>
+<div style="overflow-x:auto">
+<svg width="100%" viewBox="0 0 760 520" role="img" aria-labelledby="m19-path-title m19-path-desc" style="min-width:760px; background:#f5f5f5; border:1px solid #d8d4cc; border-radius:6px;">
+<title id="m19-path-title">Inside an L4 load-balancer tier: ECMP, connection table, Maglev, encapsulation</title>
+<desc id="m19-path-desc">An edge router spreads flows across three load-balancer nodes with ECMP. Inside one node, the packet's 5-tuple is hashed and looked up in the connection table; on a miss the Maglev table picks a backend and the flow is recorded. The packet is encapsulated in IP-in-IP to the backend, and the backend replies directly to the client, bypassing the balancer.</desc>
+<defs>
+<marker id="m19-path-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 9 5 L 0 9 z" fill="#6b6f7e"/></marker>
+<marker id="m19-path-arrow-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 9 5 L 0 9 z" fill="#bf4520"/></marker>
+</defs>
+<text x="380" y="30" text-anchor="middle" font-family="Georgia, serif" font-size="20" fill="#2d3142">One flow through an L4 load-balancer tier</text>
+<text x="380" y="50" text-anchor="middle" font-family="monospace" font-size="11" fill="#6b6f7e">STATE AT EACH STEP: ECMP HASH → CONN TABLE → MAGLEV TABLE → ENCAP</text>
+<!-- Router -->
+<rect x="16" y="200" width="118" height="78" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="75" y="226" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Edge router</text>
+<text x="75" y="246" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#6b6f7e">VIP/32 via 3</text>
+<text x="75" y="262" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#6b6f7e">ECMP next hops</text>
+<!-- LB nodes -->
+<rect x="170" y="110" width="132" height="46" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="236" y="131" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">LB node 1</text>
+<text x="236" y="147" text-anchor="middle" font-family="monospace" font-size="10" fill="#6b6f7e">BGP: VIP/32</text>
+<rect x="170" y="216" width="132" height="46" rx="6" fill="#ffffff" stroke="#bf4520" stroke-width="2"/>
+<text x="236" y="237" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">LB node 2</text>
+<text x="236" y="253" text-anchor="middle" font-family="monospace" font-size="10" fill="#6b6f7e">BGP: VIP/32</text>
+<rect x="170" y="322" width="132" height="46" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="236" y="343" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">LB node 3</text>
+<text x="236" y="359" text-anchor="middle" font-family="monospace" font-size="10" fill="#6b6f7e">BGP: VIP/32</text>
+<line x1="134" y1="220" x2="166" y2="140" stroke="#6b6f7e" stroke-width="1.5" marker-end="url(#m19-path-arrow)"/>
+<line x1="134" y1="239" x2="166" y2="239" stroke="#bf4520" stroke-width="2" marker-end="url(#m19-path-arrow-acc)"/>
+<line x1="134" y1="258" x2="166" y2="338" stroke="#6b6f7e" stroke-width="1.5" marker-end="url(#m19-path-arrow)"/>
+<!-- pipeline -->
+<rect x="330" y="76" width="262" height="330" rx="6" fill="#ffffff" stroke="#bf4520" stroke-width="2"/>
+<text x="461" y="98" text-anchor="middle" font-family="monospace" font-size="11" fill="#bf4520" letter-spacing="1.5">INSIDE LB NODE 2 (XDP / IPVS)</text>
+<line x1="302" y1="239" x2="330" y2="239" stroke="#bf4520" stroke-width="2" stroke-dasharray="3,3"/>
+<rect x="346" y="112" width="230" height="42" rx="4" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<text x="358" y="131" font-family="sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">1  hash the 5-tuple</text>
+<text x="358" y="147" font-family="monospace" font-size="10" fill="#6b6f7e">C:51514 → VIP:80 TCP</text>
+<rect x="346" y="168" width="230" height="42" rx="4" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<text x="358" y="187" font-family="sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">2  connection table lookup</text>
+<text x="358" y="203" font-family="monospace" font-size="10" fill="#6b6f7e">hit → reuse recorded backend</text>
+<rect x="346" y="224" width="230" height="42" rx="4" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<text x="358" y="243" font-family="sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">3  miss → Maglev table</text>
+<text x="358" y="259" font-family="monospace" font-size="10" fill="#6b6f7e">table[h mod 65537] → B2</text>
+<rect x="346" y="280" width="230" height="42" rx="4" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<text x="358" y="299" font-family="sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">4  record flow → B2</text>
+<text x="358" y="315" font-family="monospace" font-size="10" fill="#6b6f7e">pins it if backends change</text>
+<rect x="346" y="336" width="230" height="52" rx="4" fill="#f5f5f5" stroke="#bf4520" stroke-width="1.5"/>
+<text x="358" y="355" font-family="sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">5  encapsulate and send</text>
+<text x="358" y="371" font-family="monospace" font-size="10" fill="#6b6f7e">outer LB → B2, proto 4</text>
+<text x="358" y="383" font-family="monospace" font-size="10" fill="#6b6f7e">inner C → VIP untouched</text>
+<line x1="461" y1="154" x2="461" y2="166" stroke="#6b6f7e" stroke-width="1.2" marker-end="url(#m19-path-arrow)"/>
+<line x1="461" y1="210" x2="461" y2="222" stroke="#6b6f7e" stroke-width="1.2" marker-end="url(#m19-path-arrow)"/>
+<line x1="461" y1="266" x2="461" y2="278" stroke="#6b6f7e" stroke-width="1.2" marker-end="url(#m19-path-arrow)"/>
+<line x1="461" y1="322" x2="461" y2="334" stroke="#6b6f7e" stroke-width="1.2" marker-end="url(#m19-path-arrow)"/>
+<!-- backends -->
+<rect x="632" y="96" width="112" height="44" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="688" y="116" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">B1</text>
+<text x="688" y="131" text-anchor="middle" font-family="monospace" font-size="10" fill="#6b6f7e">VIP on lo</text>
+<rect x="632" y="176" width="112" height="44" rx="6" fill="#ffffff" stroke="#bf4520" stroke-width="2"/>
+<text x="688" y="196" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">B2</text>
+<text x="688" y="211" text-anchor="middle" font-family="monospace" font-size="10" fill="#6b6f7e">VIP on lo</text>
+<rect x="632" y="256" width="112" height="44" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="688" y="276" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">B3</text>
+<text x="688" y="291" text-anchor="middle" font-family="monospace" font-size="10" fill="#6b6f7e">VIP on lo</text>
+<rect x="632" y="336" width="112" height="44" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="688" y="356" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">B4</text>
+<text x="688" y="371" text-anchor="middle" font-family="monospace" font-size="10" fill="#6b6f7e">VIP on lo</text>
+<path d="M 576 360 L 610 360 L 610 198 L 628 198" fill="none" stroke="#bf4520" stroke-width="2" marker-end="url(#m19-path-arrow-acc)"/>
+<!-- DSR reply -->
+<path d="M 744 358 L 752 358 L 752 440 L 75 440 L 75 282" fill="none" stroke="#bf4520" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#m19-path-arrow-acc)"/>
+<path d="M 744 198 L 752 198 L 752 358" fill="none" stroke="#bf4520" stroke-width="2" stroke-dasharray="5,4"/>
+<text x="410" y="432" text-anchor="middle" font-family="monospace" font-size="11" fill="#bf4520">reply VIP → C goes straight out via the router (DSR)</text>
+<text x="20" y="474" font-family="sans-serif" font-size="12" fill="#6b6f7e">Every LB node holds the same Maglev table, so a flow that ECMP moves to another node usually still reaches B2.</text>
+<text x="20" y="494" font-family="sans-serif" font-size="12" fill="#6b6f7e">The connection table covers the other case: backends changing while flows are open.</text>
+</svg>
+</div>
+<p>Follow one packet. The edge router has the VIP as a /32 route learned over BGP from every balancer node, so it has several equal-cost next hops. It picks one with an ECMP hash over the packet's 5-tuple. Every packet of the flow hashes the same way and reaches the same node.</p>
+<p>On that node, the packet hits the data path. At Meta and in Cilium it is XDP, running in the NIC driver before the kernel allocates a socket buffer; in IPVS it is a netfilter hook. The node hashes the 5-tuple and looks it up in its connection table. On a hit, it uses the recorded backend. On a miss — a new flow — it looks up the Maglev table, records the result, and forwards. Forwarding means building a new outer IP header (balancer → backend) around the untouched original packet. The backend's kernel decapsulates it, delivers the inner packet (client → VIP) to the socket listening on the VIP, and replies from the VIP straight to the client.</p>
+<p>Now the part the box diagram hid. Why keep a connection table at all, if Maglev already gives a deterministic answer? Because the backend set changes. When a backend is added, a few percent of Maglev slots change owner. Without the table, established flows whose slot moved would be sent to a backend that has never seen them. That backend answers with a RST. The connection table pins existing flows to their original backend; only <em>new</em> flows follow the new table.</p>
+<p>And why use Maglev at all, if there is a table? Because the ECMP hash can change too. Add or remove a balancer node and the router reshuffles some flows to different nodes. The new node has no table entry for them. If every node used round robin, the new node would pick an arbitrary backend and break the connection. With Maglev, every node computes the same answer from the same backend list. A flow that lands on a new node is usually sent to the same backend it was already using. The connection table handles backend churn; consistent hashing handles balancer churn. You need both, and neither one alone is enough.</p>
+<p>The L7 tier behind it is a different machine. Each proxy node owns sockets: a listening socket, one accepted socket per client connection, and a pool of upstream sockets per backend. Its state is per connection and per request: TLS session state, HTTP/2 stream tables, request buffers, retry budgets, and per-backend counters (active requests, recent errors for outlier detection). The proxy's health view is usually pushed to it by a control plane (xDS for Envoy), merged with what the proxy observes itself.</p>
+<h2 id="m19-deep-dive-what-the-wire-actually-does">Deep dive: what the wire actually does</h2>
+<h3 id="m19-a-full-proxy-two-connections-that-share-nothing">A full proxy: two connections that share nothing</h3>
+<p>Here is one HTTP request through an L7 proxy, captured on the proxy node. The client is <code>198.51.100.23</code>. The proxy node's address is <code>10.0.1.17</code> (the public VIP is mapped to it by the cloud edge). The backend is <code>10.0.2.41:8080</code>. Plain HTTP on port 80 keeps the payload lengths visible; with TLS the shape is the same plus a handshake. These are constructed captures, consistent but illustrative.</p>
+<pre class="text"><code># tcpdump -nn -i any &#39;tcp port 80 or tcp port 8080&#39;
+# --- client leg ---
+10:02:11.104512 eth0 In  IP 198.51.100.23.51514 &gt; 10.0.1.17.80: Flags [S], seq 3954022801, win 65535, options [mss 1460,nop,wscale 6,nop,nop,TS val 1840213 ecr 0,sackOK,eol], length 0
+10:02:11.104540 eth0 Out IP 10.0.1.17.80 &gt; 198.51.100.23.51514: Flags [S.], seq 1188290410, ack 3954022802, win 62643, options [mss 1460,sackOK,TS val 2203317 ecr 1840213,nop,wscale 7], length 0
+10:02:11.131877 eth0 In  IP 198.51.100.23.51514 &gt; 10.0.1.17.80: Flags [.], ack 1, win 2058, options [nop,nop,TS val 1840240 ecr 2203317], length 0
+10:02:11.131902 eth0 In  IP 198.51.100.23.51514 &gt; 10.0.1.17.80: Flags [P.], seq 1:84, ack 1, win 2058, options [nop,nop,TS val 1840240 ecr 2203317], length 83: HTTP: GET /api/cart HTTP/1.1
+10:02:11.131910 eth0 Out IP 10.0.1.17.80 &gt; 198.51.100.23.51514: Flags [.], ack 84, win 489, options [nop,nop,TS val 2203344 ecr 1840240], length 0
+# --- backend leg: a different connection, opened by the proxy ---
+10:02:11.132055 eth0 Out IP 10.0.1.17.38122 &gt; 10.0.2.41.8080: Flags [S], seq 702114583, win 62727, options [mss 8961,sackOK,TS val 2203344 ecr 0,nop,wscale 7], length 0
+10:02:11.132391 eth0 In  IP 10.0.2.41.8080 &gt; 10.0.1.17.38122: Flags [S.], seq 2840017719, ack 702114584, win 62643, options [mss 8961,sackOK,TS val 551902 ecr 2203344,nop,wscale 7], length 0
+10:02:11.132403 eth0 Out IP 10.0.1.17.38122 &gt; 10.0.2.41.8080: Flags [.], ack 1, win 491, options [nop,nop,TS val 2203345 ecr 551902], length 0
+10:02:11.132431 eth0 Out IP 10.0.1.17.38122 &gt; 10.0.2.41.8080: Flags [P.], seq 1:163, ack 1, win 491, options [nop,nop,TS val 2203345 ecr 551902], length 162: HTTP: GET /api/cart HTTP/1.1
+10:02:11.141006 eth0 In  IP 10.0.2.41.8080 &gt; 10.0.1.17.38122: Flags [P.], seq 1:94, ack 163, win 489, options [nop,nop,TS val 551911 ecr 2203345], length 93: HTTP: HTTP/1.1 200 OK
+10:02:11.141019 eth0 Out IP 10.0.1.17.38122 &gt; 10.0.2.41.8080: Flags [.], ack 94, win 491, options [nop,nop,TS val 2203354 ecr 551911], length 0
+# --- back to the client ---
+10:02:11.141088 eth0 Out IP 10.0.1.17.80 &gt; 198.51.100.23.51514: Flags [P.], seq 1:94, ack 84, win 489, options [nop,nop,TS val 2203354 ecr 1840240], length 93: HTTP: HTTP/1.1 200 OK</code></pre>
+<p>Things to notice:</p>
+<ul>
+<li><strong>Two handshakes, two sequence spaces.</strong> The client's ISN is 3954022801; the proxy's ISN toward the backend is 702114583. Nothing in one connection's numbering relates to the other. A retransmission on one leg is invisible on the other.</li>
+<li><strong>Different MSS on each leg.</strong> The client leg uses 1460 (internet path, 1500 MTU). The backend leg uses 8961, because AWS VPCs run a 9001-byte MTU inside the VPC. The proxy re-segments the stream. This is why a full proxy hides path-MTU problems on one side from the other side.</li>
+<li><strong>The request grew from 83 to 162 bytes.</strong> The proxy added <code>X-Forwarded-For: 198.51.100.23</code>, <code>X-Forwarded-Proto: http</code> and <code>X-Forwarded-Port: 80</code> (79 bytes with their CRLFs). The backend logs <code>10.0.1.17</code> as its TCP peer.</li>
+<li><strong>RTTs are separate.</strong> The client handshake took 27 ms (104512 → 131877, internet latency). The backend handshake took 0.34 ms (in-region). The backend spent 8.6 ms on the request (132431 → 141006). A proxy's timing logs that separate "upstream connect", "upstream response" and "total" give you exactly this split.</li>
+<li><strong>The backend connection was new only because the pool was cold.</strong> On a warm proxy, the request would go out on an existing pooled connection and the backend leg would have no SYN at all.</li>
+</ul>
+<h3 id="m19-dsr-with-ip-in-ip-the-packet-the-backend-receives">DSR with IP-in-IP: the packet the backend receives</h3>
+<p>Now the same client connecting through an L4 DSR balancer at <code>10.0.0.5</code>, which encapsulates to backend <code>10.0.2.41</code>. VIP <code>203.0.113.10</code> is configured on the backend's loopback. Captured on the backend with <code>-v</code> (checksum fields trimmed):</p>
+<pre class="text"><code># tcpdump -nn -v -i eth0 &#39;ip proto 4 or host 198.51.100.23&#39;
+10:15:40.200118 IP (tos 0x0, ttl 63, id 0, offset 0, flags [DF], proto IPIP (4), length 80)
+    10.0.0.5 &gt; 10.0.2.41: IP (tos 0x0, ttl 52, id 0, offset 0, flags [DF], proto TCP (6), length 60)
+    198.51.100.23.51514 &gt; 203.0.113.10.80: Flags [S], seq 3954022801, win 64240, options [mss 1460,sackOK,TS val 1840213 ecr 0,nop,wscale 7], length 0 (ipip-proto-4)
+10:15:40.200171 IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto TCP (6), length 60)
+    203.0.113.10.80 &gt; 198.51.100.23.51514: Flags [S.], seq 2271019934, ack 3954022802, win 65160, options [mss 1440,sackOK,TS val 99120411 ecr 1840213,nop,wscale 7], length 0</code></pre>
+<p>Read it from the outside in:</p>
+<ul>
+<li><strong>Outer header</strong>: <code>10.0.0.5 &gt; 10.0.2.41</code>, protocol 4 (IPIP), length 80. That is the inner 60-byte packet plus a 20-byte outer IPv4 header. TTL 63: the balancer sent it with 64 and one router hop decremented it.</li>
+<li><strong>Inner header</strong>: exactly what the client sent. Source is the client, destination is the VIP, TTL 52 from the client's own hops. The balancer did not touch it. That is why the backend's socket sees the real client address with no headers or PROXY protocol needed.</li>
+<li><strong>The reply is not encapsulated.</strong> It goes from <code>203.0.113.10</code> (the VIP, sourced from the loopback) straight to the client via the backend's normal default route. The balancer never sees it.</li>
+<li><strong>The SYN-ACK advertises MSS 1440, not 1460.</strong> That is deliberate, and it is the most important line here. Every client segment will grow by 20 bytes of encapsulation on the way in. If the client sent 1460-byte segments (1500-byte packets), the balancer would produce 1520-byte packets on a 1500-byte network. The backend clamps its advertised MSS (on Linux, <code>ip route ... advmss 1440</code>) so the client's segments fit after encapsulation. Google and Meta avoid the issue another way: they run a larger MTU inside the data centre than at the edge.</li>
+</ul>
+<h3 id="m19-the-backend-side-of-dsr">The backend side of DSR</h3>
+<p>For DSR to work, the backend must accept packets for the VIP but must <em>not</em> claim the VIP on the LAN. If it answered ARP requests for the VIP, the upstream router could start sending client traffic directly to one backend, bypassing the balancer. On Linux:</p>
+<pre class="text"><code># run on each Linux DSR backend — values shown are the standard settings
+ip addr add 203.0.113.10/32 dev lo                    # accept packets for the VIP
+sysctl -w net.ipv4.conf.all.arp_ignore=1              # answer ARP only for addresses on the receiving interface
+sysctl -w net.ipv4.conf.all.arp_announce=2            # never use the VIP as ARP source
+ip link set tunl0 up                                  # IPIP decapsulation (tunnel mode only)
+sysctl -w net.ipv4.conf.tunl0.rp_filter=0             # inner source is the client; don&#39;t drop as &quot;martian&quot;
+sysctl -w net.ipv4.conf.all.rp_filter=0               # effective rp_filter is the max of all and the interface</code></pre>
+<p>The <code>rp_filter</code> lines are the ones people forget. Reverse-path filtering checks that a packet's source address would be routed back out the interface it arrived on. The decapsulated packet arrives on <code>tunl0</code> with a source of <code>198.51.100.23</code>, which routes out <code>eth0</code>. Strict rp_filter drops it silently. The symptom: SYNs show up in tcpdump on eth0, but the application never sees a connection.</p>
+<h2 id="m19-deep-dive-by-the-numbers">Deep dive: by the numbers</h2>
+<p><strong>Source ports in a full proxy.</strong> A proxy connecting to a backend needs a unique 4-tuple <code>(proxy IP, proxy port, backend IP, backend port)</code>. With one proxy IP and one backend <code>IP:port</code>, the only free variable is the proxy's source port. Linux's default ephemeral range is 32768–60999: <strong>28,232 ports</strong>. macOS uses 49152–65535: 16,384. So one proxy address can hold at most 28,232 concurrent connections to one backend socket. The fixes are more source IPs on the proxy, more backend ports or IPs, or connection pooling so you need fewer connections in the first place.</p>
+<p><strong>TIME_WAIT makes it worse.</strong> The side that closes first holds the 4-tuple in TIME_WAIT for 60 s on Linux. If the proxy closes each backend connection after one request, its steady-state rate per backend tuple is capped near 28,232 / 60 ≈ <strong>470 new connections per second</strong>. That is low enough to hit in a load test. <code>net.ipv4.tcp_tw_reuse=1</code> lets Linux reuse TIME_WAIT ports for new outgoing connections when timestamps make it safe. Keep-alive pooling avoids the problem.</p>
+<p><strong>Flow table memory.</strong> A connection-tracking entry costs a few hundred bytes (it varies by kernel and build). Ten million concurrent flows is therefore several gigabytes. On Linux <code>nf_conntrack_max</code> caps the table; when it fills, the kernel logs <code>nf_conntrack: table full, dropping packet</code> and new connections fail while existing ones carry on. A SYN flood at a stateful L4 balancer attacks exactly this table. Stateless designs such as Maglev-only lookup, or SYN cookies at the balancer, exist to blunt it.</p>
+<p><strong>Health-check traffic.</strong> It scales as balancers × backends / interval. Ten HAProxy nodes checking 200 backends every 2 s is 1,000 checks per second — trivial. A service mesh where 2,000 sidecars each actively check 300 endpoints every 5 s is 120,000 checks per second, a real load on small backends. This is why meshes rely on a control plane's view of endpoint health plus passive outlier detection, and keep active checks to a minimum.</p>
+<p><strong>Detection and recovery time</strong>, from the formulas in section 4:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Settings</th>
+<th>Mark down after</th>
+<th>Mark up after</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>HAProxy defaults: 2 s, fall 3, rise 2</td>
+<td>~6 s</td>
+<td>~4 s</td>
+</tr>
+<tr class="even">
+<td>AWS ALB defaults: 30 s, 2 unhealthy, 5 healthy, 5 s timeout</td>
+<td>~60–65 s</td>
+<td>~150 s</td>
+</tr>
+<tr class="odd">
+<td>Envoy outlier: 5 consecutive 5xx at 500 req/s to the host</td>
+<td>~10 ms</td>
+<td>base ejection 30 s, longer on repeat</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Draining arithmetic.</strong> If p99.9 request time is 2 s and your longest legitimate request (an upload, a report) is 90 s, then a 300 s deregistration delay wastes four minutes per instance per deploy. Set the delay a little above the longest request you're willing to wait for. Long-lived connections (WebSockets, gRPC streams) never finish on their own; they need the server to close them, for example with <code>GOAWAY</code> or a reconnect message.</p>
+<p><strong>Hashing quality.</strong> For ring hashing, the spread of key ownership shrinks roughly as 1/√(virtual nodes). With 100 virtual nodes per backend the simulation saw 8.77%–12.46% around a 10% ideal; Envoy's ring hash defaults to a minimum ring size of 1,024 entries. Maglev with M = 65,537 and N = 10 gives each backend 6,553 or 6,554 slots, an imbalance under 0.02%.</p>
+<p><strong>Idle timeouts must nest.</strong> The rule is: each hop's idle timeout must be <em>shorter</em> than the hop behind it. A client should give up before the balancer does, and the balancer should close idle backend connections before the backend does. Typical defaults: ALB 60 s idle; NLB 350 s; Node.js <code>server.keepAliveTimeout</code> 5 s; NGINX <code>keepalive_timeout</code> 75 s; Linux TCP keepalive first probe 7,200 s. Note Node's 5 s against ALB's 60 s. That pair is the classic random 502, covered next.</p>
+<h2 id="m19-deep-dive-production-failure-modes">Deep dive: production failure modes</h2>
+<h3 id="m19-random-502s-at-low-rate-behind-an-l7-balancer">Random 502s at low rate behind an L7 balancer</h3>
+<p><strong>Symptom.</strong> 0.01%–0.5% of requests fail with 502. They don't correlate with load, and you can't reproduce them with curl.</p>
+<p><strong>Mechanism.</strong> The balancer keeps idle pooled connections to the backend for up to 60 s. The backend closes idle connections after 5 s. At some moment the backend decides to close a connection that has been idle for 5 s. In the same millisecond, the balancer picks that connection for a new request. The request arrives just as the FIN is sent; the backend answers with a RST. The balancer cannot safely retry a request that may have been processed (unless it is idempotent and the proxy is configured to), so it returns 502.</p>
+<p><strong>Prove it.</strong> The balancer's access log shows the 502 with zero bytes received from the backend and a backend response time near zero. On the backend, capture resets on the backend port:</p>
+<pre class="text"><code># run on the backend (Linux) — your output will differ
+sudo tcpdump -nn -i eth0 &#39;tcp port 8080 and (tcp[tcpflags] &amp; (tcp-rst|tcp-fin) != 0)&#39;</code></pre>
+<p>You will see the backend's FIN, then a data segment from the balancer, then the backend's RST, all within a millisecond or two.</p>
+<p><strong>Fix.</strong> Make the backend's idle timeout <em>longer</em> than the balancer's: Node.js <code>server.keepAliveTimeout = 65_000</code> (and <code>headersTimeout</code> above it), or the equivalent in your server. Now the balancer always closes first, and it never sends on a connection it has already closed.</p>
+<h3 id="m19-proxy-source-port-exhaustion">Proxy source-port exhaustion</h3>
+<p><strong>Symptom.</strong> Under load, the proxy logs <code>connect() failed (99: Cannot assign requested address)</code> (EADDRNOTAVAIL), and errors climb for one backend while others are fine.</p>
+<p><strong>Mechanism.</strong> The 28,232-port budget for one proxy-IP → backend-IP:port tuple is exhausted, often by TIME_WAIT sockets from short-lived upstream connections.</p>
+<p><strong>Prove it.</strong></p>
+<pre class="text"><code># run on the proxy (Linux) — your output will differ
+ss -tan state time-wait &#39;( dport = :8080 )&#39; | wc -l       # sockets stuck in TIME_WAIT to the backend
+sysctl net.ipv4.ip_local_port_range                       # your ephemeral range
+nstat -az | grep -i -E &#39;TcpExtTW|ListenOverflows&#39;         # TIME_WAIT churn counters</code></pre>
+<p><strong>Fix.</strong> Turn on upstream keep-alive pooling (in NGINX, <code>keepalive</code> in the <code>upstream</code> block plus <code>proxy_http_version 1.1</code> and an empty <code>Connection</code> header). Add source IPs, or spread backends across more ports. Enable <code>tcp_tw_reuse</code> for outgoing connections.</p>
+<h3 id="m19-new-pods-get-no-traffic-or-all-of-it">New pods get no traffic (or all of it)</h3>
+<p><strong>Symptom A.</strong> After a scale-up, new pods stay idle — the gRPC story from section 5. Long-lived connections pinned by an L4 decision.</p>
+<p><strong>Symptom B.</strong> After a scale-up or a restart, the <em>new</em> pod gets flooded and falls over, then the next one does. Least-connections sees zero active connections on the newcomer and sends it everything, while its caches, connection pools, and JIT are cold.</p>
+<p><strong>Prove it.</strong> Per-pod request rate against per-pod connection count, side by side on a dashboard. A newcomer at 0 connections and 5× the request rate of its peers is case B.</p>
+<p><strong>Fix.</strong> Slow start: HAProxy <code>slowstart 60s</code> on the server line, Envoy <code>slow_start_config</code>, AWS target-group slow start. Or P2C, which sends a newcomer only the traffic it wins in random pairwise comparisons, not all of it.</p>
+<h3 id="m19-health-checks-that-cause-the-outage">Health checks that cause the outage</h3>
+<p><strong>Symptom.</strong> A shared dependency (a database, an auth service) gets slow. Within a minute, every backend is marked unhealthy and the balancer returns 503 for everything. The dependency recovers; the service doesn't, because the checks now time out under the thundering reconnect.</p>
+<p><strong>Mechanism.</strong> The health endpoint checked the dependency. When the dependency slowed, every backend failed the check at the same time.</p>
+<p><strong>Prove it.</strong> The balancer's health-check log shows all targets flipping to unhealthy within one or two intervals of each other, with the same reason (timeout).</p>
+<p><strong>Fix.</strong> Health checks test what the instance controls: the process is up, it can serve a trivial request. Dependency trouble shows up as errors in real traffic, which outlier detection handles — capped by max-ejection-percent. Keep panic mode on so a mass "unhealthy" falls back to spreading traffic everywhere.</p>
+<h3 id="m19-cross-zone-imbalance-on-an-l4-balancer">Cross-zone imbalance on an L4 balancer</h3>
+<p><strong>Symptom.</strong> In an NLB-fronted service, targets in one availability zone run hot while others idle.</p>
+<p><strong>Mechanism.</strong> Cross-zone balancing is off. DNS for the NLB returns one IP per zone, and clients spread roughly evenly across zones. Each zone's node only sends to its own zone's targets. Uneven target counts per zone mean uneven per-target load. With zones of 2, 4, and 6 targets, each zone gets a third of traffic, so a target in the 2-target zone carries three times the load of one in the 6-target zone.</p>
+<p><strong>Fix.</strong> Balance target counts across zones (a topology spread constraint in Kubernetes), or enable cross-zone balancing and accept the inter-zone data transfer cost it brings.</p>
+<h3 id="m19-dsr-syns-arrive-connections-never-complete">DSR: SYNs arrive, connections never complete</h3>
+<p><strong>Symptom.</strong> In a new DSR deployment, tcpdump on the backend shows encapsulated SYNs arriving; clients time out.</p>
+<p><strong>Causes, in order of likelihood.</strong> rp_filter dropping the decapsulated packet. The VIP is missing from the loopback, so the kernel drops packets for an address it doesn't own. The reply is leaving with the backend's own address as source instead of the VIP. Or an upstream anti-spoofing filter is dropping replies whose source is the VIP, because they come from a host that "shouldn't" use that address.</p>
+<p><strong>Prove it.</strong> <code>nstat -az | grep -i rpfilter</code> on the backend; <code>ip addr show lo</code>; capture the outgoing SYN-ACK and check its source address.</p>
+<p><strong>And the slow version</strong>: connections establish, small requests work, large uploads hang. That is the encapsulation MTU problem from the capture section. Lower the backend's <code>advmss</code>, or raise the MTU on the balancer-to-backend path.</p>
+<h2 id="m19-deep-dive-2026-context">Deep dive: 2026 context</h2>
+<p><strong>eBPF and XDP have taken over software L4.</strong> Katran (Meta) and Cilium's load balancer run the whole data path in XDP: hash, connection-table lookup in a BPF map, Maglev lookup, encapsulate, transmit, all before the kernel builds an skb. A single commodity server can forward millions of packets per second per core. In Kubernetes, Cilium's kube-proxy replacement does the Service DNAT at the socket layer for pod-to-Service traffic: it rewrites the destination at <code>connect()</code> time, so there is no per-packet NAT for that path at all.</p>
+<p><strong>L7 balancing moved into the client and the mesh.</strong> Envoy's xDS APIs became the common language for pushing endpoints, weights, and health to proxies. gRPC clients speak xDS directly ("proxyless" mesh), balancing per request with no sidecar. Sidecar-less meshes such as Istio's ambient mode split the job: a per-node L4 proxy for mTLS and a per-namespace L7 proxy only where L7 policy is needed.</p>
+<p><strong>Kubernetes Gateway API replaced Ingress for new work.</strong> It separates the infrastructure owner (<code>Gateway</code>) from the app owner (<code>HTTPRoute</code>, <code>GRPCRoute</code>), with weighted backends and header matches written down in the API instead of controller-specific annotations.</p>
+<p><strong>QUIC breaks the 5-tuple assumption.</strong> A QUIC connection survives a client address change (connection migration), so the 5-tuple can change mid-connection. An L4 balancer hashing on the 5-tuple will then send the migrated connection to a different backend. The fix being standardised in the IETF's QUIC-LB draft is to route on the <em>connection ID</em>, encoding the backend's identity into the server-chosen connection ID so any balancer node can route it without state. Until that is common, many deployments hash QUIC on the destination connection ID with consistent hashing, or terminate QUIC at the edge and speak HTTP/2 or HTTP/1.1 behind it.</p>
+<p><strong>Zero trust changes the TLS question.</strong> "Terminate at the edge, plain HTTP inside" no longer passes most security reviews. The default is re-encryption, with mTLS between proxy and workload and workload identities (SPIFFE IDs in a mesh) instead of IP allow-lists. The balancer has become a policy point as much as a traffic spreader.</p>
+<p><strong>ECH weakens SNI routing.</strong> As Encrypted Client Hello spreads in browsers and CDNs, TLS-passthrough balancers that route on SNI see only the outer public name. Hostname routing for passthrough traffic increasingly needs the balancer to be the ECH-terminating party, or a different routing key.</p>
+<h2 id="m19-deep-dive-senior-interview-questions">Deep dive: senior interview questions</h2>
+<p><strong>Q1: Your L4 balancer tier uses Maglev hashing. Why does it still need a connection table, and what breaks without one?</strong></p>
+<p>Maglev gives every node the same answer for a given backend set, which handles balancer churn: a flow moved to another node by an ECMP change still hashes to the same backend. But when the <em>backend</em> set changes, a few percent of table slots change owner. Without a connection table, established flows in those slots are sent to a backend that has no socket for them, and it answers with RST. The table pins existing flows to their original backend; only new flows follow the new mapping. You need both mechanisms.</p>
+<p><strong>Q2: With DSR, how does the backend accept a packet addressed to the VIP, and what stops it from stealing the VIP on the LAN?</strong></p>
+<p>The VIP is configured on the loopback, so the kernel treats it as local. ARP is suppressed for it (<code>arp_ignore=1</code>, <code>arp_announce=2</code> on Linux), so the backend never answers "who has VIP?" and the router keeps sending VIP traffic to the balancer. In tunnel mode, rp_filter must allow the decapsulated packet, whose source is the remote client.</p>
+<p><strong>Q3: You see a steady trickle of 502s behind an ALB with Node.js backends. What's your first hypothesis, and how do you prove it?</strong></p>
+<p>An idle-timeout race. Node's default keep-alive timeout of 5 s is shorter than the ALB's 60 s idle timeout, so the backend closes pooled connections that the ALB is about to reuse. Prove it with ALB access logs (502 with no backend response bytes) and a tcpdump of FIN/RST on the backend port, showing a request arriving immediately after the backend's FIN. Fix by setting the backend's keep-alive above the balancer's idle timeout.</p>
+<p><strong>Q4: Why can P2C outperform least-connections in practice, when least-connections has strictly more information?</strong></p>
+<p>Because in a fleet of balancers, the information is local and goes stale. Every balancer instance only sees its own counts, and they all pick the same apparently idle backend at once — herding. P2C's randomness decorrelates the instances. Its worst-case load is about log log n above average, against log n / log log n for pure random. It needs no global state, and it doesn't flood a newly added backend.</p>
+<p><strong>Q5: You remove one of twenty cache nodes and the database load spikes by 20× for ten minutes. What happened?</strong></p>
+<p>Client-side <code>hash(key) mod N</code> sharding. Going from 20 to 19 nodes remaps about 95% of keys, so nearly every lookup missed and fell through to the database. Consistent hashing (ring, Maglev, or rendezvous) would remap only the removed node's ~5%. Add bounded loads if the key popularity is skewed.</p>
+<p><strong>Q6: A service sits behind an NLB with client-IP preservation, and the security team wants per-client rate limits in the app. Then the platform team moves it behind an ALB. What breaks, and how do you fix it safely?</strong></p>
+<p>The app now sees the ALB's addresses as the TCP peer, so every client looks like a handful of IPs and rate limits trigger for everyone. Read the client address from <code>X-Forwarded-For</code> instead, but take the rightmost entry added by your trusted proxies, not the leftmost, which the client controls. Otherwise anyone can bypass rate limits by sending a fake header.</p>
+<p><strong>Q7: How would you drain a backend that serves long-lived gRPC streams and WebSockets during a deploy?</strong></p>
+<p>Stop new assignments first: set the weight to zero, or remove the endpoint and wait for it to propagate (a <code>preStop</code> sleep in Kubernetes). Then have the server signal clients to move. For HTTP/2 and gRPC that is <code>GOAWAY</code>; for WebSockets, an application-level "reconnect" message followed by a close. Give clients jittered reconnect delays so they don't stampede the remaining backends. Hard-close whatever remains at the deadline. A balancer-side deregistration delay alone doesn't help, because these connections never end by themselves.</p>
+<p><strong>Q8: When is DNS-based global load balancing the wrong tool, and what do you use instead?</strong></p>
+<p>When you need failover in seconds, when clients hold long-lived connections, or when the resolver's location is a poor proxy for the user's (large public resolvers without ECS). DNS answers are cached for at least the TTL and often longer, and connections never re-resolve. Anycast moves traffic at BGP speed instead and naturally reaches the nearest site. The usual design uses anycast to the edge, regional balancing inside, and DNS for deliberate whole-region moves.</p>
+<hr />
+<p><em>Key terms: L4/L7 load balancing, VIP, NAT mode, full proxy, direct server return (DSR), IP-in-IP, round robin, least connections, least request, power of two choices (P2C), consistent hashing, ring hash, Maglev, rendezvous hashing, bounded loads, active health checks, outlier detection, panic threshold, connection draining, GOAWAY, sticky sessions, TLS termination/passthrough, SNI, PROXY protocol, X-Forwarded-For, RFC 7239, anycast, EDNS Client Subnet (RFC 7871), ECMP, cross-zone load balancing, externalTrafficPolicy.</em></p>
