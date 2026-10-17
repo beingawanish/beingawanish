@@ -57,7 +57,7 @@ def load(additions: bool = True) -> list[str]:
             continue
         fixes = GUIDE / name
         if fixes.exists():
-            ns: dict = {}
+            ns: dict = {"__file__": str(fixes)}
             exec(compile(fixes.read_text(), str(fixes), "exec"), ns)
             text = ns["apply"](text)
     return text.split("\n")

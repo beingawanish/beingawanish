@@ -1,0 +1,524 @@
+<h2 id="d06-deep-dive">Deep dive: what the notebook hid</h2>
+<p>The notebook picture — shout, write down the answer, forget it after a while — is right about the protocol and wrong about the cache. The kernel's neighbour table is not a notebook with an expiry date. It is a state machine. Every entry has a state, a few timestamps and a probe counter, plus a queue of packets waiting for it. The state decides whether the next packet goes out at once, waits, or is dropped.</p>
+<p>That state machine is the reason a failover takes 3 seconds on one network and 50 on another. It explains why "flush the ARP cache" sometimes works and why it sometimes doesn't. And it is why an incident can show "No route to host" when the routing table is fine.</p>
+<p>The notebook also hid who else keeps one. A frame's path depends on at least three caches: the sender's neighbour table, the switch's MAC address table, and often a router's ARP table. Each has its own timers. In a cloud VPC there is a fourth party, the hypervisor, which answers ARP itself and ignores everything you say. The sections below cover the state machine, what it looks like on the wire, its numbers, how it fails, and the places in 2026 where ARP is quietly faked.</p>
+<h2 id="d06-state-machine">Deep dive: the real mental model — a state machine per neighbour</h2>
+<p>RFC 4861 (section 7.3.2) defines neighbour unreachability detection for IPv6. Linux, Windows and the BSDs' IPv6 stacks implement it. Linux and Windows also run the same machine for IPv4 ARP. On Linux it lives in the generic neighbour subsystem (<code>net/core/neighbour.c</code>), with one table for ARP and one for NDP.</p>
+<p>Each entry holds roughly this:</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Field</th>
+<th>What it is</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>state</td>
+<td>INCOMPLETE, REACHABLE, STALE, DELAY, PROBE, or Linux's FAILED (plus PERMANENT and NOARP for static and point-to-point entries)</td>
+</tr>
+<tr class="even">
+<td>lladdr</td>
+<td>the cached MAC address, if any</td>
+</tr>
+<tr class="odd">
+<td>confirmed</td>
+<td>last time something proved the neighbour is alive</td>
+</tr>
+<tr class="even">
+<td>used</td>
+<td>last time a packet was sent through this entry</td>
+</tr>
+<tr class="odd">
+<td>updated</td>
+<td>last time the state or address changed</td>
+</tr>
+<tr class="even">
+<td>probes</td>
+<td>solicitations sent in the current round</td>
+</tr>
+<tr class="odd">
+<td>queue</td>
+<td>packets waiting for resolution, bounded by <code>unres_qlen_bytes</code></td>
+</tr>
+</tbody>
+</table>
+<p>The states mean exactly this:</p>
+<ul>
+<li><strong>INCOMPLETE.</strong> A packet needs this neighbour and there is no MAC. The kernel queues the packet and broadcasts a request (multicast for NDP). It retries every <code>retrans_time</code> (1 s) up to <code>mcast_solicit</code> (3) times.</li>
+<li><strong>REACHABLE.</strong> The neighbour was <em>confirmed</em> less than <code>reachable_time</code> ago. Packets go straight out with no further checks. <code>reachable_time</code> is randomised between 0.5 and 1.5 × <code>base_reachable_time</code> (30 s), so 15 to 45 seconds. The randomness stops every host on a LAN from re-probing in lockstep.</li>
+<li><strong>STALE.</strong> The MAC is still believed but nobody has confirmed it recently. Nothing happens in this state. No probe is sent until a packet actually needs the entry. An idle STALE entry costs no traffic at all.</li>
+<li><strong>DELAY.</strong> A packet was just sent on a STALE entry. The packet goes out at once to the cached MAC, and the kernel waits <code>delay_first_probe_time</code> (5 s) for proof of life from upper layers before spending a probe.</li>
+<li><strong>PROBE.</strong> No proof arrived. The kernel sends <em>unicast</em> requests to the cached MAC, <code>ucast_solicit</code> (3) of them, one second apart. Packets keep flowing to the cached MAC meanwhile.</li>
+<li><strong>FAILED</strong> (Linux). Probing got no answer. Queued packets are dropped. Local senders get <code>EHOSTUNREACH</code> ("No route to host"), and <code>ping</code> prints <code>Destination Host Unreachable</code> from your own address. The next packet starts a new INCOMPLETE round.</li>
+</ul>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 500" role="img" aria-labelledby="d06-nud-title d06-nud-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
+<title id="d06-nud-title">The neighbour cache state machine (RFC 4861, Linux defaults)</title>
+<desc id="d06-nud-desc">Six states: INCOMPLETE, REACHABLE, STALE on the top row and FAILED, PROBE, DELAY on the bottom row. A first packet creates INCOMPLETE and broadcasts; a reply moves to REACHABLE. After 15 to 45 seconds without confirmation the entry becomes STALE. A packet sent on a STALE entry moves it to DELAY; confirmation within 5 seconds returns it to REACHABLE, otherwise PROBE sends three unicast requests. A reply returns to REACHABLE; silence leads to FAILED, which drops queued packets. An unsolicited ARP or gratuitous ARP with a new MAC sets the entry to STALE.</desc>
+<defs>
+<marker id="d06-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2d3142"/></marker>
+<marker id="d06-arrow-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#bf4520"/></marker>
+</defs>
+<text x="24" y="38" font-family="Georgia,serif" font-size="22" fill="#2d3142">One neighbour entry, six states</text>
+<text x="24" y="62" font-family="system-ui,sans-serif" font-size="13" fill="#6b6f7e">timers are Linux defaults, equal to RFC 4861 · only INCOMPLETE and PROBE put ARP on the wire</text>
+<!-- state boxes -->
+<g font-family="ui-monospace,Menlo,monospace" font-size="14" font-weight="600" text-anchor="middle">
+<rect x="40" y="120" width="160" height="50" rx="6" fill="#2d3142"/><text x="120" y="142" fill="#f5f5f5">INCOMPLETE</text>
+<rect x="330" y="120" width="160" height="50" rx="6" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5"/><text x="410" y="142" fill="#2d3142">REACHABLE</text>
+<rect x="620" y="120" width="160" height="50" rx="6" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5"/><text x="700" y="142" fill="#2d3142">STALE</text>
+<rect x="40" y="310" width="160" height="50" rx="6" fill="#bf4520"/><text x="120" y="332" fill="#f5f5f5">FAILED</text>
+<rect x="330" y="310" width="160" height="50" rx="6" fill="#2d3142"/><text x="410" y="332" fill="#f5f5f5">PROBE</text>
+<rect x="620" y="310" width="160" height="50" rx="6" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5"/><text x="700" y="332" fill="#2d3142">DELAY</text>
+</g>
+<g font-family="system-ui,sans-serif" font-size="11" text-anchor="middle">
+<text x="120" y="160" fill="#f5f5f5">queue packets, broadcast</text>
+<text x="410" y="160" fill="#6b6f7e">send, no checks</text>
+<text x="700" y="160" fill="#6b6f7e">idle costs nothing</text>
+<text x="120" y="350" fill="#f5f5f5">drop queue, unreachable</text>
+<text x="410" y="350" fill="#f5f5f5">unicast to cached MAC</text>
+<text x="700" y="350" fill="#6b6f7e">send, wait for confirm</text>
+</g>
+<!-- transitions -->
+<g fill="none" stroke="#2d3142" stroke-width="1.5">
+<line x1="200" y1="135" x2="328" y2="135" marker-end="url(#d06-arrow)"/>
+<line x1="490" y1="135" x2="618" y2="135" marker-end="url(#d06-arrow)"/>
+<line x1="700" y1="170" x2="700" y2="308" marker-end="url(#d06-arrow)"/>
+<line x1="620" y1="345" x2="492" y2="345" marker-end="url(#d06-arrow)"/>
+<line x1="330" y1="345" x2="202" y2="345" marker-end="url(#d06-arrow)"/>
+<line x1="640" y1="310" x2="480" y2="172" marker-end="url(#d06-arrow)"/>
+<line x1="410" y1="310" x2="410" y2="172" marker-end="url(#d06-arrow)"/>
+<line x1="95" y1="170" x2="95" y2="308" marker-end="url(#d06-arrow)"/>
+<line x1="145" y1="310" x2="145" y2="172" marker-end="url(#d06-arrow)"/>
+<line x1="24" y1="145" x2="38" y2="145" marker-end="url(#d06-arrow)"/>
+</g>
+<!-- GARP override, accent dashed -->
+<path d="M 560 92 L 680 92 L 680 118" fill="none" stroke="#bf4520" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#d06-arrow-acc)"/>
+<!-- transition labels -->
+<g font-family="system-ui,sans-serif" font-size="11" fill="#2d3142">
+<text x="264" y="127" text-anchor="middle">reply</text>
+<text x="554" y="127" text-anchor="middle">15–45 s, no confirm</text>
+<text x="708" y="232">packet sent on</text>
+<text x="708" y="246">cached MAC</text>
+<text x="556" y="372" text-anchor="middle">5 s, no confirm</text>
+<text x="266" y="372" text-anchor="middle">3 probes, 1 s apart,</text>
+<text x="266" y="386" text-anchor="middle">no reply</text>
+<text x="570" y="268" text-anchor="end">confirmed within 5 s</text>
+<text x="570" y="282" text-anchor="end">(reply or TCP progress)</text>
+<text x="404" y="246" text-anchor="end">reply</text>
+<text x="87" y="232" text-anchor="end">3 broadcasts,</text>
+<text x="87" y="246" text-anchor="end">1 s apart</text>
+<text x="153" y="232">next packet</text>
+<text x="556" y="86" text-anchor="end" fill="#bf4520">GARP / unsolicited ARP with a new MAC → STALE (from any state with an entry)</text>
+<text x="30" y="110" fill="#6b6f7e" font-size="10">first packet</text>
+</g>
+<!-- footer notes -->
+<g font-family="system-ui,sans-serif" font-size="12">
+<rect x="24" y="410" width="772" height="72" fill="#f5f5f5" stroke="#d8d4c8" rx="4"/>
+<text x="40" y="432" fill="#2d3142">Confirmation is about the IP, not the MAC: a REACHABLE entry keeps sending to a dead MAC until its timer runs out.</text>
+<text x="40" y="452" fill="#6b6f7e">base_reachable_time 30 s (randomised ×0.5–1.5) · delay_first_probe_time 5 s · retrans_time 1 s · mcast_solicit 3 · ucast_solicit 3</text>
+<text x="40" y="472" fill="#6b6f7e">Worst-case silent failover on Linux: 45 + 5 + 3 ≈ 53 s. One gratuitous ARP cuts it to milliseconds.</text>
+</g>
+</svg>
+
+<p>The subtle part is <strong>confirmation</strong>. A neighbour is confirmed by a reply to a solicitation. It is also confirmed by <em>upper-layer hints</em>. When TCP sees new data acknowledged, it tells the neighbour layer that the next hop must be alive, because packets are getting through. That is why a busy TCP connection never generates ARP traffic after the first resolution: every ACK resets <code>confirmed</code>. UDP has no such signal unless the application passes <code>MSG_CONFIRM</code> to <code>sendmsg</code>. So a UDP-only flow on Linux walks REACHABLE → STALE → DELAY → PROBE about once per <code>reachable_time</code>, which costs one unicast ARP exchange each time.</p>
+<p>Two other inputs move entries, and both matter for failover. An ARP <em>request</em> from a neighbour updates its existing entry with the sender's MAC; if the MAC changed, the entry goes to STALE with the new address. A gratuitous ARP is exactly such a request. So on Linux a GARP <em>updates</em> an existing entry, and the next packet goes to the new MAC at once. It does not <em>create</em> an entry unless <code>arp_accept</code> is set (default 0). And <code>locktime</code> (1 s by default) blocks a second change within one second of the last one, so when two hosts answer, the first answer holds.</p>
+<p>The ladder hides a trap. Confirmation is about the <em>IP</em>, not the MAC. If the gateway's IP moves to a new box with a new MAC and nobody sends a GARP, the old entry stays REACHABLE until its timer runs out. Packets go to a dead MAC the whole time, because nothing in REACHABLE checks anything. The simulator below plays that out with the Linux defaults.</p>
+<div class="sourceCode" id="d06-cb1"><pre class="sourceCode python"><code class="sourceCode python"><span id="d06-cb1-1"><a href="#d06-cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Simulate the Linux/RFC 4861 neighbour state machine for one gateway entry.</span></span>
+<span id="d06-cb1-2"><a href="#d06-cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-3"><a href="#d06-cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">Constants are Linux defaults (net.ipv4.neigh.default.*), which match RFC 4861.</span></span>
+<span id="d06-cb1-4"><a href="#d06-cb1-4" aria-hidden="true" tabindex="-1"></a><span class="co">Scenario: resolve, talk, go idle, reuse, then the gateway&#39;s MAC changes with</span></span>
+<span id="d06-cb1-5"><a href="#d06-cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co">no gratuitous ARP. How long are packets sent to a dead MAC?</span></span>
+<span id="d06-cb1-6"><a href="#d06-cb1-6" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d06-cb1-7"><a href="#d06-cb1-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> random</span>
+<span id="d06-cb1-8"><a href="#d06-cb1-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-9"><a href="#d06-cb1-9" aria-hidden="true" tabindex="-1"></a>BASE_REACHABLE <span class="op">=</span> <span class="fl">30.0</span>    <span class="co"># base_reachable_time_ms / 1000</span></span>
+<span id="d06-cb1-10"><a href="#d06-cb1-10" aria-hidden="true" tabindex="-1"></a>DELAY_FIRST    <span class="op">=</span> <span class="fl">5.0</span>     <span class="co"># delay_first_probe_time</span></span>
+<span id="d06-cb1-11"><a href="#d06-cb1-11" aria-hidden="true" tabindex="-1"></a>RETRANS        <span class="op">=</span> <span class="fl">1.0</span>     <span class="co"># retrans_time_ms / 1000</span></span>
+<span id="d06-cb1-12"><a href="#d06-cb1-12" aria-hidden="true" tabindex="-1"></a>MCAST_SOLICIT  <span class="op">=</span> <span class="dv">3</span></span>
+<span id="d06-cb1-13"><a href="#d06-cb1-13" aria-hidden="true" tabindex="-1"></a>UCAST_SOLICIT  <span class="op">=</span> <span class="dv">3</span></span>
+<span id="d06-cb1-14"><a href="#d06-cb1-14" aria-hidden="true" tabindex="-1"></a>TICK           <span class="op">=</span> <span class="fl">0.01</span></span>
+<span id="d06-cb1-15"><a href="#d06-cb1-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-16"><a href="#d06-cb1-16" aria-hidden="true" tabindex="-1"></a>rng <span class="op">=</span> random.Random(<span class="dv">4861</span>)</span>
+<span id="d06-cb1-17"><a href="#d06-cb1-17" aria-hidden="true" tabindex="-1"></a>reachable_time <span class="op">=</span> rng.uniform(<span class="fl">0.5</span>, <span class="fl">1.5</span>) <span class="op">*</span> BASE_REACHABLE   <span class="co"># re-randomised periodically in Linux</span></span>
+<span id="d06-cb1-18"><a href="#d06-cb1-18" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;reachable_time this run: </span><span class="sc">{</span>reachable_time<span class="sc">:.1f}</span><span class="ss"> s (uniform 15..45 s)</span><span class="ch">\n</span><span class="ss">&quot;</span>)</span>
+<span id="d06-cb1-19"><a href="#d06-cb1-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-20"><a href="#d06-cb1-20" aria-hidden="true" tabindex="-1"></a>gw_mac <span class="op">=</span> <span class="st">&quot;52:54:00:00:00:01&quot;</span>     <span class="co"># who really owns 10.0.0.1 right now</span></span>
+<span id="d06-cb1-21"><a href="#d06-cb1-21" aria-hidden="true" tabindex="-1"></a>gw_alive <span class="op">=</span> {gw_mac}</span>
+<span id="d06-cb1-22"><a href="#d06-cb1-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-23"><a href="#d06-cb1-23" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Entry:</span>
+<span id="d06-cb1-24"><a href="#d06-cb1-24" aria-hidden="true" tabindex="-1"></a>    state, mac, confirmed, used, timer, probes <span class="op">=</span> <span class="st">&quot;NONE&quot;</span>, <span class="va">None</span>, <span class="fl">0.0</span>, <span class="fl">0.0</span>, <span class="va">None</span>, <span class="dv">0</span></span>
+<span id="d06-cb1-25"><a href="#d06-cb1-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-26"><a href="#d06-cb1-26" aria-hidden="true" tabindex="-1"></a>e <span class="op">=</span> Entry()</span>
+<span id="d06-cb1-27"><a href="#d06-cb1-27" aria-hidden="true" tabindex="-1"></a>log <span class="op">=</span> []</span>
+<span id="d06-cb1-28"><a href="#d06-cb1-28" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> go(t, state, why):</span>
+<span id="d06-cb1-29"><a href="#d06-cb1-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> state <span class="op">!=</span> e.state:</span>
+<span id="d06-cb1-30"><a href="#d06-cb1-30" aria-hidden="true" tabindex="-1"></a>        log.append(<span class="ss">f&quot;t=</span><span class="sc">{</span>t<span class="sc">:7.2f}</span><span class="ss">  </span><span class="sc">{</span>e<span class="sc">.</span>state<span class="sc">:&lt;10}</span><span class="ss"> -&gt; </span><span class="sc">{</span>state<span class="sc">:&lt;10}</span><span class="ss"> </span><span class="sc">{</span>why<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d06-cb1-31"><a href="#d06-cb1-31" aria-hidden="true" tabindex="-1"></a>    e.state <span class="op">=</span> state</span>
+<span id="d06-cb1-32"><a href="#d06-cb1-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-33"><a href="#d06-cb1-33" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> solicit(t, unicast):</span>
+<span id="d06-cb1-34"><a href="#d06-cb1-34" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;Send a solicitation; return the MAC that answered (or None).&quot;&quot;&quot;</span></span>
+<span id="d06-cb1-35"><a href="#d06-cb1-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> unicast:</span>
+<span id="d06-cb1-36"><a href="#d06-cb1-36" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> e.mac <span class="cf">if</span> e.mac <span class="kw">in</span> gw_alive <span class="cf">else</span> <span class="va">None</span>   <span class="co"># only the cached MAC hears it</span></span>
+<span id="d06-cb1-37"><a href="#d06-cb1-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> gw_mac <span class="cf">if</span> gw_mac <span class="kw">in</span> gw_alive <span class="cf">else</span> <span class="va">None</span>      <span class="co"># broadcast: current owner answers</span></span>
+<span id="d06-cb1-38"><a href="#d06-cb1-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-39"><a href="#d06-cb1-39" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> answer(t, mac):</span>
+<span id="d06-cb1-40"><a href="#d06-cb1-40" aria-hidden="true" tabindex="-1"></a>    note <span class="op">=</span> <span class="st">&quot; (MAC changed!)&quot;</span> <span class="cf">if</span> e.mac <span class="kw">and</span> mac <span class="op">!=</span> e.mac <span class="cf">else</span> <span class="st">&quot;&quot;</span></span>
+<span id="d06-cb1-41"><a href="#d06-cb1-41" aria-hidden="true" tabindex="-1"></a>    e.mac, e.confirmed, e.probes <span class="op">=</span> mac, t, <span class="dv">0</span></span>
+<span id="d06-cb1-42"><a href="#d06-cb1-42" aria-hidden="true" tabindex="-1"></a>    go(t, <span class="st">&quot;REACHABLE&quot;</span>, <span class="ss">f&quot;reply from </span><span class="sc">{</span>mac<span class="sc">}{</span>note<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d06-cb1-43"><a href="#d06-cb1-43" aria-hidden="true" tabindex="-1"></a>    e.timer <span class="op">=</span> t <span class="op">+</span> reachable_time</span>
+<span id="d06-cb1-44"><a href="#d06-cb1-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-45"><a href="#d06-cb1-45" aria-hidden="true" tabindex="-1"></a>sent_to <span class="op">=</span> {<span class="st">&quot;ok&quot;</span>: <span class="dv">0</span>, <span class="st">&quot;dead&quot;</span>: <span class="dv">0</span>, <span class="st">&quot;dropped&quot;</span>: <span class="dv">0</span>}</span>
+<span id="d06-cb1-46"><a href="#d06-cb1-46" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> app_send(t):</span>
+<span id="d06-cb1-47"><a href="#d06-cb1-47" aria-hidden="true" tabindex="-1"></a>    e.used <span class="op">=</span> t</span>
+<span id="d06-cb1-48"><a href="#d06-cb1-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> e.state <span class="kw">in</span> (<span class="st">&quot;NONE&quot;</span>, <span class="st">&quot;FAILED&quot;</span>):</span>
+<span id="d06-cb1-49"><a href="#d06-cb1-49" aria-hidden="true" tabindex="-1"></a>        go(t, <span class="st">&quot;INCOMPLETE&quot;</span>, <span class="st">&quot;packet queued, broadcast solicit #1&quot;</span>)</span>
+<span id="d06-cb1-50"><a href="#d06-cb1-50" aria-hidden="true" tabindex="-1"></a>        e.probes, e.timer <span class="op">=</span> <span class="dv">1</span>, t <span class="op">+</span> RETRANS</span>
+<span id="d06-cb1-51"><a href="#d06-cb1-51" aria-hidden="true" tabindex="-1"></a>        mac <span class="op">=</span> solicit(t, <span class="va">False</span>)</span>
+<span id="d06-cb1-52"><a href="#d06-cb1-52" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> mac: answer(t <span class="op">+</span> <span class="fl">0.0004</span>, mac)</span>
+<span id="d06-cb1-53"><a href="#d06-cb1-53" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span></span>
+<span id="d06-cb1-54"><a href="#d06-cb1-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> e.state <span class="op">==</span> <span class="st">&quot;INCOMPLETE&quot;</span>:</span>
+<span id="d06-cb1-55"><a href="#d06-cb1-55" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span>                      <span class="co"># queued behind resolution</span></span>
+<span id="d06-cb1-56"><a href="#d06-cb1-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> e.state <span class="op">==</span> <span class="st">&quot;STALE&quot;</span>:</span>
+<span id="d06-cb1-57"><a href="#d06-cb1-57" aria-hidden="true" tabindex="-1"></a>        go(t, <span class="st">&quot;DELAY&quot;</span>, <span class="st">&quot;packet sent on stale entry; wait for confirmation&quot;</span>)</span>
+<span id="d06-cb1-58"><a href="#d06-cb1-58" aria-hidden="true" tabindex="-1"></a>        e.timer <span class="op">=</span> t <span class="op">+</span> DELAY_FIRST</span>
+<span id="d06-cb1-59"><a href="#d06-cb1-59" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> e.mac <span class="kw">in</span> gw_alive:</span>
+<span id="d06-cb1-60"><a href="#d06-cb1-60" aria-hidden="true" tabindex="-1"></a>        sent_to[<span class="st">&quot;ok&quot;</span>] <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d06-cb1-61"><a href="#d06-cb1-61" aria-hidden="true" tabindex="-1"></a>        e.confirmed <span class="op">=</span> t <span class="op">+</span> <span class="fl">0.002</span>     <span class="co"># reply arrives -&gt; TCP progress confirms neighbour</span></span>
+<span id="d06-cb1-62"><a href="#d06-cb1-62" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span>:</span>
+<span id="d06-cb1-63"><a href="#d06-cb1-63" aria-hidden="true" tabindex="-1"></a>        sent_to[<span class="st">&quot;dead&quot;</span>] <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d06-cb1-64"><a href="#d06-cb1-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-65"><a href="#d06-cb1-65" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> timers(t):</span>
+<span id="d06-cb1-66"><a href="#d06-cb1-66" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> e.timer <span class="kw">is</span> <span class="va">None</span> <span class="kw">or</span> t <span class="op">&lt;</span> e.timer:</span>
+<span id="d06-cb1-67"><a href="#d06-cb1-67" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span></span>
+<span id="d06-cb1-68"><a href="#d06-cb1-68" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> e.state <span class="op">==</span> <span class="st">&quot;REACHABLE&quot;</span>:</span>
+<span id="d06-cb1-69"><a href="#d06-cb1-69" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> t <span class="op">&lt;</span> e.confirmed <span class="op">+</span> reachable_time:</span>
+<span id="d06-cb1-70"><a href="#d06-cb1-70" aria-hidden="true" tabindex="-1"></a>            e.timer <span class="op">=</span> e.confirmed <span class="op">+</span> reachable_time</span>
+<span id="d06-cb1-71"><a href="#d06-cb1-71" aria-hidden="true" tabindex="-1"></a>        <span class="cf">elif</span> t <span class="op">&lt;</span> e.used <span class="op">+</span> DELAY_FIRST:</span>
+<span id="d06-cb1-72"><a href="#d06-cb1-72" aria-hidden="true" tabindex="-1"></a>            go(t, <span class="st">&quot;DELAY&quot;</span>, <span class="st">&quot;reachable_time expired, recently used&quot;</span>)<span class="op">;</span> e.timer <span class="op">=</span> t <span class="op">+</span> DELAY_FIRST</span>
+<span id="d06-cb1-73"><a href="#d06-cb1-73" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span>:</span>
+<span id="d06-cb1-74"><a href="#d06-cb1-74" aria-hidden="true" tabindex="-1"></a>            go(t, <span class="st">&quot;STALE&quot;</span>, <span class="st">&quot;reachable_time expired, idle&quot;</span>)<span class="op">;</span> e.timer <span class="op">=</span> <span class="va">None</span></span>
+<span id="d06-cb1-75"><a href="#d06-cb1-75" aria-hidden="true" tabindex="-1"></a>    <span class="cf">elif</span> e.state <span class="op">==</span> <span class="st">&quot;DELAY&quot;</span>:</span>
+<span id="d06-cb1-76"><a href="#d06-cb1-76" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> e.confirmed <span class="op">&gt;=</span> e.timer <span class="op">-</span> DELAY_FIRST:</span>
+<span id="d06-cb1-77"><a href="#d06-cb1-77" aria-hidden="true" tabindex="-1"></a>            go(t, <span class="st">&quot;REACHABLE&quot;</span>, <span class="st">&quot;upper layer confirmed&quot;</span>)<span class="op">;</span> e.timer <span class="op">=</span> e.confirmed <span class="op">+</span> reachable_time</span>
+<span id="d06-cb1-78"><a href="#d06-cb1-78" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span>:</span>
+<span id="d06-cb1-79"><a href="#d06-cb1-79" aria-hidden="true" tabindex="-1"></a>            go(t, <span class="st">&quot;PROBE&quot;</span>, <span class="ss">f&quot;unicast solicit #1 to </span><span class="sc">{</span>e<span class="sc">.</span>mac<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d06-cb1-80"><a href="#d06-cb1-80" aria-hidden="true" tabindex="-1"></a>            e.probes, e.timer <span class="op">=</span> <span class="dv">1</span>, t <span class="op">+</span> RETRANS</span>
+<span id="d06-cb1-81"><a href="#d06-cb1-81" aria-hidden="true" tabindex="-1"></a>            mac <span class="op">=</span> solicit(t, <span class="va">True</span>)</span>
+<span id="d06-cb1-82"><a href="#d06-cb1-82" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> mac: answer(t <span class="op">+</span> <span class="fl">0.0003</span>, mac)</span>
+<span id="d06-cb1-83"><a href="#d06-cb1-83" aria-hidden="true" tabindex="-1"></a>    <span class="cf">elif</span> e.state <span class="kw">in</span> (<span class="st">&quot;PROBE&quot;</span>, <span class="st">&quot;INCOMPLETE&quot;</span>):</span>
+<span id="d06-cb1-84"><a href="#d06-cb1-84" aria-hidden="true" tabindex="-1"></a>        limit <span class="op">=</span> UCAST_SOLICIT <span class="cf">if</span> e.state <span class="op">==</span> <span class="st">&quot;PROBE&quot;</span> <span class="cf">else</span> MCAST_SOLICIT</span>
+<span id="d06-cb1-85"><a href="#d06-cb1-85" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> e.probes <span class="op">&gt;=</span> limit:</span>
+<span id="d06-cb1-86"><a href="#d06-cb1-86" aria-hidden="true" tabindex="-1"></a>            go(t, <span class="st">&quot;FAILED&quot;</span>, <span class="ss">f&quot;</span><span class="sc">{</span>e<span class="sc">.</span>probes<span class="sc">}</span><span class="ss"> solicits unanswered&quot;</span>)<span class="op">;</span> e.timer <span class="op">=</span> <span class="va">None</span></span>
+<span id="d06-cb1-87"><a href="#d06-cb1-87" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span></span>
+<span id="d06-cb1-88"><a href="#d06-cb1-88" aria-hidden="true" tabindex="-1"></a>        e.probes <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d06-cb1-89"><a href="#d06-cb1-89" aria-hidden="true" tabindex="-1"></a>        log.append(<span class="ss">f&quot;t=</span><span class="sc">{</span>t<span class="sc">:7.2f}</span><span class="ss">  </span><span class="sc">{</span>e<span class="sc">.</span>state<span class="sc">:&lt;10}</span><span class="ss">    </span><span class="sc">{</span><span class="st">&#39;unicast&#39;</span> <span class="cf">if</span> e<span class="sc">.</span>state <span class="op">==</span> <span class="st">&#39;PROBE&#39;</span> <span class="cf">else</span> <span class="st">&#39;broadcast&#39;</span><span class="sc">}</span><span class="ss"> solicit #</span><span class="sc">{</span>e<span class="sc">.</span>probes<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d06-cb1-90"><a href="#d06-cb1-90" aria-hidden="true" tabindex="-1"></a>        e.timer <span class="op">=</span> t <span class="op">+</span> RETRANS</span>
+<span id="d06-cb1-91"><a href="#d06-cb1-91" aria-hidden="true" tabindex="-1"></a>        mac <span class="op">=</span> solicit(t, e.state <span class="op">==</span> <span class="st">&quot;PROBE&quot;</span>)</span>
+<span id="d06-cb1-92"><a href="#d06-cb1-92" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> mac: answer(t <span class="op">+</span> <span class="fl">0.0003</span>, mac)</span>
+<span id="d06-cb1-93"><a href="#d06-cb1-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-94"><a href="#d06-cb1-94" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> traffic(t):</span>
+<span id="d06-cb1-95"><a href="#d06-cb1-95" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="dv">0</span> <span class="op">&lt;=</span> t <span class="op">&lt;</span> <span class="dv">10</span>:   <span class="cf">return</span> <span class="va">True</span>       <span class="co"># busy for 10 s</span></span>
+<span id="d06-cb1-96"><a href="#d06-cb1-96" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">abs</span>(t <span class="op">-</span> <span class="dv">120</span>) <span class="op">&lt;</span> TICK <span class="op">/</span> <span class="dv">2</span>: <span class="cf">return</span> <span class="va">True</span>   <span class="co"># one packet after a long idle</span></span>
+<span id="d06-cb1-97"><a href="#d06-cb1-97" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> t <span class="op">&gt;=</span> <span class="dv">150</span>:      <span class="cf">return</span> <span class="bu">round</span>(t <span class="op">*</span> <span class="dv">100</span>) <span class="op">%</span> <span class="dv">50</span> <span class="op">==</span> <span class="dv">0</span>   <span class="co"># steady stream, every 0.5 s</span></span>
+<span id="d06-cb1-98"><a href="#d06-cb1-98" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="va">False</span></span>
+<span id="d06-cb1-99"><a href="#d06-cb1-99" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-100"><a href="#d06-cb1-100" aria-hidden="true" tabindex="-1"></a>last_dead <span class="op">=</span> <span class="va">None</span></span>
+<span id="d06-cb1-101"><a href="#d06-cb1-101" aria-hidden="true" tabindex="-1"></a>first_dead <span class="op">=</span> <span class="va">None</span></span>
+<span id="d06-cb1-102"><a href="#d06-cb1-102" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="bu">int</span>(<span class="dv">320</span> <span class="op">/</span> TICK)):</span>
+<span id="d06-cb1-103"><a href="#d06-cb1-103" aria-hidden="true" tabindex="-1"></a>    t <span class="op">=</span> i <span class="op">*</span> TICK</span>
+<span id="d06-cb1-104"><a href="#d06-cb1-104" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">abs</span>(t <span class="op">-</span> <span class="dv">200</span>) <span class="op">&lt;</span> TICK <span class="op">/</span> <span class="dv">2</span>:</span>
+<span id="d06-cb1-105"><a href="#d06-cb1-105" aria-hidden="true" tabindex="-1"></a>        gw_mac <span class="op">=</span> <span class="st">&quot;52:54:00:00:00:02&quot;</span><span class="op">;</span> gw_alive <span class="op">=</span> {gw_mac}</span>
+<span id="d06-cb1-106"><a href="#d06-cb1-106" aria-hidden="true" tabindex="-1"></a>        log.append(<span class="ss">f&quot;t=</span><span class="sc">{</span>t<span class="sc">:7.2f}</span><span class="ss">  ** failover: 10.0.0.1 moves to </span><span class="sc">{</span>gw_mac<span class="sc">}</span><span class="ss">, no gratuitous ARP **&quot;</span>)</span>
+<span id="d06-cb1-107"><a href="#d06-cb1-107" aria-hidden="true" tabindex="-1"></a>    timers(t)</span>
+<span id="d06-cb1-108"><a href="#d06-cb1-108" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> traffic(t):</span>
+<span id="d06-cb1-109"><a href="#d06-cb1-109" aria-hidden="true" tabindex="-1"></a>        before <span class="op">=</span> sent_to[<span class="st">&quot;dead&quot;</span>]</span>
+<span id="d06-cb1-110"><a href="#d06-cb1-110" aria-hidden="true" tabindex="-1"></a>        app_send(t)</span>
+<span id="d06-cb1-111"><a href="#d06-cb1-111" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> sent_to[<span class="st">&quot;dead&quot;</span>] <span class="op">&gt;</span> before:</span>
+<span id="d06-cb1-112"><a href="#d06-cb1-112" aria-hidden="true" tabindex="-1"></a>            first_dead <span class="op">=</span> first_dead <span class="kw">or</span> t</span>
+<span id="d06-cb1-113"><a href="#d06-cb1-113" aria-hidden="true" tabindex="-1"></a>            last_dead <span class="op">=</span> t</span>
+<span id="d06-cb1-114"><a href="#d06-cb1-114" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb1-115"><a href="#d06-cb1-115" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">&quot;</span>.join(log))</span>
+<span id="d06-cb1-116"><a href="#d06-cb1-116" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="ss">packets to dead MAC: </span><span class="sc">{</span>sent_to[<span class="st">&#39;dead&#39;</span>]<span class="sc">}</span><span class="ss">, from t=</span><span class="sc">{</span>first_dead<span class="sc">:.2f}</span><span class="ss"> to t=</span><span class="sc">{</span>last_dead<span class="sc">:.2f}</span><span class="ss">&quot;</span></span>
+<span id="d06-cb1-117"><a href="#d06-cb1-117" aria-hidden="true" tabindex="-1"></a>      <span class="ss">f&quot; -&gt; blackhole </span><span class="sc">{</span>last_dead <span class="op">-</span> first_dead <span class="op">+</span> <span class="fl">0.5</span><span class="sc">:.1f}</span><span class="ss"> s&quot;</span>)</span></code></pre></div>
+<p>Real output on CPython 3.13:</p>
+<pre><code>reachable_time this run: 42.8 s (uniform 15..45 s)
+
+t=   0.00  NONE       -&gt; INCOMPLETE packet queued, broadcast solicit #1
+t=   0.00  INCOMPLETE -&gt; REACHABLE  reply from 52:54:00:00:00:01
+t=  52.82  REACHABLE  -&gt; STALE      reachable_time expired, idle
+t= 120.00  STALE      -&gt; DELAY      packet sent on stale entry; wait for confirmation
+t= 125.00  DELAY      -&gt; REACHABLE  upper layer confirmed
+t= 200.00  ** failover: 10.0.0.1 moves to 52:54:00:00:00:02, no gratuitous ARP **
+t= 242.33  REACHABLE  -&gt; DELAY      reachable_time expired, recently used
+t= 247.33  DELAY      -&gt; PROBE      unicast solicit #1 to 52:54:00:00:00:01
+t= 248.33  PROBE         unicast solicit #2
+t= 249.33  PROBE         unicast solicit #3
+t= 250.33  PROBE      -&gt; FAILED     3 solicits unanswered
+t= 250.50  FAILED     -&gt; INCOMPLETE packet queued, broadcast solicit #1
+t= 250.50  INCOMPLETE -&gt; REACHABLE  reply from 52:54:00:00:00:02 (MAC changed!)
+
+packets to dead MAC: 101, from t=200.00 to t=250.00 -&gt; blackhole 50.5 s</code></pre>
+<p>Follow the timeline. The entry spent t=10 to t=120 going quietly STALE and costing nothing. At t=120 one packet went out at once on the stale MAC, and the reply confirmed it within the 5-second DELAY window, so no probe was ever sent. Then the failover. The entry had just been confirmed, so it stayed REACHABLE for another 42.3 s, the full <code>reachable_time</code> measured from the last confirmation at about t=199.5. Then came 5 s of DELAY and 3 s of unicast probes to a MAC that no longer exists. Only FAILED forced a broadcast, and the broadcast found the new owner.</p>
+<p>Worst case with Linux defaults is about 45 + 5 + 3 = 53 s. Best case, if the entry happened to be STALE at failover, is about 5 + 3 = 8 s. One gratuitous ARP from the new owner would have updated the entry at t=200 and cut the blackhole to a few milliseconds. That gap is the whole argument for GARP.</p>
+<p>The simulator is a model, not the kernel. It skips the periodic re-randomisation of <code>reachable_time</code>, the garbage collector and <code>app_solicit</code>. The shape of the timeline is the real one.</p>
+<h2 id="d06-wire">Deep dive: what the wire and the kernel actually show</h2>
+<h3 id="d06-the-neighbour-table-with-its-timers">The neighbour table, with its timers</h3>
+<p>On Linux, <code>ip -s neigh</code> prints each entry's state and its three ages (illustrative, from a host at 10.0.0.11 — your output will differ):</p>
+<pre><code>$ ip -s neigh show dev eth0
+10.0.0.1 lladdr 52:54:00:00:00:01 ref 1 used 0/0/0 probes 1 REACHABLE
+10.0.0.21 lladdr 52:54:00:aa:00:21 used 412/407/377 probes 0 STALE
+10.0.0.30 lladdr 52:54:00:aa:00:30 ref 1 used 2/38/2 probes 0 DELAY
+10.0.0.99  used 9/1209/6 probes 3 FAILED</code></pre>
+<p><code>used a/b/c</code> is seconds since the entry was last <em>used</em>, last <em>confirmed</em> and last <em>updated</em>. Read 10.0.0.30: used 2 s ago, confirmed 38 s ago. A packet just went out on an old confirmation, so it is in DELAY and will probe in about 3 s unless TCP confirms it first. 10.0.0.99 has no <code>lladdr</code> and three probes spent: something keeps trying to reach a host that isn't there. <code>ip monitor neigh</code> streams the transitions live, which is the best way to watch a failover.</p>
+<p>The knobs are per interface, under <code>/proc/sys/net/ipv4/neigh/&lt;dev&gt;/</code> (and <code>ipv6</code>):</p>
+<pre><code>$ sysctl net.ipv4.neigh.eth0 | grep -E &#39;reach|delay|retrans|solicit|locktime&#39;
+net.ipv4.neigh.eth0.app_solicit = 0
+net.ipv4.neigh.eth0.base_reachable_time_ms = 30000
+net.ipv4.neigh.eth0.delay_first_probe_time = 5
+net.ipv4.neigh.eth0.locktime = 100
+net.ipv4.neigh.eth0.mcast_resolicit = 0
+net.ipv4.neigh.eth0.mcast_solicit = 3
+net.ipv4.neigh.eth0.retrans_time_ms = 1000
+net.ipv4.neigh.eth0.ucast_solicit = 3</code></pre>
+<p><code>locktime</code> is in hundredths of a second, so 100 is the 1 s mentioned above.</p>
+<p>macOS is simpler for IPv4. Its ARP entries just expire, after <code>net.link.ether.inet.max_age</code> seconds (1200 by default, so 20 minutes), with a refresh attempt before expiry. Its IPv6 table does run the RFC 4861 machine, and <code>ndp -an</code> shows the state letter (run on your Mac — your output will differ):</p>
+<pre><code>$ arp -an
+? (192.168.1.1) at a0:36:bc:12:34:56 on en0 ifscope [ethernet]
+? (192.168.1.40) at 8c:3b:ad:11:22:33 on en0 ifscope [ethernet]
+$ ndp -an
+Neighbor                        Linklayer Address  Netif Expire    S Flags
+fe80::a236:bcff:fe12:3456%en0   a0:36:bc:12:34:56    en0 23h59m58s S R
+fe80::1c2b:3aff:fe4d:5e6f%en0   1e:2b:3a:4d:5e:6f    en0 4s        R</code></pre>
+<p><code>S</code> is the state column: R reachable, S stale, D delay, P probe, I incomplete. The trailing <code>R</code> in Flags marks a router. The long expiry on the stale router entry is typical: a stale entry sits until it is used or garbage-collected.</p>
+<h3 id="d06-a-capture-of-the-whole-lifecycle">A capture of the whole lifecycle</h3>
+<p>This is one capture on host 10.0.0.11, abridged, with <code>tcpdump -nn -e -v arp</code> (constructed for illustration; the timings follow the Linux defaults). The gateway VIP 10.0.0.1 is held by router A (…:00:01) and fails over to router B (…:00:02) at 10:03:20.</p>
+<pre><code>10:00:00.000000 52:54:00:aa:00:0b &gt; ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), length 42: Ethernet (len 6), IPv4 (len 4), Request who-has 10.0.0.1 tell 10.0.0.11, length 28
+10:00:00.000412 52:54:00:00:00:01 &gt; 52:54:00:aa:00:0b, ethertype ARP (0x0806), length 60: Ethernet (len 6), IPv4 (len 4), Reply 10.0.0.1 is-at 52:54:00:00:00:01, length 46
+10:02:05.000180 52:54:00:aa:00:0b &gt; 52:54:00:00:00:01, ethertype ARP (0x0806), length 42: Ethernet (len 6), IPv4 (len 4), Request who-has 10.0.0.1 tell 10.0.0.11, length 28
+10:02:05.000431 52:54:00:00:00:01 &gt; 52:54:00:aa:00:0b, ethertype ARP (0x0806), length 60: Ethernet (len 6), IPv4 (len 4), Reply 10.0.0.1 is-at 52:54:00:00:00:01, length 46
+10:03:20.004000 52:54:00:00:00:02 &gt; ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), length 60: Ethernet (len 6), IPv4 (len 4), Request who-has 10.0.0.1 tell 10.0.0.1, length 46
+10:03:21.004100 52:54:00:00:00:02 &gt; ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), length 60: Ethernet (len 6), IPv4 (len 4), Request who-has 10.0.0.1 tell 10.0.0.1, length 46
+10:05:02.310022 52:54:00:aa:00:4d &gt; ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), length 60: Ethernet (len 6), IPv4 (len 4), Request who-has 10.0.0.77 tell 0.0.0.0, length 46</code></pre>
+<p>Line by line:</p>
+<ol type="1">
+<li><strong>Broadcast request</strong> from an INCOMPLETE entry. <code>length 42</code> is 14 bytes of Ethernet header plus 28 of ARP. Outgoing frames are captured before the NIC pads them, so they show 42.</li>
+<li><strong>Unicast reply</strong>, 412 µs later. Received frames show <code>length 60</code> (padded to the Ethernet minimum, FCS not counted) and an ARP <code>length 46</code> that includes the 18 padding bytes. Mismatched lengths between your own and others' frames are normal, not corruption.</li>
+<li><strong>Unicast request</strong> at 10:02:05. The destination is the gateway's MAC, not broadcast. This is the PROBE state re-checking a cached MAC: it went STALE, a packet put it in DELAY at 10:02:00, and nothing confirmed it within 5 s. Seeing unicast ARP to the gateway every minute or so from a UDP-heavy host is normal.</li>
+<li><strong>The probe's reply</strong> moves the entry back to REACHABLE.</li>
+<li><strong>Gratuitous ARP</strong> from router B: sender IP equals target IP, broadcast destination, target MAC zero (tcpdump prints the target MAC in parentheses only when it is non-zero). This is the RFC 5227 "ARP announcement" form. Every host with a 10.0.0.1 entry rewrites it to …:00:02 and goes STALE. The switches learn …:00:02's port from the source MAC at the same moment.</li>
+<li><strong>A second announcement</strong> one second later. Keepalived and most VRRP stacks repeat GARPs on purpose, because one broadcast is easy to lose during exactly the kind of event that causes a failover.</li>
+<li><strong>An RFC 5227 probe</strong> from a host that just got 10.0.0.77 from DHCP. <code>tell 0.0.0.0</code> is the tell: the host asks whether anyone already has 10.0.0.77 without claiming it, so nobody's cache is touched. Its own MAC still appears as the Ethernet source and in the ARP sender hardware field. If a reply comes back, the DHCP client declines the lease.</li>
+</ol>
+<p>The same frames, built byte by byte, show how little separates them. The "GARP reply form" is the older style some devices send instead of an announcement; RFC 5227 recommends the request form, but receivers accept both:</p>
+<div class="sourceCode" id="d06-cb7"><pre class="sourceCode python"><code class="sourceCode python"><span id="d06-cb7-1"><a href="#d06-cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Build the three &#39;special&#39; ARP frames, then run an arpwatch-style detector.&quot;&quot;&quot;</span></span>
+<span id="d06-cb7-2"><a href="#d06-cb7-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> ipaddress</span>
+<span id="d06-cb7-3"><a href="#d06-cb7-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> struct</span>
+<span id="d06-cb7-4"><a href="#d06-cb7-4" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> collections <span class="im">import</span> defaultdict</span>
+<span id="d06-cb7-5"><a href="#d06-cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb7-6"><a href="#d06-cb7-6" aria-hidden="true" tabindex="-1"></a>BCAST, ZERO <span class="op">=</span> <span class="st">b&quot;</span><span class="ch">\xff</span><span class="st">&quot;</span> <span class="op">*</span> <span class="dv">6</span>, <span class="st">b&quot;</span><span class="ch">\x00</span><span class="st">&quot;</span> <span class="op">*</span> <span class="dv">6</span></span>
+<span id="d06-cb7-7"><a href="#d06-cb7-7" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> mac(s): <span class="cf">return</span> <span class="bu">bytes</span>.fromhex(s.replace(<span class="st">&quot;:&quot;</span>, <span class="st">&quot;&quot;</span>))</span>
+<span id="d06-cb7-8"><a href="#d06-cb7-8" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> ip4(s): <span class="cf">return</span> ipaddress.IPv4Address(s).packed</span>
+<span id="d06-cb7-9"><a href="#d06-cb7-9" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> hexmac(b): <span class="cf">return</span> <span class="st">&quot;:&quot;</span>.join(<span class="ss">f&quot;</span><span class="sc">{</span>x<span class="sc">:02x}</span><span class="ss">&quot;</span> <span class="cf">for</span> x <span class="kw">in</span> b)</span>
+<span id="d06-cb7-10"><a href="#d06-cb7-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb7-11"><a href="#d06-cb7-11" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> arp_frame(eth_dst, sha, spa, tha, tpa, oper):</span>
+<span id="d06-cb7-12"><a href="#d06-cb7-12" aria-hidden="true" tabindex="-1"></a>    eth <span class="op">=</span> eth_dst <span class="op">+</span> sha <span class="op">+</span> struct.pack(<span class="st">&quot;!H&quot;</span>, <span class="bn">0x0806</span>)</span>
+<span id="d06-cb7-13"><a href="#d06-cb7-13" aria-hidden="true" tabindex="-1"></a>    arp <span class="op">=</span> struct.pack(<span class="st">&quot;!HHBBH6s4s6s4s&quot;</span>, <span class="dv">1</span>, <span class="bn">0x0800</span>, <span class="dv">6</span>, <span class="dv">4</span>, oper, sha, spa, tha, tpa)</span>
+<span id="d06-cb7-14"><a href="#d06-cb7-14" aria-hidden="true" tabindex="-1"></a>    frame <span class="op">=</span> eth <span class="op">+</span> arp</span>
+<span id="d06-cb7-15"><a href="#d06-cb7-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> frame <span class="op">+</span> <span class="st">b&quot;</span><span class="ch">\x00</span><span class="st">&quot;</span> <span class="op">*</span> (<span class="dv">60</span> <span class="op">-</span> <span class="bu">len</span>(frame))   <span class="co"># pad to Ethernet minimum (FCS not shown)</span></span>
+<span id="d06-cb7-16"><a href="#d06-cb7-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb7-17"><a href="#d06-cb7-17" aria-hidden="true" tabindex="-1"></a>me, vip <span class="op">=</span> mac(<span class="st">&quot;52:54:00:aa:00:02&quot;</span>), <span class="st">&quot;10.0.0.50&quot;</span></span>
+<span id="d06-cb7-18"><a href="#d06-cb7-18" aria-hidden="true" tabindex="-1"></a>frames <span class="op">=</span> {</span>
+<span id="d06-cb7-19"><a href="#d06-cb7-19" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;RFC 5227 probe&quot;</span>:        arp_frame(BCAST, me, ip4(<span class="st">&quot;0.0.0.0&quot;</span>), ZERO, ip4(vip), <span class="dv">1</span>),</span>
+<span id="d06-cb7-20"><a href="#d06-cb7-20" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;announcement (GARP-rq)&quot;</span>: arp_frame(BCAST, me, ip4(vip), ZERO, ip4(vip), <span class="dv">1</span>),</span>
+<span id="d06-cb7-21"><a href="#d06-cb7-21" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;GARP reply form&quot;</span>:        arp_frame(BCAST, me, ip4(vip), me, ip4(vip), <span class="dv">2</span>),</span>
+<span id="d06-cb7-22"><a href="#d06-cb7-22" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="d06-cb7-23"><a href="#d06-cb7-23" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> name, f <span class="kw">in</span> frames.items():</span>
+<span id="d06-cb7-24"><a href="#d06-cb7-24" aria-hidden="true" tabindex="-1"></a>    oper, sha, spa, tha, tpa <span class="op">=</span> struct.unpack(<span class="st">&quot;!H6s4s6s4s&quot;</span>, f[<span class="dv">20</span>:<span class="dv">42</span>])</span>
+<span id="d06-cb7-25"><a href="#d06-cb7-25" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">:&lt;23}</span><span class="ss"> </span><span class="sc">{</span><span class="bu">len</span>(f)<span class="sc">}</span><span class="ss"> B  oper=</span><span class="sc">{</span>oper<span class="sc">}</span><span class="ss"> spa=</span><span class="sc">{</span>ipaddress<span class="sc">.</span>IPv4Address(spa)<span class="sc">!s:&lt;9}</span><span class="ss"> &quot;</span></span>
+<span id="d06-cb7-26"><a href="#d06-cb7-26" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;tha=</span><span class="sc">{</span>hexmac(tha)<span class="sc">}</span><span class="ss"> tpa=</span><span class="sc">{</span>ipaddress<span class="sc">.</span>IPv4Address(tpa)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d06-cb7-27"><a href="#d06-cb7-27" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;bytes 14..41 of the announcement:&quot;</span>, frames[<span class="st">&quot;announcement (GARP-rq)&quot;</span>][<span class="dv">14</span>:<span class="dv">42</span>].<span class="bu">hex</span>(<span class="st">&quot; &quot;</span>))</span>
+<span id="d06-cb7-28"><a href="#d06-cb7-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d06-cb7-29"><a href="#d06-cb7-29" aria-hidden="true" tabindex="-1"></a><span class="co"># --- detector: (seconds, sender IP, sender MAC) as a sniffer would log them ---</span></span>
+<span id="d06-cb7-30"><a href="#d06-cb7-30" aria-hidden="true" tabindex="-1"></a>OBS <span class="op">=</span> [</span>
+<span id="d06-cb7-31"><a href="#d06-cb7-31" aria-hidden="true" tabindex="-1"></a>    (<span class="fl">0.0</span>,  <span class="st">&quot;10.0.0.1&quot;</span>,  <span class="st">&quot;52:54:00:00:00:01&quot;</span>),   <span class="co"># real gateway</span></span>
+<span id="d06-cb7-32"><a href="#d06-cb7-32" aria-hidden="true" tabindex="-1"></a>    (<span class="fl">0.4</span>,  <span class="st">&quot;10.0.0.21&quot;</span>, <span class="st">&quot;52:54:00:aa:00:21&quot;</span>),</span>
+<span id="d06-cb7-33"><a href="#d06-cb7-33" aria-hidden="true" tabindex="-1"></a>    (<span class="fl">31.0</span>, <span class="st">&quot;10.0.0.1&quot;</span>,  <span class="st">&quot;52:54:00:00:00:01&quot;</span>),</span>
+<span id="d06-cb7-34"><a href="#d06-cb7-34" aria-hidden="true" tabindex="-1"></a>    (<span class="fl">60.2</span>, <span class="st">&quot;10.0.0.66&quot;</span>, <span class="st">&quot;52:54:00:bb:00:66&quot;</span>),   <span class="co"># attacker&#39;s own address</span></span>
+<span id="d06-cb7-35"><a href="#d06-cb7-35" aria-hidden="true" tabindex="-1"></a>    (<span class="fl">61.0</span>, <span class="st">&quot;10.0.0.1&quot;</span>,  <span class="st">&quot;52:54:00:bb:00:66&quot;</span>),   <span class="co"># forged: gateway is at attacker</span></span>
+<span id="d06-cb7-36"><a href="#d06-cb7-36" aria-hidden="true" tabindex="-1"></a>    (<span class="fl">61.2</span>, <span class="st">&quot;10.0.0.1&quot;</span>,  <span class="st">&quot;52:54:00:00:00:01&quot;</span>),   <span class="co"># real gateway answers a request</span></span>
+<span id="d06-cb7-37"><a href="#d06-cb7-37" aria-hidden="true" tabindex="-1"></a>    (<span class="fl">62.0</span>, <span class="st">&quot;10.0.0.1&quot;</span>,  <span class="st">&quot;52:54:00:bb:00:66&quot;</span>),</span>
+<span id="d06-cb7-38"><a href="#d06-cb7-38" aria-hidden="true" tabindex="-1"></a>    (<span class="fl">63.0</span>, <span class="st">&quot;10.0.0.1&quot;</span>,  <span class="st">&quot;52:54:00:bb:00:66&quot;</span>),</span>
+<span id="d06-cb7-39"><a href="#d06-cb7-39" aria-hidden="true" tabindex="-1"></a>    (<span class="fl">90.0</span>, <span class="st">&quot;10.0.0.50&quot;</span>, <span class="st">&quot;52:54:00:aa:00:01&quot;</span>),   <span class="co"># VIP on node A</span></span>
+<span id="d06-cb7-40"><a href="#d06-cb7-40" aria-hidden="true" tabindex="-1"></a>    (<span class="fl">95.0</span>, <span class="st">&quot;10.0.0.50&quot;</span>, <span class="st">&quot;52:54:00:aa:00:02&quot;</span>),   <span class="co"># failover to node B, then quiet</span></span>
+<span id="d06-cb7-41"><a href="#d06-cb7-41" aria-hidden="true" tabindex="-1"></a>]</span>
+<span id="d06-cb7-42"><a href="#d06-cb7-42" aria-hidden="true" tabindex="-1"></a>last, flips, owners <span class="op">=</span> {}, defaultdict(<span class="bu">list</span>), defaultdict(<span class="bu">set</span>)</span>
+<span id="d06-cb7-43"><a href="#d06-cb7-43" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> t, ip_, m <span class="kw">in</span> OBS:</span>
+<span id="d06-cb7-44"><a href="#d06-cb7-44" aria-hidden="true" tabindex="-1"></a>    owners[m].add(ip_)</span>
+<span id="d06-cb7-45"><a href="#d06-cb7-45" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> ip_ <span class="kw">in</span> last <span class="kw">and</span> last[ip_][<span class="dv">1</span>] <span class="op">!=</span> m:</span>
+<span id="d06-cb7-46"><a href="#d06-cb7-46" aria-hidden="true" tabindex="-1"></a>        flips[ip_].append(t)</span>
+<span id="d06-cb7-47"><a href="#d06-cb7-47" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;t=</span><span class="sc">{</span>t<span class="sc">:5.1f}</span><span class="ss"> CHANGE  </span><span class="sc">{</span>ip_<span class="sc">:&lt;10}</span><span class="ss"> </span><span class="sc">{</span>last[ip_][<span class="dv">1</span>]<span class="sc">}</span><span class="ss"> -&gt; </span><span class="sc">{</span>m<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d06-cb7-48"><a href="#d06-cb7-48" aria-hidden="true" tabindex="-1"></a>    last[ip_] <span class="op">=</span> (t, m)</span>
+<span id="d06-cb7-49"><a href="#d06-cb7-49" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> ip_, ts <span class="kw">in</span> flips.items():</span>
+<span id="d06-cb7-50"><a href="#d06-cb7-50" aria-hidden="true" tabindex="-1"></a>    verdict <span class="op">=</span> <span class="st">&quot;FLIP-FLOP: two live claimants (spoofing or duplicate IP)&quot;</span> <span class="cf">if</span> <span class="bu">len</span>(ts) <span class="op">&gt;=</span> <span class="dv">2</span> <span class="cf">else</span> <span class="st">&quot;single move (failover?)&quot;</span></span>
+<span id="d06-cb7-51"><a href="#d06-cb7-51" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>ip_<span class="sc">:&lt;10}</span><span class="ss"> </span><span class="sc">{</span><span class="bu">len</span>(ts)<span class="sc">}</span><span class="ss"> change(s): </span><span class="sc">{</span>verdict<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d06-cb7-52"><a href="#d06-cb7-52" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> m, ips <span class="kw">in</span> owners.items():</span>
+<span id="d06-cb7-53"><a href="#d06-cb7-53" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span>(ips) <span class="op">&gt;</span> <span class="dv">1</span>:</span>
+<span id="d06-cb7-54"><a href="#d06-cb7-54" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>m<span class="sc">}</span><span class="ss"> claims </span><span class="sc">{</span><span class="bu">sorted</span>(ips)<span class="sc">}</span><span class="ss"> -&gt; one MAC, many IPs (router, proxy ARP, or attacker)&quot;</span>)</span></code></pre></div>
+<p>Real output:</p>
+<pre><code>RFC 5227 probe          60 B  oper=1 spa=0.0.0.0   tha=00:00:00:00:00:00 tpa=10.0.0.50
+announcement (GARP-rq)  60 B  oper=1 spa=10.0.0.50 tha=00:00:00:00:00:00 tpa=10.0.0.50
+GARP reply form         60 B  oper=2 spa=10.0.0.50 tha=52:54:00:aa:00:02 tpa=10.0.0.50
+bytes 14..41 of the announcement: 00 01 08 00 06 04 00 01 52 54 00 aa 00 02 0a 00 00 32 00 00 00 00 00 00 0a 00 00 32
+t= 61.0 CHANGE  10.0.0.1   52:54:00:00:00:01 -&gt; 52:54:00:bb:00:66
+t= 61.2 CHANGE  10.0.0.1   52:54:00:bb:00:66 -&gt; 52:54:00:00:00:01
+t= 62.0 CHANGE  10.0.0.1   52:54:00:00:00:01 -&gt; 52:54:00:bb:00:66
+t= 95.0 CHANGE  10.0.0.50  52:54:00:aa:00:01 -&gt; 52:54:00:aa:00:02
+10.0.0.1   3 change(s): FLIP-FLOP: two live claimants (spoofing or duplicate IP)
+10.0.0.50  1 change(s): single move (failover?)
+52:54:00:bb:00:66 claims [&#39;10.0.0.1&#39;, &#39;10.0.0.66&#39;] -&gt; one MAC, many IPs (router, proxy ARP, or attacker)</code></pre>
+<p>The detector half is how <code>arpwatch</code> and switch-side tools think. A failover changes an IP's MAC once and then goes quiet. Spoofing changes it back and forth, because the real owner keeps answering and the attacker keeps re-poisoning. One MAC claiming several IPs is the other signal. It is normal for a router or a proxy-ARP box, and suspicious for anything else, especially when one of the IPs is the gateway.</p>
+<h3 id="d06-ndp-on-the-wire">NDP on the wire</h3>
+<p>IPv6 does the same job over ICMPv6. A Neighbor Solicitation to the solicited-node group and its advertisement, abridged from <code>tcpdump -nn -v icmp6</code> (illustrative):</p>
+<pre><code>IP6 (hlim 255, next-header ICMPv6 (58) payload length: 32) 2001:db8:7::11 &gt; ff02::1:ff00:1: [icmp6 sum ok] ICMP6, neighbor solicitation, length 32, who has 2001:db8:7::1
+      source link-address option (1), length 8 (1): 52:54:00:aa:00:0b
+IP6 (hlim 255, next-header ICMPv6 (58) payload length: 32) 2001:db8:7::1 &gt; 2001:db8:7::11: [icmp6 sum ok] ICMP6, neighbor advertisement, length 32, tgt is 2001:db8:7::1, Flags [router, solicited, override]
+      destination link-address option (2), length 8 (1): 52:54:00:00:00:01</code></pre>
+<p>Two details carry real weight. The hop limit is 255, and receivers <em>must</em> drop NDP with any other value (RFC 4861). A packet that crossed a router would have 254 or less, so a remote attacker cannot inject NDP. And the Flags line is the state machine's input: <code>solicited</code> makes the entry REACHABLE, while an <em>unsolicited</em> NA with <code>override</code> just updates the MAC and leaves the entry STALE, which is NDP's version of a gratuitous ARP.</p>
+<h2 id="d06-numbers">Deep dive: by the numbers</h2>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Parameter</th>
+<th>RFC 4861</th>
+<th>Linux default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Base reachable time</td>
+<td>30 s</td>
+<td><code>base_reachable_time_ms</code> = 30000</td>
+<td>actual value random in 15–45 s; Windows uses the same base</td>
+</tr>
+<tr class="even">
+<td>Delay before first probe</td>
+<td>5 s</td>
+<td><code>delay_first_probe_time</code> = 5</td>
+<td></td>
+</tr>
+<tr class="odd">
+<td>Retransmit interval</td>
+<td>1 s</td>
+<td><code>retrans_time_ms</code> = 1000</td>
+<td>an IPv6 RA can override it per link</td>
+</tr>
+<tr class="even">
+<td>Broadcast/multicast solicits</td>
+<td>3</td>
+<td><code>mcast_solicit</code> = 3</td>
+<td></td>
+</tr>
+<tr class="odd">
+<td>Unicast solicits</td>
+<td>3</td>
+<td><code>ucast_solicit</code> = 3</td>
+<td></td>
+</tr>
+<tr class="even">
+<td>Flap lock</td>
+<td>n/a</td>
+<td><code>locktime</code> = 100 (1 s)</td>
+<td></td>
+</tr>
+<tr class="odd">
+<td>GC soft limits</td>
+<td>n/a</td>
+<td><code>gc_thresh1</code> 128, <code>gc_thresh2</code> 512</td>
+<td>below thresh1, nothing is collected</td>
+</tr>
+<tr class="even">
+<td>Hard table limit</td>
+<td>n/a</td>
+<td><code>gc_thresh3</code> = 1024</td>
+<td>per table (ARP, NDP), per network namespace</td>
+</tr>
+<tr class="odd">
+<td>macOS ARP lifetime</td>
+<td>n/a</td>
+<td><code>net.link.ether.inet.max_age</code> = 1200 s</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>Defaults vary by kernel version and distribution, and many cloud images raise the GC thresholds. Treat the table as "what you get if nobody changed anything" and check with <code>sysctl</code>.</p>
+<p><strong>Worked: how long does a failover take?</strong> VRRP is defined in RFC 3768 (v2) and RFC 5798 (v3). The backup declares the master dead after the <em>master down interval</em>: 3 × advertisement interval + skew time. With a 1 s interval, skew = (256 − priority) / 256 seconds. With a 1 s interval and priority 100, that is 3 + 156/256 = 3.61 s. The new master then sends GARPs. Hosts with an existing entry switch on the first GARP. So the outage is about 3.6 s plus a GARP round, and none of it is ARP timeout. Without the GARP, add 8–53 s from the simulator on Linux hosts, and up to 20 minutes on a stack that only expires entries. VRRP also uses a virtual MAC, 00:00:5e:00:01:<em>VRID</em>, so with VRRP the MAC doesn't even change on failover. The GARP's real job there is teaching the <em>switches</em> which port the virtual MAC now lives on.</p>
+<p><strong>Worked: the cost of broadcast.</strong> A flat /21 with 2,000 hosts, each sending one ARP broadcast every 30 s on average, produces about 67 broadcasts per second. Every host's NIC passes every one of them up to the kernel. At 60 bytes each that is about 32 kbit/s, which is nothing on the wire, but 67 interrupts per second on every sleeping laptop, phone and IoT device is not nothing. That is the real reason big L2 domains are a bad idea. It is also why NDP uses solicited-node multicast. A 2,000-host IPv6 LAN spreads its solicitations over many multicast groups, and a NIC filters out groups it hasn't joined in hardware.</p>
+<p><strong>Worked: the queue.</strong> While an entry is INCOMPLETE, packets wait in its queue. Linux bounds it by <code>unres_qlen_bytes</code>, which defaults to roughly the default socket buffer size, around 200 KB on most systems. A fast sender hitting an unresolved neighbour fills that in milliseconds, and the excess is dropped silently. <code>ip -s ntable show</code> reports it as <code>unresolved discards</code>. After three seconds of no reply the whole queue is dropped on the way to FAILED.</p>
+<h2 id="d06-failures">Deep dive: production failure modes</h2>
+<h3 id="d06-1-failover-that-takes-a-minute-instead-of-seconds">1. Failover that takes a minute instead of seconds</h3>
+<p><strong>Symptom.</strong> Keepalived, Pacemaker or a load balancer pair fails over and the logs say the new node took the VIP in 2 s, but clients see 30–60 s of timeouts. Some clients recover early and some late.</p>
+<p><strong>Mechanism.</strong> The new owner didn't send a GARP, sent it before its interface was up, or sent it into a network that dropped it. Clients with REACHABLE entries keep sending to the old MAC until their own state machine walks through DELAY and PROBE, and that takes 8–53 s depending on where each client was in its cycle. That spread is why "some recover early." Routers and firewalls are often worse: many ignore GARP for entries they didn't ask for, as anti-spoofing policy.</p>
+<p><strong>Prove it.</strong> Capture on a client during a test failover: <code>sudo tcpdump -nn -e -i eth0 arp and host 10.0.0.50</code>. No <code>who-has 10.0.0.50 tell 10.0.0.50</code> from the new MAC means no GARP. On a client, <code>ip monitor neigh</code> shows whether the entry changed on the GARP or only after PROBE → FAILED.</p>
+<p><strong>Fix.</strong> Make the new owner announce: keepalived does it by default and its <code>vrrp_garp_*</code> settings control repeats and delays, and <code>arping -U -c 3 -I eth0 10.0.0.50</code> (iputils) does it by hand. Use a virtual MAC where the platform supports it, so caches never need to change. Check whether the upstream router honours GARP.</p>
+<h3 id="d06-2-neighbor-table-overflow">2. "neighbor table overflow"</h3>
+<p><strong>Symptom.</strong> Random connection failures on a busy host, and <code>dmesg</code> shows <code>neighbour: arp_cache: neighbor table overflow!</code> (<code>ndisc_cache</code> for IPv6). Often a Kubernetes node, a NAT gateway VM or a host on a huge flat subnet.</p>
+<p><strong>Mechanism.</strong> The table hit <code>gc_thresh3</code> (1024 by default). A Kubernetes node on a routed CNI may have an entry for every local pod's veth peer and every peer node. A host on a /16 talking to thousands of neighbours can blow through 1,024 entries. Once the table is full, new neighbours can't be resolved, and packets to them fail as if the host were down.</p>
+<p><strong>Prove it.</strong> <code>ip -4 neigh show | wc -l</code> (and <code>ip -6</code>) against <code>sysctl net.ipv4.neigh.default.gc_thresh3</code>. The overflow message is rate-limited, so its absence isn't proof; count entries.</p>
+<p><strong>Fix.</strong> Raise the thresholds with headroom over the real neighbour count, for example <code>gc_thresh1=8192</code>, <code>gc_thresh2=32768</code>, <code>gc_thresh3=65536</code>. Many managed Kubernetes node images already do. Then ask why one host has that many L2 neighbours.</p>
+<h3 id="d06-3-arp-flux-the-wrong-interface-answers">3. ARP flux: the wrong interface answers</h3>
+<p><strong>Symptom.</strong> A host with two NICs on the same subnet, or an LVS direct-routing real server with the VIP on loopback, receives traffic on the wrong interface. Or the load balancer is bypassed and every client hits one real server.</p>
+<p><strong>Mechanism.</strong> Linux treats IP addresses as belonging to the <em>host</em>, not the interface. With the default <code>arp_ignore=0</code>, it answers an ARP request for any local address on any interface, including a VIP on <code>lo</code>. With <code>arp_announce=0</code>, it may use any local address as the source of its own ARP requests, which teaches neighbours the wrong mapping.</p>
+<p><strong>Prove it.</strong> <code>tcpdump -e arp</code> on the real server shows it replying <code>10.0.0.50 is-at &lt;its own NIC MAC&gt;</code> for the VIP it should never claim.</p>
+<p><strong>Fix.</strong> On LVS-DR real servers, the classic settings are <code>net.ipv4.conf.all.arp_ignore=1</code> (reply only if the target address is on the receiving interface) and <code>arp_announce=2</code> (always use the best local address for the outgoing interface). For multi-NIC hosts, combine them with policy routing so each NIC's traffic leaves by its own interface.</p>
+<h3 id="d06-4-arp-spoofing-on-a-trusted-lan">4. ARP spoofing on a "trusted" LAN</h3>
+<p><strong>Symptom.</strong> Intermittent TLS certificate errors, slow throughput through one host, or the detector above reporting the gateway's MAC flip-flopping. Often there is no symptom at all, which is the point.</p>
+<p><strong>Mechanism.</strong> ARP has no authentication. An attacker on the segment sends unsolicited replies, "10.0.0.1 is-at attacker-MAC", every second or two. On Linux, an unsolicited reply only updates an <em>existing</em> entry, but every host on the LAN has an entry for the gateway. The victim's cache flips to the attacker, the attacker forwards traffic on to the real gateway to stay invisible, and it now sits in the middle. The repeated sending beats the real gateway's occasional replies and <code>locktime</code>'s one-second window.</p>
+<p><strong>Prove it.</strong> <code>arp -an</code> (or <code>ip neigh</code>) shows two IPs, one of them the gateway, with the same MAC. <code>tcpdump -e arp</code> shows a stream of unsolicited replies for the gateway's IP from a MAC that isn't the gateway. arpwatch logs <code>flip flop</code>.</p>
+<p><strong>Fix.</strong> At the switch: DHCP snooping plus Dynamic ARP Inspection (DAI) drops ARP whose IP/MAC pair isn't in the snooping binding table. For IPv6, RA Guard (RFC 6105) and ND inspection do the same job. On the hosts, a static ARP entry for the gateway helps on small, fixed networks. And above all, end-to-end encryption: TLS, SSH and WireGuard turn a successful spoof into a denial of service instead of a data leak. That is the zero-trust stance: assume the LAN is hostile, because ARP makes it so.</p>
+<h3 id="d06-5-proxy-arp-hides-a-misconfiguration-until-it-doesnt">5. Proxy ARP hides a misconfiguration until it doesn't</h3>
+<p><strong>Symptom.</strong> A host with the wrong subnet mask, say /16 on a /24 network, has worked for years. Then a router is replaced or hardened and the host can reach only its own /24.</p>
+<p><strong>Mechanism.</strong> With the /16, the host thinks 10.10.5.9 is on-link and ARPs for it directly. The old router had proxy ARP on (Cisco IOS enables it by default on interfaces; Linux has <code>net.ipv4.conf.&lt;dev&gt;.proxy_arp</code>) and answered with its own MAC for any address it had a route to. The host's mistake was silently routed. The new router doesn't proxy, nobody answers, and the entries go FAILED.</p>
+<p><strong>Prove it.</strong> On the host, <code>arp -an</code> shows many different off-subnet IPs all mapped to the router's MAC: the one-MAC-many-IPs signal again. After the change, those same IPs show <code>(incomplete)</code>.</p>
+<p><strong>Fix.</strong> Correct the mask. Turn proxy ARP off on routers unless something depends on it on purpose, and find out what does before you turn it off.</p>
+<p>Something does depend on it on purpose in many Kubernetes clusters. Calico gives each pod a default route to 169.254.1.1, an address that exists nowhere, and enables <code>proxy_arp</code> on the host side of each pod's veth. The pod ARPs for 169.254.1.1, and the host answers with its veth MAC, <code>ee:ee:ee:ee:ee:ee</code>. Every packet the pod sends goes to the host, where ordinary routing takes over. Proxy ARP as an architectural choice, not an accident.</p>
+<h3 id="d06-6-neighbour-cache-exhaustion-from-scanning">6. Neighbour-cache exhaustion from scanning</h3>
+<p><strong>Symptom.</strong> A router's CPU spikes, legitimate new neighbours fail to resolve, and the logs show huge numbers of INCOMPLETE entries.</p>
+<p><strong>Mechanism.</strong> Traffic arrives for addresses in a connected subnet that nobody is using. The router must ARP or NDP for each one ("glean"), which creates an INCOMPLETE entry and queues the packet. On IPv4 a /24 bounds the damage at 254 entries. On an IPv6 /64, a scanner can name 2^64 different addresses, and every one of them costs the router an entry and three solicitations. RFC 6583 describes the attack.</p>
+<p><strong>Prove it.</strong> The router's neighbour table full of incomplete entries for sequential or random addresses; on Linux, <code>ip -6 neigh show nud incomplete | wc -l</code>.</p>
+<p><strong>Fix.</strong> Control-plane policing that rate-limits glean traffic, platform limits on unresolved entries per interface, and longer prefixes on links that don't need a /64: /127 for point-to-point (RFC 6164) is partly motivated by exactly this.</p>
+<h2 id="d06-cloud">Deep dive: 2026 context — where ARP is faked</h2>
+<p>Most packets in 2026 never meet a real ARP responder. They meet a hypervisor or a smart NIC that answers from a database. If you carry the LAN mental model into a cloud VPC, failover designs break in confusing ways.</p>
+<p><strong>Cloud VPCs answer ARP themselves.</strong> An AWS VPC, an Azure virtual network and a Google Cloud VPC are not broadcast domains. There is no broadcast and, by default, no multicast. When a VM ARPs, the host's virtual switch (on AWS, the Nitro card) intercepts the request and answers from the VPC's mapping of IP to instance. The target VM never sees it. Azure makes this obvious: neighbours, including the gateway, show up with the MAC <code>12:34:56:78:9a:bc</code>, the host's stand-in. AWS answers with the MAC of the destination's network interface. Google Cloud has historically configured guests with a /32 address and a route via the gateway, so a guest sends everything to the gateway's MAC and on-link ARP to peers barely happens.</p>
+<p><strong>So gratuitous ARP moves nothing.</strong> A keepalived pair in a VPC can send GARPs all day. The mapping database doesn't learn from them, and the hypervisor drops or ignores them. Moving a VIP in the cloud is an <em>API call</em>: reassign the secondary private IP to the other instance's interface, move an Elastic IP, or rewrite a route table entry to point at the new instance. That is what Pacemaker's AWS resource agents and keepalived notify scripts do. Failover time is then API latency plus propagation, typically seconds, and it should be measured, not assumed. The managed alternative is to put a cloud load balancer in front and stop moving IPs at all.</p>
+<p><strong>Source/destination checks are ARP's cousin.</strong> The hypervisor also drops packets whose source or destination IP isn't assigned to the VM's interface. A VM acting as a router or NAT must have that check disabled, or its forwarded packets vanish. It is the same database answering a different question: does this address belong here?</p>
+<p><strong>Data-centre fabrics suppress ARP.</strong> In EVPN-VXLAN fabrics, each leaf switch learns IP/MAC bindings from its local ports and distributes them in BGP (EVPN type-2 routes). When a host ARPs, its own leaf answers from that table and the broadcast never crosses the fabric. This <em>ARP suppression</em> is how a "stretched L2" across hundreds of racks avoids becoming one enormous broadcast domain. It also means a GARP after a VM moves is turned into a BGP update, and how fast that update converges is your failover time.</p>
+<p><strong>Kubernetes uses ARP in three different ways.</strong> Calico's proxy ARP (above) makes every pod's first hop the host. MetalLB and kube-vip in L2 mode do the opposite: one node answers ARP for a Service's external IP and sends GARPs when leadership moves, so they inherit every LAN failover issue in this section. Those issues include upstream routers that ignore GARP and the 8–53 s tail on Linux clients. And overlay CNIs (VXLAN, Geneve) often pre-populate neighbour entries as <code>PERMANENT</code> from the control plane, so ARP for remote pods is never sent at all.</p>
+<p><strong>IPv6 closes one old gap.</strong> Routers traditionally ignored unsolicited NAs for neighbours they had no entry for. A new host's first inbound packets waited on the router's own resolution, or were dropped. RFC 9131 (2021) lets routers create STALE entries from unsolicited NAs, so a host can announce itself the way GARP always allowed. Support is growing in router software; check yours.</p>
+<h2 id="d06-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: Name the neighbour states and say which ones send packets on the wire.</strong></p>
+<p>INCOMPLETE sends broadcast (or solicited-node multicast) solicitations, 3 at 1 s intervals. PROBE sends unicast solicitations to the cached MAC, also 3 at 1 s. REACHABLE, STALE and DELAY send no ARP at all. STALE costs nothing until a packet uses it. DELAY waits 5 s for an upper-layer confirmation before spending a probe. FAILED (Linux) sends nothing; it drops the queue and reports unreachable.</p>
+<p><strong>Q2: Why does a long-lived TCP connection generate no ARP traffic, but a UDP metrics sender generates a unicast ARP exchange about every 30 seconds?</strong></p>
+<p>TCP confirms the neighbour whenever acknowledgements show forward progress, so the entry stays REACHABLE indefinitely. UDP gives the kernel no such signal unless the application uses <code>MSG_CONFIRM</code>. The entry expires to STALE, the next send moves it to DELAY, and after 5 s without confirmation a unicast probe goes out and the reply confirms it.</p>
+<p><strong>Q3: A VIP fails over and clients take 40 seconds to follow. The new node "definitely" sent a GARP. What could be going on?</strong></p>
+<p>Clients only update entries they already have, and a GARP sent before the interface was up, or into a VLAN they're not on, never reached them. The upstream router may ignore unsolicited ARP as anti-spoofing policy, so off-subnet clients wait for the router's cache. Or this is a cloud VPC, where GARP is ignored entirely and the IP has to be moved by API. Capture on a client, and use <code>ip monitor neigh</code> to see when the entry actually changed.</p>
+<p><strong>Q4: What does <code>arp_accept=0</code> mean for gratuitous ARP on Linux?</strong></p>
+<p>The host won't <em>create</em> a new entry from a GARP. It will still <em>update</em> an existing entry with the new MAC, putting it in STALE. Failover works for hosts that were talking to the VIP, which are the ones that matter. Hosts that weren't simply resolve normally on their next packet.</p>
+<p><strong>Q5: How does ARP spoofing actually work against a Linux host that ignores unsolicited replies for unknown IPs?</strong></p>
+<p>The attacker doesn't need to create an entry. Every host already has one for the gateway, and unsolicited replies or requests update existing entries. The attacker repeats the forged mapping every second or two, which outlasts the 1 s <code>locktime</code> and outnumbers the real gateway's answers. Defences: DAI with DHCP snooping on the switch, static gateway entries where practical, and encryption so a man in the middle gains nothing.</p>
+<p><strong>Q6: Why does an AWS VPC ignore your gratuitous ARP, and how do you build an HA VIP there?</strong></p>
+<p>The VPC isn't a broadcast domain. The Nitro host answers ARP from the VPC's own IP-to-interface mapping, and nothing a guest broadcasts changes that mapping. You move the IP through the API: reassign a secondary private IP, move an Elastic IP, or rewrite a route table entry to point at the new instance. Or you use a managed load balancer and don't move IPs.</p>
+<p><strong>Q7: What is Calico doing with 169.254.1.1?</strong></p>
+<p>It is a fake gateway. Every pod's default route points at it. The host side of each pod's veth has proxy ARP enabled, so the host answers for 169.254.1.1 with its own veth MAC (<code>ee:ee:ee:ee:ee:ee</code>). All pod traffic therefore lands in the host's routing table, which is where Calico's real routes live. No bridge, no shared L2 between pods.</p>
+<p><strong>Q8: Why is a /64 on a router-to-router link a security problem that a /127 isn't?</strong></p>
+<p>Packets to unused addresses in a connected subnet force the router to create INCOMPLETE neighbour entries and send solicitations. A /64 has 2^64 such addresses, so a scanner can exhaust the neighbour cache and the CPU (RFC 6583). A /127 has two addresses, both in use, so there is nothing to glean. RFC 6164 recommends /127 for exactly this kind of reason.</p>

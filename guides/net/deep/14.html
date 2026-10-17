@@ -1,0 +1,597 @@
+<h2 id="d14-deep-dive">Deep dive: airtime is the real currency</h2>
+<p>The module's walkie-talkie analogy is the right first step. Only one radio talks at a time, everyone else waits, and nobody hears a collision while it is talking. What the analogy hides is the <em>cost</em> of each turn. On Wi-Fi you don't share bandwidth. You share <strong>time on the air</strong>. A slow station holding the channel for 2 ms costs everyone exactly as much as a fast station holding it for 2 ms, even though one moved a hundred times more data.</p>
+<p>Once you think in airtime, most Wi-Fi mysteries resolve. A "1.2 Gbit/s link" delivers 600 Mbit/s. One old phone slows a whole office. Turning <em>down</em> AP power speeds things up. Roaming glitches show up as long silences. This deep dive covers the per-station state machine, what a capture of a WPA3 join and a busy download actually shows, the airtime arithmetic, the production failures, and what Wi-Fi 7 changes.</p>
+<h2 id="d14-mental-model">Deep dive: the real mental model</h2>
+<h3 id="d14-loop">The loop every radio runs</h3>
+<p>Every 802.11 transmitter, AP or client, runs the same loop for each of its queues. Since 802.11e (EDCA), a station has four queues, one per access category, and each contends on its own.</p>
+<ol type="1">
+<li><strong>Carrier sense, two ways.</strong> <em>Physical</em> carrier sense is the Clear Channel Assessment (CCA). On a 20 MHz OFDM channel, a radio must treat the medium as busy if it decodes a Wi-Fi preamble at −82 dBm or stronger. If it can't decode anything, it still backs off for any energy at −62 dBm or stronger. <em>Virtual</em> carrier sense is the <strong>NAV</strong>, a countdown timer. Every frame carries a Duration field saying how many microseconds the exchange will still occupy. Any station that decodes the frame loads that value into its NAV and treats the medium as busy until the NAV reaches zero, whether it hears anything or not.</li>
+<li><strong>Wait an AIFS.</strong> After the medium goes idle, wait SIFS plus AIFSN slots. Best effort uses AIFSN 3, which is 16 + 3 × 9 = 43 µs at 5 GHz.</li>
+<li><strong>Count down a random backoff.</strong> The counter is drawn uniformly from 0 to CW, and CW starts at CWmin. It drops by one for each idle 9 µs slot. If the medium goes busy, the counter <em>freezes</em> and resumes later. It never restarts. That freeze is what makes the scheme fair over time: a station that lost the last round keeps its smaller remaining count.</li>
+<li><strong>Transmit for one TXOP.</strong> When the counter hits zero, the station sends. With aggregation, that is one PPDU holding an A-MPDU of up to 64 MPDUs, or 256 for HE (Wi-Fi 6) peers that negotiate it, bounded by a maximum PPDU duration of about 5.5 ms.</li>
+<li><strong>Wait SIFS for the answer.</strong> The receiver replies with an ACK or a BlockAck exactly SIFS (16 µs) later. That reply needs no contention, because nobody else can grab the medium within such a short gap.</li>
+<li><strong>No answer means collision, or noise.</strong> The transmitter can't tell which. It doubles CW (15 → 31 → 63 … up to CWmax 1023), increments a retry counter, and tries again. The standard's default retry limits are 7 for short frames and 4 for long ones (<code>dot11ShortRetryLimit</code>, <code>dot11LongRetryLimit</code>). Drivers often replace these with their own rate-dependent retry chains.</li>
+</ol>
+<div style="overflow-x:auto">
+<svg viewBox="0 0 720 560" style="min-width:720px;width:100%;height:auto;background:#f5f5f5;border:1px solid rgba(45,49,66,0.12);border-radius:6px" role="img" aria-labelledby="d14-txop-title d14-txop-desc">
+<title id="d14-txop-title">One transmission opportunity on the air, and the state each radio keeps</title>
+<desc id="d14-txop-desc">Timeline of one best-effort TXOP: the AP waits an AIFS and four backoff slots, sends a preamble and an eight-MPDU A-MPDU in which one MPDU is lost, and the laptop answers SIFS later with a BlockAck whose bitmap marks the hole. A phone in the same cell freezes its backoff counter and sets its NAV from the Duration field. Below, the per-station state at the AP, the contention state in every station, and the airtime budget showing that only about a third of the TXOP carries payload.</desc>
+<defs>
+<marker id="d14-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4f5d75"/></marker>
+</defs>
+<!-- lane labels -->
+<text x="20" y="74" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="12" font-weight="600" fill="#2d3142">AP</text>
+<text x="20" y="88" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580">sender</text>
+<text x="20" y="124" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="12" font-weight="600" fill="#2d3142">LAPTOP</text>
+<text x="20" y="138" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580">receiver</text>
+<text x="20" y="174" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="12" font-weight="600" fill="#2d3142">PHONE</text>
+<text x="20" y="188" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580">bystander</text>
+<line x1="120" y1="100" x2="704" y2="100" stroke="rgba(45,49,66,0.12)"/>
+<line x1="120" y1="150" x2="704" y2="150" stroke="rgba(45,49,66,0.12)"/>
+<line x1="120" y1="200" x2="704" y2="200" stroke="rgba(45,49,66,0.12)"/>
+<!-- AP: AIFS + backoff -->
+<rect x="130" y="62" width="44" height="30" fill="rgba(79,93,117,0.08)" stroke="#bfc0c0" stroke-dasharray="3,2"/>
+<text x="152" y="81" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">AIFS 43</text>
+<rect x="176" y="62" width="13" height="30" fill="#f5f5f5" stroke="#bfc0c0"/>
+<rect x="191" y="62" width="13" height="30" fill="#f5f5f5" stroke="#bfc0c0"/>
+<rect x="206" y="62" width="13" height="30" fill="#f5f5f5" stroke="#bfc0c0"/>
+<rect x="221" y="62" width="13" height="30" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="205" y="56" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">backoff 4 x 9 us</text>
+<!-- AP: preamble + A-MPDU -->
+<rect x="236" y="62" width="40" height="30" fill="rgba(46,90,168,0.18)" stroke="#2e5aa8"/>
+<text x="256" y="81" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#2e5aa8" text-anchor="middle">PRE 50</text>
+<rect x="276" y="62" width="27" height="30" fill="rgba(46,90,168,0.10)" stroke="#2e5aa8"/>
+<rect x="303" y="62" width="27" height="30" fill="rgba(46,90,168,0.10)" stroke="#2e5aa8"/>
+<rect x="330" y="62" width="27" height="30" fill="rgba(46,90,168,0.10)" stroke="#2e5aa8"/>
+<rect x="357" y="62" width="27" height="30" fill="rgba(46,90,168,0.10)" stroke="#2e5aa8"/>
+<rect x="384" y="62" width="27" height="30" fill="rgba(191,69,32,0.18)" stroke="#bf4520"/>
+<rect x="411" y="62" width="27" height="30" fill="rgba(46,90,168,0.10)" stroke="#2e5aa8"/>
+<rect x="438" y="62" width="27" height="30" fill="rgba(46,90,168,0.10)" stroke="#2e5aa8"/>
+<rect x="465" y="62" width="27" height="30" fill="rgba(46,90,168,0.10)" stroke="#2e5aa8"/>
+<text x="289" y="81" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#2e5aa8" text-anchor="middle">1201</text>
+<text x="397" y="81" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#bf4520" text-anchor="middle">1205</text>
+<text x="478" y="81" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#2e5aa8" text-anchor="middle">1208</text>
+<text x="324" y="56" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#2e5aa8" text-anchor="middle">A-MPDU, 8 MPDUs, HE-MCS11</text>
+<text x="397" y="40" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#bf4520" text-anchor="middle">corrupted: no error at sender, it cannot hear</text>
+<line x1="397" y1="44" x2="397" y2="60" stroke="#bf4520" stroke-width="1"/>
+<!-- SIFS -->
+<text x="506" y="81" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">SIFS</text>
+<text x="506" y="92" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">16</text>
+<!-- Laptop: BlockAck -->
+<rect x="520" y="112" width="52" height="30" fill="rgba(191,69,32,0.12)" stroke="#bf4520"/>
+<text x="546" y="131" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#bf4520" text-anchor="middle">BA 32</text>
+<text x="300" y="132" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">decodes all 8 subframes, checks each FCS</text>
+<text x="640" y="124" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#bf4520" text-anchor="middle">SSN 1201</text>
+<text x="640" y="136" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#bf4520" text-anchor="middle">bits 1111 0111</text>
+<!-- AP next TXOP -->
+<rect x="574" y="62" width="44" height="30" fill="rgba(79,93,117,0.08)" stroke="#bfc0c0" stroke-dasharray="3,2"/>
+<text x="596" y="81" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="7" fill="#5a6580" text-anchor="middle">AIFS+bo</text>
+<rect x="620" y="62" width="80" height="30" fill="rgba(46,90,168,0.10)" stroke="#2e5aa8"/>
+<text x="660" y="75" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#2e5aa8" text-anchor="middle">1205 Retry=1</text>
+<text x="660" y="87" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#2e5aa8" text-anchor="middle">+ 1209-1215</text>
+<!-- Phone -->
+<rect x="130" y="162" width="104" height="30" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="182" y="181" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">counting 11 -&gt; 7</text>
+<rect x="236" y="162" width="336" height="30" fill="rgba(79,93,117,0.10)" stroke="#4f5d75" stroke-dasharray="5,4"/>
+<text x="404" y="175" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#4f5d75" text-anchor="middle">CCA busy (preamble above -82 dBm), then NAV = 48 us from Duration</text>
+<text x="404" y="187" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#4f5d75" text-anchor="middle">backoff counter FROZEN at 7: it resumes, never restarts</text>
+<rect x="574" y="162" width="44" height="30" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="596" y="181" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">7 -&gt; 3</text>
+<text x="660" y="181" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8" fill="#5a6580" text-anchor="middle">frozen again</text>
+<!-- time axis -->
+<line x1="130" y1="214" x2="700" y2="214" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#d14-arr)"/>
+<text x="130" y="230" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580">time (microseconds, not to scale)</text>
+<!-- state boxes -->
+<rect x="20" y="256" width="216" height="200" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="32" y="276" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" font-weight="600" fill="#2d3142">AP: PER-STATION STATE</text>
+<text x="32" y="298" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">4 AC queues: VO VI BE BK</text>
+<text x="32" y="316" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">BA window per TID:</text>
+<text x="42" y="332" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">SSN 1201, size 64</text>
+<text x="32" y="352" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">rate table (minstrel-style):</text>
+<text x="42" y="368" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">MCS11 2SS  success 0.91</text>
+<text x="42" y="384" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">MCS9  2SS  success 0.99</text>
+<text x="42" y="400" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">MCS0  1SS  fallback</text>
+<text x="32" y="420" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">airtime used (fairness)</text>
+<text x="32" y="440" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">one copy per associated STA</text>
+<rect x="252" y="256" width="216" height="200" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/>
+<text x="264" y="276" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" font-weight="600" fill="#2d3142">EVERY RADIO: CONTENTION</text>
+<text x="264" y="298" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">per AC:</text>
+<text x="274" y="314" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">backoff counter  7</text>
+<text x="274" y="330" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">CW  15 (x2+1 per fail)</text>
+<text x="274" y="346" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">retry count  0 of 7</text>
+<text x="264" y="368" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">shared:</text>
+<text x="274" y="384" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">NAV timer  48 us</text>
+<text x="274" y="400" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">CCA  busy / idle</text>
+<text x="264" y="420" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">collision signal = no ACK</text>
+<text x="264" y="440" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#5a6580">within SIFS + timeout</text>
+<rect x="484" y="256" width="216" height="200" rx="6" fill="#f5f5f5" stroke="#bf4520"/>
+<text x="496" y="276" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" font-weight="600" fill="#bf4520">AIRTIME BUDGET, THIS TXOP</text>
+<text x="496" y="298" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">AIFS               43.0 us</text>
+<text x="496" y="314" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">backoff 4 slots    36.0</text>
+<text x="496" y="330" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">HE preamble        50.4</text>
+<text x="496" y="346" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2e5aa8">8 MPDUs, 7 symbols 95.2</text>
+<text x="496" y="362" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">SIFS               16.0</text>
+<text x="496" y="378" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">BlockAck           32.0</text>
+<line x1="496" y1="386" x2="688" y2="386" stroke="#bfc0c0"/>
+<text x="496" y="402" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#2d3142">total             272.6 us</text>
+<text x="496" y="422" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#bf4520">data symbols = 35% of the air</text>
+<text x="496" y="440" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="9" fill="#bf4520">~350 Mbit/s on a 1201 link</text>
+<!-- footer -->
+<rect x="20" y="472" width="680" height="44" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.12)"/>
+<text x="34" y="490" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" font-style="italic" fill="#2d3142">The link rate only applies to the blue data symbols. Everything else is fixed cost per turn, paid by every radio in range,</text>
+<text x="34" y="508" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" font-style="italic" fill="#2d3142">which is why aggregation, fewer stations per channel, and fast rates for everyone matter more than peak MCS.</text>
+<!-- legend -->
+<rect x="20" y="532" width="18" height="10" fill="rgba(46,90,168,0.18)" stroke="#2e5aa8"/>
+<text x="44" y="541" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580">data PPDU</text>
+<rect x="140" y="532" width="18" height="10" fill="rgba(79,93,117,0.10)" stroke="#4f5d75" stroke-dasharray="3,2"/>
+<text x="164" y="541" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580">deferring (CCA / NAV)</text>
+<rect x="300" y="532" width="18" height="10" fill="rgba(191,69,32,0.18)" stroke="#bf4520"/>
+<text x="324" y="541" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="10" fill="#5a6580">loss and its repair (focal)</text>
+</svg>
+</div>
+<h3 id="d14-half-duplex">Why half-duplex is physics, not a design choice</h3>
+<p>An AP transmitting at +20 dBm and listening for a client at −70 dBm faces a 90 dB gap. That is a factor of a billion in power. Its own signal leaks into its receiver far more strongly than anything it is trying to hear. Antennas on the same device give nowhere near 90 dB of isolation. So the radio cannot listen while it talks, and collision <em>detection</em> is impossible.</p>
+<p>Two consequences follow. First, the missing ACK is the only collision signal, and it arrives only after the whole frame has been sent. On Ethernet, a collision costs a few microseconds. On Wi-Fi, a collided 4 ms A-MPDU wastes 4 ms of everyone's airtime. That is why stations often send a short RTS before a long aggregate: if the RTS collides, only ~50 µs are lost. Second, a station's view of the medium is local. <strong>Hidden nodes</strong> are two clients that both reach the AP but can't hear each other. CCA can't protect them, because each sees an idle channel while the other is talking. RTS/CTS helps because the AP's CTS sets the NAV of everyone near the <em>receiver</em>, including the hidden station.</p>
+<h3 id="d14-edca">EDCA: four queues with different rules</h3>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Access category</th>
+<th>AIFSN</th>
+<th>CWmin</th>
+<th>CWmax</th>
+<th>TXOP limit</th>
+<th>Typical traffic</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Voice (AC_VO)</td>
+<td>2</td>
+<td>3</td>
+<td>7</td>
+<td>1.504 ms</td>
+<td>VoIP, DSCP EF</td>
+</tr>
+<tr class="even">
+<td>Video (AC_VI)</td>
+<td>2</td>
+<td>7</td>
+<td>15</td>
+<td>3.008 ms</td>
+<td>Interactive video</td>
+</tr>
+<tr class="odd">
+<td>Best effort (AC_BE)</td>
+<td>3</td>
+<td>15</td>
+<td>1023</td>
+<td>none (one PPDU)</td>
+<td>Almost everything</td>
+</tr>
+<tr class="even">
+<td>Background (AC_BK)</td>
+<td>7</td>
+<td>15</td>
+<td>1023</td>
+<td>none (one PPDU)</td>
+<td>Bulk, backups</td>
+</tr>
+</tbody>
+</table>
+<p>These are the standard's default client parameters for OFDM PHYs. The AP advertises the values clients should use in its beacons, and APs use slightly different values themselves. Voice wins mostly by drawing from a tiny window: a mean backoff of 1.5 slots, against 7.5 for best effort. The catch is that the mapping from DSCP to access category happens on the sending device. A laptop that marks all its traffic EF gets voice priority for its bulk upload too.</p>
+<h3 id="d14-rate">Rate adaptation: a per-peer table and a guess</h3>
+<p>For each peer, the transmitter keeps a rate table: MCS index, number of spatial streams, channel width, and guard interval, each with a running success probability. Linux's default algorithm (<code>minstrel_ht</code>) spends a small fraction of frames <em>probing</em> other rates. It keeps an exponentially weighted success rate for each, and builds a multi-rate retry chain: try the best-throughput rate, then the second-best, then the most reliable, then a robust fallback. Vendor firmware does something similar, under other names.</p>
+<p>The rate the table settles on depends mostly on SNR. As a rule of thumb (data sheets vary by several dB): 1024-QAM (HE MCS 10–11) needs an SNR in the mid-30s dB, 256-QAM (MCS 8–9) around 30 dB, 64-QAM (MCS 5–7) roughly 20–27 dB, and MCS 0 works in single digits. Each step down the table lengthens every frame, and therefore every other station's wait. Rate adaptation and retries also pull against each other. Retrying at a high rate wastes airtime on failures. Dropping the rate wastes airtime on success.</p>
+<h3 id="d14-rate-anomaly">The rate anomaly</h3>
+<p>DCF and EDCA are fair <em>per transmission opportunity</em>, not per unit of airtime. Every backlogged station wins about the same number of TXOPs. If one station sends at MCS 0 and another at MCS 11, they get the same number of turns, and the slow station's turns last a hundred times longer. Both end up with roughly the slow station's throughput. This was measured and named in 2003 as the 802.11 performance anomaly. The numbers section reproduces it.</p>
+<p>The fixes live at the AP. An airtime-fairness scheduler gives each station equal <em>time</em>, not equal turns. Linux's mac80211 has had one since around 2018, used by drivers such as ath9k, ath10k and mt76. Raising the minimum basic rate keeps stations from associating at very low rates. Wi-Fi 6 OFDMA helps a different case: it splits one TXOP into resource units (as small as 26 tones, nine of them in 20 MHz). Many small packets to many clients then share one preamble and one contention cycle.</p>
+<h3 id="d14-channels">Channel planning: contention domains, not coverage circles</h3>
+<p>A cell has two radii. The <em>data</em> radius is where a client gets a usable MCS. The <em>contention</em> radius is where another radio's preamble arrives above −82 dBm, and it is much larger. Every AP and client within contention range of each other on the same channel shares one airtime pool. Two APs on channel 36 in adjacent rooms are not two networks with double the capacity. They are one network taking turns.</p>
+<p>So channel planning is about cutting contention domains:</p>
+<ul>
+<li><strong>Count the channels.</strong> 2.4 GHz has 3 non-overlapping 20 MHz channels (1/6/11). 5 GHz in the US has 25 twenty-megahertz channels, but only 6 non-overlapping 80 MHz blocks (starting at 36, 52, 100, 116, 132 and 149), and many of them are DFS channels. 6 GHz in the US has 59 twenty-megahertz channels, 14 at 80 MHz, 7 at 160 MHz, and 3 at 320 MHz. Europe opened only the lower 500 MHz of 6 GHz, which gives 24 twenty-megahertz channels.</li>
+<li><strong>Width spends channels.</strong> Doubling width roughly doubles each cell's peak rate. It also halves the number of independent channels, and halves the transmit power per MHz, because power limits apply to the whole channel. In a dense office, 20 or 40 MHz at 5 GHz often beats 80 MHz in total capacity.</li>
+<li><strong>Power sets the cell size.</strong> Lower AP transmit power shrinks both radii, so more cells can reuse a channel. It also fixes a quieter problem: phones transmit at much lower power than APs. A loud AP gives a client a strong signal it can't answer. The uplink fails first, and the client sees "full bars, nothing works".</li>
+<li><strong>DFS has timers.</strong> Before using a radar-band channel, an AP must listen for 60 seconds (10 minutes on the weather-radar channels at 5600–5650 MHz under ETSI rules). If it detects radar, it must leave and stay away for 30 minutes. Clients follow it to a new channel, or disconnect.</li>
+<li><strong>6 GHz discovery is different.</strong> Clients may not send probe requests blind on most 6 GHz channels. They find 6 GHz APs through Reduced Neighbor Reports in 2.4/5 GHz beacons, or by scanning the 15 Preferred Scanning Channels, one per 80 MHz block.</li>
+</ul>
+<h3 id="d14-roaming">Roaming: the client decides, the network advises</h3>
+<p>Roaming is a client-side state machine. Its inputs are the current AP's RSSI and SNR, the retry rate, and whatever the network tells it. Its trigger thresholds are vendor-specific and often conservative, around −70 to −75 dBm. Each roam has four costs, and each 802.11 amendment removes one.</p>
+<ol type="1">
+<li><strong>Finding candidates.</strong> A full scan of 2.4 + 5 GHz visits around 35 channels. On DFS channels the client must wait to hear a beacon (every 102.4 ms) before it may probe. A blind scan therefore takes hundreds of milliseconds to seconds, usually spread out between data bursts. <strong>802.11k</strong> neighbor reports list the nearby APs and their channels, so the client scans three channels instead of thirty-five.</li>
+<li><strong>Choosing.</strong> <strong>802.11v</strong> BSS Transition Management lets the AP send a ranked candidate list. It can also set a "disassociation imminent" bit, which says: leave now, or be dropped. The client is still free to ignore it.</li>
+<li><strong>Re-authenticating.</strong> Without help, a roam repeats the whole join: SAE or 802.1X, then association, then the 4-way handshake. With 802.1X, the EAP-TLS exchange alone takes many round trips to a RADIUS server, often 100+ ms. PMKSA caching skips that step when returning to an AP the client already authenticated with. <strong>802.11r</strong> (Fast BSS Transition) goes further.</li>
+<li><strong>Re-keying.</strong> Under 802.11r, the first authentication in a <em>mobility domain</em> produces a PMK-R0, held by a key holder (usually a controller, or the first AP). From it, a PMK-R1 is derived for each AP in the domain. A roam is then four frames: an FT authentication request and response that carry the nonces, then reassociation. The PTK is derived inside those frames, so no separate 4-way handshake is needed. The exchange can go over the air to the target AP or "over the DS" through the current one.</li>
+</ol>
+<p>Done well, a roam is a few to a few tens of milliseconds of silence. Done badly, it is a scan, a full 802.1X exchange and a 4-way handshake: half a second or more, which a video call's jitter buffer won't hide. Because the client keeps its IP address across an ESS roam (it's one layer-2 network), TCP and QUIC don't notice. They only see a pause.</p>
+<h3 id="d14-sae">WPA3-SAE: what actually goes over the air</h3>
+<p>SAE runs <em>inside 802.11 Authentication frames</em> (authentication algorithm 3), before association. There are two message types, and each side sends one of each.</p>
+<ul>
+<li><strong>Commit.</strong> Both sides map the password to a secret point on an elliptic curve (group 19, NIST P-256, is mandatory). Each picks random secrets and sends a <em>scalar</em> (32 bytes) and an <em>element</em> (a curve point, 64 bytes). Nothing in a commit lets an observer test password guesses offline.</li>
+<li><strong>Confirm.</strong> Each side derives a shared key from the exchange and sends a hash over the transcript. A matching confirm proves that the peer used the same password <em>in this exchange</em>. An attacker gets one password guess per live exchange, and the AP can rate-limit that. Under load, the AP answers commits with an <em>anti-clogging token</em> that the client must echo, which costs a spoofer its round trips.</li>
+</ul>
+<p>The result is a fresh PMK for each session, and with it forward secrecy. Then the ordinary 4-way handshake runs on top to derive the PTK and deliver the GTK and IGTK.</p>
+<p>Two details matter in practice. The original way of mapping the password to a curve point (<em>hunting and pecking</em>) looped a password-dependent number of times. The 2019 Dragonblood research used that timing to leak information about the password. The fix is <strong>hash-to-element (H2E)</strong>: a constant-time mapping, signalled by status code 126 in the commit. 6 GHz allows only H2E. The other detail is that WPA3 requires Protected Management Frames (802.11w). Deauthentication and disassociation frames are then integrity-protected with the IGTK (BIP), and forged ones are discarded.</p>
+<p><strong>Transition mode</strong> advertises both the PSK AKM (2) and the SAE AKM (8) on one SSID. It exists for old clients, and it lets an attacker with a fake AP lure a client into using WPA2 with the same password. Clients that remember "this network supports WPA3" refuse that downgrade, but not all clients do.</p>
+<h2 id="d14-wire">Deep dive: what the air actually shows</h2>
+<h3 id="d14-wire-join">A WPA3-Personal join, frame by frame</h3>
+<p>This is a constructed but internally consistent view of a monitor-mode capture. It is a tshark summary with the columns trimmed and renamed, and the link-layer ACKs to each management frame left out. To capture your own on Linux, put the adapter in monitor mode (<code>iw dev wlan0 set type monitor</code> while the interface is down, or a separate monitor interface) and run <code>tshark -i wlan0 -w join.pcapng</code>. On macOS the supported route is the Sniffer in Wireless Diagnostics. Your capture will differ.</p>
+<pre class="text"><code> #  time(s)   from -&gt; to   frame                       detail
+ 1  0.000000  STA  -&gt; AP   Authentication              alg=SAE(3) seq=1 status=126(H2E) group=19
+                                                       scalar 32 B, element 64 B           &lt;- Commit
+ 2  0.004120  AP   -&gt; STA  Authentication              alg=SAE(3) seq=1 status=126(H2E) group=19   &lt;- Commit
+ 3  0.004610  STA  -&gt; AP   Authentication              alg=SAE(3) seq=2 status=0 send-confirm=1     &lt;- Confirm
+ 4  0.008230  AP   -&gt; STA  Authentication              alg=SAE(3) seq=2 status=0 send-confirm=1     &lt;- Confirm
+                                                       both sides now hold the same fresh PMK
+ 5  0.009050  STA  -&gt; AP   Association Request         SSID=Office RSN: pairwise=CCMP-128 AKM=00-0f-ac:8 (SAE)
+                                                       RSN caps: MFPC=1 MFPR=1 (PMF required)
+                                                       group mgmt cipher=BIP-CMAC-128
+ 6  0.011470  AP   -&gt; STA  Association Response        status=0 AID=7
+ 7  0.012880  AP   -&gt; STA  EAPOL-Key (Message 1 of 4)  key_info=0x0088 replay=1 ANonce
+ 8  0.014020  STA  -&gt; AP   EAPOL-Key (Message 2 of 4)  key_info=0x0108 replay=1 SNonce, MIC
+ 9  0.015560  AP   -&gt; STA  EAPOL-Key (Message 3 of 4)  key_info=0x13c8 replay=2 MIC, Install,
+                                                       encrypted key data: GTK + IGTK
+10  0.016140  STA  -&gt; AP   EAPOL-Key (Message 4 of 4)  key_info=0x0308 replay=2 MIC
+11  0.031900  STA  -&gt; AP   QoS Data (protected)        CCMP, payload 342 B   &lt;- DHCPDISCOVER, now encrypted</code></pre>
+<p>What to notice:</p>
+<ul>
+<li><strong>Frames 1–4 are the SAE exchange.</strong> The 4 ms between the client's commit and the AP's commit is the AP's elliptic-curve arithmetic. Nothing in these four frames lets you test a password offline.</li>
+<li><strong>Frame 5 is where security gets negotiated.</strong> AKM suite 8 is SAE. (2 is PSK, 1 is 802.1X, 9 is FT-SAE, 24 is the newer SAE-EXT-KEY.) MFPR=1 means the client refuses to associate without Protected Management Frames.</li>
+<li><strong>Key-info values decode bit by bit.</strong> 0x0008 means pairwise, 0x0080 Ack, 0x0100 MIC, 0x0040 Install, 0x0200 Secure, 0x1000 encrypted key data. The low three bits are the descriptor version, and they are 0 here because the SAE AKM defines its own algorithms. A WPA2-PSK join shows 0x008a, 0x010a, 0x13ca, 0x030a instead.</li>
+<li><strong>The whole join took 16 ms</strong> on a quiet channel, before DHCP. Add scanning, and on a busy channel contention for every one of those frames, and a real join takes far longer.</li>
+</ul>
+<h3 id="d14-wire-data">A download on the air: aggregation, BlockAck, one retry</h3>
+<pre class="text"><code> #   time(s)    from -&gt; to  frame          SN         retry  dur(us)  rate                         bytes
+ 40  2.104000   AP -&gt; STA   A-MPDU, 8 MPDUs 1201-1208 0      48       HE-MCS11 2SS 80MHz GI0.8     8 x 1560
+                            PPDU airtime: 50.4 us preamble + 7 symbols x 13.6 us = 145.6 us
+ 41  2.104162   STA -&gt; AP   BlockAck       SSN=1201   -      0        24 Mb/s non-HT dup           32
+                            bitmap(first byte)=0xef: bits for SN 1201..1208 = 1111 0111  &lt;- SN 1205 missing
+ 42  2.104273   AP -&gt; STA   A-MPDU, 8 MPDUs 1205,1209-1215
+                                                      1205: retry=1  others 0     HE-MCS11 2SS 80MHz  8 x 1560
+ 43  2.104435   STA -&gt; AP   BlockAck       SSN=1205   -      0        24 Mb/s non-HT dup           32
+                            bitmap(first two bytes)=0xf1 0x07: 1205 and 1209-1215 all received</code></pre>
+<p>Check the arithmetic, because it is the whole lesson. Frame 40's Duration of 48 µs covers what remains of the exchange after it: SIFS (16) plus the BlockAck (32). Every other station loads that into its NAV. The BlockAck starts 16 µs after the PPDU ends (2.104000 + 145.6 µs + 16 µs ≈ 2.104162). The AP's next TXOP starts 111 µs after the BlockAck <em>began</em>: 32 µs of BlockAck, a 43 µs AIFS, and 4 backoff slots of 9 µs. The lost MPDU wasn't resent alone. It rode in the next aggregate with its Retry bit set, and the BlockAck window slid forward to start at 1205.</p>
+<p>In the second bitmap, bit 0 is SN 1205, bits 4–10 are SN 1209–1215, and bits 1–3 (SN 1206–1208) are zero because they were already acknowledged and are not in this aggregate. So the bitmap is <code>1000 1111 1110 0000…</code>, which is 0xf1 0x07 when written LSB-first.</p>
+<p>Eight 1,500-byte packets moved in about 273 µs from one TXOP start to the next. That is about 350 Mbit/s of IP payload on a "1201 Mbit/s" link. That's because 8 packets per aggregate is small. The next section shows how the number grows with aggregation.</p>
+<h3 id="d14-wire-counters">The radio's own counters</h3>
+<p>You don't need a monitor-mode capture to see most of this. The driver keeps counters. <strong>Linux — your output will differ:</strong></p>
+<pre class="text"><code>$ iw dev wlan0 link
+Connected to aa:bb:cc:dd:ee:01 (on wlan0)
+    SSID: Office
+    freq: 5180
+    signal: -61 dBm
+    rx bitrate: 960.8 MBit/s 80MHz HE-MCS 9 HE-NSS 2 HE-GI 0 HE-DCM 0
+    tx bitrate: 720.6 MBit/s 80MHz HE-MCS 7 HE-NSS 2 HE-GI 0 HE-DCM 0
+
+$ iw dev wlan0 station dump | grep -E &#39;tx (packets|retries|failed)|signal avg|beacon loss&#39;
+    tx packets: 612301
+    tx retries: 48211          &lt;- 7.9% of frames needed at least one retry
+    tx failed:  37             &lt;- gave up after the retry chain
+    beacon loss:    0
+    signal avg: -60 [-62, -63] dBm
+
+$ iw dev wlan0 survey dump | grep -A5 &#39;in use&#39;
+    frequency:          5180 MHz [in use]
+    noise:              -95 dBm
+    channel active time:        60014 ms
+    channel busy time:      38409 ms   &lt;- 64% of the last minute, the medium was busy
+    channel receive time:       35112 ms   &lt;- mostly *other* stations&#39; frames
+    channel transmit time:      1820 ms</code></pre>
+<p>That survey output answers "is it me or the air?" in one line. The channel was busy 64% of the time, and only 3% was this radio transmitting. Sustained busy time above roughly 60–70% means the channel is saturated, whatever the signal strength says.</p>
+<p><strong>macOS — your output will differ.</strong> The <code>airport</code> command the module uses was removed in macOS Sonoma 14.4. Use <code>wdutil</code> (needs <code>sudo</code>) or <code>system_profiler SPAirPortDataType</code>. Field names vary by release, and recent versions redact the SSID and BSSID unless the calling app has location permission.</p>
+<pre class="text"><code>$ sudo wdutil info          # excerpt
+    RSSI                 : -61 dBm
+    Noise                : -95 dBm
+    Tx Rate              : 720.0 Mbps
+    PHY Mode             : 11ax
+    MCS Index            : 7
+    NSS                  : 2
+    Channel              : 5g36/80
+    CCA                  : 64 %</code></pre>
+<p><code>CCA</code> is the same "medium busy" percentage as Linux's busy time. RSSI minus noise gives the SNR, here 34 dB. That's enough for MCS 9–11 by the rule of thumb above, yet the client transmits at MCS 7, which points at contention or uplink trouble rather than signal strength.</p>
+<h2 id="d14-numbers">Deep dive: by the numbers</h2>
+<h3 id="d14-constants">Timing constants (5 GHz OFDM)</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Value</th>
+<th>Where it comes from</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Slot time</td>
+<td>9 µs</td>
+<td>OFDM PHY</td>
+</tr>
+<tr class="even">
+<td>SIFS</td>
+<td>16 µs</td>
+<td>OFDM PHY (2.4 GHz uses 10 µs plus a 6 µs signal extension)</td>
+</tr>
+<tr class="odd">
+<td>DIFS / AIFS[BE]</td>
+<td>34 µs / 43 µs</td>
+<td>SIFS + 2 or 3 slots</td>
+</tr>
+<tr class="even">
+<td>Mean backoff, best effort</td>
+<td>67.5 µs</td>
+<td>7.5 slots × 9 µs from CWmin 15</td>
+</tr>
+<tr class="odd">
+<td>Legacy OFDM preamble</td>
+<td>20 µs</td>
+<td>L-STF + L-LTF + L-SIG</td>
+</tr>
+<tr class="even">
+<td>HE single-user preamble, 2 streams</td>
+<td>≈ 50 µs</td>
+<td>Legacy part, HE-SIG-A, HE-STF, two HE-LTFs</td>
+</tr>
+<tr class="odd">
+<td>HE OFDM symbol</td>
+<td>13.6 µs</td>
+<td>12.8 µs + 0.8 µs guard interval</td>
+</tr>
+<tr class="even">
+<td>Beacon interval</td>
+<td>102.4 ms</td>
+<td>100 TU, the common default</td>
+</tr>
+<tr class="odd">
+<td>CCA thresholds (20 MHz)</td>
+<td>−82 dBm preamble, −62 dBm energy</td>
+<td>Standard minimums</td>
+</tr>
+</tbody>
+</table>
+<h3 id="d14-airtime">From link rate to TCP throughput</h3>
+<p>The "link rate" your OS shows is the PHY rate: data bits per OFDM symbol divided by symbol time. Throughput is that rate multiplied by the fraction of airtime spent carrying your payload. The script below builds the airtime budget explicitly, using the constants above and typical frame overheads. Run it: <code>~/.local/bin/python3.13 d14_airtime.py</code></p>
+<div class="sourceCode" id="d14-cb5"><pre class="sourceCode python"><code class="sourceCode python"><span id="d14-cb5-1"><a href="#d14-cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Why Wi-Fi throughput is not the link rate: an airtime budget (Python 3.13 stdlib).</span></span>
+<span id="d14-cb5-2"><a href="#d14-cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co">Timings are 5 GHz OFDM values from IEEE 802.11; overhead sizes are typical, not exhaustive.&quot;&quot;&quot;</span></span>
+<span id="d14-cb5-3"><a href="#d14-cb5-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> math</span>
+<span id="d14-cb5-4"><a href="#d14-cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb5-5"><a href="#d14-cb5-5" aria-hidden="true" tabindex="-1"></a><span class="ex">SLOT</span>, SIFS <span class="op">=</span> <span class="dv">9</span>, <span class="dv">16</span>                                  <span class="co"># microseconds</span></span>
+<span id="d14-cb5-6"><a href="#d14-cb5-6" aria-hidden="true" tabindex="-1"></a>AIFS_BE <span class="op">=</span> SIFS <span class="op">+</span> <span class="dv">3</span> <span class="op">*</span> <span class="ex">SLOT</span>                           <span class="co"># AIFSN=3 for best effort -&gt; 43 us</span></span>
+<span id="d14-cb5-7"><a href="#d14-cb5-7" aria-hidden="true" tabindex="-1"></a>MEAN_BACKOFF <span class="op">=</span> <span class="fl">7.5</span> <span class="op">*</span> <span class="ex">SLOT</span>                           <span class="co"># CWmin=15 -&gt; mean 7.5 slots</span></span>
+<span id="d14-cb5-8"><a href="#d14-cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb5-9"><a href="#d14-cb5-9" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> he_rate(mcs, nss, width<span class="op">=</span><span class="dv">80</span>, gi<span class="op">=</span><span class="fl">0.8</span>):</span>
+<span id="d14-cb5-10"><a href="#d14-cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;802.11ax (HE) single-user PHY rate in Mbit/s.&quot;&quot;&quot;</span></span>
+<span id="d14-cb5-11"><a href="#d14-cb5-11" aria-hidden="true" tabindex="-1"></a>    bits, code <span class="op">=</span> {<span class="dv">7</span>: (<span class="dv">6</span>, <span class="dv">5</span><span class="op">/</span><span class="dv">6</span>), <span class="dv">9</span>: (<span class="dv">8</span>, <span class="dv">5</span><span class="op">/</span><span class="dv">6</span>), <span class="dv">11</span>: (<span class="dv">10</span>, <span class="dv">5</span><span class="op">/</span><span class="dv">6</span>), <span class="dv">0</span>: (<span class="dv">1</span>, <span class="dv">1</span><span class="op">/</span><span class="dv">2</span>), <span class="dv">4</span>: (<span class="dv">4</span>, <span class="dv">3</span><span class="op">/</span><span class="dv">4</span>)}[mcs]</span>
+<span id="d14-cb5-12"><a href="#d14-cb5-12" aria-hidden="true" tabindex="-1"></a>    tones <span class="op">=</span> {<span class="dv">20</span>: <span class="dv">234</span>, <span class="dv">40</span>: <span class="dv">468</span>, <span class="dv">80</span>: <span class="dv">980</span>, <span class="dv">160</span>: <span class="dv">1960</span>}[width]</span>
+<span id="d14-cb5-13"><a href="#d14-cb5-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> tones <span class="op">*</span> bits <span class="op">*</span> code <span class="op">*</span> nss <span class="op">/</span> (<span class="fl">12.8</span> <span class="op">+</span> gi)</span>
+<span id="d14-cb5-14"><a href="#d14-cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb5-15"><a href="#d14-cb5-15" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> legacy_ppdu_us(nbytes, mbps):                   <span class="co"># 802.11a/g OFDM frame duration</span></span>
+<span id="d14-cb5-16"><a href="#d14-cb5-16" aria-hidden="true" tabindex="-1"></a>    bits_per_sym <span class="op">=</span> mbps <span class="op">*</span> <span class="dv">4</span>                          <span class="co"># 4 us symbols</span></span>
+<span id="d14-cb5-17"><a href="#d14-cb5-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">20</span> <span class="op">+</span> <span class="dv">4</span> <span class="op">*</span> math.ceil((<span class="dv">16</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">*</span> nbytes <span class="op">+</span> <span class="dv">6</span>) <span class="op">/</span> bits_per_sym)</span>
+<span id="d14-cb5-18"><a href="#d14-cb5-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb5-19"><a href="#d14-cb5-19" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> he_ppdu_us(nbytes, rate, nss):</span>
+<span id="d14-cb5-20"><a href="#d14-cb5-20" aria-hidden="true" tabindex="-1"></a>    preamble <span class="op">=</span> <span class="dv">36</span> <span class="op">+</span> nss <span class="op">*</span> <span class="fl">7.2</span>                       <span class="co"># legacy + HE-SIG-A + HE-STF + HE-LTFs</span></span>
+<span id="d14-cb5-21"><a href="#d14-cb5-21" aria-hidden="true" tabindex="-1"></a>    sym <span class="op">=</span> <span class="fl">13.6</span></span>
+<span id="d14-cb5-22"><a href="#d14-cb5-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> preamble <span class="op">+</span> sym <span class="op">*</span> math.ceil((<span class="dv">16</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">*</span> nbytes <span class="op">+</span> <span class="dv">6</span>) <span class="op">/</span> (rate <span class="op">*</span> sym))</span>
+<span id="d14-cb5-23"><a href="#d14-cb5-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb5-24"><a href="#d14-cb5-24" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> ba_us(n):                                        <span class="co"># compressed BlockAck at 24 Mbit/s</span></span>
+<span id="d14-cb5-25"><a href="#d14-cb5-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> legacy_ppdu_us(<span class="dv">32</span> <span class="cf">if</span> n <span class="op">&lt;=</span> <span class="dv">64</span> <span class="cf">else</span> <span class="dv">56</span>, <span class="dv">24</span>)  <span class="co"># 64- or 256-bit bitmap</span></span>
+<span id="d14-cb5-26"><a href="#d14-cb5-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb5-27"><a href="#d14-cb5-27" aria-hidden="true" tabindex="-1"></a>MPDU <span class="op">=</span> <span class="dv">4</span> <span class="op">+</span> <span class="dv">26</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">1500</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">4</span>                 <span class="co"># delim+QoS hdr+CCMP hdr+LLC+IP+MIC+FCS</span></span>
+<span id="d14-cb5-28"><a href="#d14-cb5-28" aria-hidden="true" tabindex="-1"></a>MPDU <span class="op">+=</span> <span class="op">-</span>MPDU <span class="op">%</span> <span class="dv">4</span>                                    <span class="co"># pad to 4 bytes inside the A-MPDU</span></span>
+<span id="d14-cb5-29"><a href="#d14-cb5-29" aria-hidden="true" tabindex="-1"></a>ACK_MPDU <span class="op">=</span> <span class="dv">4</span> <span class="op">+</span> <span class="dv">26</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">52</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">4</span>                <span class="co"># a 52-byte TCP ACK, wrapped</span></span>
+<span id="d14-cb5-30"><a href="#d14-cb5-30" aria-hidden="true" tabindex="-1"></a>ACK_MPDU <span class="op">+=</span> <span class="op">-</span>ACK_MPDU <span class="op">%</span> <span class="dv">4</span></span>
+<span id="d14-cb5-31"><a href="#d14-cb5-31" aria-hidden="true" tabindex="-1"></a>TCP_PAYLOAD <span class="op">=</span> <span class="dv">1448</span>                                   <span class="co"># 1500 - 20 IP - 32 TCP (timestamps)</span></span>
+<span id="d14-cb5-32"><a href="#d14-cb5-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb5-33"><a href="#d14-cb5-33" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;1) PHY rates (HE, 0.8 us GI)&quot;</span>)</span>
+<span id="d14-cb5-34"><a href="#d14-cb5-34" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> mcs, nss, w <span class="kw">in</span> ((<span class="dv">11</span>, <span class="dv">2</span>, <span class="dv">80</span>), (<span class="dv">9</span>, <span class="dv">2</span>, <span class="dv">80</span>), (<span class="dv">7</span>, <span class="dv">2</span>, <span class="dv">80</span>), (<span class="dv">4</span>, <span class="dv">1</span>, <span class="dv">20</span>), (<span class="dv">0</span>, <span class="dv">1</span>, <span class="dv">20</span>)):</span>
+<span id="d14-cb5-35"><a href="#d14-cb5-35" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;   MCS</span><span class="sc">{</span>mcs<span class="sc">:&lt;2}</span><span class="ss"> </span><span class="sc">{</span>nss<span class="sc">}</span><span class="ss">SS </span><span class="sc">{</span>w<span class="sc">:&gt;3}</span><span class="ss"> MHz : </span><span class="sc">{</span>he_rate(mcs, nss, w)<span class="sc">:7.1f}</span><span class="ss"> Mbit/s&quot;</span>)</span>
+<span id="d14-cb5-36"><a href="#d14-cb5-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb5-37"><a href="#d14-cb5-37" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">2) 802.11a/g at 54 Mbit/s, one 1500-byte packet per channel access&quot;</span>)</span>
+<span id="d14-cb5-38"><a href="#d14-cb5-38" aria-hidden="true" tabindex="-1"></a>data <span class="op">=</span> legacy_ppdu_us(<span class="dv">1500</span> <span class="op">+</span> <span class="dv">34</span>, <span class="dv">54</span>)                 <span class="co"># MAC hdr+LLC+FCS = 34 bytes</span></span>
+<span id="d14-cb5-39"><a href="#d14-cb5-39" aria-hidden="true" tabindex="-1"></a>ack <span class="op">=</span> legacy_ppdu_us(<span class="dv">14</span>, <span class="dv">24</span>)</span>
+<span id="d14-cb5-40"><a href="#d14-cb5-40" aria-hidden="true" tabindex="-1"></a>cycle <span class="op">=</span> SIFS <span class="op">+</span> <span class="dv">2</span> <span class="op">*</span> <span class="ex">SLOT</span> <span class="op">+</span> MEAN_BACKOFF <span class="op">+</span> data <span class="op">+</span> SIFS <span class="op">+</span> ack</span>
+<span id="d14-cb5-41"><a href="#d14-cb5-41" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;   DIFS 34 + backoff </span><span class="sc">{</span>MEAN_BACKOFF<span class="sc">}</span><span class="ss"> + data </span><span class="sc">{</span>data<span class="sc">}</span><span class="ss"> + SIFS 16 + ACK </span><span class="sc">{</span>ack<span class="sc">}</span><span class="ss"> = </span><span class="sc">{</span>cycle<span class="sc">}</span><span class="ss"> us&quot;</span>)</span>
+<span id="d14-cb5-42"><a href="#d14-cb5-42" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;   IP throughput </span><span class="sc">{</span><span class="dv">1500</span> <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> cycle<span class="sc">:.1f}</span><span class="ss"> Mbit/s  (</span><span class="sc">{</span><span class="dv">1500</span> <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> cycle <span class="op">/</span> <span class="dv">54</span><span class="sc">:.0%}</span><span class="ss"> of 54)&quot;</span>)</span>
+<span id="d14-cb5-43"><a href="#d14-cb5-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb5-44"><a href="#d14-cb5-44" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">3) 802.11ax MCS11 2SS 80 MHz, A-MPDU of N packets per TXOP, AP -&gt; laptop TCP download&quot;</span>)</span>
+<span id="d14-cb5-45"><a href="#d14-cb5-45" aria-hidden="true" tabindex="-1"></a>rate <span class="op">=</span> he_rate(<span class="dv">11</span>, <span class="dv">2</span>, <span class="dv">80</span>)</span>
+<span id="d14-cb5-46"><a href="#d14-cb5-46" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> n <span class="kw">in</span> (<span class="dv">1</span>, <span class="dv">8</span>, <span class="dv">32</span>, <span class="dv">64</span>, <span class="dv">256</span>):</span>
+<span id="d14-cb5-47"><a href="#d14-cb5-47" aria-hidden="true" tabindex="-1"></a>    down <span class="op">=</span> AIFS_BE <span class="op">+</span> MEAN_BACKOFF <span class="op">+</span> he_ppdu_us(n <span class="op">*</span> MPDU, rate, <span class="dv">2</span>) <span class="op">+</span> SIFS <span class="op">+</span> ba_us(n)</span>
+<span id="d14-cb5-48"><a href="#d14-cb5-48" aria-hidden="true" tabindex="-1"></a>    acks <span class="op">=</span> <span class="bu">max</span>(n <span class="op">//</span> <span class="dv">2</span>, <span class="dv">1</span>)                            <span class="co"># delayed ACK: one per two segments</span></span>
+<span id="d14-cb5-49"><a href="#d14-cb5-49" aria-hidden="true" tabindex="-1"></a>    up <span class="op">=</span> AIFS_BE <span class="op">+</span> MEAN_BACKOFF <span class="op">+</span> he_ppdu_us(acks <span class="op">*</span> ACK_MPDU, he_rate(<span class="dv">9</span>, <span class="dv">2</span>, <span class="dv">80</span>), <span class="dv">2</span>) <span class="op">+</span> SIFS <span class="op">+</span> ba_us(acks)</span>
+<span id="d14-cb5-50"><a href="#d14-cb5-50" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> n <span class="op">==</span> <span class="dv">1</span>:</span>
+<span id="d14-cb5-51"><a href="#d14-cb5-51" aria-hidden="true" tabindex="-1"></a>        up <span class="op">/=</span> <span class="dv">2</span>                                      <span class="co"># one uplink TXOP per two packets</span></span>
+<span id="d14-cb5-52"><a href="#d14-cb5-52" aria-hidden="true" tabindex="-1"></a>    goodput <span class="op">=</span> n <span class="op">*</span> TCP_PAYLOAD <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> (down <span class="op">+</span> up)</span>
+<span id="d14-cb5-53"><a href="#d14-cb5-53" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;   N=</span><span class="sc">{</span>n<span class="sc">:&gt;3}</span><span class="ss">: data </span><span class="sc">{</span>down<span class="sc">:7.1f}</span><span class="ss"> us + ACK TXOP </span><span class="sc">{</span>up<span class="sc">:5.1f}</span><span class="ss"> us -&gt; TCP&quot;</span></span>
+<span id="d14-cb5-54"><a href="#d14-cb5-54" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot; </span><span class="sc">{</span>goodput<span class="sc">:6.1f}</span><span class="ss"> Mbit/s (</span><span class="sc">{</span>goodput <span class="op">/</span> rate<span class="sc">:.0%}</span><span class="ss"> of </span><span class="sc">{</span>rate<span class="sc">:.0f}</span><span class="ss">)&quot;</span>)</span>
+<span id="d14-cb5-55"><a href="#d14-cb5-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb5-56"><a href="#d14-cb5-56" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">4) Same link, 64-packet A-MPDUs, with 10</span><span class="sc">% o</span><span class="st">f MPDUs lost and resent&quot;</span>)</span>
+<span id="d14-cb5-57"><a href="#d14-cb5-57" aria-hidden="true" tabindex="-1"></a>n, loss <span class="op">=</span> <span class="dv">64</span>, <span class="fl">0.10</span></span>
+<span id="d14-cb5-58"><a href="#d14-cb5-58" aria-hidden="true" tabindex="-1"></a>down <span class="op">=</span> AIFS_BE <span class="op">+</span> MEAN_BACKOFF <span class="op">+</span> he_ppdu_us(n <span class="op">*</span> MPDU, rate, <span class="dv">2</span>) <span class="op">+</span> SIFS <span class="op">+</span> ba_us(n)</span>
+<span id="d14-cb5-59"><a href="#d14-cb5-59" aria-hidden="true" tabindex="-1"></a>up <span class="op">=</span> AIFS_BE <span class="op">+</span> MEAN_BACKOFF <span class="op">+</span> he_ppdu_us(<span class="dv">32</span> <span class="op">*</span> ACK_MPDU, he_rate(<span class="dv">9</span>, <span class="dv">2</span>, <span class="dv">80</span>), <span class="dv">2</span>) <span class="op">+</span> SIFS <span class="op">+</span> ba_us(<span class="dv">32</span>)</span>
+<span id="d14-cb5-60"><a href="#d14-cb5-60" aria-hidden="true" tabindex="-1"></a>good <span class="op">=</span> n <span class="op">*</span> (<span class="dv">1</span> <span class="op">-</span> loss) <span class="op">*</span> TCP_PAYLOAD <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> (down <span class="op">+</span> up)</span>
+<span id="d14-cb5-61"><a href="#d14-cb5-61" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;   </span><span class="sc">{</span>good<span class="sc">:.1f}</span><span class="ss"> Mbit/s  (retries also push rate control down a step or two)&quot;</span>)</span>
+<span id="d14-cb5-62"><a href="#d14-cb5-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb5-63"><a href="#d14-cb5-63" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">5) Rate anomaly: per-packet fairness, 1500-byte packets, no aggregation&quot;</span>)</span>
+<span id="d14-cb5-64"><a href="#d14-cb5-64" aria-hidden="true" tabindex="-1"></a>fast <span class="op">=</span> AIFS_BE <span class="op">+</span> MEAN_BACKOFF <span class="op">+</span> he_ppdu_us(MPDU, rate, <span class="dv">2</span>) <span class="op">+</span> SIFS <span class="op">+</span> ba_us(<span class="dv">1</span>)</span>
+<span id="d14-cb5-65"><a href="#d14-cb5-65" aria-hidden="true" tabindex="-1"></a>slow_rate <span class="op">=</span> he_rate(<span class="dv">0</span>, <span class="dv">1</span>, <span class="dv">20</span>)</span>
+<span id="d14-cb5-66"><a href="#d14-cb5-66" aria-hidden="true" tabindex="-1"></a>slow <span class="op">=</span> AIFS_BE <span class="op">+</span> MEAN_BACKOFF <span class="op">+</span> he_ppdu_us(MPDU, slow_rate, <span class="dv">1</span>) <span class="op">+</span> SIFS <span class="op">+</span> ba_us(<span class="dv">1</span>)</span>
+<span id="d14-cb5-67"><a href="#d14-cb5-67" aria-hidden="true" tabindex="-1"></a>each <span class="op">=</span> <span class="dv">1500</span> <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> (fast <span class="op">+</span> slow)                      <span class="co"># they alternate turns</span></span>
+<span id="d14-cb5-68"><a href="#d14-cb5-68" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;   fast station alone: </span><span class="sc">{</span><span class="dv">1500</span> <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> fast<span class="sc">:6.1f}</span><span class="ss"> Mbit/s   slow alone: </span><span class="sc">{</span><span class="dv">1500</span> <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> slow<span class="sc">:5.1f}</span><span class="ss">&quot;</span>)</span>
+<span id="d14-cb5-69"><a href="#d14-cb5-69" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;   sharing: each gets </span><span class="sc">{</span>each<span class="sc">:.1f}</span><span class="ss"> Mbit/s; the slow one uses </span><span class="sc">{</span>slow <span class="op">/</span> (fast <span class="op">+</span> slow)<span class="sc">:.0%}</span><span class="ss"> of airtime&quot;</span>)</span></code></pre></div>
+<p>Real output:</p>
+<pre class="text"><code>1) PHY rates (HE, 0.8 us GI)
+   MCS11 2SS  80 MHz :  1201.0 Mbit/s
+   MCS9  2SS  80 MHz :   960.8 Mbit/s
+   MCS7  2SS  80 MHz :   720.6 Mbit/s
+   MCS4  1SS  20 MHz :    51.6 Mbit/s
+   MCS0  1SS  20 MHz :     8.6 Mbit/s
+
+2) 802.11a/g at 54 Mbit/s, one 1500-byte packet per channel access
+   DIFS 34 + backoff 67.5 + data 248 + SIFS 16 + ACK 28 = 393.5 us
+   IP throughput 30.5 Mbit/s  (56% of 54)
+
+3) 802.11ax MCS11 2SS 80 MHz, A-MPDU of N packets per TXOP, AP -&gt; laptop TCP download
+   N=  1: data   222.5 us + ACK TXOP 111.2 us -&gt; TCP   34.7 Mbit/s (3% of 1201)
+   N=  8: data   304.1 us + ACK TXOP 222.5 us -&gt; TCP  176.0 Mbit/s (15% of 1201)
+   N= 32: data   548.9 us + ACK TXOP 236.1 us -&gt; TCP  472.2 Mbit/s (39% of 1201)
+   N= 64: data   875.3 us + ACK TXOP 249.7 us -&gt; TCP  659.0 Mbit/s (55% of 1201)
+   N=256: data  2882.5 us + ACK TXOP 339.3 us -&gt; TCP  920.4 Mbit/s (77% of 1201)
+
+4) Same link, 64-packet A-MPDUs, with 10% of MPDUs lost and resent
+   593.1 Mbit/s  (retries also push rate control down a step or two)
+
+5) Rate anomaly: per-packet fairness, 1500-byte packets, no aggregation
+   fast station alone:   53.9 Mbit/s   slow alone:   7.2
+   sharing: each gets 6.4 Mbit/s; the slow one uses 88% of airtime</code></pre>
+<p>Walk through it, because every number is a design decision someone made.</p>
+<p><strong>Part 2: the classic 54 Mbit/s.</strong> Without aggregation, each 1,500-byte packet pays for a DIFS, a backoff, a preamble and an ACK. That overhead (145.5 µs) is more than half the data time (248 µs), so the best case is 30.5 Mbit/s of IP payload, and TCP's ACKs, travelling the other way, take a further bite. That is why 802.11g never delivered more than the mid-20s in real use.</p>
+<p><strong>Part 3: why aggregation exists.</strong> At 1,201 Mbit/s, a 1,500-byte packet needs one 13.6 µs symbol, but the fixed cost of a turn is still about 200 µs. One packet per turn gives 35 Mbit/s, which is 3% of the link rate. Aggregating 64 packets reaches 659 Mbit/s (55%). Even 256 packets, which only Wi-Fi 6 pairs negotiate, top out around 77%. Real links lose more to retries, competing stations, and rate drops.</p>
+<p><strong>Part 4: retries.</strong> Losing 10% of MPDUs costs 10% of throughput directly. The bigger cost is indirect: rate control reacts to loss by stepping down, and each MCS step costs 10–25% of rate.</p>
+<p><strong>Part 5: the rate anomaly.</strong> A station at MCS 0 (8.6 Mbit/s) sharing per-packet fairly with one at MCS 11 drags the fast station from 53.9 Mbit/s down to 6.4. The slow station uses 88% of the airtime. This is the "one old laptop ruins the meeting room" effect, in numbers.</p>
+<h3 id="d14-contention">Contention: what more stations cost</h3>
+<p>The next script simulates saturated best-effort stations running the backoff loop from the mental model: CWmin 15, doubling to 1023, and dropping a frame after its 7th failed attempt. Run it: <code>~/.local/bin/python3.13 d14_contention.py</code></p>
+<div class="sourceCode" id="d14-cb7"><pre class="sourceCode python"><code class="sourceCode python"><span id="d14-cb7-1"><a href="#d14-cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Saturated CSMA/CA (802.11 DCF, best effort): how collisions grow with stations in a cell.&quot;&quot;&quot;</span></span>
+<span id="d14-cb7-2"><a href="#d14-cb7-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> random</span>
+<span id="d14-cb7-3"><a href="#d14-cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb7-4"><a href="#d14-cb7-4" aria-hidden="true" tabindex="-1"></a>CWMIN, CWMAX, RETRY_LIMIT <span class="op">=</span> <span class="dv">15</span>, <span class="dv">1023</span>, <span class="dv">7</span></span>
+<span id="d14-cb7-5"><a href="#d14-cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb7-6"><a href="#d14-cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> run(stations: <span class="bu">int</span>, transmissions: <span class="bu">int</span> <span class="op">=</span> <span class="dv">200_000</span>, seed: <span class="bu">int</span> <span class="op">=</span> <span class="dv">1</span>):</span>
+<span id="d14-cb7-7"><a href="#d14-cb7-7" aria-hidden="true" tabindex="-1"></a>    rng <span class="op">=</span> random.Random(seed)</span>
+<span id="d14-cb7-8"><a href="#d14-cb7-8" aria-hidden="true" tabindex="-1"></a>    cw <span class="op">=</span> [CWMIN] <span class="op">*</span> stations</span>
+<span id="d14-cb7-9"><a href="#d14-cb7-9" aria-hidden="true" tabindex="-1"></a>    retries <span class="op">=</span> [<span class="dv">0</span>] <span class="op">*</span> stations</span>
+<span id="d14-cb7-10"><a href="#d14-cb7-10" aria-hidden="true" tabindex="-1"></a>    backoff <span class="op">=</span> [rng.randint(<span class="dv">0</span>, CWMIN) <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(stations)]</span>
+<span id="d14-cb7-11"><a href="#d14-cb7-11" aria-hidden="true" tabindex="-1"></a>    ok <span class="op">=</span> collided <span class="op">=</span> dropped <span class="op">=</span> idle_slots <span class="op">=</span> <span class="dv">0</span></span>
+<span id="d14-cb7-12"><a href="#d14-cb7-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> ok <span class="op">+</span> collided <span class="op">&lt;</span> transmissions:</span>
+<span id="d14-cb7-13"><a href="#d14-cb7-13" aria-hidden="true" tabindex="-1"></a>        step <span class="op">=</span> <span class="bu">min</span>(backoff)                     <span class="co"># everyone counts down idle slots together</span></span>
+<span id="d14-cb7-14"><a href="#d14-cb7-14" aria-hidden="true" tabindex="-1"></a>        idle_slots <span class="op">+=</span> step</span>
+<span id="d14-cb7-15"><a href="#d14-cb7-15" aria-hidden="true" tabindex="-1"></a>        backoff <span class="op">=</span> [b <span class="op">-</span> step <span class="cf">for</span> b <span class="kw">in</span> backoff]</span>
+<span id="d14-cb7-16"><a href="#d14-cb7-16" aria-hidden="true" tabindex="-1"></a>        talkers <span class="op">=</span> [i <span class="cf">for</span> i, b <span class="kw">in</span> <span class="bu">enumerate</span>(backoff) <span class="cf">if</span> b <span class="op">==</span> <span class="dv">0</span>]</span>
+<span id="d14-cb7-17"><a href="#d14-cb7-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="bu">len</span>(talkers) <span class="op">==</span> <span class="dv">1</span>:</span>
+<span id="d14-cb7-18"><a href="#d14-cb7-18" aria-hidden="true" tabindex="-1"></a>            ok <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d14-cb7-19"><a href="#d14-cb7-19" aria-hidden="true" tabindex="-1"></a>            i <span class="op">=</span> talkers[<span class="dv">0</span>]</span>
+<span id="d14-cb7-20"><a href="#d14-cb7-20" aria-hidden="true" tabindex="-1"></a>            cw[i], retries[i] <span class="op">=</span> CWMIN, <span class="dv">0</span></span>
+<span id="d14-cb7-21"><a href="#d14-cb7-21" aria-hidden="true" tabindex="-1"></a>            backoff[i] <span class="op">=</span> rng.randint(<span class="dv">0</span>, cw[i])</span>
+<span id="d14-cb7-22"><a href="#d14-cb7-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span>:</span>
+<span id="d14-cb7-23"><a href="#d14-cb7-23" aria-hidden="true" tabindex="-1"></a>            collided <span class="op">+=</span> <span class="dv">1</span>                       <span class="co"># no ACK for anyone; deferrers keep their counts</span></span>
+<span id="d14-cb7-24"><a href="#d14-cb7-24" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> i <span class="kw">in</span> talkers:</span>
+<span id="d14-cb7-25"><a href="#d14-cb7-25" aria-hidden="true" tabindex="-1"></a>                retries[i] <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d14-cb7-26"><a href="#d14-cb7-26" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> retries[i] <span class="op">&gt;=</span> RETRY_LIMIT:   <span class="co"># 7th failed attempt: drop the frame</span></span>
+<span id="d14-cb7-27"><a href="#d14-cb7-27" aria-hidden="true" tabindex="-1"></a>                    dropped <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d14-cb7-28"><a href="#d14-cb7-28" aria-hidden="true" tabindex="-1"></a>                    cw[i], retries[i] <span class="op">=</span> CWMIN, <span class="dv">0</span></span>
+<span id="d14-cb7-29"><a href="#d14-cb7-29" aria-hidden="true" tabindex="-1"></a>                <span class="cf">else</span>:</span>
+<span id="d14-cb7-30"><a href="#d14-cb7-30" aria-hidden="true" tabindex="-1"></a>                    cw[i] <span class="op">=</span> <span class="bu">min</span>(<span class="dv">2</span> <span class="op">*</span> cw[i] <span class="op">+</span> <span class="dv">1</span>, CWMAX)</span>
+<span id="d14-cb7-31"><a href="#d14-cb7-31" aria-hidden="true" tabindex="-1"></a>                backoff[i] <span class="op">=</span> rng.randint(<span class="dv">0</span>, cw[i])</span>
+<span id="d14-cb7-32"><a href="#d14-cb7-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> ok, collided, dropped, idle_slots</span>
+<span id="d14-cb7-33"><a href="#d14-cb7-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d14-cb7-34"><a href="#d14-cb7-34" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;stations&#39;</span><span class="sc">:&gt;8}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;collided %&#39;</span><span class="sc">:&gt;12}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;idle slots/tx&#39;</span><span class="sc">:&gt;14}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;drops&#39;</span><span class="sc">:&gt;7}</span><span class="ss">&quot;</span>)</span>
+<span id="d14-cb7-35"><a href="#d14-cb7-35" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> n <span class="kw">in</span> (<span class="dv">2</span>, <span class="dv">5</span>, <span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">50</span>):</span>
+<span id="d14-cb7-36"><a href="#d14-cb7-36" aria-hidden="true" tabindex="-1"></a>    ok, col, drop, idle <span class="op">=</span> run(n)</span>
+<span id="d14-cb7-37"><a href="#d14-cb7-37" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>n<span class="sc">:&gt;8}</span><span class="ss"> </span><span class="sc">{</span>col <span class="op">/</span> (ok <span class="op">+</span> col)<span class="sc">:&gt;11.1%}</span><span class="ss"> </span><span class="sc">{</span>idle <span class="op">/</span> (ok <span class="op">+</span> col)<span class="sc">:&gt;14.2f}</span><span class="ss"> </span><span class="sc">{</span>drop<span class="sc">:&gt;7}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+<p>Real output:</p>
+<pre class="text"><code>stations   collided %  idle slots/tx   drops
+       2        5.8%           4.53       0
+       5       14.9%           2.82      28
+      10       21.7%           2.19     239
+      20       28.9%           1.82    1065
+      50       40.0%           1.45    4828</code></pre>
+<p>With two busy stations, about one transmission in 17 collides. With 20, more than a quarter do, and each collision burns a full frame's airtime with nothing delivered. Frames start getting dropped after seven failures, which TCP sees as loss and answers by slowing down. Idle slots per transmission fall as the number of stations grows, so the channel looks <em>busier</em> while carrying less. Real cells are rarely fully saturated, but at the lunch rush in a cafeteria, they get close.</p>
+<h3 id="d14-ref-numbers">Other numbers worth carrying</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Value</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Broadcast at 1 Mbit/s (2.4 GHz DSSS)</td>
+<td>≈ 12 ms per 1,500-byte frame</td>
+<td>About the airtime of 14 aggregated TXOPs carrying 900 packets at MCS 11</td>
+</tr>
+<tr class="even">
+<td>Broadcast at 6 Mbit/s (5 GHz)</td>
+<td>≈ 2 ms per 1,500-byte frame</td>
+<td>Multicast and broadcast go at a basic rate, with no ACK and no retry</td>
+</tr>
+<tr class="odd">
+<td>Non-overlapping channels, 2.4 / 5 / 6 GHz (US, 20 MHz)</td>
+<td>3 / 25 / 59</td>
+<td>Many 5 GHz channels are DFS</td>
+</tr>
+<tr class="even">
+<td>DFS channel check / radar non-occupancy</td>
+<td>60 s (10 min on weather channels, ETSI) / 30 min</td>
+<td>Regulatory</td>
+</tr>
+<tr class="odd">
+<td>Roam with 802.11r</td>
+<td>A few to a few tens of ms</td>
+<td>Depends on contention and implementation</td>
+</tr>
+<tr class="even">
+<td>Roam with full 802.1X</td>
+<td>Often 100+ ms, up to seconds</td>
+<td>RADIUS round trips dominate</td>
+</tr>
+<tr class="odd">
+<td>Peak PHY rate, 2 streams</td>
+<td>1,201 Mbit/s (HE, 80 MHz); 2,402 Mbit/s (HE, 160 MHz); 5,765 Mbit/s (EHT, 320 MHz, 4096-QAM)</td>
+<td>Laptops and phones are usually 2 × 2</td>
+</tr>
+</tbody>
+</table>
+<h2 id="d14-failures">Deep dive: production failure modes</h2>
+<p><strong>1. Full bars, slow Wi-Fi.</strong> <em>Symptom:</em> RSSI is −55 dBm, yet throughput is a fraction of the link rate, and worse at busy hours. <em>Mechanism:</em> co-channel contention. Other APs and clients on the same channel, yours or a neighbour's, are taking airtime. <em>Prove it:</em> <code>iw dev wlan0 survey dump</code> on Linux, or <code>CCA</code> in <code>sudo wdutil info</code> on macOS. Busy time well above 50% while you aren't transmitting means the air is full. A scan shows who else is on the channel. <em>Fix:</em> narrower channels, more channel diversity, lower AP power so cells stop hearing each other, and moving capable clients to 5 or 6 GHz.</p>
+<p><strong>2. One device slows the whole room.</strong> <em>Symptom:</em> everyone's speed drops when a particular old device is active. <em>Mechanism:</em> the rate anomaly, or 802.11b protection mechanisms on 2.4 GHz. <em>Prove it:</em> on the AP (or via <code>iw dev wlan0 station dump</code> on a Linux AP), compare per-station <code>tx bitrate</code> and airtime. The culprit sits at MCS 0–2, or at a legacy rate. <em>Fix:</em> raise the minimum basic rate (drop 1, 2, 5.5, 11, and often 6 and 9 Mbit/s), turn on airtime fairness, and move that client to a better band or a wire.</p>
+<p><strong>3. Hidden nodes.</strong> <em>Symptom:</em> high retry counts on the uplink, while the channel's busy time looks moderate. <em>Mechanism:</em> clients on opposite sides of the AP can't hear each other, so their transmissions overlap at the AP. <em>Prove it:</em> the retry ratio in station dump (retries ÷ packets) is high, while busy time is not. Lowering the RTS threshold on the client side makes the retries drop. <em>Fix:</em> more, smaller cells, AP placement nearer to the clients, or RTS/CTS for large frames.</p>
+<p><strong>4. Multicast eating the air.</strong> <em>Symptom:</em> a whole cell slows down when many devices are idle. <em>Mechanism:</em> mDNS, SSDP, ARP and IPv6 neighbour discovery go out as broadcast or multicast frames at the lowest basic rate. At 1 Mbit/s, each 1,500-byte frame holds the air for about 12 ms. <em>Prove it:</em> a monitor-mode capture filtered to <code>wlan.da[0] &amp; 1</code> shows the multicast volume, and the radiotap header shows the rate. <em>Fix:</em> multicast-to-unicast conversion, proxy ARP and ND at the AP, a higher basic rate, and filtering of discovery protocols between VLANs.</p>
+<p><strong>5. Calls stutter while walking.</strong> <em>Symptom:</em> video freezes for a second at the same doorway every time. <em>Mechanism:</em> a sticky client holding a dying AP, a full re-authentication on each roam, or a coverage gap. <em>Prove it:</em> run <code>ping -i 0.2 &lt;gateway&gt;</code> while walking and look for gaps (some macOS versions need <code>sudo</code> for sub-second intervals). Log the BSSID once a second (<code>iw dev wlan0 link</code> on Linux, <code>sudo wdutil info</code> on macOS), and on Linux watch <code>iw event -t</code> for disconnect and connect events. Gaps of hundreds of milliseconds at each BSSID change mean slow roams. A falling RSSI long before any change means a sticky client. <em>Fix:</em> enable 802.11k/v/r, reduce power so cell edges are crisp, and fix the coverage gap.</p>
+<p><strong>6. Old clients can't join after enabling 802.11r.</strong> <em>Symptom:</em> certain older devices fail to associate, or loop between associating and disconnecting. <em>Mechanism:</em> some legacy drivers mishandle the FT AKM or the mobility-domain element in beacons, even when PSK is offered alongside. <em>Prove it:</em> a capture shows the client sending no association request at all, or getting rejected. Disabling FT fixes it. <em>Fix:</em> test your client fleet. Use a separate SSID for legacy devices, or the AP's adaptive or mixed FT mode, if it has one.</p>
+<p><strong>7. 6 GHz invisible to Wi-Fi 6E devices.</strong> <em>Symptom:</em> new laptops never use 6 GHz even beside the AP. <em>Mechanism:</em> 6 GHz requires WPA3 (SAE with H2E), OWE or Enterprise, plus PMF. An SSID configured as WPA2 can't be offered on 6 GHz, or the client can't discover it because the AP isn't advertising it in Reduced Neighbor Reports. <em>Prove it:</em> a scan shows no 6 GHz BSSs for that SSID. <em>Fix:</em> run WPA3 with H2E on that SSID. Keep WPA2-only devices on a separate SSID.</p>
+<p><strong>8. Everyone disconnects at once, occasionally.</strong> <em>Symptom:</em> all clients on one AP drop for seconds, at random times. <em>Mechanism:</em> a DFS radar detection, real or false, forces the AP off the channel. <em>Prove it:</em> the AP's log shows a radar event and a channel change at that time. <em>Fix:</em> avoid the most error-prone DFS channels near airports and weather radars, or accept the occasional event as the price of the extra spectrum.</p>
+<h2 id="d14-2026">Deep dive: 2026 context</h2>
+<p><strong>Wi-Fi 7 (802.11be) changes the shape of a link.</strong> Multi-Link Operation lets one association span radios in two or three bands at once. A client can send on whichever link is free first, which mainly cuts <em>latency</em> under contention, or aggregate links for throughput. 320 MHz channels exist only in 6 GHz. 4096-QAM needs an SNR in the high 30s or more, so it only shows up at short range. Preamble puncturing lets a wide channel carry on around a busy 20 MHz slice, instead of dropping to a narrower width.</p>
+<p><strong>6 GHz is the clean band, with rules.</strong> No legacy devices, WPA3 or OWE only, and PMF mandatory. Standard-power operation in the US uses an Automated Frequency Coordination database to protect licensed users. Indoor low-power APs don't need it.</p>
+<p><strong>Private MAC addresses.</strong> Phones and laptops now use a random MAC address per network, and some operating systems rotate it periodically. MAC-based allowlists, DHCP reservations and "device tracking by MAC" all break. Identity has to come from 802.1X credentials, certificates, or the device-management system.</p>
+<p><strong>Zero trust treats Wi-Fi as an underlay.</strong> Corporate networks increasingly use WPA3-Enterprise with EAP-TLS device certificates for the air hop, and then don't trust the WLAN for anything more. Applications authenticate users and devices end to end. The Wi-Fi encryption protects only the hop between client and AP.</p>
+<p><strong>Open networks get encryption.</strong> Enhanced Open (OWE, RFC 8110) runs an unauthenticated Diffie-Hellman exchange during association. Café traffic is encrypted against passive sniffing, though nothing authenticates the AP. Passpoint and OpenRoaming automate secure joining to public networks with credentials instead of captive portals.</p>
+<p><strong>QUIC and roaming.</strong> An ESS roam keeps your IP address, so neither TCP nor QUIC notices anything but a pause. Moving between <em>networks</em> — Wi-Fi to cellular, or between two SSIDs — changes the address. QUIC connection migration survives that. TCP doesn't, unless something like Multipath TCP is in use.</p>
+<h2 id="d14-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: My laptop shows a 1,201 Mbit/s link but speed tests top out around 600. Is something wrong?</strong></p>
+<p>A: Probably not. The link rate is the PHY rate during the data portion of a frame. Every channel access also pays for AIFS, backoff, a ~50 µs preamble, SIFS and a BlockAck, about 200 µs in total. The client's TCP ACKs need their own channel accesses. With 64-packet aggregates that leaves about 55% of the PHY rate as TCP goodput, before any retries or competing stations. 50–65% of link rate is normal. Under 30% on a quiet channel is worth investigating.</p>
+<p><strong>Q2: Why does a single slow client hurt everyone?</strong></p>
+<p>A: The MAC is fair per transmission opportunity, not per unit of airtime. A client at MCS 0 takes as many turns as a client at MCS 11, and each turn lasts far longer. Everyone converges towards the slow client's throughput. The fixes are airtime fairness at the AP, higher minimum rates, and moving that client.</p>
+<p><strong>Q3: What does the Duration field do, and what breaks if a station ignores it?</strong></p>
+<p>A: It sets the NAV in every station that decodes it: virtual carrier sense. It protects the rest of an exchange (the SIFS gap and the BlockAck) and, through RTS/CTS, protects receivers from hidden transmitters. A station that ignores it can transmit into someone else's ACK. The sender then sees a missing ACK, retries, and doubles its backoff for nothing.</p>
+<p><strong>Q4: Why does lowering AP transmit power often improve performance?</strong></p>
+<p>A: Smaller cells mean fewer APs and clients inside each other's contention range on the same channel, so the channels get reused more. It also balances the link. Clients transmit at lower power than APs, so a loud AP attracts clients from distances where their uplink can't reach back. Retries and low MCS on the uplink follow.</p>
+<p><strong>Q5: Walk me through 802.11r. What does it actually skip?</strong></p>
+<p>A: The first join in a mobility domain does full authentication, either SAE or 802.1X. That creates a PMK-R0 at a key holder, and PMK-R1s are derived for each AP. A roam is then an FT authentication exchange that carries the nonces, then reassociation. The PTK is derived from the PMK-R1 inside those four frames. It skips the SAE or EAP exchange and the separate 4-way handshake. What it doesn't skip is scanning. That's 802.11k's job, and the decision to roam is still the client's.</p>
+<p><strong>Q6: What does SAE protect against that WPA2-PSK doesn't, and why did H2E matter?</strong></p>
+<p>A: SAE removes the offline dictionary attack: a captured exchange gives no way to test password guesses, so each guess needs a live run against the AP. Each session gets a fresh PMK, which gives forward secrecy. The original password-to-element mapping looped a password-dependent number of times, and Dragonblood exploited that through timing and cache side channels. Hash-to-element replaced it with a constant-time mapping, and 6 GHz requires it.</p>
+<p><strong>Q7: How do you tell whether slow Wi-Fi is your client, the AP, or the air?</strong></p>
+<p>A: Three numbers. Channel busy percentage (survey dump, or CCA in <code>wdutil</code>) tells me whether the air is full. SNR (RSSI minus noise) against the negotiated MCS tells me whether the link is healthy for its signal. The retry ratio (station dump) tells me whether frames are failing. High busy time means the air. Good SNR with a low MCS and high retries points to interference or hidden nodes. Clean numbers with low throughput send me above layer 2: DNS, TCP, or the WAN.</p>
+<p><strong>Q8: Why can't Wi-Fi just detect collisions like Ethernet, and what does that cost?</strong></p>
+<p>A: The radio's own transmission is roughly 90 dB stronger at its receiver than anything distant, so it can't hear a collision while sending. The missing ACK is the only signal, and it arrives after the whole frame. A collision therefore costs the full frame duration, which can be milliseconds with aggregation. Hence random backoff before sending, RTS/CTS before long frames, and the decline in efficiency as stations are added.</p>
+<p><strong>Standards cited in this deep dive:</strong> IEEE 802.11-2020 (including the folded-in 802.11e EDCA, 802.11i RSN, 802.11k, 802.11r, 802.11v and 802.11w amendments), IEEE 802.11ax-2021 (HE, Wi-Fi 6/6E), IEEE 802.11be (EHT, Wi-Fi 7), RFC 8110 (Opportunistic Wireless Encryption). WPA3, Enhanced Open and Passpoint are Wi-Fi Alliance certifications built on those mechanisms. Regulatory numbers (channels, DFS timers, power) are for the US and the EU as stated, and differ elsewhere.</p>

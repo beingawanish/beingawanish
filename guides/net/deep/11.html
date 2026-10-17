@@ -1,0 +1,659 @@
+<h2 id="d11-deep-dive">Deep dive: what "the resolver walks the tree" hides</h2>
+<p>The module gave you the phone-book tree and the stub/recursive/authoritative split. That picture is right, and it is also where most people stop. It hides the part that decides how DNS behaves in production: <strong>state</strong>. Every box in the diagram is a cache with its own keys, its own expiry rules, its own caps, and its own failure behaviour. "DNS is slow", "DNS is stale" and "DNS works on my laptop but not in the pod" are almost always questions about which cache answered and why.</p>
+<p>This deep dive goes under the analogy. It covers what each resolver role actually stores, the TTL arithmetic that follows, negative caching, a full <code>dig +trace</code> read line by line, what happens when an answer outgrows a UDP datagram, the DNSSEC chain of signatures, encrypted transports, and the two traps that bite modern infrastructure hardest: split-horizon views and the Kubernetes <code>ndots</code> search list.</p>
+<h2 id="d11-mental-model">Deep dive: the real mental model — caches all the way down</h2>
+<h3 id="d11-roles-as-state">The three roles, as machines with state</h3>
+<p>Think of each role in terms of what it keeps in memory and what it does on a miss.</p>
+<p><strong>The stub resolver</strong> lives on your machine. It holds configuration, not knowledge: a list of nameservers, a search list, and options such as <code>ndots</code>, <code>timeout</code> and <code>attempts</code>. Whether it caches depends entirely on the OS.</p>
+<ul>
+<li><strong>glibc on Linux</strong> does not cache at all. Every <code>getaddrinfo()</code> goes to the network unless something local (<code>systemd-resolved</code> on 127.0.0.53, <code>nscd</code>, <code>dnsmasq</code>) sits in front.</li>
+<li><strong>macOS</strong> routes lookups through <code>mDNSResponder</code>, which does cache and also holds per-domain resolver rules (<code>scutil --dns</code> prints them, including <code>/etc/resolver/&lt;domain&gt;</code> files and VPN-pushed scopes).</li>
+<li><strong>Applications and runtimes</strong> often cache on top. Browsers keep their own host cache. The JVM caches successful lookups for 30 seconds by default when no security manager is installed, controlled by <code>networkaddress.cache.ttl</code>. Go, Node and Python have their own quirks; none of them sees the TTL through <code>getaddrinfo()</code>.</li>
+</ul>
+<p><strong>The recursive resolver</strong> is where the real state lives. A production resolver such as Unbound or BIND keeps several separate structures:</p>
+<ul>
+<li><strong>The RRset cache.</strong> Key: (owner name, type, class). Value: the record set plus an <em>absolute</em> expiry time. The resolver never stores "TTL 300"; it stores "expires at 14:05:00" and computes the remaining TTL on every answer.</li>
+<li><strong>The negative cache.</strong> NXDOMAIN entries keyed by name, and NODATA entries keyed by (name, type). Each one also carries an expiry derived from the zone's SOA (more below).</li>
+<li><strong>The infrastructure cache.</strong> For every authoritative server it has talked to: a smoothed RTT estimate, whether it handles EDNS, whether it has been lame or timing out. Resolvers use the RTT numbers to pick the fastest of a zone's nameservers, which is why the second query to a zone is often faster than the first even when the answer itself was not cached.</li>
+<li><strong>The delegation cache.</strong> NS records and glue for every zone cut it has crossed. A warm resolver jumps straight to <code>example.com</code>'s servers without touching root or <code>.com</code>.</li>
+<li><strong>The key cache</strong> (validating resolvers only). DNSKEY and DS sets plus their validation status: secure, insecure or bogus.</li>
+<li><strong>The in-flight request list.</strong> If 500 clients ask for the same name in the same millisecond, a good resolver sends one upstream query and fans the answer out to all of them.</li>
+</ul>
+<p><strong>The authoritative server</strong> keeps no cache at all for its own zones. It holds the zone in memory, answers from it, and sets the <code>aa</code> flag. Its state is the zone data plus a serial number in the SOA, which secondaries poll to know when to transfer a new copy.</p>
+<div style="overflow-x:auto">
+<svg viewBox="0 0 800 520" role="img" aria-labelledby="d11-state-title d11-state-desc" style="min-width:800px;max-width:100%;height:auto;">
+<title id="d11-state-title">The state inside each DNS role</title>
+<desc id="d11-state-desc">The application and stub resolver hold configuration and short caches; the recursive resolver holds six structures (RRset cache with absolute expiry, negative cache, infrastructure cache, delegation cache, key cache, in-flight list); the authoritative server holds the zone and SOA serial. Queries flow right with RD set, iterative queries carry RD clear, and answers flow back with the remaining TTL.</desc>
+<defs>
+<marker id="d11-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2d3142"/></marker>
+<marker id="d11-arr-acc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#bf4520"/></marker>
+</defs>
+<rect x="0" y="0" width="800" height="520" fill="#f5f5f5"/>
+<text x="24" y="34" font-family="monospace" font-size="11" fill="#8a8f98" letter-spacing="2">D11 · STATE</text>
+<text x="24" y="62" font-family="sans-serif" font-size="21" font-weight="600" fill="#2d3142">What each DNS role keeps in memory</text>
+<!-- client column -->
+<g font-family="sans-serif" fill="#2d3142">
+<rect x="16" y="92" width="168" height="120" rx="6" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5"/>
+<text x="28" y="114" font-size="13" font-weight="600">app / browser</text>
+<text x="28" y="136" font-family="monospace" font-size="10" fill="#5a6580">own host cache, own rules</text>
+<text x="28" y="152" font-family="monospace" font-size="10" fill="#5a6580">JVM: 30 s by default</text>
+<text x="28" y="168" font-family="monospace" font-size="10" fill="#5a6580">sees no TTL via</text>
+<text x="28" y="184" font-family="monospace" font-size="10" fill="#5a6580">getaddrinfo()</text>
+<rect x="16" y="232" width="168" height="152" rx="6" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5"/>
+<text x="28" y="254" font-size="13" font-weight="600">stub resolver</text>
+<text x="28" y="276" font-family="monospace" font-size="10" fill="#5a6580">nameserver (max 3)</text>
+<text x="28" y="292" font-family="monospace" font-size="10" fill="#5a6580">search list</text>
+<text x="28" y="308" font-family="monospace" font-size="10" fill="#5a6580">ndots, timeout, attempts</text>
+<text x="28" y="332" font-family="monospace" font-size="10" fill="#2d3142">glibc: no cache</text>
+<text x="28" y="348" font-family="monospace" font-size="10" fill="#2d3142">macOS: mDNSResponder</text>
+<text x="28" y="364" font-family="monospace" font-size="10" fill="#2d3142">caches + scoped rules</text>
+</g>
+<!-- resolver -->
+<g font-family="sans-serif" fill="#2d3142">
+<rect x="232" y="92" width="336" height="292" rx="6" fill="#bf4520" fill-opacity="0.06" stroke="#bf4520" stroke-width="1.5"/>
+<text x="248" y="114" font-size="13" font-weight="600">recursive resolver</text>
+<text x="404" y="114" font-family="monospace" font-size="10" fill="#5a6580">Unbound, BIND, CoreDNS…</text>
+<rect x="248" y="128" width="148" height="72" rx="4" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<text x="258" y="146" font-size="11" font-weight="600">RRset cache</text>
+<text x="258" y="164" font-family="monospace" font-size="9" fill="#5a6580">(name,type,class) →</text>
+<text x="258" y="178" font-family="monospace" font-size="9" fill="#5a6580">rrset, expires_at</text>
+<text x="258" y="192" font-family="monospace" font-size="9" fill="#bf4520">absolute time, not TTL</text>
+<rect x="404" y="128" width="148" height="72" rx="4" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<text x="414" y="146" font-size="11" font-weight="600">negative cache</text>
+<text x="414" y="164" font-family="monospace" font-size="9" fill="#5a6580">NXDOMAIN: name</text>
+<text x="414" y="178" font-family="monospace" font-size="9" fill="#5a6580">NODATA: (name,type)</text>
+<text x="414" y="192" font-family="monospace" font-size="9" fill="#5a6580">ttl = min(SOA ttl, MIN)</text>
+<rect x="248" y="208" width="148" height="72" rx="4" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<text x="258" y="226" font-size="11" font-weight="600">infrastructure cache</text>
+<text x="258" y="244" font-family="monospace" font-size="9" fill="#5a6580">per server IP:</text>
+<text x="258" y="258" font-family="monospace" font-size="9" fill="#5a6580">smoothed RTT, EDNS ok,</text>
+<text x="258" y="272" font-family="monospace" font-size="9" fill="#5a6580">timeouts, lameness</text>
+<rect x="404" y="208" width="148" height="72" rx="4" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<text x="414" y="226" font-size="11" font-weight="600">delegation cache</text>
+<text x="414" y="244" font-family="monospace" font-size="9" fill="#5a6580">zone cut → NS + glue</text>
+<text x="414" y="258" font-family="monospace" font-size="9" fill="#5a6580">lets a warm resolver</text>
+<text x="414" y="272" font-family="monospace" font-size="9" fill="#5a6580">skip root and TLD</text>
+<rect x="248" y="288" width="148" height="80" rx="4" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<text x="258" y="306" font-size="11" font-weight="600">key cache</text>
+<text x="258" y="324" font-family="monospace" font-size="9" fill="#5a6580">DNSKEY, DS sets</text>
+<text x="258" y="338" font-family="monospace" font-size="9" fill="#5a6580">secure | insecure |</text>
+<text x="258" y="352" font-family="monospace" font-size="9" fill="#5a6580">bogus; trust anchor</text>
+<rect x="404" y="288" width="148" height="80" rx="4" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<text x="414" y="306" font-size="11" font-weight="600">in-flight list</text>
+<text x="414" y="324" font-family="monospace" font-size="9" fill="#5a6580">500 clients, same name,</text>
+<text x="414" y="338" font-family="monospace" font-size="9" fill="#5a6580">same ms → one upstream</text>
+<text x="414" y="352" font-family="monospace" font-size="9" fill="#5a6580">query, fanned back out</text>
+</g>
+<!-- authoritative -->
+<g font-family="sans-serif" fill="#2d3142">
+<rect x="616" y="92" width="168" height="292" rx="6" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5"/>
+<text x="628" y="114" font-size="13" font-weight="600">authoritative</text>
+<text x="628" y="136" font-family="monospace" font-size="10" fill="#5a6580">zone in memory</text>
+<text x="628" y="152" font-family="monospace" font-size="10" fill="#5a6580">no cache for own zone</text>
+<text x="628" y="176" font-family="monospace" font-size="10" fill="#2d3142">SOA serial 2026101601</text>
+<text x="628" y="192" font-family="monospace" font-size="10" fill="#5a6580">secondaries poll it,</text>
+<text x="628" y="208" font-family="monospace" font-size="10" fill="#5a6580">then AXFR/IXFR (TCP)</text>
+<text x="628" y="232" font-family="monospace" font-size="10" fill="#5a6580">RRSIGs with</text>
+<text x="628" y="248" font-family="monospace" font-size="10" fill="#5a6580">inception/expiry</text>
+<text x="628" y="272" font-family="monospace" font-size="10" fill="#2d3142">answers set aa=1</text>
+<text x="628" y="296" font-family="monospace" font-size="10" fill="#5a6580">TTL here is the</text>
+<text x="628" y="312" font-family="monospace" font-size="10" fill="#5a6580">original, full value</text>
+</g>
+<!-- arrows -->
+<g font-family="monospace" font-size="10">
+<line x1="184" y1="262" x2="230" y2="262" stroke="#2d3142" stroke-width="1.5" marker-end="url(#d11-arr)"/>
+<text x="188" y="254" fill="#2d3142">RD=1</text>
+<line x1="230" y1="340" x2="186" y2="340" stroke="#bf4520" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#d11-arr-acc)"/>
+<text x="188" y="332" fill="#bf4520">rem TTL</text>
+<line x1="568" y1="160" x2="614" y2="160" stroke="#2d3142" stroke-width="1.5" marker-end="url(#d11-arr)"/>
+<text x="572" y="152" fill="#2d3142">RD=0</text>
+<line x1="614" y1="250" x2="570" y2="250" stroke="#bf4520" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#d11-arr-acc)"/>
+<text x="578" y="242" fill="#bf4520">TTL</text>
+<line x1="100" y1="212" x2="100" y2="230" stroke="#2d3142" stroke-width="1.5" marker-end="url(#d11-arr)"/>
+</g>
+<rect x="16" y="404" width="768" height="96" rx="6" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<g font-family="sans-serif" font-size="12" fill="#2d3142">
+<text x="32" y="428"><tspan font-weight="600">On a hit:</tspan> TTL returned = expires_at − now, so every downstream cache expires at the same instant.</text>
+<text x="32" y="450"><tspan font-weight="600">On a miss:</tspan> check the in-flight list, find the closest cached zone cut, ask its fastest server with RD=0.</text>
+<text x="32" y="472"><tspan font-weight="600">Caps:</tspan> stored TTL = min(TTL, max-ttl); negative entries get a separate, lower cap. Local policy.</text>
+<text x="32" y="492" fill="#8a8f98">Staleness grows only where a layer ignores the TTL it was handed: app caches, JVMs, pinned libraries.</text>
+</g>
+</svg>
+</div>
+<h3 id="d11-ttl-arithmetic">TTL arithmetic: remaining TTL flows downstream</h3>
+<p>Because each cache stores an absolute expiry, the TTL it hands downstream is the <em>remaining</em> time, not the original value. A stub that caches a resolver's answer expires at the same instant as the resolver's copy. Layers do not add up. That is the rule that makes migrations predictable.</p>
+<p>Two things do break the rule. First, any layer that ignores the TTL and pins its own value: an application cache, a JVM, a client library with a fixed refresh interval. Second, resolver caps. Resolvers clamp TTLs to a configured maximum and sometimes a minimum. Unbound's defaults are <code>cache-max-ttl: 86400</code> and <code>cache-max-negative-ttl: 3600</code>. BIND's are <code>max-cache-ttl 604800</code> (one week) and <code>max-ncache-ttl 10800</code> (three hours). Operators can and do change these, and some public resolvers enforce a floor. Treat any specific number as a default that varies.</p>
+<p>The script below does this arithmetic with a fake clock. Real output from the sandbox:</p>
+<div class="sourceCode" id="d11-cb1"><pre class="sourceCode python"><code class="sourceCode python"><span id="d11-cb1-1"><a href="#d11-cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;TTL arithmetic a resolver actually does: absolute expiry, remaining TTL handed</span></span>
+<span id="d11-cb1-2"><a href="#d11-cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">downstream, resolver caps, and RFC 2308 negative-cache TTL. Fake clock, no network.&quot;&quot;&quot;</span></span>
+<span id="d11-cb1-3"><a href="#d11-cb1-3" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> dataclasses <span class="im">import</span> dataclass</span>
+<span id="d11-cb1-4"><a href="#d11-cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb1-5"><a href="#d11-cb1-5" aria-hidden="true" tabindex="-1"></a><span class="at">@dataclass</span></span>
+<span id="d11-cb1-6"><a href="#d11-cb1-6" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Entry:</span>
+<span id="d11-cb1-7"><a href="#d11-cb1-7" aria-hidden="true" tabindex="-1"></a>    data: <span class="bu">str</span></span>
+<span id="d11-cb1-8"><a href="#d11-cb1-8" aria-hidden="true" tabindex="-1"></a>    expires: <span class="bu">float</span>          <span class="co"># absolute time, not a countdown</span></span>
+<span id="d11-cb1-9"><a href="#d11-cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb1-10"><a href="#d11-cb1-10" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Cache:</span>
+<span id="d11-cb1-11"><a href="#d11-cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="fu">__init__</span>(<span class="va">self</span>, name, max_ttl<span class="op">=</span><span class="dv">86400</span>, max_neg_ttl<span class="op">=</span><span class="dv">3600</span>):   <span class="co"># Unbound&#39;s defaults</span></span>
+<span id="d11-cb1-12"><a href="#d11-cb1-12" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.name, <span class="va">self</span>.max_ttl, <span class="va">self</span>.max_neg <span class="op">=</span> name, max_ttl, max_neg_ttl</span>
+<span id="d11-cb1-13"><a href="#d11-cb1-13" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.store <span class="op">=</span> {}</span>
+<span id="d11-cb1-14"><a href="#d11-cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb1-15"><a href="#d11-cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> put(<span class="va">self</span>, key, data, ttl, now, negative<span class="op">=</span><span class="va">False</span>):</span>
+<span id="d11-cb1-16"><a href="#d11-cb1-16" aria-hidden="true" tabindex="-1"></a>        ttl <span class="op">=</span> <span class="bu">min</span>(ttl, <span class="va">self</span>.max_neg <span class="cf">if</span> negative <span class="cf">else</span> <span class="va">self</span>.max_ttl)</span>
+<span id="d11-cb1-17"><a href="#d11-cb1-17" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.store[key] <span class="op">=</span> Entry(data, now <span class="op">+</span> ttl)</span>
+<span id="d11-cb1-18"><a href="#d11-cb1-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb1-19"><a href="#d11-cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> get(<span class="va">self</span>, key, now):</span>
+<span id="d11-cb1-20"><a href="#d11-cb1-20" aria-hidden="true" tabindex="-1"></a>        e <span class="op">=</span> <span class="va">self</span>.store.get(key)</span>
+<span id="d11-cb1-21"><a href="#d11-cb1-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> e <span class="kw">and</span> e.expires <span class="op">&gt;</span> now:</span>
+<span id="d11-cb1-22"><a href="#d11-cb1-22" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> e.data, <span class="bu">int</span>(e.expires <span class="op">-</span> now)  <span class="co"># remaining TTL is what goes downstream</span></span>
+<span id="d11-cb1-23"><a href="#d11-cb1-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">None</span>, <span class="dv">0</span></span>
+<span id="d11-cb1-24"><a href="#d11-cb1-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb1-25"><a href="#d11-cb1-25" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> negative_ttl(soa_ttl, soa_minimum):</span>
+<span id="d11-cb1-26"><a href="#d11-cb1-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">min</span>(soa_ttl, soa_minimum)             <span class="co"># RFC 2308 section 5</span></span>
+<span id="d11-cb1-27"><a href="#d11-cb1-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb1-28"><a href="#d11-cb1-28" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Remaining TTL flows down: layers do not add up, unless one pins its own TTL.</span></span>
+<span id="d11-cb1-29"><a href="#d11-cb1-29" aria-hidden="true" tabindex="-1"></a>resolver <span class="op">=</span> Cache(<span class="st">&quot;resolver&quot;</span>)</span>
+<span id="d11-cb1-30"><a href="#d11-cb1-30" aria-hidden="true" tabindex="-1"></a>stub <span class="op">=</span> Cache(<span class="st">&quot;stub&quot;</span>)</span>
+<span id="d11-cb1-31"><a href="#d11-cb1-31" aria-hidden="true" tabindex="-1"></a>resolver.put((<span class="st">&quot;api.example.com&quot;</span>, <span class="st">&quot;A&quot;</span>), <span class="st">&quot;203.0.113.10&quot;</span>, <span class="dv">300</span>, now<span class="op">=</span><span class="dv">0</span>)</span>
+<span id="d11-cb1-32"><a href="#d11-cb1-32" aria-hidden="true" tabindex="-1"></a>data, left <span class="op">=</span> resolver.get((<span class="st">&quot;api.example.com&quot;</span>, <span class="st">&quot;A&quot;</span>), now<span class="op">=</span><span class="dv">200</span>)</span>
+<span id="d11-cb1-33"><a href="#d11-cb1-33" aria-hidden="true" tabindex="-1"></a>stub.put((<span class="st">&quot;api.example.com&quot;</span>, <span class="st">&quot;A&quot;</span>), data, left, now<span class="op">=</span><span class="dv">200</span>)</span>
+<span id="d11-cb1-34"><a href="#d11-cb1-34" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;t=200 resolver hands stub </span><span class="sc">{</span>data<span class="sc">}</span><span class="ss"> with TTL </span><span class="sc">{</span>left<span class="sc">}</span><span class="ss">; stub expires at t=</span><span class="sc">{</span>stub<span class="sc">.</span>store[(<span class="st">&#39;api.example.com&#39;</span>,<span class="st">&#39;A&#39;</span>)]<span class="sc">.</span>expires<span class="sc">:.0f}</span><span class="ss">&quot;</span>)</span>
+<span id="d11-cb1-35"><a href="#d11-cb1-35" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;      both copies die at t=300: worst-case staleness is 300s, not 300+300s&quot;</span>)</span>
+<span id="d11-cb1-36"><a href="#d11-cb1-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb1-37"><a href="#d11-cb1-37" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. A JVM-style app cache that ignores TTL and pins 30s on top of everything.</span></span>
+<span id="d11-cb1-38"><a href="#d11-cb1-38" aria-hidden="true" tabindex="-1"></a>app_pin <span class="op">=</span> <span class="dv">30</span></span>
+<span id="d11-cb1-39"><a href="#d11-cb1-39" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;      ...but an app cache that pins </span><span class="sc">{</span>app_pin<span class="sc">}</span><span class="ss">s after its own fetch makes it </span><span class="sc">{</span><span class="dv">300</span> <span class="op">+</span> app_pin<span class="sc">}</span><span class="ss">s&quot;</span>)</span>
+<span id="d11-cb1-40"><a href="#d11-cb1-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb1-41"><a href="#d11-cb1-41" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. Negative caching: SOA in the authority section decides how long NXDOMAIN lives.</span></span>
+<span id="d11-cb1-42"><a href="#d11-cb1-42" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> soa_ttl, minimum <span class="kw">in</span> [(<span class="dv">3600</span>, <span class="dv">300</span>), (<span class="dv">900</span>, <span class="dv">86400</span>), (<span class="dv">86400</span>, <span class="dv">86400</span>)]:</span>
+<span id="d11-cb1-43"><a href="#d11-cb1-43" aria-hidden="true" tabindex="-1"></a>    neg <span class="op">=</span> negative_ttl(soa_ttl, minimum)</span>
+<span id="d11-cb1-44"><a href="#d11-cb1-44" aria-hidden="true" tabindex="-1"></a>    capped <span class="op">=</span> <span class="bu">min</span>(neg, resolver.max_neg)</span>
+<span id="d11-cb1-45"><a href="#d11-cb1-45" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;NXDOMAIN with SOA TTL=</span><span class="sc">{</span>soa_ttl<span class="sc">:5d}</span><span class="ss">, MINIMUM=</span><span class="sc">{</span>minimum<span class="sc">:5d}</span><span class="ss">: negative TTL=</span><span class="sc">{</span>neg<span class="sc">:5d}</span><span class="ss">s, &quot;</span></span>
+<span id="d11-cb1-46"><a href="#d11-cb1-46" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;after a 3600s resolver cap: </span><span class="sc">{</span>capped<span class="sc">}</span><span class="ss">s&quot;</span>)</span>
+<span id="d11-cb1-47"><a href="#d11-cb1-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb1-48"><a href="#d11-cb1-48" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. Migration: lowering TTL is itself a cached change.</span></span>
+<span id="d11-cb1-49"><a href="#d11-cb1-49" aria-hidden="true" tabindex="-1"></a>old_ttl, new_ttl <span class="op">=</span> <span class="dv">86400</span>, <span class="dv">300</span></span>
+<span id="d11-cb1-50"><a href="#d11-cb1-50" aria-hidden="true" tabindex="-1"></a>lowered_at <span class="op">=</span> <span class="dv">0</span></span>
+<span id="d11-cb1-51"><a href="#d11-cb1-51" aria-hidden="true" tabindex="-1"></a>safe_change <span class="op">=</span> lowered_at <span class="op">+</span> old_ttl</span>
+<span id="d11-cb1-52"><a href="#d11-cb1-52" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;lower TTL </span><span class="sc">{</span>old_ttl<span class="sc">}</span><span class="ss">-&gt;</span><span class="sc">{</span>new_ttl<span class="sc">}</span><span class="ss"> at t=0; last copy with the old TTL can live until t=</span><span class="sc">{</span>safe_change<span class="sc">}</span><span class="ss">s&quot;</span></span>
+<span id="d11-cb1-53"><a href="#d11-cb1-53" aria-hidden="true" tabindex="-1"></a>      <span class="ss">f&quot; (</span><span class="sc">{</span>safe_change<span class="op">/</span><span class="dv">3600</span><span class="sc">:.0f}</span><span class="ss"> h); change the record after that and staleness is &lt;= </span><span class="sc">{</span>new_ttl<span class="sc">}</span><span class="ss">s&quot;</span>)</span>
+<span id="d11-cb1-54"><a href="#d11-cb1-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb1-55"><a href="#d11-cb1-55" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. Authoritative load: at most one refetch per busy cache per TTL (an upper bound).</span></span>
+<span id="d11-cb1-56"><a href="#d11-cb1-56" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> caches <span class="kw">in</span> (<span class="dv">20_000</span>, <span class="dv">200_000</span>):</span>
+<span id="d11-cb1-57"><a href="#d11-cb1-57" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> ttl <span class="kw">in</span> (<span class="dv">30</span>, <span class="dv">300</span>, <span class="dv">3600</span>):</span>
+<span id="d11-cb1-58"><a href="#d11-cb1-58" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span>caches<span class="sc">:7,d}</span><span class="ss"> independent resolver caches, TTL </span><span class="sc">{</span>ttl<span class="sc">:4d}</span><span class="ss">s -&gt; ~</span><span class="sc">{</span>caches<span class="op">/</span>ttl<span class="sc">:8.1f}</span><span class="ss"> qps per RRset at the authority&quot;</span>)</span></code></pre></div>
+<pre class="text"><code>t=200 resolver hands stub 203.0.113.10 with TTL 100; stub expires at t=300
+      both copies die at t=300: worst-case staleness is 300s, not 300+300s
+      ...but an app cache that pins 30s after its own fetch makes it 330s
+NXDOMAIN with SOA TTL= 3600, MINIMUM=  300: negative TTL=  300s, after a 3600s resolver cap: 300s
+NXDOMAIN with SOA TTL=  900, MINIMUM=86400: negative TTL=  900s, after a 3600s resolver cap: 900s
+NXDOMAIN with SOA TTL=86400, MINIMUM=86400: negative TTL=86400s, after a 3600s resolver cap: 3600s
+lower TTL 86400-&gt;300 at t=0; last copy with the old TTL can live until t=86400s (24 h); change the record after that and staleness is &lt;= 300s
+   20,000 independent resolver caches, TTL   30s -&gt; ~   666.7 qps per RRset at the authority
+   20,000 independent resolver caches, TTL  300s -&gt; ~    66.7 qps per RRset at the authority
+   20,000 independent resolver caches, TTL 3600s -&gt; ~     5.6 qps per RRset at the authority
+  200,000 independent resolver caches, TTL   30s -&gt; ~  6666.7 qps per RRset at the authority
+  200,000 independent resolver caches, TTL  300s -&gt; ~   666.7 qps per RRset at the authority
+  200,000 independent resolver caches, TTL 3600s -&gt; ~    55.6 qps per RRset at the authority</code></pre>
+<p>Read the migration line twice. Lowering the TTL is itself a DNS change, so it is subject to the <em>old</em> TTL. If you lower from 86400 to 300 at noon on Tuesday, a resolver that fetched the record at 11:59 still holds it, with the old TTL, until 11:59 on Wednesday. Change the address before then and that resolver serves the old one for up to a day.</p>
+<p>The last block is the other side of the trade. Each busy resolver cache refetches a record roughly once per TTL, so authoritative load scales as (number of independent caches) ÷ TTL. It is an upper bound, because idle caches don't refetch. Note "independent caches": a large public resolver is not one cache. It is many anycast sites, and often several cache instances per site, so it can count as hundreds of caches against your authority.</p>
+<h3 id="d11-negative-caching">Negative caching, precisely</h3>
+<p>A "no" comes in two shapes, and resolvers cache them differently.</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Response</th>
+<th>Header</th>
+<th>Means</th>
+<th>Cached per</th>
+<th>Typical cause</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>NXDOMAIN</td>
+<td><code>status: NXDOMAIN</code> (RCODE 3)</td>
+<td>The name does not exist, for any type</td>
+<td>name</td>
+<td>typo, deleted record, record not created yet</td>
+</tr>
+<tr class="even">
+<td>NODATA</td>
+<td><code>status: NOERROR</code>, <code>ANSWER: 0</code></td>
+<td>The name exists, but not with this type</td>
+<td>(name, type)</td>
+<td>asking AAAA for an IPv4-only host</td>
+</tr>
+</tbody>
+</table>
+<p>Both carry the zone's SOA record in the authority section. RFC 2308 says the negative TTL is the smaller of two numbers: the SOA record's own TTL and the SOA's MINIMUM field (the last number in the record). The script above shows the three common combinations. A resolver cap can only shorten the result.</p>
+<p>Two refinements matter in 2026. RFC 8020 says an NXDOMAIN means <em>nothing exists below that name either</em>, so a resolver may answer NXDOMAIN for <code>a.b.gone.example.com</code> straight from a cached NXDOMAIN for <code>gone.example.com</code>. And RFC 8198 ("aggressive NSEC") lets a validating resolver use signed NSEC ranges it already holds to synthesize NXDOMAIN for names it has never asked about. Both make "it doesn't exist" stickier than people expect.</p>
+<h2 id="d11-wire">Deep dive: what the wire actually shows</h2>
+<h3 id="d11-dig-trace"><code>dig +trace</code>, read line by line</h3>
+<p><code>dig +trace</code> does not ask your resolver to recurse. It asks your resolver once for the root NS set, then plays recursive resolver itself: it queries a root server, follows the referral to <code>.com</code>, follows the next referral to the zone's servers, and prints each response. Constructed illustration (realistic shape and numbers, your output will differ; signatures and digests elided):</p>
+<pre class="text"><code>$ dig +trace www.example.com                # run on your Mac — your output will differ
+
+; &lt;&lt;&gt;&gt; DiG 9.10.6 &lt;&lt;&gt;&gt; +trace www.example.com
+;; global options: +cmd
+.                   517913  IN  NS     a.root-servers.net.          # (1)
+.                   517913  IN  NS     b.root-servers.net.
+  ... 11 more root NS records ...
+.                   517913  IN  RRSIG  NS 8 0 518400 20261029170000 20261016160000 &lt;tag&gt; . &lt;sig&gt;
+;; Received 525 bytes from 192.168.1.1#53(192.168.1.1) in 9 ms     # (2)
+
+com.                172800  IN  NS     a.gtld-servers.net.          # (3)
+  ... 12 more .com NS records ...
+com.                86400   IN  DS     &lt;tag&gt; 13 2 &lt;sha-256 digest&gt;  # (4)
+com.                86400   IN  RRSIG  DS 8 1 86400 20261030050000 20261017040000 &lt;tag&gt; . &lt;sig&gt;
+;; Received 1171 bytes from 199.7.83.42#53(l.root-servers.net) in 21 ms
+
+example.com.        172800  IN  NS     ns1.example.com.             # (5)
+example.com.        172800  IN  NS     ns2.example.com.
+example.com.        86400   IN  DS     &lt;tag&gt; 13 2 &lt;sha-256 digest&gt;
+example.com.        86400   IN  RRSIG  DS 13 2 86400 20261023041528 20261016030528 &lt;tag&gt; com. &lt;sig&gt;
+;; Received 330 bytes from 192.12.94.30#53(e.gtld-servers.net) in 33 ms
+
+www.example.com.    300     IN  A      198.51.100.44                # (6)
+www.example.com.    300     IN  RRSIG  A 13 3 300 20261031000000 20261017000000 &lt;tag&gt; example.com. &lt;sig&gt;
+;; Received 191 bytes from 203.0.113.53#53(ns1.example.com) in 18 ms</code></pre>
+<ol type="1">
+<li>The root NS set came from your <em>local resolver's cache</em>. You can tell because the TTL is 517913, not the root zone's 518400 (six days). The resolver fetched it 487 seconds ago and is counting down.</li>
+<li>"Received … from 192.168.1.1" confirms it. Every later block comes from a different server, picked at random by <code>dig</code>.</li>
+<li>The root's referral. The root zone serves <code>.com</code>'s NS records with TTL 172800 (two days). These sit in the <strong>authority</strong> section of a non-authoritative response. <code>dig +trace</code> hides the glue A/AAAA records in the additional section; add <code>+additional</code> to see them.</li>
+<li>The DS record is the DNSSEC link from root to <code>.com</code>: a hash of <code>.com</code>'s key-signing key, signed by the root (algorithm 8 is RSA/SHA-256, labels 1). The two long numbers in every RRSIG are the expiration and inception times. A signature outside that window is invalid, no matter how good the math.</li>
+<li><code>.com</code>'s referral to the zone, with the zone's own DS. Notice the RRSIG on this DS has signer <code>com.</code>: each parent signs the link to its child.</li>
+<li>The authoritative answer, with its own signature by <code>example.com.</code> (labels 3 = <code>www.example.com</code>). The 18 ms is one RTT to the zone's nameserver.</li>
+</ol>
+<p>What the trace does <em>not</em> show is just as useful. It bypasses your resolver's cache, so it shows what the world will see after caches expire, not what your users see now. That makes it the right tool after a change ("is the delegation right?") and the wrong tool for "why is my laptop still getting the old IP?" For that, <code>dig www.example.com</code> against your normal resolver and watch the TTL count down.</p>
+<p>One macOS warning. The <code>dig</code> that ships with macOS is BIND 9.10.6, and it reads <code>/etc/resolv.conf</code> directly. It ignores the per-domain rules that <code>mDNSResponder</code> applies to every real application, such as VPN split DNS and <code>/etc/resolver/*</code> files. To see what applications see, use <code>dscacheutil -q host -a name www.example.com</code>. For newer <code>dig</code> features used below (<code>+https</code>, Extended DNS Error output), install a current BIND with <code>brew install bind</code>. On Linux, <code>getent ahosts www.example.com</code> follows the same path as <code>getaddrinfo()</code>, and <code>resolvectl query</code> does the same when systemd-resolved is in use.</p>
+<h3 id="d11-nxdomain">An NXDOMAIN, and the number that controls it</h3>
+<pre class="text"><code>$ dig newapi.example.com                    # constructed illustration
+;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: NXDOMAIN, id: 60120
+;; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 1, ADDITIONAL: 1
+
+;; AUTHORITY SECTION:
+example.com.  3412  IN  SOA  ns1.example.com. hostmaster.example.com. 2026101601 7200 3600 1209600 3600</code></pre>
+<p>The SOA fields after the two names are serial, refresh, retry, expire and MINIMUM. Here MINIMUM is 3600 and the SOA's TTL was also 3600, so the negative TTL is 3600 seconds. The resolver has held this "no" for 188 seconds, which is why the SOA's TTL now reads 3412. If you create <code>newapi</code> right now, this resolver keeps saying it doesn't exist for another 57 minutes. The fix is not to flush everything. It is to never query a name before creating it: health checks and deploy scripts that "probe whether the record is live yet" poison the cache they are waiting on.</p>
+<h3 id="d11-edns">EDNS0: how a 12-byte header asks for bigger answers</h3>
+<p>The original limit for DNS over UDP was 512 bytes. EDNS0 (RFC 6891) lifts it with a pseudo-record called OPT, placed in the additional section. OPT reuses the record fields for new meanings:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Field</th>
+<th>Normal meaning</th>
+<th>In OPT</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>NAME</td>
+<td>owner name</td>
+<td>always root (one zero byte)</td>
+</tr>
+<tr class="even">
+<td>TYPE</td>
+<td>record type</td>
+<td>41</td>
+</tr>
+<tr class="odd">
+<td>CLASS</td>
+<td>IN (1)</td>
+<td>the sender's UDP payload size</td>
+</tr>
+<tr class="even">
+<td>TTL (32 bits)</td>
+<td>cache time</td>
+<td>extended RCODE (8) · version (8) · DO bit (1) · zero (15)</td>
+</tr>
+<tr class="odd">
+<td>RDATA</td>
+<td>record data</td>
+<td>options: cookies, padding, client subnet, EDE…</td>
+</tr>
+</tbody>
+</table>
+<p>The script below builds a query by hand, runs a tiny authoritative server on localhost, and serves an answer too big for the advertised buffer. The server sets TC; the client retries the same query over TCP, where every message gets a 2-byte length prefix (RFC 1035 §4.2.2). Real output:</p>
+<div class="sourceCode" id="d11-cb5"><pre class="sourceCode python"><code class="sourceCode python"><span id="d11-cb5-1"><a href="#d11-cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;A tiny authoritative server on localhost that answers over UDP and TCP.</span></span>
+<span id="d11-cb5-2"><a href="#d11-cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co">The client advertises an EDNS0 buffer of 1232 bytes; the answer is bigger,</span></span>
+<span id="d11-cb5-3"><a href="#d11-cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co">so the server sets TC=1 over UDP and the client retries over TCP.&quot;&quot;&quot;</span></span>
+<span id="d11-cb5-4"><a href="#d11-cb5-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> socket, socketserver, struct, threading, time</span>
+<span id="d11-cb5-5"><a href="#d11-cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-6"><a href="#d11-cb5-6" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> qname(name):</span>
+<span id="d11-cb5-7"><a href="#d11-cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="st">b&quot;&quot;</span>.join(<span class="bu">bytes</span>([<span class="bu">len</span>(p)]) <span class="op">+</span> p.encode() <span class="cf">for</span> p <span class="kw">in</span> name.rstrip(<span class="st">&quot;.&quot;</span>).split(<span class="st">&quot;.&quot;</span>)) <span class="op">+</span> <span class="st">b&quot;</span><span class="ch">\0</span><span class="st">&quot;</span></span>
+<span id="d11-cb5-8"><a href="#d11-cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-9"><a href="#d11-cb5-9" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> build_query(qid, name, qtype<span class="op">=</span><span class="dv">16</span>, bufsize<span class="op">=</span><span class="dv">1232</span>, do<span class="op">=</span><span class="va">False</span>):</span>
+<span id="d11-cb5-10"><a href="#d11-cb5-10" aria-hidden="true" tabindex="-1"></a>    hdr <span class="op">=</span> struct.pack(<span class="st">&quot;!HHHHHH&quot;</span>, qid, <span class="bn">0x0100</span>, <span class="dv">1</span>, <span class="dv">0</span>, <span class="dv">0</span>, <span class="dv">1</span>)      <span class="co"># RD=1, QD=1, AR=1</span></span>
+<span id="d11-cb5-11"><a href="#d11-cb5-11" aria-hidden="true" tabindex="-1"></a>    q <span class="op">=</span> qname(name) <span class="op">+</span> struct.pack(<span class="st">&quot;!HH&quot;</span>, qtype, <span class="dv">1</span>)</span>
+<span id="d11-cb5-12"><a href="#d11-cb5-12" aria-hidden="true" tabindex="-1"></a>    ttl_field <span class="op">=</span> <span class="bn">0x00008000</span> <span class="cf">if</span> do <span class="cf">else</span> <span class="dv">0</span>                           <span class="co"># ext-rcode|ver|DO|Z</span></span>
+<span id="d11-cb5-13"><a href="#d11-cb5-13" aria-hidden="true" tabindex="-1"></a>    opt <span class="op">=</span> <span class="st">b&quot;</span><span class="ch">\0</span><span class="st">&quot;</span> <span class="op">+</span> struct.pack(<span class="st">&quot;!HHIH&quot;</span>, <span class="dv">41</span>, bufsize, ttl_field, <span class="dv">0</span>) <span class="co"># root name, TYPE=OPT</span></span>
+<span id="d11-cb5-14"><a href="#d11-cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> hdr <span class="op">+</span> q <span class="op">+</span> opt</span>
+<span id="d11-cb5-15"><a href="#d11-cb5-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-16"><a href="#d11-cb5-16" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> parse_header(msg):</span>
+<span id="d11-cb5-17"><a href="#d11-cb5-17" aria-hidden="true" tabindex="-1"></a>    qid, flags, qd, an, ns, ar <span class="op">=</span> struct.unpack(<span class="st">&quot;!HHHHHH&quot;</span>, msg[:<span class="dv">12</span>])</span>
+<span id="d11-cb5-18"><a href="#d11-cb5-18" aria-hidden="true" tabindex="-1"></a>    names <span class="op">=</span> [n <span class="cf">for</span> b, n <span class="kw">in</span> [(<span class="dv">15</span>, <span class="st">&quot;qr&quot;</span>), (<span class="dv">10</span>, <span class="st">&quot;aa&quot;</span>), (<span class="dv">9</span>, <span class="st">&quot;tc&quot;</span>), (<span class="dv">8</span>, <span class="st">&quot;rd&quot;</span>), (<span class="dv">7</span>, <span class="st">&quot;ra&quot;</span>)] <span class="cf">if</span> flags <span class="op">&gt;&gt;</span> b <span class="op">&amp;</span> <span class="dv">1</span>]</span>
+<span id="d11-cb5-19"><a href="#d11-cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> qid, <span class="st">&quot; &quot;</span>.join(names), flags <span class="op">&amp;</span> <span class="bn">0xF</span>, an</span>
+<span id="d11-cb5-20"><a href="#d11-cb5-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-21"><a href="#d11-cb5-21" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> client_bufsize(query):</span>
+<span id="d11-cb5-22"><a href="#d11-cb5-22" aria-hidden="true" tabindex="-1"></a>    <span class="co"># OPT RR is the last 11 bytes of our query: name(1) type(2) class(2) ttl(4) rdlen(2)</span></span>
+<span id="d11-cb5-23"><a href="#d11-cb5-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, query[<span class="op">-</span><span class="dv">8</span>:<span class="op">-</span><span class="dv">6</span>])[<span class="dv">0</span>] <span class="cf">if</span> <span class="bu">len</span>(query) <span class="op">&gt;</span> <span class="dv">12</span> <span class="cf">else</span> <span class="dv">512</span></span>
+<span id="d11-cb5-24"><a href="#d11-cb5-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-25"><a href="#d11-cb5-25" aria-hidden="true" tabindex="-1"></a><span class="co"># Zone data: eight 200-byte TXT strings, like a domain with lots of verification tokens.</span></span>
+<span id="d11-cb5-26"><a href="#d11-cb5-26" aria-hidden="true" tabindex="-1"></a>TXT <span class="op">=</span> [(<span class="st">&quot;v</span><span class="sc">%d</span><span class="st">=&quot;</span> <span class="op">%</span> i <span class="op">+</span> <span class="st">&quot;x&quot;</span> <span class="op">*</span> <span class="dv">196</span>).encode() <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">8</span>)]</span>
+<span id="d11-cb5-27"><a href="#d11-cb5-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-28"><a href="#d11-cb5-28" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> answer(query):</span>
+<span id="d11-cb5-29"><a href="#d11-cb5-29" aria-hidden="true" tabindex="-1"></a>    qid <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, query[:<span class="dv">2</span>])[<span class="dv">0</span>]</span>
+<span id="d11-cb5-30"><a href="#d11-cb5-30" aria-hidden="true" tabindex="-1"></a>    end <span class="op">=</span> query.index(<span class="st">b&quot;</span><span class="ch">\0</span><span class="st">&quot;</span>, <span class="dv">12</span>) <span class="op">+</span> <span class="dv">5</span></span>
+<span id="d11-cb5-31"><a href="#d11-cb5-31" aria-hidden="true" tabindex="-1"></a>    question <span class="op">=</span> query[<span class="dv">12</span>:end]</span>
+<span id="d11-cb5-32"><a href="#d11-cb5-32" aria-hidden="true" tabindex="-1"></a>    rrs <span class="op">=</span> <span class="st">b&quot;&quot;</span>.join(<span class="st">b&quot;</span><span class="ch">\xc0\x0c</span><span class="st">&quot;</span> <span class="op">+</span> struct.pack(<span class="st">&quot;!HHIH&quot;</span>, <span class="dv">16</span>, <span class="dv">1</span>, <span class="dv">300</span>, <span class="bu">len</span>(t) <span class="op">+</span> <span class="dv">1</span>) <span class="op">+</span> <span class="bu">bytes</span>([<span class="bu">len</span>(t)]) <span class="op">+</span> t</span>
+<span id="d11-cb5-33"><a href="#d11-cb5-33" aria-hidden="true" tabindex="-1"></a>                   <span class="cf">for</span> t <span class="kw">in</span> TXT)</span>
+<span id="d11-cb5-34"><a href="#d11-cb5-34" aria-hidden="true" tabindex="-1"></a>    hdr <span class="op">=</span> struct.pack(<span class="st">&quot;!HHHHHH&quot;</span>, qid, <span class="bn">0x8500</span>, <span class="dv">1</span>, <span class="bu">len</span>(TXT), <span class="dv">0</span>, <span class="dv">0</span>)  <span class="co"># QR AA RD, NOERROR</span></span>
+<span id="d11-cb5-35"><a href="#d11-cb5-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> hdr <span class="op">+</span> question <span class="op">+</span> rrs</span>
+<span id="d11-cb5-36"><a href="#d11-cb5-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-37"><a href="#d11-cb5-37" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> UDP(socketserver.BaseRequestHandler):</span>
+<span id="d11-cb5-38"><a href="#d11-cb5-38" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> handle(<span class="va">self</span>):</span>
+<span id="d11-cb5-39"><a href="#d11-cb5-39" aria-hidden="true" tabindex="-1"></a>        data, sock <span class="op">=</span> <span class="va">self</span>.request</span>
+<span id="d11-cb5-40"><a href="#d11-cb5-40" aria-hidden="true" tabindex="-1"></a>        full <span class="op">=</span> answer(data)</span>
+<span id="d11-cb5-41"><a href="#d11-cb5-41" aria-hidden="true" tabindex="-1"></a>        limit <span class="op">=</span> client_bufsize(data)</span>
+<span id="d11-cb5-42"><a href="#d11-cb5-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="bu">len</span>(full) <span class="op">&gt;</span> limit:  <span class="co"># truncate: header + question only, TC bit set</span></span>
+<span id="d11-cb5-43"><a href="#d11-cb5-43" aria-hidden="true" tabindex="-1"></a>            end <span class="op">=</span> data.index(<span class="st">b&quot;</span><span class="ch">\0</span><span class="st">&quot;</span>, <span class="dv">12</span>) <span class="op">+</span> <span class="dv">5</span></span>
+<span id="d11-cb5-44"><a href="#d11-cb5-44" aria-hidden="true" tabindex="-1"></a>            hdr <span class="op">=</span> <span class="bu">bytearray</span>(full[:<span class="dv">12</span>])<span class="op">;</span> hdr[<span class="dv">2</span>] <span class="op">|=</span> <span class="bn">0x02</span><span class="op">;</span> hdr[<span class="dv">6</span>:<span class="dv">8</span>] <span class="op">=</span> <span class="st">b&quot;</span><span class="ch">\0\0</span><span class="st">&quot;</span></span>
+<span id="d11-cb5-45"><a href="#d11-cb5-45" aria-hidden="true" tabindex="-1"></a>            full <span class="op">=</span> <span class="bu">bytes</span>(hdr) <span class="op">+</span> data[<span class="dv">12</span>:end]</span>
+<span id="d11-cb5-46"><a href="#d11-cb5-46" aria-hidden="true" tabindex="-1"></a>        sock.sendto(full, <span class="va">self</span>.client_address)</span>
+<span id="d11-cb5-47"><a href="#d11-cb5-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-48"><a href="#d11-cb5-48" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> TCP(socketserver.BaseRequestHandler):</span>
+<span id="d11-cb5-49"><a href="#d11-cb5-49" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> handle(<span class="va">self</span>):</span>
+<span id="d11-cb5-50"><a href="#d11-cb5-50" aria-hidden="true" tabindex="-1"></a>        n <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, <span class="va">self</span>.request.recv(<span class="dv">2</span>))[<span class="dv">0</span>]   <span class="co"># 2-byte length prefix (RFC 1035 4.2.2)</span></span>
+<span id="d11-cb5-51"><a href="#d11-cb5-51" aria-hidden="true" tabindex="-1"></a>        data <span class="op">=</span> <span class="st">b&quot;&quot;</span></span>
+<span id="d11-cb5-52"><a href="#d11-cb5-52" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="bu">len</span>(data) <span class="op">&lt;</span> n:</span>
+<span id="d11-cb5-53"><a href="#d11-cb5-53" aria-hidden="true" tabindex="-1"></a>            data <span class="op">+=</span> <span class="va">self</span>.request.recv(n <span class="op">-</span> <span class="bu">len</span>(data))</span>
+<span id="d11-cb5-54"><a href="#d11-cb5-54" aria-hidden="true" tabindex="-1"></a>        resp <span class="op">=</span> answer(data)</span>
+<span id="d11-cb5-55"><a href="#d11-cb5-55" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.request.sendall(struct.pack(<span class="st">&quot;!H&quot;</span>, <span class="bu">len</span>(resp)) <span class="op">+</span> resp)</span>
+<span id="d11-cb5-56"><a href="#d11-cb5-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-57"><a href="#d11-cb5-57" aria-hidden="true" tabindex="-1"></a>udp <span class="op">=</span> socketserver.UDPServer((<span class="st">&quot;127.0.0.1&quot;</span>, <span class="dv">0</span>), UDP)</span>
+<span id="d11-cb5-58"><a href="#d11-cb5-58" aria-hidden="true" tabindex="-1"></a>port <span class="op">=</span> udp.server_address[<span class="dv">1</span>]</span>
+<span id="d11-cb5-59"><a href="#d11-cb5-59" aria-hidden="true" tabindex="-1"></a>tcp <span class="op">=</span> socketserver.TCPServer((<span class="st">&quot;127.0.0.1&quot;</span>, port), TCP)</span>
+<span id="d11-cb5-60"><a href="#d11-cb5-60" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> s <span class="kw">in</span> (udp, tcp):</span>
+<span id="d11-cb5-61"><a href="#d11-cb5-61" aria-hidden="true" tabindex="-1"></a>    threading.Thread(target<span class="op">=</span>s.serve_forever, daemon<span class="op">=</span><span class="va">True</span>).start()</span>
+<span id="d11-cb5-62"><a href="#d11-cb5-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-63"><a href="#d11-cb5-63" aria-hidden="true" tabindex="-1"></a>q <span class="op">=</span> build_query(<span class="bn">0x4d2a</span>, <span class="st">&quot;big.example.test&quot;</span>, bufsize<span class="op">=</span><span class="dv">1232</span>, do<span class="op">=</span><span class="va">True</span>)</span>
+<span id="d11-cb5-64"><a href="#d11-cb5-64" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;query: </span><span class="sc">{</span><span class="bu">len</span>(q)<span class="sc">}</span><span class="ss"> bytes, EDNS bufsize=</span><span class="sc">{</span>client_bufsize(q)<span class="sc">}</span><span class="ss">, DO=1&quot;</span>)</span>
+<span id="d11-cb5-65"><a href="#d11-cb5-65" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;  hex:&quot;</span>, q.<span class="bu">hex</span>(<span class="st">&quot; &quot;</span>))</span>
+<span id="d11-cb5-66"><a href="#d11-cb5-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-67"><a href="#d11-cb5-67" aria-hidden="true" tabindex="-1"></a>t0 <span class="op">=</span> time.perf_counter()</span>
+<span id="d11-cb5-68"><a href="#d11-cb5-68" aria-hidden="true" tabindex="-1"></a>u <span class="op">=</span> socket.socket(socket.AF_INET, socket.SOCK_DGRAM)<span class="op">;</span> u.settimeout(<span class="dv">2</span>)</span>
+<span id="d11-cb5-69"><a href="#d11-cb5-69" aria-hidden="true" tabindex="-1"></a>u.sendto(q, (<span class="st">&quot;127.0.0.1&quot;</span>, port))</span>
+<span id="d11-cb5-70"><a href="#d11-cb5-70" aria-hidden="true" tabindex="-1"></a>r, _ <span class="op">=</span> u.recvfrom(<span class="dv">65535</span>)</span>
+<span id="d11-cb5-71"><a href="#d11-cb5-71" aria-hidden="true" tabindex="-1"></a>qid, flags, rcode, an <span class="op">=</span> parse_header(r)</span>
+<span id="d11-cb5-72"><a href="#d11-cb5-72" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;UDP reply: </span><span class="sc">{</span><span class="bu">len</span>(r)<span class="sc">}</span><span class="ss"> bytes  id=</span><span class="sc">{</span>qid<span class="sc">:#06x}</span><span class="ss"> flags=[</span><span class="sc">{</span>flags<span class="sc">}</span><span class="ss">] rcode=</span><span class="sc">{</span>rcode<span class="sc">}</span><span class="ss"> answers=</span><span class="sc">{</span>an<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d11-cb5-73"><a href="#d11-cb5-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb5-74"><a href="#d11-cb5-74" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="st">&quot;tc&quot;</span> <span class="kw">in</span> flags:</span>
+<span id="d11-cb5-75"><a href="#d11-cb5-75" aria-hidden="true" tabindex="-1"></a>    t <span class="op">=</span> socket.create_connection((<span class="st">&quot;127.0.0.1&quot;</span>, port), timeout<span class="op">=</span><span class="dv">2</span>)</span>
+<span id="d11-cb5-76"><a href="#d11-cb5-76" aria-hidden="true" tabindex="-1"></a>    t.sendall(struct.pack(<span class="st">&quot;!H&quot;</span>, <span class="bu">len</span>(q)) <span class="op">+</span> q)</span>
+<span id="d11-cb5-77"><a href="#d11-cb5-77" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, t.recv(<span class="dv">2</span>))[<span class="dv">0</span>]</span>
+<span id="d11-cb5-78"><a href="#d11-cb5-78" aria-hidden="true" tabindex="-1"></a>    r <span class="op">=</span> <span class="st">b&quot;&quot;</span></span>
+<span id="d11-cb5-79"><a href="#d11-cb5-79" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="bu">len</span>(r) <span class="op">&lt;</span> n:</span>
+<span id="d11-cb5-80"><a href="#d11-cb5-80" aria-hidden="true" tabindex="-1"></a>        r <span class="op">+=</span> t.recv(n <span class="op">-</span> <span class="bu">len</span>(r))</span>
+<span id="d11-cb5-81"><a href="#d11-cb5-81" aria-hidden="true" tabindex="-1"></a>    qid, flags, rcode, an <span class="op">=</span> parse_header(r)</span>
+<span id="d11-cb5-82"><a href="#d11-cb5-82" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;TCP reply: </span><span class="sc">{</span><span class="bu">len</span>(r)<span class="sc">}</span><span class="ss"> bytes  id=</span><span class="sc">{</span>qid<span class="sc">:#06x}</span><span class="ss"> flags=[</span><span class="sc">{</span>flags<span class="sc">}</span><span class="ss">] rcode=</span><span class="sc">{</span>rcode<span class="sc">}</span><span class="ss"> answers=</span><span class="sc">{</span>an<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d11-cb5-83"><a href="#d11-cb5-83" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;total </span><span class="sc">{</span><span class="dv">1000</span><span class="op">*</span>(time.perf_counter()<span class="op">-</span>t0)<span class="sc">:.2f}</span><span class="ss"> ms on loopback (one extra RTT + TCP handshake on a real path)&quot;</span>)</span></code></pre></div>
+<pre class="text"><code>query: 45 bytes, EDNS bufsize=1232, DO=1
+  hex: 4d 2a 01 00 00 01 00 00 00 00 00 01 03 62 69 67 07 65 78 61 6d 70 6c 65 04 74 65 73 74 00 00 10 00 01 00 00 29 04 d0 00 00 80 00 00 00
+UDP reply: 34 bytes  id=0x4d2a flags=[qr aa tc rd] rcode=0 answers=0
+TCP reply: 1730 bytes  id=0x4d2a flags=[qr aa rd] rcode=0 answers=8
+total 6.55 ms on loopback (one extra RTT + TCP handshake on a real path)</code></pre>
+<p>Decode the last 11 bytes of the query: <code>00</code> (root name), <code>00 29</code> (TYPE 41), <code>04 d0</code> (1232), <code>00 00 80 00</code> (extended RCODE 0, version 0, DO bit set), <code>00 00</code> (no options). The UDP reply is 34 bytes: header plus question, zero answers, <code>tc</code> set. Over TCP the same answer is 1730 bytes. On a real path the fallback costs a TCP handshake plus one more round trip, so roughly two RTTs on top of the wasted UDP exchange.</p>
+<p>Why 1232? It is the payload that fits an IPv6 minimum-MTU packet without fragmentation: 1280 − 40 (IPv6 header) − 8 (UDP header). DNS Flag Day 2020 made it the recommended default, and current BIND and Unbound ship with it. Larger buffers (4096 was the old habit) invite IP fragmentation. Fragments get dropped by firewalls that can't see the UDP header in non-first fragments, and fragmented answers have been used for cache-poisoning attacks. A truncated answer that falls back to TCP is slower; a fragmented answer that vanishes is a timeout. Resolvers prefer the first.</p>
+<p>This is also why TCP/53 is not optional. RFC 7766 requires DNS implementations to support TCP, and RFC 9210 makes it an operational requirement for servers and the networks in front of them.</p>
+<h3 id="d11-dnssec">The DNSSEC chain, as a validator walks it</h3>
+<p>DNSSEC adds signatures, not encryption. Answers are still readable on the wire; they just become unforgeable. A validating resolver proves <code>www.example.com A</code> like this:</p>
+<ol type="1">
+<li>It holds one <strong>trust anchor</strong>: the root zone's key-signing key (KSK), configured locally and updated automatically under RFC 5011.</li>
+<li>It fetches the root's DNSKEY set and checks that the set is signed by the anchored KSK. That makes the root's zone-signing key (ZSK) trusted.</li>
+<li>It checks the RRSIG on the root's <code>com. DS</code> record with the root ZSK. The DS is a hash of <code>.com</code>'s KSK.</li>
+<li>It fetches <code>.com</code>'s DNSKEY set, hashes the KSK, and compares to the DS. Match: <code>.com</code>'s keys are trusted. Repeat one level down for <code>example.com</code>'s DS and DNSKEY.</li>
+<li>It checks the RRSIG on the <code>A</code> record with <code>example.com</code>'s ZSK, and checks the inception/expiration window against its own clock.</li>
+<li>If every link holds, it sets <strong>AD</strong> (authenticated data) in the reply. If any link fails, it returns <strong>SERVFAIL</strong>, not the unverified data.</li>
+</ol>
+<p>Unsigned zones are fine: the parent proves, with a signed NSEC or NSEC3 record, that no DS exists, and the validator marks the child "insecure" and answers normally. The dangerous state is a DS in the parent that no longer matches the child's keys. That happens after a DNS provider move or a botched key rollover, and it makes the whole zone SERVFAIL for every validating resolver at once.</p>
+<p>Proving a DNSSEC failure takes two queries. The <code>+cd</code> flag (checking disabled) tells the resolver to skip validation:</p>
+<pre class="text"><code>$ dig www.broken.example                    # constructed illustration, BIND 9.18+ dig
+;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: SERVFAIL, id: 3301
+;; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 1
+; EDE: 7 (Signature Expired)
+
+$ dig +cd www.broken.example
+;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: NOERROR, id: 3302
+;; flags: qr rd ra cd; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1</code></pre>
+<p>SERVFAIL without <code>+cd</code> and an answer with it means validation is failing. The EDE line is an Extended DNS Error (RFC 8914) that modern resolvers attach to explain the failure: 6 is "DNSSEC Bogus", 7 "Signature Expired", 9 "DNSKEY Missing", 22 "No Reachable Authority". macOS's built-in <code>dig</code> is too old to print EDE.</p>
+<h3 id="d11-encrypted">Encrypted transports: DoT, DoH, DoQ</h3>
+<p>Classic DNS is plaintext UDP, so anyone on the path can read and rewrite it. Three transports fix that between the stub and the resolver. None of them changes the resolver-to-authoritative leg, which is still mostly plaintext.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Transport</th>
+<th>RFC</th>
+<th>Port</th>
+<th>What it looks like on the wire</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>DNS over TLS (DoT)</td>
+<td>7858</td>
+<td>TCP 853</td>
+<td>a TLS session carrying length-prefixed DNS messages; easy to identify and block</td>
+</tr>
+<tr class="even">
+<td>DNS over HTTPS (DoH)</td>
+<td>8484</td>
+<td>TCP 443 (or UDP 443 with HTTP/3)</td>
+<td>HTTP POST or GET of <code>application/dns-message</code>; blends into web traffic</td>
+</tr>
+<tr class="odd">
+<td>DNS over QUIC (DoQ)</td>
+<td>9250</td>
+<td>UDP 853</td>
+<td>QUIC streams, one query per stream</td>
+</tr>
+</tbody>
+</table>
+<p>The operational consequence is who chooses the resolver. With DoH, the <em>application</em> can pick its own resolver and bypass the OS entirely. A browser doing that will not see your corporate split-horizon zone, and your network's DNS logs go quiet. Firefox checks a canary name, <code>use-application-dns.net</code>: if the network's resolver returns NXDOMAIN for it, Firefox does not enable DoH by default. Managed browsers can be pinned by policy. RFC 9462 (Discovery of Designated Resolvers) goes the other way: a client asks its plain resolver for <code>_dns.resolver.arpa</code> SVCB records and learns an encrypted endpoint for the same resolver.</p>
+<p>To try DoH without any special tool, <code>curl</code> can resolve its own target over DoH: <code>curl --doh-url https://1.1.1.1/dns-query -sv https://example.com -o /dev/null</code> (run on your Mac — your output will differ).</p>
+<h2 id="d11-numbers">Deep dive: by the numbers</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Value</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>DNS header</td>
+<td>12 bytes</td>
+<td>ID, flags, four counts</td>
+</tr>
+<tr class="even">
+<td>Classic UDP limit</td>
+<td>512 bytes</td>
+<td>without EDNS0</td>
+</tr>
+<tr class="odd">
+<td>Recommended EDNS buffer</td>
+<td>1232 bytes</td>
+<td>1280 − 40 − 8; Flag Day 2020 default in BIND/Unbound</td>
+</tr>
+<tr class="even">
+<td>Query ID entropy</td>
+<td>16 bits</td>
+<td>plus ~16 bits of source-port randomization since 2008 (Kaminsky)</td>
+</tr>
+<tr class="odd">
+<td>Root NS TTL</td>
+<td>518400 s (6 days)</td>
+<td>as served by the root zone</td>
+</tr>
+<tr class="even">
+<td>TLD delegation TTL from root</td>
+<td>172800 s (2 days)</td>
+<td>NS records for <code>com.</code> etc.</td>
+</tr>
+<tr class="odd">
+<td>Unbound default caps</td>
+<td>86400 s positive, 3600 s negative</td>
+<td>configurable</td>
+</tr>
+<tr class="even">
+<td>BIND default caps</td>
+<td>604800 s positive, 10800 s negative</td>
+<td>configurable</td>
+</tr>
+<tr class="odd">
+<td>CoreDNS in Kubernetes</td>
+<td><code>cache 30</code> in the default Corefile</td>
+<td>caps cached TTLs at 30 s</td>
+</tr>
+<tr class="even">
+<td>glibc stub defaults</td>
+<td>timeout 5 s, attempts 2, at most 3 nameservers</td>
+<td><code>options timeout:</code> / <code>attempts:</code> override</td>
+</tr>
+<tr class="odd">
+<td>Cache hit on a LAN resolver</td>
+<td>~1–5 ms</td>
+<td>mostly the RTT to the resolver</td>
+</tr>
+<tr class="even">
+<td>Cache hit at a public anycast resolver</td>
+<td>~5–30 ms</td>
+<td>depends on distance to the nearest site</td>
+</tr>
+<tr class="odd">
+<td>Cold full walk</td>
+<td>~50–300 ms</td>
+<td>root and TLD referrals are usually cached, so the zone's own RTT dominates</td>
+</tr>
+<tr class="even">
+<td>TCP fallback cost</td>
+<td>+2 RTT</td>
+<td>handshake plus the retried query</td>
+</tr>
+<tr class="odd">
+<td>Route 53 Resolver per-ENI limit</td>
+<td>1024 packets/s</td>
+<td>AWS-documented; exceeding it drops queries silently</td>
+</tr>
+</tbody>
+</table>
+<p>Hit-rate math is simple once you see that misses are per TTL, not per query. A resolver receiving 100 queries per second for one name with TTL 60 misses about once a minute: a hit rate of 1 − (1/60)/100 ≈ 99.98%. The same name at 0.01 queries per second (once every 100 s) misses every time. Low-traffic names get almost nothing from caching, which is why a cold internal service can see full-walk latency on most lookups while the popular ones are instant.</p>
+<h2 id="d11-failures">Deep dive: production failure modes</h2>
+<p><strong>"We changed the record an hour ago and half the traffic still goes to the old IP."</strong> Mechanism: the old answer was cached with a long TTL, or something above the resolver pins answers. Prove it: <code>dig api.example.com</code> against the resolvers your clients use and read the TTL column; compare with <code>dig @ns1.example.com api.example.com</code> (authoritative, <code>aa</code> set). If the resolver is right but clients are wrong, look at application caches: JVM <code>networkaddress.cache.ttl</code>, connection pools that never re-resolve, HTTP keep-alive connections still open to the old IP. Fix: lower TTLs one old-TTL ahead; make long-lived clients re-resolve on reconnect.</p>
+<p><strong>"The new record works for me but not for the monitoring system."</strong> Mechanism: the monitor queried the name before it existed and cached NXDOMAIN for the SOA's negative TTL. Prove it: <code>dig</code> the name against the monitor's resolver and look for <code>status: NXDOMAIN</code> with a counting-down SOA TTL. Fix: create before you probe; keep SOA MINIMUM modest (300–3600 s is common).</p>
+<p><strong>"Some lookups time out, but only for one domain, and only from the office."</strong> Mechanism: the answer is large (DNSSEC, many TXT records, long SPF chains), the network drops UDP fragments or blocks TCP/53, so either the fragmented reply vanishes or the TCP retry fails. Prove it: <code>dig +dnssec +bufsize=4096 TXT example.com</code> (likely times out), then <code>dig +tcp TXT example.com</code> (fails if TCP/53 is blocked), then <code>dig +bufsize=1232 TXT example.com</code> (when the answer exceeds 1232 bytes, <code>dig</code> prints <code>;; Truncated, retrying in TCP mode.</code>). Fix: allow TCP/53; use 1232-byte buffers; trim bloated TXT sets.</p>
+<p><strong>"Everything in one zone is SERVFAIL, everywhere, at once."</strong> Mechanism: DNSSEC broke. Signatures expired because the signer stopped, or the DS in the parent no longer matches after a provider change. Prove it: the <code>+cd</code> test above; check the RRSIG expiration timestamps; compare <code>dig DS example.com @a.gtld-servers.net</code> with <code>dig DNSKEY example.com @ns1.example.com</code>. Fix: re-sign, or update/remove the DS at the registrar. Remember the DS has its own TTL (86400 s in <code>.com</code>), so the repair propagates at that speed.</p>
+<p><strong>"Pods take 5 seconds to resolve, randomly."</strong> Mechanism: glibc sends the A and AAAA queries in parallel from the same socket. In kube-proxy's iptables mode both UDP packets are DNAT-ed to a CoreDNS pod, and a race in conntrack insertion can drop one. glibc then waits its full 5-second timeout before retrying. Prove it: <code>conntrack -S</code> on the node and watch <code>insert_failed</code> climb; CoreDNS sees only one of the two queries. Fix: NodeLocal DNSCache (a node-local resolver on 169.254.20.10 that talks TCP upstream), or <code>options single-request-reopen</code> in the pod's <code>dnsConfig</code>.</p>
+<p><strong>"Every external call from the cluster makes ten DNS queries."</strong> Mechanism: the <code>ndots:5</code> search list. The next section shows the arithmetic. Prove it: enable the CoreDNS <code>log</code> plugin briefly and watch <code>api.vendor.example.payments.svc.cluster.local</code> NXDOMAINs scroll past. Fix: trailing dots on external FQDNs in config, or <code>dnsConfig: {options: [{name: ndots, value: "2"}]}</code> for workloads that mostly call out.</p>
+<p><strong>"It resolves in the VPC but the record we just added in the public zone doesn't."</strong> Mechanism: split-horizon shadowing. In AWS, if a Route 53 private hosted zone for <code>example.com</code> is associated with the VPC, the VPC resolver answers <em>every</em> <code>example.com</code> name from the private zone. A name missing there gets NXDOMAIN; it does not fall through to the public zone. Prove it: compare <code>dig</code> from inside the VPC with <code>dig @8.8.8.8</code> from outside. Fix: create the record in both zones, or make the private zone a narrower subdomain.</p>
+<p><strong>"<code>dig</code> says one thing, the app does another" (on a Mac).</strong> Mechanism: macOS <code>dig</code> reads <code>/etc/resolv.conf</code> and bypasses <code>mDNSResponder</code>'s scoped resolvers, so VPN split DNS and <code>/etc/resolver/*</code> rules don't apply to it. Prove it: <code>scutil --dns</code> lists the per-domain resolvers; <code>dscacheutil -q host -a name &lt;host&gt;</code> shows what applications get. Fix: debug with the tool that follows the same path as the app. Flush with <code>sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder</code>.</p>
+<h2 id="d11-2026">Deep dive: 2026 context</h2>
+<h3 id="d11-ndots">Kubernetes: the <code>ndots</code> search list</h3>
+<p>A pod's <code>/etc/resolv.conf</code> usually looks like the one in the script below: the cluster DNS service IP, a search list starting with the pod's own namespace, and <code>options ndots:5</code>. The rule (glibc and most stubs) is: if the name has <em>fewer</em> dots than <code>ndots</code> and no trailing dot, try every search domain first and the literal name last. Real output:</p>
+<div class="sourceCode" id="d11-cb8"><pre class="sourceCode python"><code class="sourceCode python"><span id="d11-cb8-1"><a href="#d11-cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;What a glibc-style stub actually sends for one getaddrinfo() call,</span></span>
+<span id="d11-cb8-2"><a href="#d11-cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co">given a Kubernetes pod&#39;s /etc/resolv.conf. Pure computation, no network.&quot;&quot;&quot;</span></span>
+<span id="d11-cb8-3"><a href="#d11-cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb8-4"><a href="#d11-cb8-4" aria-hidden="true" tabindex="-1"></a>RESOLV_CONF <span class="op">=</span> <span class="st">&quot;&quot;&quot;</span><span class="ch">\</span></span>
+<span id="d11-cb8-5"><a href="#d11-cb8-5" aria-hidden="true" tabindex="-1"></a><span class="st">nameserver 10.96.0.10</span></span>
+<span id="d11-cb8-6"><a href="#d11-cb8-6" aria-hidden="true" tabindex="-1"></a><span class="st">search payments.svc.cluster.local svc.cluster.local cluster.local us-west-2.compute.internal</span></span>
+<span id="d11-cb8-7"><a href="#d11-cb8-7" aria-hidden="true" tabindex="-1"></a><span class="st">options ndots:5</span></span>
+<span id="d11-cb8-8"><a href="#d11-cb8-8" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;&quot;&quot;</span></span>
+<span id="d11-cb8-9"><a href="#d11-cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb8-10"><a href="#d11-cb8-10" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> parse(text):</span>
+<span id="d11-cb8-11"><a href="#d11-cb8-11" aria-hidden="true" tabindex="-1"></a>    search, ndots <span class="op">=</span> [], <span class="dv">1</span>                      <span class="co"># ndots defaults to 1 when unset</span></span>
+<span id="d11-cb8-12"><a href="#d11-cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> line <span class="kw">in</span> text.splitlines():</span>
+<span id="d11-cb8-13"><a href="#d11-cb8-13" aria-hidden="true" tabindex="-1"></a>        key, <span class="op">*</span>vals <span class="op">=</span> line.split()</span>
+<span id="d11-cb8-14"><a href="#d11-cb8-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> key <span class="op">==</span> <span class="st">&quot;search&quot;</span>:</span>
+<span id="d11-cb8-15"><a href="#d11-cb8-15" aria-hidden="true" tabindex="-1"></a>            search <span class="op">=</span> vals</span>
+<span id="d11-cb8-16"><a href="#d11-cb8-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">elif</span> key <span class="op">==</span> <span class="st">&quot;options&quot;</span>:</span>
+<span id="d11-cb8-17"><a href="#d11-cb8-17" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> v <span class="kw">in</span> vals:</span>
+<span id="d11-cb8-18"><a href="#d11-cb8-18" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> v.startswith(<span class="st">&quot;ndots:&quot;</span>):</span>
+<span id="d11-cb8-19"><a href="#d11-cb8-19" aria-hidden="true" tabindex="-1"></a>                    ndots <span class="op">=</span> <span class="bu">int</span>(v.split(<span class="st">&quot;:&quot;</span>)[<span class="dv">1</span>])</span>
+<span id="d11-cb8-20"><a href="#d11-cb8-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> search, ndots</span>
+<span id="d11-cb8-21"><a href="#d11-cb8-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb8-22"><a href="#d11-cb8-22" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> candidates(name, search, ndots):</span>
+<span id="d11-cb8-23"><a href="#d11-cb8-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> name.endswith(<span class="st">&quot;.&quot;</span>):                     <span class="co"># fully qualified: no search list at all</span></span>
+<span id="d11-cb8-24"><a href="#d11-cb8-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> [name]</span>
+<span id="d11-cb8-25"><a href="#d11-cb8-25" aria-hidden="true" tabindex="-1"></a>    absolute <span class="op">=</span> name <span class="op">+</span> <span class="st">&quot;.&quot;</span></span>
+<span id="d11-cb8-26"><a href="#d11-cb8-26" aria-hidden="true" tabindex="-1"></a>    expanded <span class="op">=</span> [<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">.</span><span class="sc">{</span>d<span class="sc">}</span><span class="ss">.&quot;</span> <span class="cf">for</span> d <span class="kw">in</span> search]</span>
+<span id="d11-cb8-27"><a href="#d11-cb8-27" aria-hidden="true" tabindex="-1"></a>    <span class="co"># dots &gt;= ndots: try the name as-is first; otherwise walk the search list first</span></span>
+<span id="d11-cb8-28"><a href="#d11-cb8-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> [absolute] <span class="op">+</span> expanded <span class="cf">if</span> name.count(<span class="st">&quot;.&quot;</span>) <span class="op">&gt;=</span> ndots <span class="cf">else</span> expanded <span class="op">+</span> [absolute]</span>
+<span id="d11-cb8-29"><a href="#d11-cb8-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d11-cb8-30"><a href="#d11-cb8-30" aria-hidden="true" tabindex="-1"></a>search, ndots <span class="op">=</span> parse(RESOLV_CONF)</span>
+<span id="d11-cb8-31"><a href="#d11-cb8-31" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> name <span class="kw">in</span> [<span class="st">&quot;ledger&quot;</span>, <span class="st">&quot;ledger.payments&quot;</span>, <span class="st">&quot;api.vendor.example&quot;</span>, <span class="st">&quot;api.vendor.example.&quot;</span>]:</span>
+<span id="d11-cb8-32"><a href="#d11-cb8-32" aria-hidden="true" tabindex="-1"></a>    tries <span class="op">=</span> candidates(name, search, ndots)</span>
+<span id="d11-cb8-33"><a href="#d11-cb8-33" aria-hidden="true" tabindex="-1"></a>    <span class="co"># the real answer exists only for the last candidate in the external case;</span></span>
+<span id="d11-cb8-34"><a href="#d11-cb8-34" aria-hidden="true" tabindex="-1"></a>    <span class="co"># every earlier try is an NXDOMAIN, and glibc asks A and AAAA for each.</span></span>
+<span id="d11-cb8-35"><a href="#d11-cb8-35" aria-hidden="true" tabindex="-1"></a>    hit <span class="op">=</span> <span class="bu">next</span>((i <span class="cf">for</span> i, c <span class="kw">in</span> <span class="bu">enumerate</span>(tries)</span>
+<span id="d11-cb8-36"><a href="#d11-cb8-36" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> c <span class="kw">in</span> (<span class="st">&quot;ledger.payments.svc.cluster.local.&quot;</span>, <span class="st">&quot;api.vendor.example.&quot;</span>)), <span class="va">None</span>)</span>
+<span id="d11-cb8-37"><a href="#d11-cb8-37" aria-hidden="true" tabindex="-1"></a>    used <span class="op">=</span> tries[: hit <span class="op">+</span> <span class="dv">1</span>]</span>
+<span id="d11-cb8-38"><a href="#d11-cb8-38" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">!r:22}</span><span class="ss"> dots=</span><span class="sc">{</span>name<span class="sc">.</span>rstrip(<span class="st">&#39;.&#39;</span>)<span class="sc">.</span>count(<span class="st">&#39;.&#39;</span>)<span class="sc">}</span><span class="ss">  &quot;</span></span>
+<span id="d11-cb8-39"><a href="#d11-cb8-39" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;queries=</span><span class="sc">{</span><span class="dv">2</span><span class="op">*</span><span class="bu">len</span>(used)<span class="sc">:2d}</span><span class="ss"> (A+AAAA x </span><span class="sc">{</span><span class="bu">len</span>(used)<span class="sc">}</span><span class="ss">)  NXDOMAIN rounds=</span><span class="sc">{</span><span class="bu">len</span>(used)<span class="op">-</span><span class="dv">1</span><span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d11-cb8-40"><a href="#d11-cb8-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> c <span class="kw">in</span> used:</span>
+<span id="d11-cb8-41"><a href="#d11-cb8-41" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="st">&quot;    &quot;</span>, c)</span></code></pre></div>
+<pre class="text"><code>&#39;ledger&#39;               dots=0  queries= 2 (A+AAAA x 1)  NXDOMAIN rounds=0
+     ledger.payments.svc.cluster.local.
+&#39;ledger.payments&#39;      dots=1  queries= 4 (A+AAAA x 2)  NXDOMAIN rounds=1
+     ledger.payments.payments.svc.cluster.local.
+     ledger.payments.svc.cluster.local.
+&#39;api.vendor.example&#39;   dots=2  queries=10 (A+AAAA x 5)  NXDOMAIN rounds=4
+     api.vendor.example.payments.svc.cluster.local.
+     api.vendor.example.svc.cluster.local.
+     api.vendor.example.cluster.local.
+     api.vendor.example.us-west-2.compute.internal.
+     api.vendor.example.
+&#39;api.vendor.example.&#39;  dots=2  queries= 2 (A+AAAA x 1)  NXDOMAIN rounds=0
+     api.vendor.example.</code></pre>
+<p><code>ndots:5</code> exists so that <code>ledger.payments</code> (service.namespace) and deeper short names resolve inside the cluster. The cost lands on external names. <code>api.vendor.example</code> has two dots, so it walks four search domains, each producing an NXDOMAIN for A and for AAAA, before the real query: ten queries and four wasted round trips per lookup. CoreDNS's 30-second cache soaks up some of that, but each of those NXDOMAINs is a separate cache entry, and the last search domain (here the cloud's <code>compute.internal</code>) may be forwarded to the VPC resolver, which then counts against the per-interface packet limit. The trailing dot (<code>api.vendor.example.</code>) skips the walk completely. Musl-based images (Alpine) have historically handled search lists differently from glibc, so test with the image you ship.</p>
+<h3 id="d11-vpc">Cloud VPC resolvers</h3>
+<p>Every major cloud gives a VPC a built-in recursive resolver at a link-local or reserved address (in AWS, the VPC base address plus two, and 169.254.169.253). It merges private zones, public DNS and forwarding rules, which makes it the place split-horizon lives in the cloud. It also has quotas. AWS documents 1024 packets per second per network interface to the Route 53 Resolver. A busy node running many pods, all doing <code>ndots</code> expansion, can hit that and see dropped queries that look like random timeouts. Node-local caching is the standard fix.</p>
+<h3 id="d11-svcb">HTTPS/SVCB records</h3>
+<p>RFC 9460 added the SVCB and HTTPS record types. An HTTPS record tells a client, before it connects, which ALPN protocols the service speaks (<code>alpn="h3,h2"</code>), alternative endpoints and ports, address hints, and the public key for Encrypted ClientHello. Browsers query HTTPS alongside A and AAAA, which is how a first visit can go straight to HTTP/3 without a prior <code>Alt-Svc</code> header (Module 12's deep dive). It also works at the zone apex, where CNAME is illegal. <code>dig HTTPS cloudflare.com</code> with a current <code>dig</code> shows one (run on your Mac with Homebrew BIND — your output will differ).</p>
+<h3 id="d11-serve-stale">Resilience features that change what "expired" means</h3>
+<p>RFC 8767 "serve-stale" lets a resolver answer from expired cache entries when every authoritative server for the zone is unreachable. It recommends a short TTL on stale answers (30 s) and a limit of one to three days. Major public resolvers and recent BIND and Unbound support it. That turns some authoritative outages into non-events. It also means "TTL expired" no longer guarantees "the old answer is gone" while your authority is down. EDE 3 ("Stale Answer") flags it.</p>
+<h3 id="d11-root-ksk">Root key rollover</h3>
+<p>The root KSK is being rolled from KSK-2017 to KSK-2024. ICANN's published plan scheduled the new key to start signing in October 2026. Resolvers that track trust anchors automatically (RFC 5011) or ship updated anchors handle this without action. A validating resolver frozen on an old image with a hard-coded anchor does not, and it will SERVFAIL everything once the old key is gone. If you run validators in long-lived appliances or air-gapped networks, check their anchors.</p>
+<h2 id="d11-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: A resolver caches an answer with TTL 300. A stub behind it caches it too. What is the worst-case staleness after you change the record?</strong> 300 seconds, not 600. The resolver passes down the <em>remaining</em> TTL, so both copies expire at the same instant. The stub can only add staleness if it ignores the TTL it was given. Application-level caches and resolver minimum-TTL floors are the usual culprits.</p>
+<p><strong>Q2: Why must you wait a full old TTL after lowering a TTL before making the real change?</strong> The TTL change is itself a cached record. Any resolver that fetched the record just before you lowered it holds it, with the old TTL, for that long. Only after one old-TTL has passed is every cached copy guaranteed to carry the short TTL.</p>
+<p><strong>Q3: How long is an NXDOMAIN cached, and who decides?</strong> The zone owner, through the SOA returned in the authority section: min(SOA TTL, SOA MINIMUM), per RFC 2308. Resolvers may cap it lower (Unbound 3600 s, BIND 10800 s by default). NXDOMAIN applies to the name for all types; NODATA applies only to the (name, type) asked.</p>
+<p><strong>Q4: A query works with <code>dig +tcp</code> but times out without it. What's happening?</strong> The UDP response is large and is being lost, almost always as IP fragments dropped by a middlebox. The client never sees a truncated reply, so it never falls back. Lowering the EDNS buffer to 1232 makes the server truncate instead, which triggers a TCP retry that works.</p>
+<p><strong>Q5: What does <code>dig +trace</code> tell you that <code>dig</code> doesn't, and when is it the wrong tool?</strong> It shows the delegation chain from the root, with each server's referral, DS records and RRSIGs. That verifies what the world will see once caches expire. It skips your resolver's cache, so it cannot explain what your users see <em>now</em>. Use plain <code>dig</code> against their resolver for that.</p>
+<p><strong>Q6: Walk me through DNSSEC validation of one A record. What fails if the parent's DS doesn't match?</strong> Trust anchor (root KSK) → root DNSKEY set → signed DS for <code>.com</code> → <code>.com</code> DNSKEY set matching that DS → signed DS for <code>example.com</code> → <code>example.com</code> DNSKEY set matching it → RRSIG over the A record within its validity window. A DS mismatch breaks the chain at that zone cut, so every name in and below the zone returns SERVFAIL from validating resolvers. <code>dig +cd</code> succeeding proves it.</p>
+<p><strong>Q7: Why does a pod calling <code>api.vendor.example</code> produce ten DNS queries?</strong> <code>ndots:5</code> and a four-domain search list. The name has two dots, fewer than five, so the stub tries all four search suffixes first, each as A and AAAA, and each returning NXDOMAIN, then the literal name. A trailing dot or a lower <code>ndots</code> removes the walk.</p>
+<p><strong>Q8: Your company's internal zone stops resolving for some laptops after a browser update. Nothing changed in DNS. Why?</strong> The browser turned on DNS over HTTPS to a public resolver, bypassing the OS resolver and with it the split-horizon view. The public resolver has never heard of the internal names. Fixes: enterprise policy to disable or pin DoH, the <code>use-application-dns.net</code> canary for Firefox, or offering an internal DoH endpoint.</p>
+<p><strong>Q9: DoH, DoT and DoQ: what do they protect, and what don't they?</strong> They encrypt the stub-to-resolver leg, so the local network can't read or rewrite queries. The resolver still sees everything, and the resolver-to-authoritative leg is usually still plaintext. The destination IP and, without ECH, the TLS SNI of the connection that follows still reveal where you went.</p>
+<p><strong>Q10: Why 1232 bytes?</strong> The IPv6 minimum MTU is 1280 bytes. Subtract 40 for the IPv6 header and 8 for UDP, and 1232 bytes of DNS payload fits any compliant path without fragmentation. Answers bigger than that are truncated and retried over TCP instead of risking fragments.</p>
+<p><em>Standards cited in this deep dive: RFC 1035 (TCP length prefix), RFC 2308 (negative caching), RFC 5011 (trust-anchor updates), RFC 6891 (EDNS0), RFC 7766 and RFC 9210 (DNS over TCP), RFC 7858 (DoT), RFC 8020 (NXDOMAIN cut), RFC 8198 (aggressive NSEC), RFC 8484 (DoH), RFC 8767 (serve-stale), RFC 8914 (Extended DNS Errors), RFC 9250 (DoQ), RFC 9460 (SVCB/HTTPS), RFC 9462 (DDR). Resolver defaults (Unbound, BIND, CoreDNS, glibc) and the AWS limit are vendor behaviour and can change by version.</em></p>
