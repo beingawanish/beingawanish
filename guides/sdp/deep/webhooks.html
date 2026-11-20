@@ -1,0 +1,283 @@
+<h2 id=dd-webhooks-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson so far sits on the receiver's side of the wire. A design review usually has to cover both sides, because sooner or later your bookstore stops only consuming webhooks and starts sending them: "order shipped" to a marketplace partner, "stock low" to a supplier's system. So this section walks the sender's pipeline first, then the signature that ties the two sides together, then the receiver's storage.</p>
+
+<h3 id=dd-webhooks-outbox level=3>Step 1: the outbox, so an event cannot be lost or invented</h3>
+<p>The first bug in most homemade senders is a dual write. The order service commits <code>status = shipped</code> to Postgres and then calls the webhook service. If the process dies between the two, the partner never hears about the shipment. Swap the order and you can announce a shipment that rolled back.</p>
+<p>The fix is a <strong>transactional outbox</strong>. In the same database transaction that changes the order, insert a row into an <code>outbox</code> table: event ID, event type, object ID, payload, created time. Either both rows commit or neither does. A separate relay then reads the outbox and hands events to the delivery system. Two common relays:</p>
+<ul>
+<li><strong>Polling relay.</strong> Workers run <code>SELECT … FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 500 FOR UPDATE SKIP LOCKED</code>, publish, then mark the rows. <code>SKIP LOCKED</code> lets several relay workers share the table without blocking each other. Simple, but it adds a polling delay (typically 100 ms to 1 s) and steady load on the primary.</li>
+<li><strong>Log-tailing relay.</strong> <a href="#change-data-capture">Change data capture</a> reads the outbox inserts from the Postgres WAL through a logical replication slot (Debezium is the usual tool). Lower latency, no polling queries. The catch: an abandoned replication slot makes Postgres keep WAL forever, and the disk fills. Alert on slot lag in bytes.</li>
+</ul>
+<p>Either way the relay is at-least-once. A crash after publishing but before marking the row republishes it. That is fine, because the event ID was fixed at insert time and every later stage deduplicates on it.</p>
+
+<h3 id=dd-webhooks-fanout level=3>Step 2: fan out to deliveries, one queue per endpoint</h3>
+<p>One event becomes one <em>delivery</em> per subscribed endpoint. The delivery row is the unit of retry: <code>(delivery_id, event_id, endpoint_id, attempt, next_attempt_at, state, last_status, last_latency_ms)</code>. The event payload is stored once and referenced, not copied per endpoint.</p>
+<p>The important decision is how deliveries are queued. A single shared queue looks fine in testing. In production it fails the first time a big customer's endpoint starts timing out. Every worker ends up sitting on 10-second timeouts to that one host while healthy endpoints wait behind it. That is head-of-line blocking, and it turns one customer's outage into everyone's latency incident.</p>
+<p>The fix is <strong>isolation per endpoint</strong>. Each endpoint gets its own logical queue, with its own concurrency cap (say 10 in-flight requests) and its own rate limit. Dispatchers pick endpoints that have due work and spare capacity. In practice this is often a scheduler over a <code>deliveries</code> table indexed on <code>(endpoint_id, next_attempt_at)</code>, or a broker partitioned by <code>endpoint_id</code>. The shape matters more than the product: a slow endpoint can only consume its own slots. That is the <a href="#bulkhead">bulkhead</a> pattern applied per customer.</p>
+
+<h3 id=dd-webhooks-attempt level=3>Step 3: one attempt, with tight edges</h3>
+<p>An attempt is an HTTP POST with strict limits, because the sender is calling code it does not own:</p>
+<ul>
+<li><strong>Timeouts:</strong> connect around 3 s, total around 10 to 15 s. Long enough for a reasonable receiver, short enough that a hung one cannot hold a worker for minutes.</li>
+<li><strong>Success means 2xx.</strong> Treat 3xx as failure and do not follow redirects (more on that under SSRF). Treat 410 Gone as "unsubscribe me" if your contract says so.</li>
+<li><strong>Read at most a few KB of the response body</strong> for the delivery log, then close. A receiver that streams megabytes back should not cost you memory.</li>
+<li><strong>Record everything:</strong> status, latency, the first bytes of the response, the resolved IP. This is the delivery log the lesson mentions, and it is what support reads.</li>
+</ul>
+
+<h3 id=dd-webhooks-retry-schedule level=3>Step 4: the retry schedule</h3>
+<p>A failed attempt sets <code>next_attempt_at</code> from a schedule. Good schedules grow fast early and then flatten, so a 30-second deploy blip recovers within a minute while a weekend outage is still covered. One reasonable schedule, with ±20% jitter on each gap:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Attempt<th>Wait after previous failure<th>Elapsed since first try (approx.)<tbody>
+<tr><td>1<td>immediate<td>0
+<tr><td>2<td>5 s<td>5 s
+<tr><td>3<td>1 min<td>1 min
+<tr><td>4<td>10 min<td>11 min
+<tr><td>5<td>1 h<td>1.2 h
+<tr><td>6<td>4 h<td>5.2 h
+<tr><td>7<td>12 h<td>17 h
+<tr><td>8<td>24 h<td>41 h
+<tr><td>9<td>24 h<td>65 h (about 2.7 days)
+</tbody></table></div></div>
+<p>The jitter matters more than the exact numbers. Without it, every delivery that failed during a receiver's outage retries at the same instants. The receiver comes back and is hit with its whole backlog at once. That is the same synchronisation problem the <a href="#retry-with-exponential-backoff">retry with exponential backoff</a> lesson solves with jitter.</p>
+<p>Publish the schedule in your docs. Receivers size their dedupe retention and their reconciliation window from it.</p>
+
+<h3 id=dd-webhooks-circuit level=3>Step 5: the endpoint circuit, and when to give up</h3>
+<p>Per-delivery retries answer "should I try this event again?" They do not answer "is this endpoint dead?" That needs a second state machine, on the endpoint:</p>
+<ol>
+<li><strong>Healthy.</strong> Deliveries flow normally.</li>
+<li><strong>Tripped.</strong> After, say, 20 consecutive failures, stop sending new attempts at full rate. Send one probe delivery every few minutes, as a <a href="#circuit-breaker">circuit breaker</a> half-open state would. Pending deliveries keep their place but do not burn workers. A success closes the circuit and the backlog drains at the endpoint's rate limit.</li>
+<li><strong>Disabled.</strong> After failures that span days (often 3 to 5), stop entirely and email the account owner. New events are still recorded in the event log, so they can be fetched or replayed later. They just are not attempted.</li>
+</ol>
+<p>This is the state that bit the bookstore in the incident. Seen from the sender's side, disabling is a kindness: it frees capacity and stops a retry flood into a host that may now belong to someone else. The obligation that comes with it is to notify loudly and keep the events retrievable.</p>
+
+<h3 id=dd-webhooks-signing level=3>Signing: what exactly gets MACed</h3>
+<p>The lesson says "verify the HMAC." The detail that matters is <em>what bytes</em> the HMAC covers. A well-designed scheme signs <code>id + "." + timestamp + "." + raw_body</code> (the Standard Webhooks convention) or <code>timestamp + "." + raw_body</code> (Stripe's <code>Stripe-Signature: t=…,v1=…</code>). Putting the timestamp inside the MAC is the whole point. If the timestamp were a separate, unsigned header, an attacker who captured one valid delivery could replay it forever with a fresh timestamp.</p>
+<p>The receiver's checks, in order:</p>
+<ol>
+<li>Read the <strong>raw body bytes</strong>. Do not parse and re-serialise JSON before verifying. Key order and whitespace change, and the MAC no longer matches. This is the most common "signatures randomly fail" bug.</li>
+<li>Reject if the timestamp is outside a window, usually ±5 minutes. That bounds replay to five minutes and tolerates modest clock skew.</li>
+<li>Recompute the HMAC-SHA256 and compare with <code>hmac.compare_digest</code> or its equivalent. A plain <code>==</code> can leak how many leading bytes matched through timing.</li>
+<li>Inside the window, a replay is still possible. Your event-ID dedupe catches it. That is why dedupe is a security control here, not only a correctness one.</li>
+</ol>
+<p>Two refinements. <strong>Secret rotation</strong> works by having the header carry several signatures, for example <code>v1,sigA v1,sigB</code>. During the overlap the sender signs with both the old and new secrets, and the receiver accepts either. Without this, rotation needs a synchronised cut-over across two companies. Nobody gets that right on a Friday.</p>
+<p><strong>Asymmetric signatures</strong> (Ed25519) let the sender publish a public key instead of sharing a secret. A leaked receiver config then cannot be used to forge events. The cost is that receivers must handle key IDs and fetch keys. Some schemes, including Standard Webhooks, define both. Note that GitHub's <code>X-Hub-Signature-256</code> covers only the body, with no timestamp. Receivers there rely on the <code>X-GitHub-Delivery</code> GUID for replay protection.</p>
+<p>Here is the receiver's check in Python's standard library, with the failure cases it must reject:</p>
+<pre><code>import hashlib, hmac
+
+SECRET = b"whsec_demo_only"
+TOLERANCE = 300  # seconds
+
+def sign(body: bytes, ts: int, secret: bytes = SECRET) -&gt; str:
+    msg = str(ts).encode() + b"." + body          # timestamp is inside the MAC
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
+def verify(body: bytes, header: str, now: int, seen: set) -&gt; str:
+    parts = dict(p.split("=", 1) for p in header.split(","))
+    ts, sig = int(parts["t"]), parts["v1"]
+    if abs(now - ts) &gt; TOLERANCE:
+        return "reject: outside timestamp window"
+    if not hmac.compare_digest(sign(body, ts), sig):
+        return "reject: bad signature"
+    if sig in seen:
+        return "reject: replay inside window"
+    seen.add(sig)
+    return "accept"
+
+body = b'{"id":"evt_81","type":"payment.succeeded","order":"ord_7f3a"}'
+t0 = 1_763_640_000
+hdr = f"t={t0},v1={sign(body, t0)}"
+seen = set()
+print("header     :", hdr[:40] + "...")
+print("fresh      :", verify(body, hdr, t0 + 2, seen))
+print("same again :", verify(body, hdr, t0 + 40, seen))
+print("tampered   :", verify(body.replace(b"7f3a", b"9999"), hdr, t0 + 3, set()))
+print("restamped  :", verify(body, hdr.replace(str(t0), str(t0 + 3000)), t0 + 3001, set()))
+print("6 min late :", verify(body, hdr, t0 + 360, set()))</code></pre>
+<p>Output:</p>
+<pre><code>header     : t=1763640000,v1=15acf591079d97e91442cec8...
+fresh      : accept
+same again : reject: replay inside window
+tampered   : reject: bad signature
+restamped  : reject: bad signature
+6 min late : reject: outside timestamp window</code></pre>
+<p>The "restamped" line is the one to show a reviewer. The attacker moved the timestamp into the window, but the timestamp is part of the signed message, so the signature breaks. (A real receiver would dedupe on the event ID in its database rather than on the signature in memory; the set here keeps the demo short.)</p>
+
+<h3 id=dd-webhooks-inbox level=3>The receiver's inbox table</h3>
+<p>On the receiving side, "save it" means an <strong>inbox</strong> table with a unique constraint on the provider's event ID:</p>
+<pre><code>CREATE TABLE webhook_inbox (
+  provider      text        NOT NULL,
+  event_id      text        NOT NULL,
+  received_at   timestamptz NOT NULL DEFAULT now(),
+  signature_ok  boolean     NOT NULL,
+  raw_body      bytea       NOT NULL,
+  processed_at  timestamptz,
+  PRIMARY KEY (provider, event_id)
+);
+
+INSERT INTO webhook_inbox (provider, event_id, signature_ok, raw_body)
+VALUES ('payments', $1, true, $2)
+ON CONFLICT (provider, event_id) DO NOTHING;</code></pre>
+<p>The handler returns 200 whether the insert wrote a row or hit the conflict. A duplicate is still a successful receipt. The worker then does the business change and sets <code>processed_at</code> <em>in the same transaction</em>. If the worker crashes halfway, both roll back and the event is retried. If it commits, a redelivery of the same row finds <code>processed_at</code> set and stops. This is the outbox's mirror image, and it is why the two patterns come up together in reviews.</p>
+<p>When the business effect lives outside your database (a call to the warehouse API, say), the same transaction cannot cover it. Pass the event ID through as the downstream <a href="#idempotency">idempotency key</a> so the warehouse deduplicates too.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-webhooks-svg-title dd-webhooks-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-webhooks-svg-title">Webhook delivery pipeline, sender to receiver</title>
+<desc id="dd-webhooks-svg-desc">The order service writes the order change and an outbox row in one transaction. A relay moves outbox rows into per-endpoint delivery queues. Workers send each attempt through an egress proxy that blocks private addresses. Failures go to a retry scheduler, and an endpoint health state machine trips or disables endpoints. On the receiver, the handler verifies, inserts into an inbox table with a unique event ID, returns 200, and a worker processes the event.</desc>
+<rect x="10" y="20" width="140" height="70" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="80" y="45" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Order service</text>
+<text x="80" y="63" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">1 txn: orders +</text>
+<text x="80" y="79" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">outbox row</text>
+<rect x="180" y="20" width="120" height="70" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="240" y="45" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Relay</text>
+<text x="240" y="63" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">SKIP LOCKED</text>
+<text x="240" y="79" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">or WAL/CDC</text>
+<rect x="330" y="10" width="150" height="26" rx="4" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="405" y="28" text-anchor="middle" style="fill:var(--ink,#1c2430)">queue: endpoint A</text>
+<rect x="330" y="42" width="150" height="26" rx="4" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="405" y="60" text-anchor="middle" style="fill:var(--ink,#1c2430)">queue: endpoint B</text>
+<rect x="330" y="74" width="150" height="26" rx="4" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="405" y="92" text-anchor="middle" style="fill:var(--ink,#1c2430)">queue: endpoint C (tripped)</text>
+<rect x="510" y="20" width="90" height="70" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="555" y="45" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Workers</text>
+<text x="555" y="63" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">cap 10 per</text>
+<text x="555" y="79" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">endpoint</text>
+<rect x="620" y="20" width="90" height="70" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="665" y="45" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Egress</text>
+<text x="665" y="63" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">proxy: no</text>
+<text x="665" y="79" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">private IPs</text>
+<path d="M150 55 H180 M300 55 H330 M480 55 H510 M600 55 H620" style="stroke:var(--ink,#1c2430);fill:none"/>
+<rect x="330" y="120" width="270" height="44" rx="6" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="465" y="138" text-anchor="middle" style="fill:var(--ink,#1c2430)">Retry scheduler: next_attempt_at, jitter</text>
+<text x="465" y="156" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">Endpoint state: healthy / tripped / disabled</text>
+<path d="M555 90 V120 M405 120 V100" style="stroke:var(--muted,#5c6b7c);fill:none;stroke-dasharray:4 3"/>
+<line x1="10" y1="190" x2="710" y2="190" style="stroke:var(--line,#d5dee8);stroke-dasharray:6 4"/>
+<text x="20" y="208" style="fill:var(--muted,#5c6b7c)">company boundary (public internet)</text>
+<rect x="330" y="220" width="130" height="66" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="395" y="243" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Handler</text>
+<text x="395" y="261" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">verify, insert,</text>
+<text x="395" y="277" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">200 in ~15 ms</text>
+<rect x="490" y="220" width="110" height="66" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="545" y="243" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Inbox</text>
+<text x="545" y="261" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">PK event_id</text>
+<text x="545" y="277" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">ON CONFLICT</text>
+<rect x="620" y="220" width="90" height="66" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="665" y="243" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Worker</text>
+<text x="665" y="261" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">effect +</text>
+<text x="665" y="277" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">processed_at</text>
+<path d="M665 90 V110 Q665 200 395 220" style="stroke:var(--ink,#1c2430);fill:none"/>
+<path d="M460 253 H490 M600 253 H620" style="stroke:var(--ink,#1c2430);fill:none"/>
+</svg>
+</figure>
+
+<h2 id=dd-webhooks-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<h3 id=dd-webhooks-sizing-receiver level=3>Receiver: small, as long as the handler stays small</h3>
+<p>Assume the payment provider sends the bookstore 2 million events a day, with bursts of 500 per second after a flash sale. By Little's law, in-flight requests equal arrival rate times time in system. At 15 ms per request, 500/s needs about 7.5 concurrent handlers. Two small instances cover that with plenty of headroom.</p>
+<p>Now rerun the incident's numbers. At 7.5 s per request, the same 500/s needs 3,750 concurrent handlers. That is why the inline design fell over: the slow work did not just miss the deadline. It multiplied the concurrency the edge had to hold by 500.</p>
+<p>Storage for dedupe: the inbox must remember an event ID for longer than the sender keeps retrying. With a retry window of about 3 days, keeping 30 days of IDs is comfortable and also covers manual replays. At 2 million a day, that is 60 million rows. Keep the raw bodies (about 2 KB each) for 7 days and the IDs for 30: roughly 28 GB of bodies plus a few GB of keys and indexes. Partition by day so expiry is a cheap <code>DROP PARTITION</code> rather than a slow <code>DELETE</code>.</p>
+
+<h3 id=dd-webhooks-sizing-sender level=3>Sender: slow endpoints set your worker count</h3>
+<p>Now the bookstore as a sender. Assume 5 million events a day, 1.5 subscribed endpoints per event on average, and a peak of 4 times the mean.</p>
+<ul>
+<li>Deliveries per day: 5M × 1.5 = 7.5M. Mean rate: 7.5M / 86,400 ≈ 87/s. Peak: about 350/s.</li>
+<li>Suppose 97% of attempts finish in 300 ms and 3% hit the 10 s timeout. Mean attempt time: 0.97 × 0.3 + 0.03 × 10 = 0.59 s.</li>
+<li>Concurrency at peak: 350 × 0.59 ≈ 207 in-flight requests. The 3% of slow endpoints cause more than half of that (350 × 0.03 × 10 = 105).</li>
+</ul>
+<p>That is the quantitative case for per-endpoint caps and circuit tripping. Push the timeout share to 20%, which is what one large dead customer can do, and concurrency at peak becomes 350 × (0.8 × 0.3 + 0.2 × 10) ≈ 784. Without isolation, that is the moment healthy customers start seeing delays.</p>
+<p>Retry amplification for a dead endpoint: if it receives 1,000 events an hour and each gets 9 attempts, it costs up to 9,000 attempts an hour at steady state. A tripped circuit cuts that to roughly 12 probes an hour. Most of the savings come from tripping, not from disabling.</p>
+<p>Storage: keep event payloads (2 KB) for 30 days so customers can fetch or replay: 5M × 30 × 2 KB = 300 GB. Delivery attempt rows are small (about 200 bytes with indexes) but numerous. 7.5M deliveries × 1.3 attempts × 30 days ≈ 290M rows, around 60 GB. Again, partition by day.</p>
+
+<h3 id=dd-webhooks-sizing-recon level=3>Reconciliation: cheap insurance</h3>
+<p>An hourly reconciliation poll that lists events since a cursor, 100 per page, costs one request per 100 events. Even at 2 million events a day that is 20,000 requests a day, or about 14 a minute. It is well within any provider's rate limit, and on a quiet day it costs a handful of calls. The cost case against reconciliation almost never holds up.</p>
+
+<h2 id=dd-webhooks-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+<h3 id=dd-webhooks-fm-raw-body level=3>1. Signatures fail after a framework upgrade</h3>
+<p><strong>Symptom:</strong> every delivery suddenly returns 401. The provider starts counting failures toward disabling you. <strong>Mechanism:</strong> new middleware parses the JSON body and hands the handler a re-serialised copy. The bytes changed, so the HMAC changed. A charset conversion or a proxy that strips a trailing newline does the same. <strong>Detect:</strong> a 401 rate alarm on the webhook route, split by provider; a sudden step from 0% to 100% almost always means raw-body handling, not an attack. <strong>Fix:</strong> verify against the raw request bytes before any parser runs, and add a test that replays a captured, real delivery through the full middleware stack.</p>
+
+<h3 id=dd-webhooks-fm-skew level=3>2. Clock skew rejects valid deliveries</h3>
+<p><strong>Symptom:</strong> a trickle of "timestamp outside window" rejections from one host only. <strong>Mechanism:</strong> that host's clock drifted because NTP stopped or a VM resumed from a pause. A 5-minute window hides small drift, then drops everything once drift passes the window. <strong>Detect:</strong> log <code>now - timestamp</code> for every delivery and chart it per host; the distribution should be centred near a few hundred milliseconds. <strong>Fix:</strong> fix time sync and alert on clock offset. Do not widen the window to 1 hour as a "fix". That widens the replay window by 12 times.</p>
+
+<h3 id=dd-webhooks-fm-hol level=3>3. One customer's outage slows every customer</h3>
+<p><strong>Symptom:</strong> on the sender, delivery latency for all endpoints climbs from seconds to tens of minutes, while error rate stays modest. <strong>Mechanism:</strong> a shared queue with shared workers. One large endpoint is timing out, so most workers sit on 10-second sockets to it. <strong>Detect:</strong> per-endpoint in-flight count and "oldest due delivery age" by endpoint. One endpoint holding most of the in-flight requests is the signature. <strong>Fix:</strong> per-endpoint concurrency caps and queues, plus the circuit described above.</p>
+
+<h3 id=dd-webhooks-fm-order level=3>4. Out-of-order events reverse a state change</h3>
+<p><strong>Symptom:</strong> an order shows "payment failed" even though the customer was charged. <strong>Mechanism:</strong> the first attempt of <code>payment.failed</code> (from an earlier card decline) timed out and was retried 10 minutes later. By then <code>payment.succeeded</code> had arrived and been applied. The retry overwrote it. <strong>Detect:</strong> compare each event's object version or <code>created</code> timestamp with the stored one, and count "older event applied" cases. Reconciliation mismatches are the lagging indicator. <strong>Fix:</strong> never apply a payload blindly. Either fetch current state from the provider, or keep a per-object version and drop any event older than what you have. Writing state transitions as a guarded update (<code>WHERE status IN ('pending')</code>) is a cheap safety net.</p>
+
+<h3 id=dd-webhooks-fm-ssrf level=3>5. The sender becomes an SSRF tool</h3>
+<p><strong>Symptom:</strong> a customer's delivery log shows 200 responses from an endpoint URL like <code>http://169.254.169.254/latest/meta-data/</code>, and the response snippet shows cloud credentials. <strong>Mechanism:</strong> server-side request forgery. Webhook URLs are attacker-controlled input that your servers fetch. Validating the URL at registration is not enough. The hostname can resolve to a public IP at registration and to <code>127.0.0.1</code> later (DNS rebinding), or the public endpoint can answer with a 302 redirect to an internal address. <strong>Detect:</strong> log the resolved IP for every attempt; alert on any private, loopback, link-local or metadata address. <strong>Fix:</strong></p>
+<ul>
+<li>Resolve the hostname at send time, check every resolved address against a blocklist, then connect to that exact IP (pin it) while sending the original <code>Host</code> header and SNI. Checking one lookup and connecting with another is the rebinding hole.</li>
+<li>Block 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16, 100.64.0.0/10, 0.0.0.0/8, and the IPv6 equivalents (<code>::1</code>, <code>fc00::/7</code>, <code>fe80::/10</code>), including IPv4-mapped forms like <code>::ffff:127.0.0.1</code>. Parse addresses with a real IP library; strings like <code>0x7f.1</code> and <code>2130706433</code> are also loopback.</li>
+<li>Do not follow redirects.</li>
+<li>Run delivery workers in their own network segment, with egress only through a filtering proxy (Stripe's open-source Smokescreen is one example). Then a bug in your checks still cannot reach the database subnet or the metadata service.</li>
+</ul>
+
+<h3 id=dd-webhooks-fm-recon level=3>6. Reconciliation runs, but misses the gap anyway</h3>
+<p><strong>Symptom:</strong> after a provider incident, finance finds 40 orders paid at the provider and pending at the bookstore, though reconciliation "ran every hour." <strong>Mechanism:</strong> the job used the wall clock as its cursor (<code>created &gt;= last_run_time</code>). Events created just before a run but made visible just after were skipped. Or the cursor was saved before the recovered events were queued, and the job died in between. <strong>Detect:</strong> a daily count comparison between provider and local records for the previous day, alerting on any difference. <strong>Fix:</strong> use the provider's opaque cursor or event ID ordering where it offers one. Overlap time windows by a safety margin, since dedupe makes overlap free. Save the cursor only after the events are durably queued.</p>
+
+<h3 id=dd-webhooks-fm-poison level=3>7. A poison event blocks the worker queue</h3>
+<p><strong>Symptom:</strong> the handler is fast and healthy, yet orders stop updating. <strong>Mechanism:</strong> one event has a payload version your worker cannot parse. The worker throws, the queue redelivers it, and the worker throws again, forever. If the queue is ordered (a FIFO group or a single Kafka partition), everything behind it waits. <strong>Detect:</strong> per-message delivery count and "age of oldest unprocessed inbox row." <strong>Fix:</strong> cap attempts and move the event to a <a href="#dead-letter-queue">dead-letter queue</a> with the error attached. Subscribe to a pinned API version so payload shapes change only when you choose.</p>
+
+<h2 id=dd-webhooks-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Payload shape<td>Fat event: full object in the body<td>Thin event: type + object ID; receiver fetches<td>Objects are immutable or append-only, and receivers should not need API credentials. Choose thin when ordering and staleness matter (payments), or payloads would leak too much if misrouted.
+<tr><td>Ordering<td>Unordered, parallel delivery<td>Per-endpoint or per-object FIFO<td>Almost always. FIFO means one failing event blocks every later event for that key, so a single bad delivery stalls the stream. Offer object versions instead and let receivers discard stale events.
+<tr><td>Signing<td>HMAC with shared secret<td>Asymmetric (Ed25519) with published keys<td>You want the simplest receiver code and secrets are per-endpoint. Choose asymmetric when receivers are many and you cannot trust them all to keep a secret.
+<tr><td>Sender event capture<td>Transactional outbox<td>Dual write (commit, then call the webhook service)<td>Always A, for anything that matters. B loses or invents events on every crash between the two writes.
+<tr><td>Outbox relay<td>Polling with <code>SKIP LOCKED</code><td>WAL tailing (CDC)<td>Volume is modest (hundreds per second) and you want no new infrastructure. Choose CDC for high volume or sub-100 ms latency, and budget for replication-slot monitoring.
+<tr><td>Receiver dedupe<td>Inbox table with unique key<td>Cache with TTL (e.g. Redis <code>SET NX EX</code>)<td>Effects are financial or irreversible: the database survives restarts and can share a transaction with the effect. A cache is fine for cheap, reversible effects such as cache invalidation.
+<tr><td>Build or buy (sender)<td>Build on your queue and DB<td>Managed webhook service<td>Webhooks are core to the product and you need control. Buy when you need the dashboard, retries, signing and SSRF egress quickly and the volume fits the price.
+<tr><td>Completeness path<td>Events list API with cursor<td>Bulk export or object listing by <code>updated_at</code><td>The provider has an event log with enough retention (often 30 days). Fall back to object listing when it does not, and accept that you see final state rather than each change.
+</tbody></table></div></div>
+<p>Two of these deserve opinion rather than a table. First, <strong>prefer thin events for anything stateful.</strong> Fat events feel efficient, but every receiver then has to handle stale and reordered payloads correctly, and most will not. A thin event plus a fetch moves the truth back to one place. The extra API call is cheap next to a reversed refund.</p>
+<p>Second, <strong>do not promise ordering</strong> as a sender unless customers will pay its price. Ordered delivery to an endpoint means a single failure stops the line until it succeeds or is abandoned. Most customers who ask for ordering really want "don't let an old event overwrite a new one," and a version number gives them that without the stall.</p>
+<p>A sender also needs <strong>reconciliation APIs</strong>, not just delivery. At minimum: <code>GET /events?after=&lt;cursor&gt;</code> over a documented retention period, <code>GET /deliveries?endpoint=…&amp;status=failed</code>, and <code>POST /endpoints/{id}/replay</code> with a time range. These turn "we were down for six hours" from a support ticket into a self-service call.</p>
+
+<h2 id=dd-webhooks-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Does the handler do anything other than verify, store, enqueue and return? What is its p99 latency under the provider's peak burst, and how far is that from the provider's timeout?</li>
+<li>Is the signature verified over the raw body bytes, with a constant-time compare, and is the timestamp inside the signed content?</li>
+<li>What is the timestamp window, and is clock offset on the receiving hosts monitored?</li>
+<li>Where is the dedupe key stored, and is it retained longer than the sender's retry window plus any manual-replay window?</li>
+<li>Do the business effect and the "processed" mark commit in the same transaction? If the effect is external, is the event ID passed on as an idempotency key?</li>
+<li>What happens when an older event arrives after a newer one for the same object? Show the code path.</li>
+<li>How are missed events found? What is the reconciliation cursor, when is it saved, and what is the maximum gap it can leave?</li>
+<li>Is there a silence alarm per provider, tuned to normal traffic for that time of day?</li>
+<li>(Sender) Is the event captured through an outbox in the same transaction as the state change?</li>
+<li>(Sender) Can one slow or dead endpoint consume more than its own share of workers? What are the per-endpoint concurrency cap, timeout, and circuit thresholds?</li>
+<li>(Sender) How are customer URLs protected against SSRF at send time, including DNS rebinding, redirects and IPv6 forms? Where does egress go?</li>
+<li>(Sender) How does a customer rotate a secret without downtime, and how do they replay a time range after an outage?</li>
+</ol>
+
+<h2 id=dd-webhooks-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Your handler returns 200 after saving. The database insert succeeds, but the 200 is lost on the network. What happens?"</summary>
+<p>The provider sees a timeout and retries. The retry's insert hits the unique key, does nothing, and the handler returns 200 again. One row, one effect. The point is that the 200 does not have to be reliable, because the insert is idempotent. A design that only works if the 200 always arrives is not a design.</p>
+</details>
+<details>
+<summary>"Why put the timestamp inside the HMAC instead of just checking a timestamp header?"</summary>
+<p>An unsigned timestamp can be rewritten. Someone who captured one valid delivery could replay it forever by stamping it with the current time. Signing <code>timestamp.body</code> ties the time to the content, so the window limits replay to a few minutes. Event-ID dedupe catches replays inside that window.</p>
+</details>
+<details>
+<summary>"A customer asks for guaranteed in-order delivery. What do you offer?"</summary>
+<p>Explain the cost first: strict order means one failing delivery stops all later ones for that key, possibly for days of retries. Then offer what they usually need. Each event carries a per-object version or sequence number. The receiver drops anything older than its stored version, or uses thin events and fetches current state. That gives correct final state with parallel delivery. If they truly need a gap-free sequence, point them at the events list API with a cursor, which is ordered.</p>
+</details>
+<details>
+<summary>"You validate webhook URLs at registration and reject private IPs. Is that enough to stop SSRF?"</summary>
+<p>No. DNS can change after registration (rebinding), so the hostname can resolve to <code>10.x</code> at send time. A public endpoint can also redirect to an internal one. You have to check the resolved address at every attempt, connect to that exact IP, refuse redirects, and put workers behind an egress proxy in an isolated network so a missed case still cannot reach anything internal.</p>
+</details>
+<details>
+<summary>"How long should the receiver keep dedupe keys?"</summary>
+<p>Longer than the sender will ever resend that event. That is the published retry window (often around 3 days) plus any manual replay or reconciliation window you run. If keys expire after 24 hours and the sender retries on day 3, you process the event twice. Thirty days is a common, cheap choice when the IDs live in a partitioned table.</p>
+</details>
+<details>
+<summary>"Your outbox relay uses CDC. Disk on the primary database is filling up. What happened?"</summary>
+<p>Most likely the relay stopped consuming and its logical replication slot is holding WAL. Postgres keeps every WAL segment a slot has not confirmed, so an abandoned or stuck consumer fills the disk. Check replication slot lag. Fix the consumer or drop the slot (accepting a replay from the outbox table), and alert on slot lag in bytes from then on. Newer Postgres versions can cap retained WAL per slot with <code>max_slot_wal_keep_size</code>, at the cost of invalidating the slot when it is exceeded.</p>
+</details>
+<details>
+<summary>"When would you not bother with a reconciliation poll?"</summary>
+<p>When a missed event is harmless and self-healing. A webhook that only invalidates a cache entry with a short TTL can be lost, because the TTL repairs it. For anything that moves money, inventory or permissions, the poll stays. The cost math above shows it is a few requests a minute, which is nothing next to one week of unnoticed silence.</p>
+</details>
+<details>
+<summary>"Should you also allowlist the provider's IP addresses?"</summary>
+<p>As a second layer, if the provider publishes stable ranges and you can keep the list updated. It is not authentication. Ranges change, many providers send from shared cloud addresses, and an allowlist does nothing about replay. The signature is the control. The allowlist mainly cuts down junk traffic hitting your verify code.</p>
+</details>

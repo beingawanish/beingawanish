@@ -1,0 +1,136 @@
+<h2 id=dd-minicapstone-designing-a-notification-system-capacity level=2>Deep Dive: The Capacity Plan</h2>
+<p>The capstone routes every arrow correctly. A design review then asks the next question: how big is each box, and which one breaks first? This plan uses the brief's numbers plus a few stated assumptions. Change an assumption and redo the line. That is the whole point of writing it down.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-volume level=3>Daily volume</h3>
+<ul>
+<li><strong>Transactional.</strong> Assume 200,000 orders on a normal day, each producing about 4 notifiable events (placed, shipped, out for delivery, delivered). That is 800,000 events. Preferences fan each one to about 2 channels on average, so roughly 1.6 million sends.</li>
+<li><strong>Security.</strong> Assume 50,000 events a day (new-device logins, password changes). Each goes to push plus email, and to SMS for a subset, about 120,000 sends.</li>
+<li><strong>Marketing.</strong> One campaign a day to 5 million users. Assume 60% have email marketing enabled and 40% have push enabled. That gives 3 million emails and 2 million pushes.</li>
+</ul>
+<p>The total is about 7 million sends a day, an average of 80 per second. The average is useless for sizing. The system is shaped by two peaks, and the danger is when they overlap.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-peaks level=3>The peaks</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Stage<th>Flash sale<th>Campaign<th>What sets the limit<tbody>
+<tr><td>Ingest (topics, send API)<td>5,000 events/s for 2 min<td>1 API call, expanded to 5M jobs<td>Topic partitions and the fan-out job
+<tr><td>Pipeline workers (prefs, dedupe, render)<td>2,000/s, so about a 5-min backlog<td>5M jobs at 2,000/s is about 42 min<td>Preference reads and template rendering
+<tr><td>Email channel<td>~1,000/s<td>3M at a planned 3,000/s is about 17 min<td>Provider quota (10,000/s) and mailbox-provider throttling
+<tr><td>Push channel<td>~2,000/s<td>2M at 5,000/s is under 7 min<td>Provider quota, connection count
+<tr><td>SMS channel<td>~0 (security only)<td>Not used for marketing<td>Sender-number throughput
+</table></div></div>
+<p>The pipeline row is the surprise. At 2,000 jobs per second, a 5-million-user campaign occupies the shared pipeline for 42 minutes. If a flash sale starts during that window, order confirmations queue behind marketing. That one line justifies priority lanes, covered under rate limiting. It also tells you to expand campaigns in pages (say 10,000 users per job) so the pipeline can interleave higher-priority work between pages.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-concurrency level=3>Workers and connections (Little's law)</h3>
+<p>Concurrency in flight equals throughput times latency. Assume a provider call takes 80 ms on average. Email at 3,000 per second then needs 3,000 × 0.08 = 240 requests in flight. Plan 300 to absorb latency spikes. At the full 10,000 per second you would need 800. If provider latency doubles during an incident, your concurrency need doubles too. That is one reason to cap concurrency per channel instead of letting the pool grow.</p>
+<p>Push is cheaper per connection. APNs and FCM both use HTTP/2, so one connection carries many concurrent streams. The limit per connection is advertised by the server and varies. At 5,000 pushes per second and 50 ms latency, 250 requests are in flight, which is a handful of connections.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-storage level=3>Storage</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Store<th>Assumption<th>Size<tbody>
+<tr><td>Feed entries<td>~3M rows/day at ~1 KB, kept 90 days<td>~270 GB, plus indexes
+<tr><td>Delivery ledger (one row per send attempt)<td>~7.5M/day at ~400 B, hot for 30 days, then archived<td>~90 GB hot
+<tr><td>Dedupe keys<td>~10M keys/day at ~100 B, 48 h TTL<td>~2 GB in memory
+<tr><td>Preferences<td>5M users, ~20 category-channel pairs, ~1 KB/user<td>~5 GB, read-heavy, cacheable
+<tr><td>Device tokens<td>~1.5 tokens/user, ~300 B each<td>~2.3 GB
+</table></div></div>
+<p>None of these is large. The ledger matters most operationally, because it answers support's question: "why didn't this user get it?"</p>
+<h2 id=dd-minicapstone-designing-a-notification-system-providers level=2>Deep Dive: Channel Providers and Their Limits</h2>
+<p>Each provider is a separate dependency with its own failure shape. The specifics change, so treat the numbers below as the kind of limit to look for and confirm them in your own account.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-email level=3>Email</h3>
+<p>The provider's quota (10,000 sends per second in the brief) is rarely the binding limit. Two others matter more.</p>
+<ul>
+<li><strong>Mailbox providers throttle you.</strong> Gmail, Outlook and Yahoo push back with temporary deferrals (SMTP 4xx) when volume to them rises faster than your reputation supports. A new sending domain or IP has to warm up over weeks. Blasting a campaign at quota from cold infrastructure lands it in spam or gets it deferred for hours.</li>
+<li><strong>Reputation thresholds.</strong> Amazon SES, for example, places accounts under review at a 5% bounce rate or 0.1% complaint rate, and may pause sending at higher levels. Since 2024, the large mailbox providers require bulk senders to authenticate with SPF, DKIM and DMARC. They also require one-click unsubscribe (the <code>List-Unsubscribe-Post</code> header from RFC 8058) and expect spam complaints to stay under 0.3%.</li>
+</ul>
+<p>The design consequence is to separate transactional and marketing mail onto different subdomains or IP pools. Then a bad campaign cannot damage the reputation that password-reset emails depend on.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-push level=3>Push</h3>
+<ul>
+<li><strong>APNs</strong> takes one notification per HTTP/2 request, with a 4 KB payload limit for regular notifications. A <code>410 Unregistered</code> response means the token is dead, so delete it. <code>apns-collapse-id</code> makes the device replace an earlier notification with the same ID instead of stacking a second one.</li>
+<li><strong>FCM</strong>'s HTTP v1 API also sends one message per request. Batch send was retired in 2024. Projects have a default sending quota, measured per minute, that can be raised. An <code>UNREGISTERED</code> error means the token is dead. A <code>collapse_key</code> gives the same replace-on-device behaviour, with a small cap on distinct collapse keys per device.</li>
+</ul>
+<p>Token hygiene is a capacity issue, not tidiness. After a year, a large share of stored tokens can be stale. Every send to one is a wasted request that counts against quota. Process the "dead token" responses inline and prune.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-sms level=3>SMS</h3>
+<p>SMS is the slowest, most expensive and most regulated channel. In the US, throughput depends on the sender type. A standard long code registered under 10DLC gets a rate set by its brand's trust score, which is often a few to tens of messages per second. Toll-free numbers need verification. Short codes are faster (around 100 per second) but take weeks to provision.</p>
+<p>Billing is per segment. A GSM-7 message fits 160 characters, but one emoji switches the whole message to UCS-2 and 70 characters per segment. A friendly "🔐 New login" can double the bill. Providers queue messages for only a limited time, often a few hours, before failing them.</p>
+<p>Keep SMS for security codes and alerts where it earns its cost. Handle STOP replies as an inbound event that updates preferences immediately.</p>
+<h2 id=dd-minicapstone-designing-a-notification-system-dedupe level=2>Deep Dive: Deduplication and User Preferences</h2>
+<h3 id=dd-minicapstone-designing-a-notification-system-dedupe-layers level=3>Three kinds of duplicate</h3>
+<p>"Deduplicate on event ID and user" covers the first kind only. A complete design separates three.</p>
+<ol>
+<li><strong>Redelivered events.</strong> The queue or topic hands the same event over twice. Key: <code>(event_id, user_id)</code>. Store it with <code>SET key 1 NX EX 172800</code> in Redis or a unique index in the ledger before any side effect. The TTL must exceed the longest possible redelivery delay, including DLQ replays. Forty-eight hours is a common floor.</li>
+<li><strong>Semantically repeated events.</strong> Three events for one order inside a minute (paid, confirmed, packed). Different event IDs, same user intent. Key: <code>(user_id, order_id, category)</code>, held in a short coalescing window (say 30 to 60 s for non-urgent categories), where the latest state wins. Security alerts skip the window.</li>
+<li><strong>Repeated sends.</strong> A worker calls the provider, the provider accepts, and the worker crashes before recording success. The redelivered job sends again. This is the hard one, and failure drill 3 covers it.</li>
+</ol>
+<p>Give every notification a <code>notification_id</code> at creation, and derive per-channel send IDs from it (<code>notification_id:email</code>). That one ID ties the ledger, the logs, the provider message and the webhook receipts together.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-prefs level=3>The preference model</h3>
+<p>Preferences are a small table with sharp edges:</p>
+<pre><code>preference(user_id, category, channel, state)    -- state: on | off | digest
+user_settings(user_id, timezone, quiet_start, quiet_end, global_marketing_opt_out)
+category(name, class)                             -- class: security | transactional | marketing</code></pre>
+<p>The class decides the rules. Security alerts ignore quiet hours and most opt-outs. Transactional messages respect channel choices but not marketing consent. Marketing needs explicit consent, where the law requires it, and must honour every opt-out.</p>
+<p>Encode those rules in one function in the pipeline, with tests. Do not spread them across channel workers.</p>
+<p>Two behaviours matter in production:</p>
+<ul>
+<li><strong>Read path.</strong> Cache preferences with a short TTL and invalidate on change events. Then recheck at send time against the database, for anything scheduled or delayed. The window to close is "unsubscribed at 9:00:05, emailed at 9:00:20."</li>
+<li><strong>Failure path.</strong> If the preference store is unreachable, fail closed for marketing (do not send) and fail open for security (send on the safe default channel). Writing that choice down before the outage is the whole value.</li>
+</ul>
+<h2 id=dd-minicapstone-designing-a-notification-system-ratelimit level=2>Deep Dive: Rate Limiting per User and per Channel</h2>
+<p>Three separate limits run at once, and they protect different things.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Limit<th>Protects<th>Example<th>Where it runs<tbody>
+<tr><td>Per provider (global)<td>Your account and reputation<td>Email at most 3,000/s planned, 10,000/s hard<td>Channel workers, shared token bucket
+<tr><td>Per user, per channel<td>The user's attention<td>At most 3 marketing pushes a day, 1 per hour<td>Pipeline, before scheduling
+<tr><td>Per priority class<td>Urgent traffic from bulk traffic<td>Security never waits behind marketing<td>Separate queues per class within each channel
+<tr><td>Per enterprise endpoint<td>Customers' servers<td>At most N concurrent deliveries per endpoint<td>Webhook sender
+</table></div></div>
+<p><strong>The global provider limit must be shared.</strong> Forty email workers each limiting themselves to 250 per second works until autoscaling adds ten more. The usual fix is a central token bucket, like a Redis counter or a GCRA script. Workers lease tokens in small batches (say 50 at a time) so the store is not hit per send. Make the limit adaptive. On provider throttling responses (429, SMTP 421), cut the rate sharply and recover slowly, the additive-increase, multiplicative-decrease pattern.</p>
+<p><strong>Per-user limits are a product decision with a number.</strong> Store per-user counters keyed by <code>(user, channel, class, day)</code>. When a limit would be exceeded, do not drop silently. Downgrade the message to the feed only, or fold it into the next digest, and record the reason in the ledger.</p>
+<p><strong>Priority lanes beat priority fields.</strong> A single queue with a priority attribute still makes urgent messages wait behind whatever is already in front of them. Separate queues per class let workers pull security first, then transactional, then marketing. Give marketing a guaranteed minimum share so it is never starved for a whole day either.</p>
+<h2 id=dd-minicapstone-designing-a-notification-system-drills level=2>Deep Dive: Failure Drills</h2>
+<p>A drill states the scenario, what the system should do on its own, and what an on-call engineer decides. Run them in staging with injected faults before production runs them for you.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-drill1 level=3>Drill 1: The email provider goes down for 40 minutes</h3>
+<p><strong>Automatic.</strong> Timeouts and retries fail, the email circuit breaker opens, and the email queues stop draining. Push, SMS and the feed carry on, because the bulkhead held.</p>
+<p><strong>The number to watch.</strong> Backlog age per class. In 40 minutes at 1,000 transactional emails per second, 2.4 million queue up. Some of them stop mattering. "Your order is out for delivery" sent after the parcel arrived is noise.</p>
+<p><strong>Decisions.</strong> Every notification should carry an <code>expires_at</code>, so stale ones are dropped and logged when the circuit closes. Pause the marketing lane outright. For security and transactional mail, fail over to a secondary provider, but only if it was set up beforehand. That means a verified domain, DKIM keys, warmed IPs and regular low-volume traffic through it. A failover provider that has never sent mail is not a failover.</p>
+<p><strong>Recovery.</strong> When the circuit closes, drain at the planned rate, not the hard cap. Mailbox providers react badly to a sudden surge.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-drill2 level=3>Drill 2: Flash sale during a campaign</h3>
+<p>The campaign has 30 minutes left in the pipeline when 600,000 order events arrive. Without priority lanes, order confirmations wait behind up to 3.6 million marketing jobs, a delay of about 30 minutes.</p>
+<p>With lanes, the workers pull transactional work first. The flash sale's 5-minute backlog clears as if the campaign did not exist, and the campaign finishes about 5 minutes late. Autoscaling the pipeline helps, but only up to what the preference store and channels can absorb. Set a maximum worker count that matches downstream capacity, so scaling does not just move the queue into the database.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-drill3 level=3>Drill 3: Users get the same SMS three times</h3>
+<p><strong>Mechanism.</strong> The usual cause is a queue visibility timeout shorter than the worst-case send. The SMS provider is slow, a call takes 40 seconds, the queue's 30-second visibility timeout expires, and a second worker picks up the same job. A worker crash between the provider's acceptance and the ledger write causes the same effect.</p>
+<p><strong>Detect.</strong> Count sends per <code>notification_id</code> and channel in the ledger. More than one accepted send is a duplicate, and the rate should be near zero. User complaints come later and cost more.</p>
+<p><strong>Fix.</strong> Set the visibility timeout above the client timeout plus retry budget, or extend it while working. Use a send state machine in the ledger: <code>pending → sending → sent | failed</code>, with a conditional update to claim the send before the call. A job that finds a row in <code>sending</code> from another worker backs off.</p>
+<p>The crash window cannot be closed completely, because most email and SMS APIs do not take an idempotency key. So decide per channel. For push, a duplicate is harmless when you set the collapse ID to the notification ID. For a one-time code, prefer the risk of not sending, since the user can ask again.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-drill4 level=3>Drill 4: A broken template goes to 5 million people</h3>
+<p>A missing variable renders "Hi {first_name}" in a campaign. Nothing failed, so no alarm fires.</p>
+<p>The defence is procedural and cheap. Validate templates against a sample payload before scheduling. Send each campaign to an internal seed list first, then to 1% of users, and pause for a few minutes while watching complaints and unsubscribes. Keep a kill switch per campaign that empties its remaining jobs in one action. At 3,000 emails per second, a pause after one minute has already sent 180,000, so the seed and 1% stages are what actually protect you.</p>
+<h3 id=dd-minicapstone-designing-a-notification-system-drill5 level=3>Drill 5: Bounce webhooks stop arriving</h3>
+<p>The provider's webhook endpoint configuration changed, and receipts stopped coming in. Nothing breaks visibly. But hard-bounced addresses keep receiving mail, and the bounce rate climbs toward the provider's review threshold over days.</p>
+<p>Detect it with a webhook arrival rate per provider compared with send volume. If you sent 3 million emails and received zero delivery receipts in an hour, an alarm should fire. The capstone's reconciliation job is the backstop. It polls status for sends with no receipt after a set time.</p>
+<h2 id=dd-minicapstone-designing-a-notification-system-observability level=2>Deep Dive: Observability</h2>
+<p>A notification system fails quietly. Messages that are never sent produce no errors. So the observability plan starts with a funnel and works out from there.</p>
+<ul>
+<li><strong>The funnel, per category and channel.</strong> Events received, notifications created, suppressed (with reason: preference, dedupe, rate limit, expired), sent, accepted by the provider, delivered, opened or clicked, bounced, and complained. A sudden change in any ratio is the earliest signal of a bug. A drop in "suppressed by preference" after a deploy is just as alarming as a rise.</li>
+<li><strong>Latency SLOs by class.</strong> For example: security alerts at p99 under 30 s from event to provider acceptance, transactional at p99 under 2 minutes, and campaigns fully sent within 1 hour of their scheduled start. Measure from the event's own timestamp, so queue time is included.</li>
+<li><strong>Backlog age per queue,</strong> alerted with different thresholds per class, as the capstone notes. Add consumer lag for the input topics.</li>
+<li><strong>Provider health.</strong> Error rate by provider error code, latency percentiles, throttling responses, circuit-breaker state, and dead-token rate.</li>
+<li><strong>Reputation.</strong> Bounce and complaint rates per sending domain, computed daily against the provider's thresholds, with an alarm well below them.</li>
+<li><strong>Tracing.</strong> Carry the <code>notification_id</code> and the originating event ID through every stage as trace attributes. A support engineer should be able to type a user ID and see every notification, its suppression reasons and its provider receipts, from the ledger, in one screen.</li>
+</ul>
+<h2 id=dd-minicapstone-designing-a-notification-system-evolution level=2>Deep Dive: The Evolution Path</h2>
+<p>Nobody builds the final architecture on day one, and they should not. Each stage below is triggered by a specific pain, not a calendar.</p>
+<ol>
+<li><strong>Stage 1: one queue, one provider per channel, a feed table.</strong> Enough for the first hundred thousand users. Deduplication by event ID and a preference table from the start, because retrofitting consent is miserable.</li>
+<li><strong>Stage 2: per-channel queues, a delivery ledger, webhook receipts.</strong> Triggered by the first provider outage that delayed every channel, or the first "did this user get it?" ticket nobody could answer.</li>
+<li><strong>Stage 3: priority lanes, a scheduler for quiet hours and digests, shared rate limits.</strong> Triggered by marketing volume competing with transactional traffic, the flash-sale-during-campaign drill.</li>
+<li><strong>Stage 4: secondary providers with automatic failover, split sending domains, campaign canaries.</strong> Triggered by reputation incidents or an availability SLO that one provider cannot meet.</li>
+<li><strong>Stage 5: multi-region.</strong> Region-local pipelines, providers and SSE edges, with preferences replicated and data residency respected. The tricky part is that a user's preferences and dedupe keys must be consistent enough across regions that a failover does not double-send. That usually means one home region per user.</li>
+<li><strong>Stage 6: optimisation.</strong> Send-time optimisation, per-user channel ranking, and the capstone's LLM morning brief. These only pay off once the funnel metrics from the observability plan exist to measure them.</li>
+</ol>
+<p>One honest question belongs at stage 2. Should you build this at all? Hosted notification platforms cover stages 1 to 4 for many companies. Building pays off when notifications are central to the product, volume makes per-message pricing painful, or the preference and compliance rules are unusual. If none of those holds, the ledger, the preference rules and the drills above still apply. You simply run them against someone else's pipeline.</p>
+<h2 id=dd-minicapstone-designing-a-notification-system-review level=2>Deep Dive: Design-Review Questions</h2>
+<ol>
+<li>What is the planned send rate per channel, and how far is it below both the provider quota and your mailbox-provider reputation limits?</li>
+<li>Can a campaign delay a security alert? Show the queue a security alert waits in during a campaign.</li>
+<li>What does every notification carry for expiry, and what happens to expired ones after an outage?</li>
+<li>Which three kinds of duplicate do you handle, and which per-channel risk do you accept for the crash window?</li>
+<li>Is the visibility timeout longer than the worst-case provider call plus retries?</li>
+<li>What happens when the preference store is down, by class?</li>
+<li>Where is the global rate limit enforced, and does it survive autoscaling?</li>
+<li>Is the secondary provider exercised with real traffic every week?</li>
+<li>How would you notice that delivery receipts stopped arriving?</li>
+<li>Can support answer "why didn't user X get notification Y?" in under a minute?</li>
+</ol>

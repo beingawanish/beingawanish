@@ -1,0 +1,277 @@
+<h2 id=dd-eventdriven-architecture-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson settles what goes inside an event. A real system has to settle four more things before the design holds up. What <em>kind</em> of event is this, and who is it for? How does its format change over time without breaking anyone? How does it leave the producer's database without being lost or invented? And when something goes wrong three hops later, how do you find out why? We will take them in order.</p>
+
+<h3 id=dd-eventdriven-architecture-event-kinds level=3>Three kinds of event, three different audiences</h3>
+<p>The lesson's three levels describe how much state an event carries. A second axis is just as important: who the event is for.</p>
+<ul>
+<li><strong>Notification events</strong> say "something changed, ask me if you care." <code>{order_id}</code> and nothing else. They are fine for low-volume triggers where the consumer would call the owner anyway, like a cache invalidation.</li>
+<li><strong>Event-carried state transfer (ECST)</strong> ships the current state of an entity. <code>order.updated</code> carries the whole order, every time. Consumers overwrite their local copy and do not need to know <em>what</em> changed.</li>
+<li><strong>Domain events</strong> describe a business fact in the language of the domain: <code>OrderPlaced</code>, <code>PaymentCaptured</code>, <code>ShipmentDelayed</code>. They carry the data relevant to that fact, and the name itself carries meaning. A domain event is what a fraud model or an auditor actually wants to know.</li>
+</ul>
+<p>Domain-driven design adds one more split, and it saves a lot of pain. <strong>Internal domain events</strong> live inside one service's boundary. They can change whenever that team likes. <strong>Integration events</strong> are the public subset published to other teams, with a schema under governance. Most "we cannot change anything" situations come from publishing internal events directly, so that every refactor becomes a cross-team negotiation. Translate at the boundary. Checkout's internal <code>CartLineAdjusted</code> should never reach the public topic.</p>
+<p>A practical way to tell them apart: ECST answers "what is the order now?" and a domain event answers "what just happened to it?" Many good designs carry both. <code>OrderCancelled</code> names the fact and includes the order's state after the change, so consumers do not need to apply diffs.</p>
+
+<h3 id=dd-eventdriven-architecture-envelope level=3>The envelope: metadata every event needs</h3>
+<p>Separate the envelope from the payload. The payload is the business data. The envelope is what infrastructure and debugging need. CloudEvents is a CNCF specification for this, and its core attributes are a good checklist even if you do not adopt it:</p>
+<pre><code>{
+  "specversion": "1.0",
+  "id": "evt_01HZX4K9M2",              // unique per event: the dedup key
+  "source": "/checkout",                // who produced it
+  "type": "com.bookstore.order.placed.v1",
+  "subject": "ord_7f3a",                // the entity it is about
+  "time": "2026-11-20T14:03:11.204Z",   // when it happened, at the source
+  "dataschema": "registry://order-placed/7",
+  "data": { "order_id": "ord_7f3a", "items": 3, "total_cents": 14200, ... },
+
+  // extensions worth adding
+  "traceparent": "00-4bf92f35...-00f067aa0ba902b7-01",
+  "correlationid": "req_88c1",          // the user action that started it all
+  "causationid": "evt_01HZX4K7QA",      // the event that directly caused this one
+  "entityversion": 42                   // per-order version, for ordering
+}</code></pre>
+<p>Three fields deserve emphasis. The <code>id</code> is what consumers dedupe on, so it must be assigned once, at the source, and survive retries. The per-entity <code>entityversion</code> lets a consumer ignore anything older than what it already applied. That defends against reordering from any cause. And <code>correlationid</code> plus <code>causationid</code> let you rebuild the chain of events after the fact, which we return to under tracing.</p>
+<p>On Kafka, put envelope fields in record headers where practical. Tracing libraries and routers can then read them without deserializing the payload.</p>
+
+<h3 id=dd-eventdriven-architecture-schema-registry level=3>Schema registries: how compatibility is actually checked</h3>
+<p>A schema registry stores every version of each event schema and refuses to register a new one that breaks the configured rule. In the Confluent-style wire format, each serialized record starts with a magic byte and a 4-byte schema ID. The consumer reads the ID, fetches that schema once (then caches it), and decodes the payload. So every record says exactly which schema wrote it. That is what makes mixed versions in one topic workable.</p>
+<p>The compatibility mode is the knob that matters:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Mode<th>Guarantee<th>Safe changes (Avro terms)<th>Deploy order<tbody>
+<tr><td>BACKWARD<td>New readers can read old data<td>Delete a field; add a field with a default<td>Upgrade consumers first
+<tr><td>FORWARD<td>Old readers can read new data<td>Add a field; delete a field that had a default<td>Upgrade producers first
+<tr><td>FULL<td>Both<td>Add or remove fields that have defaults<td>Either order
+<tr><td>*_TRANSITIVE<td>Same, checked against every past version, not just the last<td>As above<td>Needed when consumers replay old history
+<tr><td>NONE<td>No checks<td>Anything<td>Avoid on shared topics
+</table></div></div>
+<p>For pub/sub with unknown consumers, the producer usually deploys first and nobody can upgrade every consumer. That points to FORWARD or FULL. If consumers replay months of history, add TRANSITIVE, because a replaying consumer will meet version 3 and version 9 in the same run. BACKWARD is a common registry default. It suits a topic whose consumers you control, and it is worth checking deliberately rather than inheriting.</p>
+<p>The rules depend on the format. In Avro, defaults are what make a field optional. In Protobuf, field <em>numbers</em> are the contract: never reuse one, and mark removed numbers as <code>reserved</code>. JSON Schema is the hardest to check well, because whether extra fields are allowed (an open or closed content model) changes what "compatible" means. Teams that choose JSON for convenience often end up with weaker checks than they think.</p>
+<p>One limit no registry fixes: it checks <em>shape</em>, not <em>meaning</em>. Change <code>total</code> from dollars to cents and keep it an integer, and every check passes. Failure mode 3 below is that incident.</p>
+
+<h3 id=dd-eventdriven-architecture-outbox level=3>The outbox: one transaction, then a relay</h3>
+<p>Checkout must update its database <em>and</em> publish <code>order.placed</code>. Doing those as two separate writes is the <strong>dual write</strong> problem. Commit, then crash before publishing, and the order exists with no event. Publish, then fail the commit, and consumers act on an order that never existed. No retry ordering fixes this, because the two systems cannot commit together.</p>
+<p>The <strong>transactional outbox</strong> moves the event into the same database transaction as the state change:</p>
+<pre><code>BEGIN;
+  INSERT INTO orders (id, customer_id, total_cents, status, version)
+       VALUES ('ord_7f3a', 'c_91', 14200, 'placed', 1);
+  INSERT INTO outbox (event_id, aggregate_id, type, payload, created_at)
+       VALUES ('evt_01HZX4K9M2', 'ord_7f3a', 'order.placed.v1', '{...}', now());
+COMMIT;</code></pre>
+<p>Either both rows exist or neither does. A separate <strong>relay</strong> then reads the outbox and publishes to the broker. The relay can crash and retry, so it is at-least-once. That is why consumers dedupe on <code>event_id</code>. There are two ways to build the relay.</p>
+<p><strong>Polling relay.</strong> A worker selects unpublished rows in order, publishes them, and marks or deletes them. It is simple and portable. Its weak points are latency (the poll interval), load on the primary database, and a subtle ordering trap described in failure mode 2.</p>
+<p><strong>Log-based CDC relay.</strong> A connector such as Debezium reads the database's own change log (the Postgres WAL through a logical replication slot, or the MySQL binlog) and publishes outbox inserts as events. Debezium ships an outbox event router that turns outbox rows into properly keyed records on the right topic. Changes come out in commit order, with latency in the tens to hundreds of milliseconds and no polling queries. The cost is one more piece of infrastructure, plus replication-slot care (failure mode 4). The <a href="#change-data-capture">Change Data Capture</a> lesson covers the log reading itself.</p>
+<p>Why not CDC directly on the <code>orders</code> table and skip the outbox? You can, but then your table structure <em>is</em> your public event schema, which is the exact coupling the pub/sub lesson warned about. The outbox lets you publish a deliberate integration event while keeping the table free to change.</p>
+
+<svg role="img" aria-labelledby="dd-eventdriven-architecture-svg-title dd-eventdriven-architecture-svg-desc" viewBox="0 0 720 260" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-eventdriven-architecture-svg-title">Outbox with CDC relay and the consistency window</title>
+<desc id="dd-eventdriven-architecture-svg-desc">Checkout writes the order row and an outbox row in one transaction. A CDC relay reads the outbox from the write-ahead log and publishes to the order.placed topic. The fraud consumer updates its local view. A timeline below splits the consistency window into commit-to-relay, relay-to-broker, broker-to-consumer and apply time.</desc>
+<rect x="0" y="0" width="720" height="260" fill="var(--paper, #ffffff)"/>
+<g stroke="var(--accent, #1f5f99)" fill="var(--paper, #ffffff)">
+<rect x="16" y="30" width="170" height="96" rx="6"/>
+<rect x="216" y="54" width="130" height="48" rx="6"/>
+<rect x="376" y="54" width="140" height="48" rx="6"/>
+<rect x="546" y="30" width="158" height="96" rx="6"/>
+</g>
+<g fill="var(--ink, #1c2430)">
+<text x="28" y="50" font-weight="bold">Checkout DB</text>
+<text x="28" y="72">one transaction:</text>
+<text x="28" y="92">orders row</text>
+<text x="28" y="112">+ outbox row</text>
+<text x="228" y="76" font-weight="bold">CDC relay</text>
+<text x="228" y="94">reads WAL slot</text>
+<text x="388" y="76" font-weight="bold">order.placed</text>
+<text x="388" y="94">key = order_id</text>
+<text x="558" y="50" font-weight="bold">Fraud consumer</text>
+<text x="558" y="72">dedupe event_id</text>
+<text x="558" y="92">skip if version ≤</text>
+<text x="558" y="112">upsert local view</text>
+</g>
+<g stroke="var(--muted, #5c6b7c)" stroke-width="1.5" fill="none">
+<line x1="186" y1="78" x2="212" y2="78"/><line x1="346" y1="78" x2="372" y2="78"/><line x1="516" y1="78" x2="542" y2="78"/>
+</g>
+<g fill="var(--muted, #5c6b7c)">
+<polygon points="212,74 216,78 212,82"/><polygon points="372,74 376,78 372,82"/><polygon points="542,74 546,78 542,82"/>
+</g>
+<text x="16" y="164" fill="var(--ink, #1c2430)" font-weight="bold">Consistency window (typical, healthy)</text>
+<g stroke="var(--line, #d5dee8)">
+<rect x="16" y="176" width="200" height="26" fill="var(--bg, #f4f7fa)"/>
+<rect x="216" y="176" width="60" height="26" fill="var(--bg, #f4f7fa)"/>
+<rect x="276" y="176" width="300" height="26" fill="var(--bg, #f4f7fa)"/>
+<rect x="576" y="176" width="128" height="26" fill="var(--bg, #f4f7fa)"/>
+</g>
+<g fill="var(--ink, #1c2430)">
+<text x="24" y="194">commit → relay 20–200 ms</text>
+<text x="222" y="194">5 ms</text>
+<text x="284" y="194">consumer lag: ms normally, minutes in a backlog</text>
+<text x="584" y="194">apply 1–20 ms</text>
+</g>
+<text x="16" y="230" fill="var(--muted, #5c6b7c)">A polling relay replaces the first box with half the poll interval on average.</text>
+<text x="16" y="250" fill="var(--muted, #5c6b7c)">Lag dominates under load, so measure the window end to end: view time minus event time.</text>
+</svg>
+
+<h3 id=dd-eventdriven-architecture-choreography-orchestration level=3>Choreography and orchestration, mechanically</h3>
+<p>The pub/sub lesson gave the rule: choreograph independent reactions, orchestrate dependent steps. Here is what each looks like when it runs.</p>
+<p>In <strong>choreography</strong>, the "workflow" is the sum of subscriptions. Payment listens for <code>OrderPlaced</code> and emits <code>PaymentCaptured</code>. Inventory listens for that and emits <code>StockReserved</code>. Shipping listens for that. No single component holds the state "order ord_7f3a is at step 2 of 4." To answer "where is this order?", you have to read every service's state or rebuild the chain from events.</p>
+<p>In <strong>orchestration</strong>, a coordinator holds that state explicitly. It sends commands (<code>CapturePayment</code>) and waits for replies or events. Workflow engines such as Temporal, AWS Step Functions or Camunda persist the coordinator's state at every step. A crashed coordinator then resumes exactly where it was, timers included. The coordinator knows when a step is overdue, which choreography cannot know without extra machinery.</p>
+<p>The usual production shape is a hybrid. The order <a href="#saga">saga</a> is orchestrated, because its steps depend on each other and must be undone in order. Each step publishes domain events, and email, analytics and loyalty choreograph off those. The orchestrator handles "must happen". The events handle "may want to know".</p>
+
+<h3 id=dd-eventdriven-architecture-tracing level=3>Tracing across asynchronous hops</h3>
+<p>Synchronous tracing works because each call carries the trace context in an HTTP header. With events, the broker sits in the middle and does not forward anything by itself. So the producer must write the W3C <code>traceparent</code> into the event (a Kafka header or a message attribute), and each consumer must read it when it starts processing.</p>
+<p>The next question is how to link the spans. A consumer that processes one event can make its span a child of the producer's span. That gives the familiar single tree. But a consumer that processes a batch of 500 events has 500 parents, and a fan-out to 20 subscribers produces a tree of hours-long gaps. OpenTelemetry's messaging conventions handle this with <strong>span links</strong>. The consumer's span starts a new trace, or joins its own, and <em>links</em> to each producer span. You can still navigate between them without pretending a two-hour backlog was one request.</p>
+<p>Traces get sampled, so they will not hold every event. The durable record is the correlation and causation chain in the envelope. Log <code>event_id</code>, <code>correlationid</code> and <code>causationid</code> on every handler, and "show me everything that happened because of request <code>req_88c1</code>" becomes a log query that works even for events whose traces were sampled away. The <a href="#distributed-tracing">Distributed Tracing</a> lesson covers sampling and propagation in general.</p>
+
+<h2 id=dd-eventdriven-architecture-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-eventdriven-architecture-window-budget level=3>A consistency-window budget</h3>
+<p>"Eventually consistent" is not a requirement anyone can test. "The fraud view reflects an order within 2 seconds at p99, under 5,000 orders per second" is. Build the window from its parts and give each a budget:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Stage<th>Polling relay (500 ms interval)<th>CDC relay<th>What makes it worse<tbody>
+<tr><td>Commit → relay picks up<td>avg 250 ms, max 500 ms<td>tens of ms<td>Relay down, slot lagging, long transactions
+<tr><td>Relay → broker ack<td>~5 ms<td>~5 ms (batched)<td>ISR shrink, broker overload
+<tr><td>Broker → consumer reads<td>ms when caught up<td>same<td>Any backlog: lag ÷ drain rate
+<tr><td>Apply to view<td>1–20 ms<td>same<td>Slow view store, lock contention
+<tr><td><strong>Healthy total</strong><td><strong>~300–550 ms</strong><td><strong>~50–150 ms</strong><td>
+</table></div></div>
+<p>The healthy number is not the one that hurts. The third row is. If fraud is 480,000 events behind and drains at 1,200 per second net, every new order waits 400 seconds. The consistency window is now almost seven minutes, and nothing is technically broken. So the alert to set is on the <em>end-to-end</em> window, measured as "view updated at" minus the event's <code>time</code>. Watch the p99 per consumer.</p>
+<p>Clock skew contaminates that measure. If the producer's clock is 300 ms ahead, every window looks 300 ms shorter. Keep hosts on NTP, and treat sub-second readings as approximate. For exact numbers, compare broker append timestamps with consumer timestamps on the same clock source.</p>
+
+<h3 id=dd-eventdriven-architecture-outbox-sizing level=3>Outbox table growth</h3>
+<p>At 5,000 orders per second and 2 KB per outbox row, the outbox grows at 10 MB/s. That is 36 GB per hour of sale. Rows that are never deleted cost more than the disk they use. They bloat indexes, slow the relay's "next unpublished" query and lengthen vacuum. Plan for it:</p>
+<ul>
+<li>With a CDC relay, the outbox row is only needed long enough to reach the WAL. A common pattern inserts and then deletes the row in the same transaction, since the insert is already in the WAL. Or you delete it shortly afterwards. The table stays near empty.</li>
+<li>With a polling relay, delete in batches right after publishing, or partition the table by hour and drop old partitions. Dropping a partition is much cheaper than deleting millions of rows.</li>
+</ul>
+
+<h3 id=dd-eventdriven-architecture-replay-time level=3>Rebuild time is a recovery objective</h3>
+<p>The lesson says a new view replays 500 million events "in several hours." Make that a number you test. If one consumer instance applies 20,000 events per second with batched writes to its view store, 500 million events take 25,000 seconds, about seven hours. Twelve partitions and twelve instances in parallel bring that to about 35 minutes, if the view store can take 240,000 writes per second. Usually it cannot, so the view store sets the rebuild time, not Kafka.</p>
+<p>That rebuild time is your recovery time when a view is corrupted. If the product needs that view back within 30 minutes, you need a faster store, a periodic snapshot to replay from, or a compacted topic that holds only the latest state per key.</p>
+
+<h3 id=dd-eventdriven-architecture-versioning-cost level=3>The cost of a breaking change</h3>
+<p>Suppose <code>order.placed</code> must change incompatibly, for example splitting <code>address</code> into structured fields. Dual-publishing v1 and v2 for a 90-day deprecation window doubles the topic's write and storage costs for those 90 days. At 200 events per second and 2 KB, that is an extra 35 GB per day before replication. It is affordable. What is not cheap is the coordination: every subscriber in the catalog must confirm migration before v1 stops. With 20 subscribers, the slowest team sets the date. That is the argument for spending design effort up front on a schema you will not need to break.</p>
+
+<h2 id=dd-eventdriven-architecture-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-eventdriven-architecture-fm-dual-write level=3>1. Ghost and missing events from dual writes</h3>
+<p><strong>Symptom.</strong> Fraud scored an order that the orders database does not contain. Elsewhere, a handful of orders a day never reach email or analytics.</p>
+<p><strong>Mechanism.</strong> Checkout writes the database and calls the broker separately. A timeout after the publish but before the commit produces ghost events. A crash after the commit but before the publish produces missing ones.</p>
+<p><strong>Detect.</strong> A daily reconciliation job comparing order IDs in the database with event IDs in the topic. Both directions should be empty. Most teams discover this only when someone builds that job.</p>
+<p><strong>Fix.</strong> A transactional outbox, with a CDC or polling relay. Keep the reconciliation job afterwards as a permanent check.</p>
+
+<h3 id=dd-eventdriven-architecture-fm-outbox-gap level=3>2. The polling relay that skips rows</h3>
+<p><strong>Symptom.</strong> With the outbox in place, a few events per million still go missing, mostly during peak load.</p>
+<p><strong>Mechanism.</strong> The relay runs <code>SELECT ... WHERE id &gt; :last_seen ORDER BY id</code>. Sequence values are assigned when a row is inserted, not when its transaction commits. Transaction A takes id 101 and commits slowly. Transaction B takes id 102 and commits first. The relay reads 102, advances <code>last_seen</code> to 102, and never sees 101.</p>
+<p><strong>Detect.</strong> Gaps in published IDs that later appear in the outbox table. A reconciliation query for outbox rows older than a minute that are still unpublished.</p>
+<p><strong>Fix.</strong> Track a "published" flag per row instead of a high-water mark, so any unpublished row is found whatever its ID. Or only read rows older than a safety lag that is longer than your longest transaction. Or use CDC, which reads in commit order and does not have this problem.</p>
+
+<h3 id=dd-eventdriven-architecture-fm-semantic-break level=3>3. A compatible schema change that breaks everyone</h3>
+<p><strong>Symptom.</strong> The day after a release, loyalty awards 100 times the usual points and the finance dashboards show revenue up 100×. The registry check passed. No consumer threw an error.</p>
+<p><strong>Mechanism.</strong> Checkout changed <code>total</code> from dollars to cents. The type stayed an integer, so the change was structurally compatible and semantically breaking.</p>
+<p><strong>Detect.</strong> Data-quality checks on the consumer side: distributions of key fields compared to yesterday's. Contract tests that run consumers' sample expectations against the producer's new events in CI.</p>
+<p><strong>Fix.</strong> A meaning change is a new field (<code>total_cents</code>) or a new version, never an in-place change. Put units in field names. Make consumer-driven contract tests part of the producer's build for its most important subscribers.</p>
+
+<h3 id=dd-eventdriven-architecture-fm-slot level=3>4. A stalled CDC slot fills the primary's disk</h3>
+<p><strong>Symptom.</strong> The checkout Postgres primary's disk usage climbs for hours, then the database stops accepting writes. Checkout is down, caused by a component that only publishes events.</p>
+<p><strong>Mechanism.</strong> A logical replication slot makes Postgres keep WAL until the slot's consumer confirms it. The Debezium connector stopped (a bad config deploy, an expired credential), so the slot stopped advancing, and Postgres kept every WAL segment since.</p>
+<p><strong>Detect.</strong> Retained WAL per replication slot (from <code>pg_replication_slots</code>) and the connector's own lag metric. Alert on retained WAL size, not just on connector health. A connector can look "running" while it confirms nothing.</p>
+<p><strong>Fix.</strong> Alert early. Set <code>max_slot_wal_keep_size</code> (Postgres 13 and later) so a dead slot is invalidated before it can fill the disk. You then have to re-snapshot that connector, which is much better than an outage. Drop slots you are not using.</p>
+
+<h3 id=dd-eventdriven-architecture-fm-resurrection level=3>5. Out-of-order events resurrect a cancelled order</h3>
+<p><strong>Symptom.</strong> A customer cancels within seconds of ordering. The order shows "cancelled" in checkout but "active" in the support view, and the warehouse ships it.</p>
+<p><strong>Mechanism.</strong> <code>order.placed</code> and <code>order.cancelled</code> are on separate topics, or the same topic keyed differently. The cancel is processed first. Then the placed event arrives and upserts the order as active. Each event was valid. Their order was not.</p>
+<p><strong>Detect.</strong> Count events that arrive with an <code>entityversion</code> lower than the view's stored version. Today you are not counting them, which is why it looks random.</p>
+<p><strong>Fix.</strong> Keep one entity's lifecycle on one topic, keyed by its ID. In every view, store the last applied version and ignore anything older. Make the warehouse check the owner's current status before an irreversible step. That is the "exactly current reads go to the owner" rule from the lesson.</p>
+
+<h3 id=dd-eventdriven-architecture-fm-stuck-choreography level=3>6. A choreographed order that nobody notices is stuck</h3>
+<p><strong>Symptom.</strong> Customers write in about orders that were paid but never shipped. Every service's dashboards are green.</p>
+<p><strong>Mechanism.</strong> Inventory had a bug and stopped emitting <code>StockReserved</code> for orders containing pre-order items. Payment did its job. Shipping waits for an event that will never come. In choreography, "nothing happened" emits no signal, so no component is responsible for noticing.</p>
+<p><strong>Detect.</strong> A process monitor. That is a small consumer that tracks expected sequences (placed → paid → reserved → shipped) per order and raises an alert when a step is overdue. Or count orders by stage and alert on age.</p>
+<p><strong>Fix.</strong> Add the monitor, or recognise that this sequence is a workflow and move it to an orchestrator that owns timeouts and compensation. Then keep choreography for the independent reactions.</p>
+
+<h3 id=dd-eventdriven-architecture-fm-trace-gap level=3>7. The trace stops at the broker</h3>
+<p><strong>Symptom.</strong> A slow-receipt investigation finds checkout's trace ends at "publish order.placed, 4 ms". Email's handler appears as separate root traces with no link back. Nobody can prove where the 6 minutes went.</p>
+<p><strong>Mechanism.</strong> Only the producer was instrumented, or an intermediate hop (a stream processor, an SNS-to-SQS bridge, a retry topic) dropped the headers. Context crosses async hops only if every hop copies it.</p>
+<p><strong>Detect.</strong> The share of consumer spans with a link or parent. Aim for near 100% for each topic, and track it as a metric.</p>
+<p><strong>Fix.</strong> Instrument every hop with the messaging conventions. Make header pass-through a requirement for any component that republishes, including retry and dead-letter handlers. Log <code>correlationid</code> everywhere so investigations still work when traces were sampled away.</p>
+
+<h2 id=dd-eventdriven-architecture-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-eventdriven-architecture-publishing level=3>Getting events out of the producer</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach<th>Atomic with state?<th>Latency<th>Schema control<th>Main risk<tbody>
+<tr><td>Dual write (DB, then broker)<td>No<td>Lowest<td>Deliberate<td>Ghost and missing events
+<tr><td>Outbox + polling relay<td>Yes<td>Poll interval<td>Deliberate<td>DB load, sequence-gap skips
+<tr><td>Outbox + CDC relay<td>Yes<td>Tens–hundreds of ms<td>Deliberate<td>Slot and connector operations
+<tr><td>CDC on business tables<td>Yes<td>Tens–hundreds of ms<td>None: tables become the API<td>Coupling to schema
+<tr><td>Event sourcing<td>The event is the state<td>Low<td>Deliberate<td>Whole storage model changes
+<tr><td>Listen to yourself (publish, then update DB from the event)<td>Yes, via the log<td>Your own write waits on the broker<td>Deliberate<td>Read-your-writes is lost
+</table></div></div>
+<p>The default for a service that owns a relational database is outbox plus CDC once you have more than a couple of event types, and outbox plus polling before that. Use CDC on the business tables directly only for legacy systems you cannot change, and put a translation step between the raw change stream and the public topic. Dual write is acceptable only when losing or inventing an event is harmless, such as a metrics side channel.</p>
+
+<h3 id=dd-eventdriven-architecture-versioning level=3>Evolving an event</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Strategy<th>How<th>Good for<th>Cost<tbody>
+<tr><td>Compatible change in place<td>Add optional fields with defaults, under a registry rule<td>Most changes<td>None, if the meaning is unchanged
+<tr><td>New type, same topic<td><code>order.placed.v2</code> alongside v1; consumers filter by type<td>A breaking change for an entity whose order matters<td>Dual publish during deprecation; consumers handle both
+<tr><td>New topic<td><code>orders.v2</code> topic; mirror or dual publish<td>Re-keying, re-partitioning, big redesigns<td>Order across topics is lost during cut-over
+<tr><td>Upcasting at the consumer<td>Consumer converts old versions to the newest shape on read<td>Long-retained or event-sourced history<td>Conversion code lives forever
+</table></div></div>
+<p>Work down the table in order and stop as early as you can. Most changes should be the first row. The second row is the standard tool for a genuine break, because it keeps per-key order intact. Reach for a new topic only when the key or partitioning must change.</p>
+
+<h3 id=dd-eventdriven-architecture-coordination level=3>Choreography, orchestration or both</h3>
+<p>Ask three questions about a sequence. Does a later step depend on an earlier step's result? Must a failure undo earlier steps? Does anyone need to answer "where is order X?" in real time? Two or more yeses mean orchestration for that sequence. Everything that merely reacts to its outcomes stays choreographed. If you choreograph anyway, budget for the process monitor from failure mode 6. Without it you have an orchestrator-shaped hole and no orchestrator.</p>
+
+<h3 id=dd-eventdriven-architecture-thin-or-fat level=3>Thin, fat, or a reference to the payload</h3>
+<p>A third option sits between notification and full state: the event carries the important facts plus a link to a large or sensitive payload in an object store, sometimes called the claim-check pattern. A product's 2 MB description stays out of the topic, and access to it can be controlled and audited. Use it for large blobs or tightly regulated fields. Keep the fields most consumers need inline, or you have rebuilt the callback storm with a different endpoint.</p>
+
+<h2 id=dd-eventdriven-architecture-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li><strong>Is each published event an integration event, separate from internal domain events?</strong> What translates between them?</li>
+<li><strong>How does the event leave the producer?</strong> If the answer is "we publish after commit", where is the reconciliation proving nothing is lost?</li>
+<li><strong>What is the dedup key, and is it assigned once at the source?</strong> Does it survive relay retries?</li>
+<li><strong>Does every event carry a per-entity version, and does every view refuse older versions?</strong></li>
+<li><strong>Which registry compatibility mode, and is it transitive?</strong> Who can override it, and what does that require?</li>
+<li><strong>How would a change in meaning (units, currency, timezone) be caught?</strong> Is there a contract test for the top subscribers?</li>
+<li><strong>What is the consistency window budget per consumer, and how is it measured end to end?</strong> What is the p99 alert?</li>
+<li><strong>Which reads must be exactly current, and do they go to the owner?</strong> Which screens show an "as of" time?</li>
+<li><strong>For each multi-step sequence: who notices when it stalls?</strong> Name the orchestrator or the process monitor.</li>
+<li><strong>Do <code>traceparent</code> and the correlation ID survive every hop, including retry and dead-letter paths?</strong></li>
+<li><strong>If the CDC connector stops for a weekend, what happens to the primary database's disk?</strong></li>
+<li><strong>How long does rebuilding the largest view take, and is that tested at production size?</strong></li>
+</ol>
+
+<h2 id=dd-eventdriven-architecture-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Why not just publish to Kafka after the database commit, with retries?"</summary>
+<p>Because there is a crash window between commit and publish that retries cannot cover. The process that would retry is the one that died. In the other order, publishing before commit can announce an order that then fails to commit. The two systems cannot commit together, so you make the event part of the database transaction (an outbox) and publish it from there, at least once. Consumers dedupe on the event ID.</p>
+</details>
+
+<details>
+<summary>"What is the difference between a domain event and event-carried state transfer, and when would you publish both?"</summary>
+<p>A domain event names a business fact (<code>OrderCancelled</code>) with the data relevant to it. ECST ships the entity's current state so consumers can overwrite their copy. Publish both when consumers need to know <em>what happened</em> (to send a cancellation email) and to keep a correct view <em>without applying diffs</em>. A common design is one event that carries the fact's name plus the post-change state.</p>
+</details>
+
+<details>
+<summary>"The registry says the change is compatible. Can it still break consumers?"</summary>
+<p>Yes. A registry checks shape, not meaning. Changing units, reusing a field for a new purpose, or narrowing an enum's real values all pass structural checks. Prevent it with explicit units in names, new fields for new meanings, and consumer-driven contract tests in the producer's pipeline. A non-transitive mode also lets a chain of individually compatible changes break a consumer replaying old data.</p>
+</details>
+
+<details>
+<summary>"How do you tell a user their order is placed if the views are eventually consistent?"</summary>
+<p>Read-your-writes for the writer. The checkout response returns the order from the owner's write, so the confirmation page never depends on a view. On later screens, either read from the owner for that user's recent orders, or have the view return its version and wait briefly until it reaches the version from the write. Other users and other services can live with the window, as long as the window is measured and bounded.</p>
+</details>
+
+<details>
+<summary>"How do you trace a request through a topic with a six-minute backlog?"</summary>
+<p>Put the W3C trace context and a correlation ID in the event headers at the producer, and copy them at every hop. Consumers start their own span and add a span <em>link</em> to the producer's span, rather than pretending six minutes is one request. Traces are sampled, so also log the event ID, correlation ID and causation ID in every handler. The full chain is then always one log query away.</p>
+</details>
+
+<details>
+<summary>"Choreography looks simpler. When does it stop being simpler?"</summary>
+<p>When steps depend on each other, need compensation, or need a status answer. At that point the workflow's state is spread across services and nobody owns timeouts, so stalls are silent. You then add a process monitor that tracks expected sequences, and that monitor is a read-only orchestrator. Usually it is cleaner to orchestrate the dependent core and choreograph the side reactions.</p>
+</details>
+
+<details>
+<summary>"An event schema must change incompatibly. Walk me through it."</summary>
+<p>First, try to make it compatible: add a new field instead of changing one. If it truly must break, publish the new version as a new event type on the same topic, so per-key order holds, and dual-publish from the outbox. Use the subscriber catalog to track each consumer's migration, set a deprecation date, and watch consumption of the old type fall to zero before you stop emitting it. Only re-keying or re-partitioning justifies a new topic.</p>
+</details>
+
+<details>
+<summary>"What can take down the producer in an event-driven design that should have decoupled it?"</summary>
+<p>The publishing path. A dual write with a synchronous broker call puts broker latency in checkout's request path. A stalled CDC replication slot can fill the primary's disk. An outbox table that is never trimmed slows every insert. A <code>min.insync.replicas</code> refusal blocks publishing if checkout treats it as fatal. Decoupling covers consumers. The path from the producer's database to the broker has to be engineered and monitored like part of the producer.</p>
+</details>
