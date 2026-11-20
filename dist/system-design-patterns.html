@@ -2896,6 +2896,335 @@ ON CONFLICT (provider, event_id) DO NOTHING;</code></pre>
 <li><strong><a href="#bidirectional-streaming">Bidirectional Streaming</a></strong>: the next step when the client starts sending too, covered in the next lesson.</li>
 <li><strong><a href="#load-balancing">Load Balancing</a></strong>: held connections need least-connection balancing and deliberate draining, which that lesson explains.</li>
 </ul>
+<h2 id=dd-serversent-events-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson treats SSE as "one HTTP response that never ends." That is accurate, and it hides most of what goes wrong in production. Under it sit a small text protocol with some sharp edges, a resume protocol that only works if your servers share a log, and a chain of proxies that each have opinions about long responses. This section takes them in that order, using the food-delivery tracking page from the lesson.</p>
+
+<h3 id=dd-serversent-events-wire level=3>The wire format, line by line</h3>
+<p>An SSE stream is UTF-8 text, split into lines (LF, CR or CRLF all count). A blank line ends an event. Every other line is a field:</p>
+<ul>
+<li><code>data:</code> is the payload. Several <code>data:</code> lines in one event are joined with newlines, so multi-line JSON is legal but costs bytes. Most teams send one line of compact JSON.</li>
+<li><code>event:</code> names the type. With no name the browser fires <code>message</code>. Named events only reach listeners added with <code>addEventListener("status", …)</code>, not <code>onmessage</code>. This catches out almost every team once.</li>
+<li><code>id:</code> sets the stream's last event ID. The browser remembers it and sends it back as <code>Last-Event-ID</code> on reconnect. It <em>persists</em>: an event without an <code>id:</code> line leaves the previous value in place.</li>
+<li><code>retry:</code> is an integer in milliseconds. It sets how long the browser waits before reconnecting.</li>
+<li>A line starting with <code>:</code> is a comment. The browser ignores it. That makes it the standard heartbeat.</li>
+</ul>
+<p>Two rules finish the parser. An event with no <code>data</code> is not dispatched at all, so a block holding only <code>id:</code> just updates the ID. Unknown field names are ignored, which gives you room to extend the protocol safely.</p>
+<p>The browser side has its own rules, and they matter for failure handling:</p>
+<ul>
+<li>After a network error or a clean end of the response, <code>EventSource</code> reconnects automatically, waiting the <code>retry</code> time.</li>
+<li>If the server answers with a status other than 200, or with the wrong <code>Content-Type</code>, the browser <strong>fails the connection permanently</strong>. The <code>readyState</code> goes to <code>CLOSED</code> and nothing reconnects. That includes a 503 from an overloaded load balancer. Your app code must notice the <code>error</code> event with <code>CLOSED</code> state and reopen with its own backoff.</li>
+<li>A 204 No Content is the documented way for a server to say "stop reconnecting."</li>
+<li><code>EventSource</code> cannot set request headers or use POST. Authentication goes through cookies (with <code>withCredentials</code> for cross-origin streams) or a short-lived token in the URL. URLs end up in access logs, so keep such tokens single-use or a few minutes long.</li>
+</ul>
+<p>That last limit is why LLM APIs, which need a POST body and an <code>Authorization</code> header, use the SSE <em>format</em> without the <code>EventSource</code> <em>client</em>. Their SDKs open a <code>fetch()</code> request and parse the stream themselves. Do the same when you need headers. Just remember you then own reconnect and <code>Last-Event-ID</code>.</p>
+
+<h3 id=dd-serversent-events-server-side level=3>What the server must do on every write</h3>
+<p>Three headers and one habit. Send <code>Content-Type: text/event-stream</code>, <code>Cache-Control: no-cache</code>, and, behind nginx, <code>X-Accel-Buffering: no</code>. Do not send <code>Content-Length</code>. On HTTP/1.1 the body is then chunked or runs until close; on HTTP/2 it is just an open stream. The habit is to <strong>flush after every event</strong>. Many frameworks buffer writes until a few KB accumulate. A response compressor does the same unless it flushes per event, which is why turning on gzip for the whole site is a classic way to break SSE.</p>
+
+<h3 id=dd-serversent-events-resume level=3>Last-Event-ID resume needs a shared log</h3>
+<p>The lesson's replay buffer sounds like a per-server ring of recent events. That design has a hole. When a node dies, its 50,000 clients reconnect through the load balancer and land on <em>other</em> nodes. Those nodes never held their buffers. So the replay buffer has to live outside the SSE nodes, in a store every node can read by ID range.</p>
+<p>Redis Streams fits this well. Each order's stream is a key. <code>XADD order:7f3a MAXLEN ~ 200 * status …</code> appends and trims. On reconnect, <code>XRANGE order:7f3a (&lt;last-id&gt; +</code> returns everything after the client's ID. The <code>(</code> makes the start exclusive. Stream IDs (<code>&lt;ms&gt;-&lt;seq&gt;</code>) are ordered, so they work directly as SSE <code>id:</code> values. Kafka offsets work too when the stream maps to a partition, though per-entity streams with Kafka mean filtering a shared partition.</p>
+<p>The subtle part is the <strong>order of operations on resume</strong>. Suppose the node first reads the replay range and then subscribes for live events. Any event published between those two steps is lost: too late for the read, too early for the subscription. The safe sequence is:</p>
+<ol>
+<li>Subscribe to live events for the stream and hold them in a local queue.</li>
+<li>Read the replay range after <code>Last-Event-ID</code> from the log.</li>
+<li>Send the replayed events, then drain the queued live events, skipping any ID already sent.</li>
+<li>Switch to forwarding live events directly.</li>
+</ol>
+<p>If <code>Last-Event-ID</code> is older than the oldest entry in the log, send an explicit reset (a named <code>reset</code> event, or close with a 204 and let the app refetch). The client then loads current state from the ordinary API and opens a fresh stream.</p>
+<p>Here is a toy version of the protocol with Python's standard library. The server holds events 41 to 44 in its buffer. The client drops after two events, resumes with <code>Last-Event-ID: 42</code>, and finally asks with an ID far too old.</p>
+<pre><code>import http.client, http.server, threading
+
+# Replay buffer for one order's stream: event ids 41..44 are still held.
+BUFFER = {i: f'{{"order":"7f3a","status":"step{i}"}}' for i in range(41, 45)}
+
+class Stream(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *args): pass
+    def do_GET(self):
+        last = int(self.headers.get("Last-Event-ID") or 0)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")   # ask nginx not to buffer
+        self.end_headers()                             # no Content-Length: open-ended body
+        out = ["retry: 3000\n\n", ": heartbeat\n\n"]
+        if last and last + 1 &lt; min(BUFFER):            # gap older than the buffer
+            out.append("event: reset\ndata: {}\n\n")
+        else:
+            out += [f"id: {i}\nevent: status\ndata: {d}\n\n"
+                    for i, d in BUFFER.items() if i &gt; last]
+        for chunk in out:                              # a real server would keep the
+            self.wfile.write(chunk.encode())           # response open; this one ends
+            self.wfile.flush()
+        self.close_connection = True
+
+def listen(last_id, drop_after=None):
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_port)
+    headers = {"Accept": "text/event-stream"}
+    if last_id:
+        headers["Last-Event-ID"] = last_id
+    conn.request("GET", "/orders/7f3a/stream", headers=headers)
+    resp = conn.getresponse()
+    print(f"GET Last-Event-ID={last_id or '-'} -&gt; {resp.status}")
+    fields, seen, count = {}, last_id, 0
+    for raw in resp:
+        line = raw.decode().rstrip("\n")
+        print("  |", line)
+        if line == "":                                 # blank line = dispatch
+            if "data" in fields:
+                seen, count = fields.get("id", seen), count + 1
+                print(f"  =&gt; {fields.get('event', 'message')} (last id {seen})")
+                if count == drop_after:
+                    break                              # simulate a dropped connection
+            fields = {}
+        elif not line.startswith(":"):                 # ':' lines are comments
+            name, _, value = line.partition(":")
+            fields[name] = value.removeprefix(" ")
+    conn.close()
+    return seen
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stream)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+last = listen(None, drop_after=2)   # receives 41, 42, then the connection drops
+listen(last)                        # resumes: server replays 43, 44
+listen("12")                        # far too old: server sends a reset event
+server.shutdown()</code></pre>
+<p>Output:</p>
+<pre><code>GET Last-Event-ID=- -&gt; 200
+  | retry: 3000
+  |
+  | : heartbeat
+  |
+  | id: 41
+  | event: status
+  | data: {"order":"7f3a","status":"step41"}
+  |
+  =&gt; status (last id 41)
+  | id: 42
+  | event: status
+  | data: {"order":"7f3a","status":"step42"}
+  |
+  =&gt; status (last id 42)
+GET Last-Event-ID=42 -&gt; 200
+  | retry: 3000
+  |
+  | : heartbeat
+  |
+  | id: 43
+  | event: status
+  | data: {"order":"7f3a","status":"step43"}
+  |
+  =&gt; status (last id 43)
+  | id: 44
+  | event: status
+  | data: {"order":"7f3a","status":"step44"}
+  |
+  =&gt; status (last id 44)
+GET Last-Event-ID=12 -&gt; 200
+  | retry: 3000
+  |
+  | : heartbeat
+  |
+  | event: reset
+  | data: {}
+  |
+  =&gt; reset (last id 12)</code></pre>
+<p>Notice the last line. The reset event carried no <code>id:</code>, so the client's last ID is still 12. That is the persistence rule from the wire format. A real client must clear its stored ID when it handles a reset. Otherwise its next reconnect asks for the same impossible range and loops.</p>
+
+<h3 id=dd-serversent-events-fanout level=3>Fan-out: pub/sub behind the SSE nodes</h3>
+<p>SSE nodes should hold connections and nothing else. Business services never talk to them directly. They publish to a bus, and each SSE node subscribes to what its connected clients need. The bus can be Redis pub/sub, NATS, or Kafka with a consumer per node. The main design choice is topic granularity:</p>
+<ul>
+<li><strong>Per-entity topics</strong> (<code>order.7f3a</code>). A node subscribes to exactly the orders its clients watch and unsubscribes when the last viewer leaves. No wasted traffic, but subscription churn tracks connection churn. A reconnect storm becomes a subscribe storm on the bus.</li>
+<li><strong>Sharded topics</strong> (<code>orders.shard-17</code> of 64). Every node subscribes to all shards and filters locally against a map of <code>order_id → connections</code>. Subscriptions are static. The cost is that every node receives every event. That is fine at 1,000 events per second and wasteful at 1,000,000.</li>
+<li><strong>Broadcast topics</strong> (one live score, a million viewers). The bus sends one message per node. The expensive fan-out happens inside each node, as one write per connection.</li>
+</ul>
+<p>Redis pub/sub is fire-and-forget: a node that is disconnected for a second misses those messages. That is acceptable only because the replay log above catches them on the client's next resume. Treat the bus as the fast path and the log as the truth, the same "speed from push, truth from the log" split the <a href="#webhooks">webhooks</a> lesson makes.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-serversent-events-svg-title dd-serversent-events-svg-desc" viewBox="0 0 720 280" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-serversent-events-svg-title">SSE fan-out architecture</title>
+<desc id="dd-serversent-events-svg-desc">Browsers connect over HTTP/2 to a load balancer using least-connections. The balancer spreads streams across several SSE nodes. Each node subscribes to a pub/sub bus that order services publish to. Every node reads a shared replay log, such as Redis Streams, when a client reconnects with Last-Event-ID.</desc>
+<rect x="10" y="40" width="110" height="200" rx="6" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="65" y="65" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Browsers</text>
+<text x="65" y="85" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">200,000</text>
+<text x="65" y="101" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">EventSource</text>
+<text x="65" y="200" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">retry: jittered</text>
+<rect x="150" y="90" width="110" height="100" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="205" y="118" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Load balancer</text>
+<text x="205" y="138" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">HTTP/2 edge</text>
+<text x="205" y="154" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">least-conn</text>
+<text x="205" y="170" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">idle &gt; heartbeat</text>
+<rect x="300" y="30" width="130" height="50" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="365" y="52" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">SSE node 1</text>
+<text x="365" y="70" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">50k streams</text>
+<rect x="300" y="115" width="130" height="50" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="365" y="137" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">SSE node 2</text>
+<text x="365" y="155" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">50k streams</text>
+<rect x="300" y="200" width="130" height="50" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="365" y="222" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">SSE node N</text>
+<text x="365" y="240" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">50k streams</text>
+<path d="M120 140 H150 M260 140 L300 55 M260 140 H300 M260 140 L300 225" style="stroke:var(--ink,#1c2430);fill:none"/>
+<rect x="480" y="40" width="120" height="70" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="540" y="65" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Pub/sub bus</text>
+<text x="540" y="83" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">live path</text>
+<text x="540" y="99" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">(fire-and-forget)</text>
+<rect x="480" y="170" width="120" height="70" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="540" y="195" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Replay log</text>
+<text x="540" y="213" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">Redis Streams</text>
+<text x="540" y="229" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">XRANGE (id +</text>
+<path d="M430 55 L480 75 M430 140 L480 80 M430 225 L480 85" style="stroke:var(--ink,#1c2430);fill:none"/>
+<path d="M430 60 L480 195 M430 145 L480 200 M430 230 L480 205" style="stroke:var(--muted,#5c6b7c);fill:none;stroke-dasharray:4 3"/>
+<rect x="630" y="100" width="80" height="80" rx="6" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="670" y="130" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Order</text>
+<text x="670" y="148" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">services</text>
+<text x="670" y="166" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">publish</text>
+<path d="M630 125 L600 80 M630 155 L600 200" style="stroke:var(--ink,#1c2430);fill:none"/>
+</svg>
+</figure>
+
+<h3 id=dd-serversent-events-proxies level=3>Proxies, buffering and timeouts</h3>
+<p>Every hop between the server and the browser can break a stream in one of two ways. It can <strong>buffer</strong>, holding output until a size threshold or the end of the response. Or it can <strong>time out</strong>, closing a connection that has been quiet too long. The defaults are usually wrong for SSE. nginx's <code>proxy_read_timeout</code> defaults to 60 seconds. AWS Application Load Balancer's idle timeout also defaults to 60 seconds. CDNs have their own limits, and they vary by vendor and plan.</p>
+<p>A typical nginx location for the stream route:</p>
+<pre><code>location /orders/ {
+    proxy_pass http://sse_nodes;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";   # keep upstream connection open, no "close"
+    proxy_buffering off;              # or send X-Accel-Buffering: no per response
+    proxy_cache off;
+    gzip off;                         # compression buffers unless it flushes per event
+    proxy_read_timeout 1h;            # longer than any expected quiet period
+}
+
+upstream sse_nodes {
+    least_conn;
+    server 10.0.1.11:8080;
+    server 10.0.1.12:8080;
+    keepalive 64;
+}</code></pre>
+<p>The heartbeat closes the gap the config cannot. Send a comment line every 15 seconds and every idle timer on the path keeps resetting, including ones you do not control, such as a mobile carrier's NAT. Pick the interval from the shortest timeout you know of, then halve it. At 15 seconds and 200,000 connections, heartbeats cost about 13,300 tiny writes a second across the fleet. That is real but small, and it buys you streams that survive quiet periods.</p>
+<p>Buffering you cannot configure, such as a corporate proxy or an antivirus product inspecting HTTPS, needs detection instead. Put a server timestamp in each event and have the client report lag. If lag arrives in 30-second steps, fall back to long polling for that client.</p>
+
+<h3 id=dd-serversent-events-http2 level=3>HTTP/1.1 connection limits vs HTTP/2</h3>
+<p>Over HTTP/1.1, browsers cap concurrent connections per host, at about 6 in Chrome and Firefox. The cap is shared across all tabs. One SSE stream per tab means the seventh tab's stream never opens. Worse, the six open streams also take every slot for ordinary API calls to that host, so the whole app freezes, not just the live view. Chrome and Firefox have treated this as working as intended, so it will not be fixed for you.</p>
+<p>HTTP/2 fixes it by multiplexing many streams over one TCP connection. Each SSE stream becomes one HTTP/2 stream. The limit becomes <code>SETTINGS_MAX_CONCURRENT_STREAMS</code>, which servers commonly set at 100 or more (nginx's <code>http2_max_concurrent_streams</code> defaults to 128). Two caveats:</p>
+<ul>
+<li><strong>HTTP/2 to the browser does not mean HTTP/2 to the backend.</strong> A load balancer that terminates HTTP/2 often speaks HTTP/1.1 upstream. That is fine, but each client stream is still one backend connection. Your SSE nodes count the same number of sockets either way.</li>
+<li><strong>TCP head-of-line blocking.</strong> All streams on one HTTP/2 connection share one TCP connection. A lost packet stalls every stream on it until retransmission. On lossy mobile networks that adds latency spikes. HTTP/3 over QUIC removes this, because loss on one stream does not block the others.</li>
+</ul>
+<p>If you must support HTTP/1.1 clients, open one stream per browser, not per tab. One tab owns the stream, chosen by leader election over <code>BroadcastChannel</code> or held in a <code>SharedWorker</code>, and relays events to the others.</p>
+
+<h2 id=dd-serversent-events-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<h3 id=dd-serversent-events-sizing-memory level=3>Memory per connection</h3>
+<p>The lesson says "a few tens of kilobytes" per connection. Here is where that comes from, for an idle stream on a Go or Node-style async server. These are assumptions to check with a load test, not constants:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Component<th>Idle cost (rough)<th>Notes<tbody>
+<tr><td>Kernel socket state and buffers<td>4–20 KB<td>Linux sizes socket buffers dynamically; idle sockets sit near the low end of <code>tcp_rmem</code>/<code>tcp_wmem</code>. Grows when a client reads slowly.
+<tr><td>TLS session state<td>0 or ~10–40 KB<td>Zero if TLS ends at the load balancer. Otherwise depends heavily on the library and whether idle read/write buffers are released.
+<tr><td>Runtime per connection<td>4–16 KB<td>Example: a Go goroutine stack (starts at 2 KB, grows) plus HTTP read/write buffers.
+<tr><td>Application state<td>1–4 KB<td>User ID, subscribed topics, last ID sent, a bounded send queue.
+</tbody></table></div></div>
+<p>Take 40 KB all-in with TLS on the node. Then 50,000 connections use about 2 GB, and the lesson's 200,000 viewers need about 8 GB across the fleet. Memory is not the binding limit here. The binding limits are usually these three:</p>
+<ul>
+<li><strong>File descriptors.</strong> Each connection is one. A default soft <code>ulimit -n</code> of 1,024 stops a node at about a thousand streams. Raise it (and <code>fs.nr_open</code> if needed) to well above your target.</li>
+<li><strong>Ephemeral ports between proxy and node.</strong> Each proxied stream uses a source port on the proxy. Linux's default <code>ip_local_port_range</code> is 32768–60999, which is 28,232 ports per (proxy IP, node IP, node port) combination. A single proxy talking to a node on one port caps that node at about 28,000 streams, well below the 50,000 you planned. Fix it with more proxy source IPs, several listening ports per node, or a wider port range.</li>
+<li><strong>Write fan-out CPU</strong>, covered next.</li>
+</ul>
+
+<h3 id=dd-serversent-events-sizing-fanout level=3>Fan-out cost</h3>
+<p>For the tracking page: 200,000 active orders, about 12 status events each over 40 minutes. That is 200,000 × 12 / 2,400 s = 1,000 events per second in total. With sharded topics and 4 nodes, the bus carries 4,000 messages a second. Each node writes about 250 events a second to clients. Trivial.</p>
+<p>Broadcast is different. Say the bookstore streams a live "flash sale stock remaining" counter to 200,000 viewers, updating twice a second. Each update becomes 50,000 writes per node. Assume about 5 µs of CPU per small write, including the syscall and TLS encryption. That is 50,000 × 5 µs = 0.25 CPU-seconds per update per node, or half a core at 2 updates a second. Ten updates a second needs 2.5 cores just to write. Two cheap fixes: coalesce, sending the latest value at most every 500 ms per connection, and batch several pending events into one write.</p>
+
+<h3 id=dd-serversent-events-sizing-storm level=3>Reconnect storm math</h3>
+<p>A node holding 50,000 streams crashes. Every client waits its <code>retry</code> time, say a fixed 3 seconds, and reconnects. Those 50,000 reconnects arrive within roughly a second at the remaining three nodes. Each costs a TLS handshake, roughly 1 ms of CPU for a full handshake (less with ECDSA certificates and session resumption), plus an auth check and a replay-log read. That is about 50 CPU-seconds of handshakes landing in one second, on nodes that were already busy. Add 50,000 <code>XRANGE</code> calls hitting Redis at once.</p>
+<p>Now spread it. Have the server send each connection a random <code>retry</code> between 1 and 30 seconds when the stream opens. It has to be sent in advance, because a crashed node cannot send anything. The arrival rate drops to about 50,000 / 30 ≈ 1,700 per second, or under 600 per surviving node. That is an ordinary load. The price is that some users wait up to 30 seconds after a crash. Replay hides the missed events, so they see a short pause, not a gap.</p>
+
+<h3 id=dd-serversent-events-sizing-replay level=3>Replay log size</h3>
+<p>Size the log by time, not by count. The window must cover the longest disconnect you want to resume from: a deploy of one node plus the worst-case jittered retry, say 5 minutes. At 1,000 events a second, 5 minutes is 300,000 entries. At about 300 bytes each in Redis, including overhead, that is around 90 MB. Per-order streams trimmed with <code>MAXLEN ~ 50</code> also bound it, and an order with only 12 events never comes near the cap. This is cheap enough that the replay window is rarely worth skimping on.</p>
+
+<h2 id=dd-serversent-events-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+<h3 id=dd-serversent-events-fm-buffering level=3>1. Events arrive in bursts</h3>
+<p><strong>Symptom:</strong> some users see 30 to 60 seconds of updates arrive at once. <strong>Mechanism:</strong> something on the path buffers the response: a proxy with buffering on, a compressor that does not flush, a framework write buffer, or a corporate inspection proxy. <strong>Detect:</strong> put a server timestamp in each event and have clients report receive lag. Chart lag by network or region; buffering shows as a sawtooth, not noise. <strong>Fix:</strong> <code>proxy_buffering off</code> or <code>X-Accel-Buffering: no</code>, no compression on the route (or flush per event), and explicit flushes in the handler. For networks you cannot change, detect the sawtooth and switch that client to long polling.</p>
+
+<h3 id=dd-serversent-events-fm-idle level=3>2. Streams die at exactly 60 seconds</h3>
+<p><strong>Symptom:</strong> a burst of reconnects every minute, and quiet orders show "connection lost" banners. <strong>Mechanism:</strong> an idle timeout on a proxy or load balancer, often a 60-second default, closes streams with no traffic. <strong>Detect:</strong> a histogram of stream duration. A sharp spike at 60.0 seconds is a timer, not a network. <strong>Fix:</strong> heartbeat comments every 15 seconds, and raise the idle timeouts you control above the heartbeat interval with margin.</p>
+
+<h3 id=dd-serversent-events-fm-six level=3>3. The seventh tab freezes the whole app</h3>
+<p><strong>Symptom:</strong> users with many tabs report that the site "hangs" and even the buttons stop working. <strong>Mechanism:</strong> HTTP/1.1's per-host limit of about 6 connections, shared across tabs. Open streams take every slot, so ordinary API requests queue behind them forever. <strong>Detect:</strong> the negotiated protocol in your edge access logs (look for <code>HTTP/1.1</code> on stream routes) and client-side timing for requests stuck in "stalled." <strong>Fix:</strong> HTTP/2 at the edge, and one stream per browser shared across tabs for clients that still arrive on HTTP/1.1.</p>
+
+<h3 id=dd-serversent-events-fm-gap level=3>4. Events go missing after a reconnect</h3>
+<p><strong>Symptom:</strong> an order sits at "preparing" though the driver has already picked it up. A refresh fixes it. <strong>Mechanism:</strong> one of two races. Either the replay buffer was in memory on a node the client did not reconnect to, or the node read the replay range before subscribing to live events, losing whatever was published in between. <strong>Detect:</strong> give events a per-stream sequence number and have clients report gaps (received 44 after 42). Without this you will only hear about it from support. <strong>Fix:</strong> a shared replay log, subscribe-then-replay with ID dedupe, and a client that refetches state when it sees a gap.</p>
+
+<h3 id=dd-serversent-events-fm-storm level=3>5. A deploy turns into a reconnect storm, then an outage</h3>
+<p><strong>Symptom:</strong> after a rolling deploy, CPU on the remaining nodes spikes, the load balancer starts returning 503s, and streams stay dead after the spike passes. <strong>Mechanism:</strong> each restarted node dropped 50,000 streams at once with a fixed retry. The surge overloaded the survivors. Then the 503s, being non-200 responses, made <code>EventSource</code> close permanently. Users who hit a 503 never reconnect until they reload the page. <strong>Detect:</strong> new streams per second, TLS handshakes per second, and the count of clients in <code>CLOSED</code> state (report it from the client). <strong>Fix:</strong> jittered <code>retry</code> values set at stream open. Drain in waves: before shutdown, close streams in batches over a minute or two, rather than all at once. Wrap <code>EventSource</code> so a permanent failure reopens with backoff. Shed load at the edge with a rate limit on new streams rather than failing streams already open.</p>
+
+<h3 id=dd-serversent-events-fm-skew level=3>6. New nodes sit idle while old ones run out of memory</h3>
+<p><strong>Symptom:</strong> autoscaling adds two nodes during the Friday peak. They stay nearly empty, and the original nodes keep climbing toward their limits. <strong>Mechanism:</strong> long-lived connections never rebalance. Least-connections routing only affects <em>new</em> streams, and existing ones may stay open for hours. <strong>Detect:</strong> connections per node, and the ratio of busiest to least busy. <strong>Fix:</strong> cap stream lifetime: close each stream after a randomised 20 to 40 minutes. The client resumes with <code>Last-Event-ID</code> and lands wherever the balancer sends it. The cost is a steady, small reconnect rate, which is far easier to plan for than a storm.</p>
+
+<h3 id=dd-serversent-events-fm-slow level=3>7. One slow client grows a node's memory</h3>
+<p><strong>Symptom:</strong> node memory climbs during broadcast-heavy periods, without an increase in connection count. <strong>Mechanism:</strong> clients on poor mobile networks read slowly. Their kernel send buffers fill, then the server's per-connection queue grows without limit. <strong>Detect:</strong> per-connection queued bytes, with a histogram and the top 10 offenders, next to process RSS. <strong>Fix:</strong> a bounded queue per connection. When it is full, either drop to the latest state (for counters and positions) or close the stream so the client resumes from its last ID. This is <a href="#backpressure">backpressure</a> with a delivery guarantee behind it: closing is safe precisely because resume exists.</p>
+
+<h2 id=dd-serversent-events-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Client<td>Browser <code>EventSource</code><td><code>fetch()</code> with a stream parser<td>Cookie auth works and a GET is enough. Choose <code>fetch()</code> when you need headers or a POST body (LLM APIs), and accept that you own reconnect and <code>Last-Event-ID</code>.
+<tr><td>Replay store<td>Shared log (Redis Streams, Kafka)<td>In-memory ring per node, with sticky sessions<td>Almost always. Per-node memory loses the buffer exactly when you need it, which is when a node dies.
+<tr><td>Topic granularity<td>Sharded topics, filter on node<td>Per-entity subscriptions<td>Total event rate is modest, so every node can afford to see every event. Choose per-entity when the rate is high and each node needs only a small slice.
+<tr><td>TLS termination<td>At the load balancer<td>On the SSE node<td>You want lower node memory and cheaper reconnects. Terminate on the node when policy requires encryption end-to-end; budget the extra memory and handshake CPU.
+<tr><td>Streams per browser<td>One per tab, HTTP/2 edge<td>One shared per browser (leader tab or <code>SharedWorker</code>)<td>Your edge speaks HTTP/2 to nearly every client. Choose shared when HTTP/1.1 clients are a meaningful share, or when tabs are many.
+<tr><td>Event payload<td>Thin: "order changed, version 7"<td>Fat: the full order view<td>Payloads are large or viewers have different permissions on the same object. Choose fat for small, uniform payloads where an extra fetch per event would double load.
+<tr><td>Transport<td>SSE<td>Long polling fallback, or WebSocket<td>Only the server sends. Keep long polling as a fallback for buffering networks. Move to WebSocket only when the client streams too (see <a href="#bidirectional-streaming">Bidirectional Streaming</a>).
+</tbody></table></div></div>
+<p>The row that matters most in reviews is the replay store. Teams start with an in-memory buffer because it works in a single-node demo, and it keeps working until the first crash. Put the log outside the nodes from day one; with Redis Streams it costs a few lines.</p>
+<p>The TLS row is a quieter win. Terminating at the balancer means the expensive handshakes of a reconnect storm land on a tier built for them, and SSE nodes shrink to sockets plus application state.</p>
+
+<h2 id=dd-serversent-events-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Where does the replay buffer live, and does a client that reconnects to a <em>different</em> node still resume correctly?</li>
+<li>On resume, does the node subscribe before reading the replay range, and dedupe by ID across the two?</li>
+<li>What exactly happens when <code>Last-Event-ID</code> is older than the buffer? Show the reset event and the client's refetch path, including clearing its stored ID.</li>
+<li>List every hop between server and browser. For each, what are its buffering behaviour and idle timeout, and is the heartbeat interval below the shortest one?</li>
+<li>Is compression disabled on the stream route, or proven to flush per event?</li>
+<li>Do clients reach the edge over HTTP/2? What happens for an HTTP/1.1 user with eight tabs open?</li>
+<li>What is the planned connections-per-node figure, and have file descriptor limits and proxy-to-node ephemeral ports been checked against it?</li>
+<li>What is the reconnect rate when one node, or all nodes, restart? Are <code>retry</code> values jittered and sent at stream open?</li>
+<li>Does the client wrapper reopen the stream after a non-200 response closes <code>EventSource</code> for good?</li>
+<li>How are connections rebalanced after scale-out? Is there a maximum stream lifetime?</li>
+<li>Is every connection's send queue bounded, and what happens to a slow client when it fills?</li>
+<li>How is authorisation re-checked on a stream that stays open for hours, and are events filtered per user before they reach the socket?</li>
+</ol>
+
+<h2 id=dd-serversent-events-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"The replay buffer is in memory on each node. What breaks?"</summary>
+<p>Resume after a node failure. The dead node's clients reconnect through the load balancer to other nodes, which never saw their events. Sticky sessions do not help, because the node they were stuck to is gone. The buffer must live in a shared log that any node can read by ID range, such as Redis Streams or a Kafka topic.</p>
+</details>
+<details>
+<summary>"Walk me through a resume without losing an event."</summary>
+<p>Subscribe to live events first and queue them locally. Then read the log from <code>Last-Event-ID</code> exclusive. Send the replayed events, then the queued live ones, skipping any ID already sent. Then forward live. Reading first and subscribing second loses whatever was published in between. If the ID is older than the log, send a reset and let the client refetch state.</p>
+</details>
+<details>
+<summary>"Why do you send a random <code>retry</code> value with every new stream?"</summary>
+<p>Because the reconnect delay must be set before the failure. A crashed node cannot tell 50,000 clients to back off. With a fixed 3-second retry, they all return within about a second. With a random 1 to 30 seconds, the surge drops to under 2,000 per second, which the survivors can absorb. <code>EventSource</code> does not reliably add its own backoff or jitter, so the server has to.</p>
+</details>
+<details>
+<summary>"Your load balancer returns 503 during overload. What does that do to SSE clients?"</summary>
+<p>It ends them for good. A non-200 response makes <code>EventSource</code> fail the connection and stop reconnecting. Only a reload brings the user back, so overload turns into a lasting outage for those users. Wrap <code>EventSource</code> to reopen with backoff after a permanent close. At the edge, prefer rate-limiting new streams, or holding them briefly, over error responses.</p>
+</details>
+<details>
+<summary>"Does HTTP/2 remove the need to think about connection counts?"</summary>
+<p>For the browser, mostly: many streams share one connection, so the 6-per-host limit stops mattering. For your servers, no. A balancer that terminates HTTP/2 usually opens one backend connection per stream, so nodes still hold one socket per viewer. And all streams on one HTTP/2 connection share TCP, so packet loss stalls them together. HTTP/3 is what removes that.</p>
+</details>
+<details>
+<summary>"You autoscaled from 4 to 6 nodes but the old 4 are still overloaded. Why, and what do you change?"</summary>
+<p>Long-lived streams do not move. Least-connections only routes new streams, and existing ones can stay open for hours. Add a maximum stream lifetime with jitter (say 20 to 40 minutes). Each close is cheap because the client resumes with <code>Last-Event-ID</code>. Over one lifetime period the fleet rebalances on its own. During a sudden scale-out you can also close a slice of streams on the busiest nodes deliberately.</p>
+</details>
+<details>
+<summary>"Where does the CPU go on a node with 50,000 idle streams? And with a broadcast?"</summary>
+<p>Idle, almost nowhere: heartbeats are one tiny write per connection every 15 seconds, about 3,300 writes a second per node. A broadcast is 50,000 writes for one event, roughly a quarter of a CPU-second at 5 µs a write. So the expensive case is broadcast frequency times audience per node. Coalesce updates per connection and batch writes rather than adding nodes.</p>
+</details>
+<details>
+<summary>"Why not put the access token in the SSE URL and be done?"</summary>
+<p>URLs land in access logs, proxy logs and browser history, so a long-lived token there leaks. If you must use a URL token because <code>EventSource</code> cannot send headers, make it single-use or valid for a minute, and exchange it at connect time. Better options are a cookie scoped to the stream route, or a <code>fetch()</code>-based client that can send an <code>Authorization</code> header. Either way, re-check authorisation during the stream, not only at connect.</p>
+</details>
 <h2 id=h2-12-tldr level=2>12. TL;DR</h2>
 <div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th><tbody><tr><td><strong>Problem</strong><td>Polling makes cost grow with audience and staleness grow with the interval. The result is heavy infrastructure whose main job is answering "nothing yet."<tr><td><strong>Mechanism</strong><td>One never-ending HTTP response per client. The server pushes text events as news happens. The browser's EventSource reconnects automatically with Last-Event-ID against a short replay buffer. Async I/O servers hold the connections, and randomized reconnect delays prevent stampedes.<tr><td><strong>Costs</strong><td>One direction only, long-lived-connection operations (draining, heartbeats, proxy buffering details), a resume window rather than a history, and text frames only.<tr><td><strong>Skip it when</strong><td>The client streams too (WebSockets), changes are too rare to hold connections for (polling), the payload is media (WebRTC), or both ends are your own servers (pub/sub).<tr><td><strong>30-second answer</strong><td>Hold one plain-HTTP stream per client and push news as it happens. Cost tracks events instead of audience size, the browser handles reconnect and resume, and this is why LLM tokens appear as they are generated. Move to WebSockets only when the client has something to stream back.</table></div></div>
 
