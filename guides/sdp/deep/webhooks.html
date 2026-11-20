@@ -277,7 +277,3 @@ ON CONFLICT (provider, event_id) DO NOTHING;</code></pre>
 <summary>"When would you not bother with a reconciliation poll?"</summary>
 <p>When a missed event is harmless and self-healing. A webhook that only invalidates a cache entry with a short TTL can be lost, because the TTL repairs it. For anything that moves money, inventory or permissions, the poll stays. The cost math above shows it is a few requests a minute, which is nothing next to one week of unnoticed silence.</p>
 </details>
-<details>
-<summary>"Should you also allowlist the provider's IP addresses?"</summary>
-<p>As a second layer, if the provider publishes stable ranges and you can keep the list updated. It is not authentication. Ranges change, many providers send from shared cloud addresses, and an allowlist does nothing about replay. The signature is the control. The allowlist mainly cuts down junk traffic hitting your verify code.</p>
-</details>

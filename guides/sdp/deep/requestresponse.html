@@ -169,14 +169,6 @@
 <div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Option<th>Good at<th>Risk<tbody><tr><td>Client library in each service<td>Knows which calls are idempotent; can use idempotency keys<td>Every team configures it differently; nested retries<tr><td>Service mesh sidecar<td>Uniform policy, retry budgets, per-request balancing<td>Retries things the app considers unsafe unless configured per route; hides behavior from developers<tr><td>Edge or API gateway only<td>One place, easy to audit<td>Too coarse; one retry re-runs the whole chain<tr><td>No retries, fail fast<td>Simplest; no amplification<td>Every transient blip reaches the user</table></div></div>
 <p>Pick <strong>one</strong> layer per call path that owns retries, and turn them off elsewhere. Timeouts are the opposite: every layer needs one, all derived from the same propagated deadline.</p>
 
-<h3 id=dd-requestresponse-choose-tail-tactic level=3>Taming the tail: retry, hedge or tie</h3>
-<ul>
-<li><strong>Retry after timeout.</strong> Cheap, but the user has already waited the full timeout. Good for rare failures, useless for tail latency.</li>
-<li><strong>Hedge after the p95.</strong> About 5% extra load, big tail improvement. Only for idempotent reads.</li>
-<li><strong>Tied requests.</strong> Send to two replicas at once, each told about the other. Whichever starts first cancels its twin. Best tail, but it needs server support and cross-replica messaging. Rare outside very large systems.</li>
-<li><strong>Partial results.</strong> Answer with what arrived by the deadline. Often the best choice for search and feeds, and the core of <a href="#graceful-degradation">Graceful Degradation</a>.</li>
-</ul>
-
 <h3 id=dd-requestresponse-snippet level=3>A deadline-aware retry, in code</h3>
 <p>This sketch shows the three rules together: retry only idempotent requests or ones with a key, never past the deadline, and only within a budget. It uses only the Python standard library.</p>
 <pre><code>import random, time, urllib.request, urllib.error
@@ -252,18 +244,8 @@ def call(url, deadline, method="GET", body=None, key=None, budget=None):
 </details>
 
 <details>
-<summary>"What is the difference between a timeout and a deadline, and why does it matter in a chain?"</summary>
-<p>A timeout is relative and local to one hop. A deadline is absolute and shared by the whole request. With per-hop timeouts, inner hops can wait longer than the outer caller, so they keep working after the user got an error. With a propagated deadline, every hop knows how much time is left, skips work that cannot finish, and cancels its children when time runs out.</p>
-</details>
-
-<details>
 <summary>"Retries at every layer seem safer. What is wrong with that?"</summary>
 <p>They multiply. Three attempts at each of three layers means 27 attempts at the bottom for one user click, which hits the weakest service exactly when it is struggling. Retry at one layer, add jittered backoff, and cap retries with a budget, for example 10% of normal traffic. Then the worst case is 1.1x load, not 27x.</p>
-</details>
-
-<details>
-<summary>"Your clients see occasional connection-reset errors on idle connections. Is retrying them safe?"</summary>
-<p>It depends on when the reset happened. If the connection failed before any byte of the request was accepted, the server never saw it, so a retry is safe for any method. Many HTTP clients do this automatically for reused connections. If the reset came after the request was sent, the outcome is ambiguous again, and only idempotent requests can be retried. The real fix is to make the client's idle timeout shorter than the server's, so the race rarely happens.</p>
 </details>
 
 <details>
