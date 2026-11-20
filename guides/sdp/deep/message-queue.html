@@ -41,7 +41,7 @@
 <p>RabbitMQ <strong>pushes</strong> messages to consumers. A consumer opens a channel (a lightweight session inside one TCP connection), subscribes with <code>basic.consume</code>, and receives messages tagged with a per-channel <strong>delivery tag</strong>. It then answers each one:</p>
 <ul>
 <li><code>basic.ack</code>: done, delete it.</li>
-<li><code>basic.nack</code> or <code>basic.reject</code> with <code>requeue=true</code>: put it back. RabbitMQ requeues it at or near its original position, which is usually the head of the queue.</li>
+<li><code>basic.nack</code> or <code>basic.reject</code> with <code>requeue=true</code>: put it back. On a classic queue, RabbitMQ requeues it at or near its original position, which is usually the head of the queue. Quorum queues have handled returned messages differently across versions, so check yours.</li>
 <li>Same with <code>requeue=false</code>: drop it, or route it to the queue's dead-letter exchange if one is set.</li>
 </ul>
 <p>If the channel or connection closes, every unacked message on it goes back to Ready. That is the crash-redelivery mechanism. RabbitMQ also enforces a <strong>consumer timeout</strong> (30 minutes by default in recent versions): a delivery held unacked longer than that closes the channel, so a stuck consumer cannot hold messages forever.</p>
@@ -68,7 +68,7 @@
   "deadLetterTargetArn": "arn:aws:sqs:us-east-1:123456789012:orders-dlq",
   "maxReceiveCount": "5"
 }</code></pre>
-<p><strong>Standard queues</strong> give at-least-once delivery and best-effort ordering with very high throughput. <strong>FIFO queues</strong> add strict ordering within a <code>MessageGroupId</code> and deduplicate sends that reuse a <code>MessageDeduplicationId</code> within a five-minute window. FIFO trades throughput for that; its per-queue limits are much lower than standard's, with a high-throughput mode that raises them. Check the current quotas rather than relying on remembered numbers. Both kinds also cap in-flight messages per queue, roughly 120,000 for standard and 20,000 for FIFO. A huge fleet with long visibility timeouts can hit that ceiling.</p>
+<p><strong>Standard queues</strong> give at-least-once delivery and best-effort ordering with very high throughput. <strong>FIFO queues</strong> add strict ordering within a <code>MessageGroupId</code> and deduplicate sends that reuse a <code>MessageDeduplicationId</code> within a five-minute window. FIFO trades throughput for that; its per-queue limits are much lower than standard's, with a high-throughput mode that raises them. Check the current quotas rather than relying on remembered numbers. Both kinds also cap in-flight (received but not deleted) messages per queue, on the order of 100,000; the exact figures have changed over time. A huge fleet with long visibility timeouts can hit that ceiling.</p>
 <p>FIFO ordering has a sharp edge. While any message in a group is in flight, SQS will not deliver the next message of that group. A slow or failing message blocks its whole group until it is deleted or moves to the DLQ.</p>
 
 <h3 id=dd-message-queue-kafka level=3>Kafka as a queue: offsets, not acks</h3>
