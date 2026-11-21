@@ -1,0 +1,273 @@
+<h2 id=dd-saga-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson lists the parts: a saga log, compensations, idempotency, an orchestrator. This section shows how they fit together in code and storage. The questions are concrete. What does a row in the saga table look like? How does a command reach the payment service without a dual write? How does a second orchestrator know it should not touch a saga the first one is still running? And what do engines like Temporal and Step Functions do for you?</p>
+
+<h3 id=dd-saga-step-types level=3>Three kinds of step, and why their order is fixed</h3>
+<p>Every step in a saga falls into one of three kinds. Sorting the steps this way is the first design task, because the kinds dictate the order.</p>
+<ul>
+<li><strong>Compensatable</strong> steps can be undone by a business action. Reserving inventory (undo: release) and charging a card (undo: refund) are compensatable.</li>
+<li>The <strong>pivot</strong> is the go/no-go step. Once it succeeds, the saga will finish going forward. Before it fails, the saga can still roll back. The courier handoff is checkout's pivot.</li>
+<li><strong>Retriable</strong> steps come after the pivot. They must eventually succeed, because there is no going back. Sending the confirmation email and updating loyalty points belong here. They need idempotency and patient retries, not compensations.</li>
+</ul>
+<p>The legal shape is: compensatable steps, then one pivot, then retriable steps. A compensatable step after the pivot is a design bug. If it fails, you cannot undo it and you cannot undo the pivot either. Draw your saga, label each step, and check the shape before writing code.</p>
+<p>This also explains the lesson's Q3. The confirmation email is a retriable effect. It was placed before the pivot, where it could be followed by a rollback it could not reverse.</p>
+
+<h3 id=dd-saga-log-schema level=3>The saga log as a table</h3>
+<p>A homegrown orchestrator needs surprisingly little storage. One row per saga, plus an append-only history for debugging and audit:</p>
+<pre><code>CREATE TABLE saga (
+  saga_id        TEXT PRIMARY KEY,      -- derived from the client's checkout request ID
+  kind           TEXT NOT NULL,         -- 'checkout'
+  definition_ver INT  NOT NULL,         -- which version of the state machine started it
+  state          TEXT NOT NULL,         -- RESERVING, CHARGING, SHIPPING, COMPENSATING_REFUND, ...
+  data           JSONB NOT NULL,        -- order ID, amounts, provider references
+  attempt        INT  NOT NULL DEFAULT 0,
+  next_run_at    TIMESTAMPTZ NOT NULL,  -- when the next action is due (retry backoff, deadline)
+  deadline_at    TIMESTAMPTZ NOT NULL,  -- give up and compensate after this
+  lease_owner    TEXT,                  -- which orchestrator instance holds it
+  lease_until    TIMESTAMPTZ,
+  version        BIGINT NOT NULL        -- bumped on every transition, for compare-and-set
+);
+CREATE INDEX saga_due ON saga (next_run_at) WHERE state NOT IN ('DONE', 'FAILED');
+
+CREATE TABLE saga_event (               -- one row per transition, never updated
+  saga_id TEXT, seq INT, at TIMESTAMPTZ, from_state TEXT, to_state TEXT, detail JSONB,
+  PRIMARY KEY (saga_id, seq)
+);</code></pre>
+<p>Each column answers a recovery question. <code>next_run_at</code> turns retries into data: a sleeping saga is just a row whose time has not come. <code>deadline_at</code> stops a saga waiting forever on a reply that will never arrive. <code>definition_ver</code> lets you deploy a changed workflow while old sagas finish on the old one. <code>version</code> is what makes transitions safe when two orchestrators race.</p>
+<p>Make <code>saga_id</code> a function of the client's request ID. Then a double-clicked "Place order" button hits the primary key and starts one saga, not two.</p>
+
+<h3 id=dd-saga-lease-cas level=3>Leases and compare-and-set: one owner per saga</h3>
+<p>Orchestrators are stateless workers that poll for due sagas. Two of them can pick up the same row. The lesson names the two guards. Here is how they combine in practice:</p>
+<ol>
+<li><strong>Claim with a lease.</strong> A worker runs <code>UPDATE saga SET lease_owner = 'w7', lease_until = now() + interval '30 seconds' WHERE saga_id = $1 AND (lease_until IS NULL OR lease_until &lt; now())</code>. One worker wins. In Postgres, <code>SELECT ... FOR UPDATE SKIP LOCKED</code> on the due index is a common way to fetch a batch without contention.</li>
+<li><strong>Act.</strong> Send the next command, using an idempotency key of <code>saga_id + step + attempt-independent suffix</code>, for example <code>7f3a:charge</code>. The key must not include the attempt number, or each retry becomes a new charge.</li>
+<li><strong>Transition with compare-and-set.</strong> <code>UPDATE saga SET state = 'SHIPPING', version = version + 1 ... WHERE saga_id = $1 AND version = $2</code>. If zero rows change, someone else moved the saga. Discard your result and re-read.</li>
+</ol>
+<p>Why both? The lease keeps two workers from doing the same work at the same time, which saves effort. The compare-and-set keeps a worker whose lease silently expired (a long GC pause) from overwriting newer state. A lease alone is not safe, because a paused process cannot know its lease ran out. The idempotency key covers the remaining gap: both workers may still send the same command, and the receiver applies it once.</p>
+
+<h3 id=dd-saga-commands-outbox level=3>Getting commands out without a dual write</h3>
+<p>When the orchestrator talks to services over a queue, each transition has two effects: update the saga row and publish a command. Doing them separately is the dual-write bug from the <a href="#message-queue">message queue</a> deep dive. Crash between them and the saga thinks it asked for a shipment that was never requested.</p>
+<p>The fix is a transactional outbox in the orchestrator's own database. Update the saga row and insert the command into an outbox table in one local transaction. A relay publishes outbox rows. The participant service does the mirror image. It consumes the command and records the business change, the processed command ID (its inbox) and the reply event in one local transaction.</p>
+<p>So a single saga step is really three local transactions joined by two at-least-once hops. Every hop can duplicate, which is why every handler deduplicates. And every wait state needs a deadline, because a hop can also be delayed for a long time.</p>
+<p>With synchronous calls (HTTP to the payment provider), there is no outbox. The orchestrator records "about to charge, key 7f3a:charge" first, then calls. On a crash it calls again with the same key, and the provider's idempotency returns the original result. The ordering rule is the same as the write-ahead log: intent first, effect second.</p>
+
+<h3 id=dd-saga-orchestrator-code level=3>A minimal orchestrator loop</h3>
+<p>The whole mechanism fits in a few dozen lines. This sketch uses Python's standard <code>sqlite3</code> to stay self-contained. A production version runs on Postgres with <code>SKIP LOCKED</code>, real leases and a proper backoff.</p>
+<pre><code>import json, sqlite3, time
+
+# Forward steps and their compensations, in order. The pivot ("ship") is last.
+STEPS = [("reserve", "release"), ("charge", "refund"), ("ship", None)]
+MAX_ATTEMPTS = 5
+
+def undo_from(step: int) -&gt; tuple:
+    """Find the nearest earlier step that has a compensation."""
+    while step &gt;= 0 and STEPS[step][1] is None:
+        step -= 1
+    return ("FAILED", 0, 0) if step &lt; 0 else ("COMPENSATING", step, 0)
+
+def tick(db: sqlite3.Connection, saga_id: str, call) -&gt; None:
+    """Advance one saga by one step. Safe to run from several workers."""
+    row = db.execute("SELECT state, step, attempt, version, data FROM saga WHERE saga_id=?",
+                     (saga_id,)).fetchone()
+    state, step, attempt, version, data = row
+    if state in ("DONE", "FAILED", "NEEDS_HUMAN"):
+        return
+    forward = state == "FORWARD"
+    name = STEPS[step][0] if forward else STEPS[step][1]
+    key = f"{saga_id}:{name}"             # stable across retries and across workers
+    try:
+        outcome = call(name, key, json.loads(data))   # 'ok', 'retry' or 'fail'
+    except TimeoutError:
+        outcome = "retry"                 # unknown outcome: same key next time, never guess
+    if outcome == "ok" and forward:
+        new = ("DONE", step, 0) if step == len(STEPS) - 1 else ("FORWARD", step + 1, 0)
+    elif outcome == "ok":                 # a compensation worked: undo the step before it
+        new = undo_from(step - 1)
+    elif outcome == "retry" and attempt + 1 &lt; MAX_ATTEMPTS:
+        new = (state, step, attempt + 1)  # a real system also sets next_run_at with backoff
+    elif forward:                         # the step failed for good: undo earlier steps
+        new = undo_from(step - 1)         # (an unknown outcome must be resolved first)
+    else:
+        new = ("NEEDS_HUMAN", step, attempt)   # a compensation kept failing: escalate
+    cur = db.execute("UPDATE saga SET state=?, step=?, attempt=?, version=version+1 "
+                     "WHERE saga_id=? AND version=?", (*new, saga_id, version))
+    db.commit()
+    if cur.rowcount == 0:
+        pass                              # another worker moved this saga; our result is discarded</code></pre>
+<p>Notice what the loop never does. It never keeps progress in a local variable between ticks. It never retries a compensation forever. And it never builds a new idempotency key for a retry. Those three habits carry most of the correctness.</p>
+
+<h3 id=dd-saga-temporal level=3>Durable execution: what Temporal and Step Functions do for you</h3>
+<p><strong>Temporal</strong> (and Cadence, its predecessor) lets you write the saga as ordinary code: <code>reserve()</code>, <code>charge()</code>, <code>ship()</code>, with compensations registered as you go. Under the hood it records an <strong>event history</strong> for each workflow. Every activity scheduled, every result, every timer is an event. When a worker crashes, another worker <strong>replays</strong> the workflow code from the start against that history. Calls whose results are already recorded return instantly from the history instead of running again. The code catches up to where it stopped and continues.</p>
+<p>Replay brings one strict rule: workflow code must be <strong>deterministic</strong>. It cannot read the wall clock, generate random numbers, or call the network directly. Those go through activities or SDK helpers that record their results. Change the order of steps in code while old workflows are still running, and replay no longer matches history. The SDKs provide versioning calls (<code>patched</code> or <code>GetVersion</code>, depending on the language) for this.</p>
+<p>The knobs that matter are on activities. <code>StartToClose</code> limits one attempt. <code>ScheduleToClose</code> limits all attempts together. A <strong>heartbeat timeout</strong> detects a dead worker on long activities. The retry policy sets initial interval, backoff coefficient, maximum interval, maximum attempts and non-retryable error types. Histories also have size limits, in the tens of thousands of events. A long-lived workflow uses <strong>continue-as-new</strong> to start a fresh history.</p>
+<p><strong>AWS Step Functions</strong> defines the saga as a JSON state machine (Amazon States Language). <code>Retry</code> blocks give backoff per state and <code>Catch</code> blocks route failures to compensation states. Standard workflows can run for up to a year and record every transition, and they are billed per state transition. Express workflows are cheaper per execution and limited to five minutes. They suit short, high-volume sagas where you can rely on idempotency more than on the engine's exactly-once step execution.</p>
+<p>All of these engines give you the saga log, timers, retries and visibility. None of them gives you compensations or isolation. You still decide what "undo a charge" means and what other services may do with "charged, not shipped".</p>
+
+<h3 id=dd-saga-countermeasures level=3>Countermeasures for the missing isolation</h3>
+<p>The lesson introduces semantic locks. They are one of a family of techniques for living without isolation. The original saga paper and later practice describe several. Each one prevents a specific anomaly.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Countermeasure<th>How it works<th>Prevents<th>Example in checkout<tbody><tr><td>Semantic lock<td>A status field marks a business object as in-use by a saga<td>Conflicting sagas acting on the same object<td><code>order_status = PROCESSING</code> blocks a cancel saga until shipping resolves<tr><td>Commutative updates<td>Design updates so their order does not matter<td>Lost updates between sagas<td>Inventory as increments and decrements, not "set stock to 4"<tr><td>Pessimistic view (reorder)<td>Put the step with the riskiest visible effect last<td>Dirty reads of effects that later roll back<td>Grant loyalty points after the pivot, not after the charge<tr><td>Reread value<td>Before overwriting, check the value has not changed since the saga read it<td>Lost updates<td>Recheck the price version before charging<tr><td>Version file<td>Record operations as they arrive and apply them in the right order<td>Out-of-order commands, like cancel before reserve<td>Inventory records "release 7f3a" even if the reserve has not arrived yet<tr><td>By value<td>Pick the mechanism per request based on risk<td>Over-engineering low-value flows<td>Orders over $5,000 take a slower, locked path</table></div></div>
+<p>Most production sagas use two or three of these. Semantic locks and commutative updates are the workhorses. The version file is the one teams forget, and its absence causes the "cancel arrived before reserve" bug in the failure modes below.</p>
+
+<h3 id=dd-saga-choreography level=3>Choreography, mechanically</h3>
+<p>In a choreographed saga there is no saga row. The state is spread across services. Inventory knows it reserved, payment knows it charged, and each publishes an event the next service reacts to. A <strong>correlation ID</strong> (the order ID) on every event is the only thread tying them together.</p>
+<p>Compensations are also choreographed. Shipping publishes <code>shipment.failed</code>, payment reacts by refunding and publishes <code>payment.refunded</code>, inventory reacts by releasing. That works for three steps. At seven steps with two parallel branches, the failure graph becomes hard for anyone to hold in their head. "Where is order 7f3a?" then needs a separate projection that consumes every event, which is an orchestrator's state table rebuilt after the fact. If you find yourself building that projection, you wanted orchestration.</p>
+
+<h2 id=dd-saga-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions for the bookstore: 50 checkouts per second on average, 200 per second at peak, the lesson's step latencies (reserve 50 ms, charge 200 ms, ship 100 ms), and a saga store on Postgres.</p>
+
+<h3 id=dd-saga-write-rate level=3>Saga store write rate</h3>
+<p>Count the writes per saga on the happy path. Create the saga row (1). For each of three steps: record "starting" with the intent and key, then record the result (2 x 3 = 6). Mark it done (1). That is 8 row writes, plus 8 history events if you keep a separate history table, plus 3 outbox rows if commands go through queues.</p>
+<ul>
+<li>At peak: 200 x (8 + 8 + 3) = 3,800 writes per second. A single well-tuned Postgres primary handles that, but it is no longer "a little table on the side".</li>
+<li>Many teams merge the intent write into the previous result write ("T1 done, starting T2" is one update, as in the lesson). That roughly halves the row updates.</li>
+<li>Polling for due sagas adds reads. With 20 workers each polling every 200 ms, that is 100 queries per second against the partial index on <code>next_run_at</code>. Cheap, if the index stays small because finished sagas leave it.</li>
+</ul>
+
+<h3 id=dd-saga-storage level=3>Storage and retention</h3>
+<p>Average day: 50 x 86,400 = 4.32 million sagas. Suppose a saga row is 2 KB and its 10 history events are 500 B each, so about 7 KB per saga.</p>
+<ul>
+<li>Per day: 4.32 M x 7 KB, about 30 GB.</li>
+<li>Kept for 30 days for support and disputes: about 900 GB, before indexes.</li>
+</ul>
+<p>That is why finished sagas move out of the hot table. Keep live and recently finished sagas in the primary table, partition the history by day, and drop or archive old partitions. Card disputes can arrive months later, so the provider references belong in the order record itself, not only in saga history you plan to delete.</p>
+
+<h3 id=dd-saga-in-flight level=3>How many sagas are in flight</h3>
+<p>Little's law again: in flight = rate x duration.</p>
+<ul>
+<li>Normal day: 50 per second x 0.4 s = about 20 sagas in flight. A dashboard showing "20 processing" is healthy.</li>
+<li>During the lesson's shipping outage, each saga retries shipping for 30 seconds, then compensates for a few seconds. At peak, 200 x 33 s is about 6,600 sagas in flight. Every one of them shows customers "processing".</li>
+<li>The outage lasted 20 minutes. At peak rate, 200 x 1,200 = 240,000 checkouts hit the failed step. Each one needs a refund and a release.</li>
+</ul>
+
+<h3 id=dd-saga-compensation-load level=3>The compensation wave</h3>
+<p>That last number is where sagas surprise people. The outage turns into 240,000 refund calls to the payment provider. Suppose the provider allows 100 refund requests per second for your account.</p>
+<ul>
+<li>Refunds are generated at 200 per second for 20 minutes but drain at only 100 per second. The backlog grows by 100 per second, to 120,000 refunds when shipping recovers.</li>
+<li>It then drains at 100 per second, which takes another 20 minutes. Some customers wait 40 minutes for "your order failed, you were not charged".</li>
+<li>If the orchestrator ignores the rate limit, it gets 429 responses, retries them on backoff, and makes the provider throttle harder. The compensation path then becomes its own outage.</li>
+</ul>
+<p>Two design choices help. First, give compensations a rate-limited queue of their own, sized to the provider's limit, so they degrade into a predictable backlog. Second, think about whether to compensate at all. If shipping is down for 20 minutes, holding the orders in "awaiting shipment" and retrying for an hour may be better than refunding a quarter of a million customers. That is a business decision. Write it into the saga's deadline policy.</p>
+
+<h3 id=dd-saga-retry-budget level=3>Retry budget and the deadline</h3>
+<p>The lesson retries shipping for 30 seconds. With exponential backoff starting at 1 s and doubling, attempts land at 0, 1, 3, 7, 15 and 31 seconds. That is six attempts in about 31 seconds. Add jitter, as the <a href="#retry-with-exponential-backoff">retry lesson</a> explains, so 6,600 waiting sagas do not retry in lockstep.</p>
+<p>Then set the saga's total deadline from the customer's view. If the promise is "you'll know within 2 minutes", the forward retry budget plus the worst compensation time must fit under 2 minutes. A shipping retry budget of 30 s and a refund that takes 200 ms with its own retries leaves room. A refund backlog of 20 minutes, from the section above, does not. Then the honest message is "we're reversing your charge" and a follow-up email, not a fake failure screen.</p>
+
+<h3 id=dd-saga-stuck-alerting level=3>Alerting on stuck sagas, with numbers</h3>
+<p>Suppose the SLO is: 99.9% of checkouts reach a terminal state within 10 seconds. On an average day, 0.1% of 4.32 million is 4,320 slow sagas a day, about 3 per minute. An alert on "any saga older than 10 s" would page constantly.</p>
+<p>Alert on two things instead. First, <strong>the count of sagas in any one non-terminal state older than its own limit</strong>, for example more than 50 sagas in CHARGING for over 60 s. That catches a dependency failure within a minute. Second, <strong>the age of the oldest saga in NEEDS_HUMAN or COMPENSATING</strong>, which catches the slow leak that throughput graphs hide. Both queries run off the same <code>(state, next_run_at)</code> data the orchestrator already keeps.</p>
+
+<h2 id=dd-saga-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-saga-fm-compensation-fails level=3>1. The compensation that cannot succeed</h3>
+<p><strong>Symptom.</strong> A slowly growing number of sagas sits in COMPENSATING. Customers write in saying they were charged for an order that "failed".</p>
+<p><strong>Mechanism.</strong> The refund is rejected permanently: the card was closed, the provider's refund window passed, or the charge was already disputed. The orchestrator treats every error as transient and retries forever. Or it gives up silently and marks the saga FAILED, which is worse, because then nobody knows money is owed.</p>
+<p><strong>Detect.</strong> Age of the oldest saga in COMPENSATING. Compensation errors grouped by error code, where any non-retryable code is a page.</p>
+<p><strong>Fix.</strong> Classify compensation errors as retryable or permanent, as you do for forward steps. A permanent failure moves the saga to NEEDS_HUMAN with a task that carries the order, provider references and the next safe options: refund to store credit, send a check, contact the customer. The saga is not complete until a person closes that task.</p>
+
+<h3 id=dd-saga-fm-cancel-before-reserve level=3>2. The cancel that arrived before the reserve</h3>
+<p><strong>Symptom.</strong> Inventory counts slowly drift downward. Items show as reserved for orders that failed days ago.</p>
+<p><strong>Mechanism.</strong> The reserve command timed out at the orchestrator, but it was only delayed in a queue. The orchestrator compensated by sending "release 7f3a". Inventory had no reservation for 7f3a yet, so it treated the release as a harmless no-op. Then the delayed reserve arrived and was applied. The reservation now belongs to a saga that is already FAILED, and nothing will ever release it.</p>
+<p><strong>Detect.</strong> A reconciliation job comparing reservations with the state of their sagas. Any reservation whose saga is terminal and not DONE is a leak.</p>
+<p><strong>Fix.</strong> Use the version-file countermeasure. When a release arrives for an unknown reservation, inventory records a tombstone: "7f3a is cancelled". When the late reserve arrives, it sees the tombstone and refuses. The tombstone must outlive the longest possible message delay. A daily sweep that releases reservations of terminal sagas is the safety net.</p>
+
+<h3 id=dd-saga-fm-dual-start level=3>3. Two sagas for one checkout</h3>
+<p><strong>Symptom.</strong> A small number of customers are charged twice. The two charges have different idempotency keys, so the provider accepted both.</p>
+<p><strong>Mechanism.</strong> The API created the saga with a random UUID. The customer's phone retried the checkout request after a timeout. The second request created a second saga with a second UUID, which derived a second set of idempotency keys. Each saga was individually perfect.</p>
+<p><strong>Detect.</strong> More than one saga per cart or per client request ID. Duplicate charges for the same order total within seconds.</p>
+<p><strong>Fix.</strong> Derive <code>saga_id</code> from the client's request ID or the cart ID plus checkout attempt, and put a unique constraint on it. A retried request then finds the existing saga and returns its status. This is <a href="#idempotency">idempotency</a> at the saga boundary, not only at each step.</p>
+
+<h3 id=dd-saga-fm-nondeterminism level=3>4. The deploy that froze every running workflow</h3>
+<p><strong>Symptom.</strong> Right after a deploy, all checkouts started before the deploy stop progressing. New ones work. On Temporal, workflow task failures spike with non-determinism errors.</p>
+<p><strong>Mechanism.</strong> The deploy added a fraud-check step between reserve and charge. In-flight workflows replay against histories that have "reserve, then charge". The new code expects "reserve, then fraud check". Replay fails. In a homegrown orchestrator, the equivalent bug is a state rename: old rows say <code>CHARGING</code>, the new code only knows <code>PAYMENT_PENDING</code>.</p>
+<p><strong>Detect.</strong> Workflow task failure rate by worker build. Count of non-terminal sagas whose definition version is older than the current one and whose <code>next_run_at</code> is in the past.</p>
+<p><strong>Fix.</strong> Version every workflow change. In Temporal, guard new code paths with the versioning API so old histories take the old path. In a table-driven orchestrator, store <code>definition_ver</code> on each saga and keep old definitions runnable until their sagas drain. Add a replay test to CI that runs recent production histories against the new code.</p>
+
+<h3 id=dd-saga-fm-lost-command level=3>5. The saga waiting for a reply that will never come</h3>
+<p><strong>Symptom.</strong> Some orders sit in SHIPPING forever. The shipping service has no record of them.</p>
+<p><strong>Mechanism.</strong> The orchestrator updated the saga row and then published the command as a separate step. It crashed in between. Or the command was published but the shipping service dropped it on a deserialization error. Either way, the saga waits for <code>shipment.created</code>, and no deadline wakes it.</p>
+<p><strong>Detect.</strong> Sagas whose <code>deadline_at</code> has passed while still non-terminal. If you have no deadline column, that is the finding.</p>
+<p><strong>Fix.</strong> Use an outbox for commands. Give every waiting state a timeout that re-sends the command with the same key, then compensates or escalates after the deadline. Route undeliverable commands to a <a href="#dead-letter-queue">dead letter queue</a> with an alert, so a poison command is visible instead of silently swallowed.</p>
+
+<h3 id=dd-saga-fm-compensation-storm level=3>6. The compensation storm after an outage</h3>
+<p><strong>Symptom.</strong> Shipping recovers, but the payment provider now returns 429 Too Many Requests. Refunds lag by half an hour. The payment team asks why your service is attacking them.</p>
+<p><strong>Mechanism.</strong> The compensation-wave arithmetic above. Thousands of sagas all hit their retry deadline at nearly the same time and fire refunds at full speed. Throttled refunds retry, adding more load.</p>
+<p><strong>Detect.</strong> Refund request rate against the provider's limit. 429 counts on compensation calls. COMPENSATING count climbing after the original dependency has recovered.</p>
+<p><strong>Fix.</strong> Rate-limit compensations per downstream with a token bucket sized below the provider's limit. Add jitter to deadlines. Reconsider the policy: for a short outage, waiting longer before compensating may be cheaper than mass refunds. A <a href="#bulkhead">bulkhead</a> keeps the refund backlog from eating the worker capacity that new checkouts need.</p>
+
+<h3 id=dd-saga-fm-dirty-read level=3>7. The anomaly between two sagas</h3>
+<p><strong>Symptom.</strong> A customer cancels an order and still receives the package. Or the cancel succeeds and the warehouse ships anyway, so the customer gets the item and the refund.</p>
+<p><strong>Mechanism.</strong> Two sagas touched one order. The cancel saga read status "charged", refunded, and released inventory. At the same moment the checkout saga, past the charge step, handed the package to the courier. Neither saga was wrong alone. Together they produced an outcome no one designed. This is the no-isolation anomaly between sagas, not just between a saga and a reader.</p>
+<p><strong>Detect.</strong> Orders with both a refund and a delivery. A count of sagas that started on an object already held by another saga.</p>
+<p><strong>Fix.</strong> Use a semantic lock: the checkout saga sets <code>PROCESSING</code>, and the cancel saga either waits, queues a "cancel requested" flag that checkout checks before the pivot, or refuses with "too late, return it instead". Transitions on the order should be compare-and-set on its status, so only one saga can move it from PROCESSING.</p>
+
+<h2 id=dd-saga-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-saga-choose-engine level=3>Where the saga log lives</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Option<th>What you build<th>What you get<th>Watch out for<th>Fits<tbody><tr><td>Homegrown table + poller<td>Schema, leases, backoff, outbox, dashboards<td>Full control, one database you already run<td>You will rebuild timers, versioning and visibility, slowly<td>One or two simple sagas, a team that knows its database well<tr><td>Temporal or Cadence<td>Workflow and activity code; you run (or buy) the cluster<td>Event history, replay, timers, retries, per-workflow visibility<td>Determinism rules, history limits, another stateful system to operate<td>Many workflows, long-running or human-in-the-loop steps<tr><td>AWS Step Functions<td>A state machine in JSON plus Lambda or service integrations<td>Fully managed, visual execution history<td>Per-transition cost at volume; logic split between JSON and code<td>AWS-native teams, moderate volume, short to medium flows<tr><td>BPMN engine (Camunda, Zeebe)<td>A process model in BPMN plus workers<td>Diagrams the business can read, human tasks built in<td>Heavier tooling; easy to put business logic in diagrams<td>Processes with many human approvals and business owners<tr><td>Choreography over a broker<td>Events, handlers, and a projection for status<td>Loose coupling, no central component<td>No single place to ask "where is this order"; failure logic spread out<td>Two or three steps, or reactions that are truly independent</table></div></div>
+<p>The usual path is homegrown for the first saga, then an engine once there are five. The signal to switch is when you start writing a generic timer service and a workflow-versioning scheme. Those are exactly what the engines provide.</p>
+
+<h3 id=dd-saga-choose-recovery level=3>Backward or forward recovery</h3>
+<p>Compensation is backward recovery: undo and fail. Forward recovery means retry until the saga succeeds. For each step, choose based on what the customer would want. If shipping is down for 20 minutes, most bookstore customers would rather have their order ship late than be refunded. That points to forward recovery with a long deadline and an honest "delayed" status. If an item turns out to be out of stock, forward recovery is impossible, so compensate fast. Mixed policies are normal, and the saga definition should state them per step.</p>
+
+<h3 id=dd-saga-choose-api level=3>What the client sees: synchronous or asynchronous</h3>
+<p>A 400 ms saga can sit behind a synchronous API: the request waits for a terminal state, with a timeout. If the timeout fires, the API returns <code>202 Accepted</code> with a status URL, and the client polls or receives a push. Design the async path even if the sync path covers 99.9% of orders. The 0.1% are exactly the orders in trouble, and they are the ones a client must not retry blindly.</p>
+
+<h3 id=dd-saga-choose-parallel level=3>Sequential or parallel steps</h3>
+<p>Reserve and fraud check do not depend on each other, so they can run in parallel: 50 ms and 120 ms become 120 ms instead of 170 ms. The cost is compensation logic. If fraud check fails, reserve may still be in flight, and its compensation must handle "cancel before done" (failure mode 2). Parallelize only independent compensatable steps before the pivot. Keep the pivot and everything after it sequential.</p>
+
+<h2 id=dd-saga-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Is each step labeled compensatable, pivot or retriable, and does the order follow compensatable, then pivot, then retriable?</li>
+<li>For every compensatable step, who in the business signed off on its compensation, and does it restore everything (points, counters, coupons), not just the main record?</li>
+<li>Where does the saga state live, and does every transition use compare-and-set or an equivalent fencing check?</li>
+<li>How is the saga ID derived? Can a client retry ever start a second saga for the same checkout?</li>
+<li>Is every step's idempotency key stable across retries and across orchestrator instances?</li>
+<li>How are commands and state updates kept consistent: outbox, synchronous call with intent logged first, or an engine?</li>
+<li>Does every waiting state have a deadline, and what happens when it passes: re-send, compensate or escalate?</li>
+<li>What happens when a compensation fails permanently? Who gets the human task, and what information does it carry?</li>
+<li>Which intermediate states are visible to other services and to customers, and which countermeasure (semantic lock, commutative update, reordering, version file) protects each conflict?</li>
+<li>How is a workflow definition change deployed while sagas are in flight?</li>
+<li>Are compensations rate-limited per downstream, and has the compensation wave from a 20-minute outage been sized?</li>
+<li>Which dashboards show sagas by state and age, and which alerts fire on stuck states rather than on overall throughput?</li>
+</ol>
+
+<h2 id=dd-saga-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Why must the pivot be the only irreversible step before the end?"</summary>
+<p>Because recovery only works in one direction at a time. Before the pivot, a failure can roll everything back. After the pivot, the saga can only go forward, so every later step must be retriable until it succeeds. A compensatable step after the pivot can fail and need undoing, but the pivot cannot be undone, so the saga has no consistent place to land. Two irreversible steps have the same problem: if the second fails, the first cannot be reversed.</p>
+</details>
+
+<details>
+<summary>"Two orchestrator instances both think they own saga 7f3a. What prevents a double charge?"</summary>
+<p>Three layers. The lease means usually only one instance works on it. Compare-and-set on the saga's version means only one instance's state transition lands; the other sees zero rows updated and discards its result. And the idempotency key <code>7f3a:charge</code> means that even if both sent the charge, the provider applied it once and returned the same result to both. The first two protect the saga's state. The third protects the outside world.</p>
+</details>
+
+<details>
+<summary>"Isn't a compensation just a rollback?"</summary>
+<p>No. A rollback erases work that was never visible. A compensation is a new, visible business action that happens after the original was committed and possibly observed. A refund appears on the customer's statement next to the charge. The original effect may also have triggered reactions, like an email or a loyalty grant, that the compensation does not reach. That is why compensations are designed by business owners, can be imperfect, and need their own idempotency and failure handling.</p>
+</details>
+
+<details>
+<summary>"How do you test a saga?"</summary>
+<p>Inject failure at every step boundary, including the awkward ones: crash after the side effect but before recording it, a timeout where the call actually succeeded, a duplicate delivery of each command, a compensation that fails, and a late forward command after compensation. For each, assert the final state and that no external effect happened twice. Durable-execution engines help because you can replay recorded histories. A homegrown orchestrator can do the same by running <code>tick</code> against a fake service that fails on a schedule.</p>
+</details>
+
+<details>
+<summary>"A customer cancels while checkout is between charge and ship. What happens?"</summary>
+<p>That depends on the semantic lock policy you chose, and you should say which. One good answer: the order is in PROCESSING, so the cancel is recorded as a flag rather than run as a competing saga. Before the pivot, checkout checks the flag, compensates (refund, release) and ends as CANCELLED. If the flag arrives after the pivot, the cancel becomes a return flow, which is forward recovery. Two sagas must never both act on the order at once.</p>
+</details>
+
+<details>
+<summary>"Temporal says it gives exactly-once execution. Why do activities still need idempotency?"</summary>
+<p>The workflow code's progress is exactly-once in the sense that replay never re-runs a recorded step. Activities are different. They are at-least-once: a worker can call the payment provider and crash before reporting the result, and the activity is retried. Temporal cannot know whether the external effect happened. So the activity passes an idempotency key derived from the workflow ID and step, and the provider deduplicates.</p>
+</details>
+
+<details>
+<summary>"When would you choose choreography for a saga anyway?"</summary>
+<p>When the steps are few, owned by teams that should not depend on a shared orchestrator, and their failure handling is simple. A two-step "order placed, then reserve stock, else cancel" across two teams can be fine. Add a status projection from day one, so support can answer "where is this order" without searching logs. When the projection starts needing timers and retry logic, migrate to orchestration.</p>
+</details>
+
+<details>
+<summary>"Sagas give eventual consistency. How do you stop the UI from lying to the user?"</summary>
+<p>Expose the saga's state as the product state, with honest names: "processing", "payment received", "reversing charge". Send outward messages, like confirmation emails, only from terminal or post-pivot states. After a user's own action, show their pending change from the saga's record rather than reading a projection that may lag. The UI does not lie if it shows what the saga actually knows.</p>
+</details>

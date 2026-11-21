@@ -1,0 +1,236 @@
+<h2 id=dd-sidecar-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>"The app talks plaintext over localhost to its sidecar" hides a real question: how does the app's traffic get to the sidecar at all? The Checkout code still calls <code>http://inventory:8080</code>. Nobody changed it to call <code>localhost</code>. This section follows one call from Checkout to Inventory through a Kubernetes pod with an Envoy sidecar, the way Istio and similar meshes wire it. Then it covers lifecycle, protocol handling and the helper sidecars that are not proxies.</p>
+
+<h3 id=dd-sidecar-namespace level=3>One pod, one network namespace</h3>
+<p>All containers in a Kubernetes pod share one network namespace. They share one IP address, one loopback interface, and one set of <code>iptables</code> rules. That shared namespace is what makes a transparent sidecar possible. Anything you do to the pod's network rules applies to the app container too, without touching the app.</p>
+<p>Before the app starts, a setup step installs NAT rules in that namespace. In Istio this is either an init container (<code>istio-init</code>, which needs the <code>NET_ADMIN</code> capability) or a CNI plugin that does the same work on the node, so that application pods do not need elevated privileges. The rules say, roughly:</p>
+<ul>
+<li>Outbound TCP from any process <em>except</em> the proxy's own user ID gets redirected to the proxy's outbound listener (port 15001 in Istio).</li>
+<li>Inbound TCP to the pod gets redirected to the proxy's inbound listener (port 15006).</li>
+<li>Traffic from the proxy's user ID (1337 by default) is excluded. Without that rule, the proxy's own outbound connections would be redirected back into itself in an endless loop.</li>
+</ul>
+
+<svg role="img" aria-labelledby="dd-sidecar-svg-title dd-sidecar-svg-desc" viewBox="0 0 720 250" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-sidecar-svg-title">How a call is redirected through two sidecars</title>
+<desc id="dd-sidecar-svg-desc">In the Checkout pod, the app connects to inventory port 8080. An iptables rule redirects the connection to the local Envoy outbound listener on port 15001. Envoy recovers the original destination, picks an Inventory endpoint and opens a mutual TLS connection across the network. In the Inventory pod, iptables redirects the inbound connection to Envoy's inbound listener on port 15006, which terminates TLS, checks the caller identity and forwards plaintext to the app on localhost port 8080.</desc>
+<rect x="0" y="0" width="720" height="250" fill="var(--paper, #ffffff)"/>
+<g stroke="var(--line, #d5dee8)" fill="var(--bg, #f4f7fa)">
+<rect x="10" y="14" width="300" height="222" rx="8"/>
+<rect x="410" y="14" width="300" height="222" rx="8"/>
+</g>
+<g fill="var(--muted, #5c6b7c)">
+<text x="22" y="34">Checkout pod (one network namespace)</text>
+<text x="422" y="34">Inventory pod (one network namespace)</text>
+</g>
+<g stroke="var(--accent, #1f5f99)" fill="var(--paper, #ffffff)">
+<rect x="24" y="48" width="130" height="56" rx="6"/>
+<rect x="24" y="166" width="272" height="56" rx="6"/>
+<rect x="556" y="48" width="140" height="56" rx="6"/>
+<rect x="424" y="166" width="272" height="56" rx="6"/>
+</g>
+<g fill="var(--ink, #1c2430)">
+<text x="36" y="70" font-weight="bold">Checkout app</text>
+<text x="36" y="90">connect inventory:8080</text>
+<text x="36" y="188" font-weight="bold">Envoy outbound :15001</text>
+<text x="36" y="208">orig. dst → pick endpoint → mTLS</text>
+<text x="568" y="70" font-weight="bold">Inventory app</text>
+<text x="568" y="90">plaintext :8080</text>
+<text x="436" y="188" font-weight="bold">Envoy inbound :15006</text>
+<text x="436" y="208">end TLS → check identity → fwd</text>
+</g>
+<g stroke="var(--muted, #5c6b7c)" stroke-width="1.5" fill="none">
+<line x1="89" y1="104" x2="89" y2="162"/>
+<line x1="296" y1="194" x2="420" y2="194"/>
+<line x1="626" y1="166" x2="626" y2="108"/>
+</g>
+<g fill="var(--muted, #5c6b7c)">
+<polygon points="85,158 89,166 93,158"/>
+<polygon points="416,190 424,194 416,198"/>
+<polygon points="622,112 626,104 630,112"/>
+<text x="98" y="138">iptables REDIRECT</text>
+<text x="318" y="184">mTLS over network</text>
+<text x="636" y="138">localhost</text>
+</g>
+</svg>
+
+<p>So the Checkout app opens a TCP connection to Inventory's service IP, and the kernel quietly delivers it to Envoy on port 15001 instead. Envoy asks the kernel for the original destination (the <code>SO_ORIGINAL_DST</code> socket option) and learns the app meant <code>inventory:8080</code>. From there it acts as a normal <a href="#reverse-proxy">reverse proxy</a>:</p>
+<ol>
+<li><strong>Listener and filter chain.</strong> Envoy matches the original destination to a listener configuration. For HTTP, the HTTP connection manager parses the request, which is where retries, timeouts and header-based routing can apply.</li>
+<li><strong>Route and cluster.</strong> The route maps the request to a <em>cluster</em>, Envoy's name for a group of upstream endpoints (all healthy Inventory pods).</li>
+<li><strong>Load balancing and pooling.</strong> Envoy picks an endpoint (round robin or least-request, for example) and takes a connection from its pool for that endpoint, or opens a new one.</li>
+<li><strong>mTLS.</strong> The upstream connection uses the pod's workload certificate. The other side presents its own. Each side checks the peer's identity, often a SPIFFE ID such as <code>spiffe://cluster.local/ns/shop/sa/inventory</code>.</li>
+</ol>
+<p>On the Inventory side, the inbound rule sends the connection to port 15006. Envoy ends TLS, records the caller's verified identity, applies any inbound policy, and forwards plaintext to <code>127.0.0.1:8080</code>. The Inventory app sees a local connection.</p>
+<p>The same intercept also catches calls to things outside the mesh, such as a payment provider or a managed database. Every sidecar configuration needs a rule for those: pass them through untouched, send them through an egress gateway, or block them.</p>
+
+<h3 id=dd-sidecar-threads level=3>Inside Envoy: workers and per-worker pools</h3>
+<p>Envoy runs a small number of worker threads. Each one owns its own connections and its own connection pools, so there is no locking on the hot path. The number of workers is the <code>concurrency</code> setting. Sidecar deployments usually set it low, often 2, because the sidecar's CPU limit is small and one worker per node core would be wasteful.</p>
+<p>Per-worker pools have a side effect that surprises people. A sidecar with 2 workers, calling a service with 40 healthy endpoints, can hold up to 2 × 40 = 80 upstream connections for that one service over HTTP/1.1. HTTP/2 between sidecars multiplexes many requests per connection, which keeps the count closer to one per worker per endpoint. That is one reason meshes upgrade sidecar-to-sidecar traffic to HTTP/2 when they can.</p>
+
+<h3 id=dd-sidecar-protocol level=3>Knowing what protocol it is carrying</h3>
+<p>To apply HTTP retries, the proxy has to know the bytes are HTTP. There are two ways it finds out:</p>
+<ul>
+<li><strong>Explicit declaration.</strong> In Kubernetes, the Service port's <code>appProtocol</code> field (or a port name prefix such as <code>http-</code> or <code>grpc-</code>) tells the mesh what to expect. This is reliable and costs nothing.</li>
+<li><strong>Sniffing.</strong> The proxy reads the first bytes of the connection and guesses. This works for client-first protocols such as HTTP, where the client speaks first. It does not work for server-first protocols such as MySQL or SMTP, where the server sends a greeting before the client says anything. The proxy waits for client bytes that never come, gives up after a timeout, and then treats the stream as plain TCP. Connections are slow to start, or fail.</li>
+</ul>
+<p>Declare protocols explicitly for every port. Treat sniffing as a convenience for prototypes.</p>
+
+<h3 id=dd-sidecar-lifecycle level=3>Startup and shutdown order</h3>
+<p>The lesson names the startup race. The mechanism is simple: by default, containers in a pod start in parallel. If the app is faster, its first outbound calls hit iptables rules that point at a proxy that is not listening yet, and they fail with connection refused.</p>
+<p>There are three generations of fixes:</p>
+<ul>
+<li><strong>Hold the app.</strong> Istio's <code>holdApplicationUntilProxyStarts</code> injects the proxy first and uses a post-start hook that blocks until Envoy is ready. Kubernetes waits for that hook before starting the next container. It works, but it relies on container ordering details.</li>
+<li><strong>Native sidecar containers.</strong> Kubernetes added sidecars as a first-class concept. They are init containers with <code>restartPolicy: Always</code>. They start before the app containers, they must pass their startup probe before the app starts, and they keep running for the life of the pod. The feature was beta and on by default from Kubernetes 1.29 and became stable in 1.33. Check what your cluster version and mesh release support.</li>
+<li><strong>Shutdown order.</strong> On deletion, every container gets SIGTERM. If the sidecar exits first, the app's in-flight calls and its shutdown hooks (flush the last metrics, ack the last message) lose their network. Native sidecars are terminated <em>after</em> the app containers. With the older model, you configure a drain period on the proxy, or a <code>preStop</code> hook that waits for the app to finish.</li>
+</ul>
+<p>Native sidecars also fix a long-standing problem with Kubernetes Jobs. With an ordinary sidecar container, the batch container finishes, but the proxy keeps running, so the pod never completes. Teams used to work around this with scripts that told the proxy to quit. A native sidecar is shut down automatically when the main containers finish.</p>
+
+<h3 id=dd-sidecar-probes level=3>Health checks through the proxy</h3>
+<p>Kubelet sends liveness and readiness probes to the pod IP. With strict mTLS on inbound traffic, a plaintext probe from the kubelet would be rejected, because the kubelet holds no workload certificate. Meshes therefore rewrite probes. The probe goes to an agent port on the sidecar (15020 or 15021 in Istio), and the agent calls the app's real health endpoint locally. The consequence matters in an incident: a failing probe can mean the app is sick, <em>or</em> that the sidecar's agent is. The <a href="#health-check-endpoint">health check</a> lesson's distinction between shallow and deep checks now has a third layer.</p>
+
+<h3 id=dd-sidecar-other level=3>Sidecars that are not proxies</h3>
+<p>The proxy is the famous sidecar, but the pattern is older and wider. In each case below, the helper shares the pod's lifecycle and its local resources, such as the network namespace or a shared volume.</p>
+<ul>
+<li><strong>Log shippers.</strong> The app writes to a file or stdout. A Fluent Bit or Vector sidecar tails it and ships it. Many clusters use a per-node agent instead, which is cheaper. A sidecar is the right choice when a pod needs its own parsing or its own destination.</li>
+<li><strong>Secret agents.</strong> A Vault Agent sidecar authenticates with the pod's service account, fetches short-lived secrets, writes them to a shared in-memory volume, and renews them. The app reads a file and never handles the auth flow.</li>
+<li><strong>Database auth proxies.</strong> Cloud SQL Auth Proxy, for example, runs beside the app and handles IAM authentication and TLS to the managed database. The app connects to <code>localhost:5432</code>.</li>
+<li><strong>Config reloaders.</strong> A small container watches a ConfigMap and signals the main process to reload when it changes.</li>
+</ul>
+
+<h2 id=dd-sidecar-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-sidecar-sizing-memory level=3>Memory is mostly configuration</h3>
+<p>The lesson's 50 MB per sidecar is a reasonable baseline for a small mesh. The part that grows is configuration. By default, many meshes send every sidecar the routes, clusters and endpoints for <em>every</em> service, because any pod might call any other. Memory then grows with the size of the whole mesh, not with what this pod actually does.</p>
+<p>A rough model for capacity planning:</p>
+<pre><code>sidecar_memory ≈ baseline + (services_known × per_service_cost)
+               + (endpoints_known × per_endpoint_cost)</code></pre>
+<p>The coefficients depend heavily on the proxy version and on how much routing and telemetry is configured, so measure them on your own fleet. Two snapshots tell the story. At 11 services with 40 pods each, the per-service term is small and 50 MB holds. At 800 services with 20,000 endpoints, the same sidecar can need several times that, multiplied across every pod. The fix is scoping: tell each sidecar which services it actually calls. Istio's <code>Sidecar</code> resource does this, and other meshes have equivalents. A checkout pod that knows about 12 services instead of 800 uses close to baseline memory again, and receives far fewer config updates.</p>
+
+<h3 id=dd-sidecar-sizing-reserved level=3>Reserved, not just used</h3>
+<p>Kubernetes schedules on <em>requests</em>, not on actual usage. If every sidecar requests 100 millicores of CPU and 64 MB of memory, the bookstore's 440 sidecars reserve:</p>
+<pre><code>CPU:    440 × 0.1 core = 44 cores reserved
+Memory: 440 × 64 MB    ≈ 28 GB reserved</code></pre>
+<p>Those 44 cores are unavailable to anything else even if the sidecars idle at 10 millicores. At, say, 4 usable cores per node, that is 11 nodes of capacity you pay for. The usual tuning is per workload: small requests for quiet services, larger ones for the few hot paths. Set CPU requests from measured p95 usage, and watch for throttling if you also set CPU limits. A throttled proxy shows up as latency spikes, not as errors.</p>
+
+<h3 id=dd-sidecar-sizing-cpu level=3>CPU per request</h3>
+<p>Proxy CPU scales with request rate, TLS work, and how much each request is inspected (telemetry, header manipulation, policy). A planning figure in the range of a few tenths of a vCPU per 1,000 requests per second, per proxy hop, is common for HTTP with telemetry enabled. Treat it as a starting point and load-test your own configuration.</p>
+<p>Apply it to the bookstore. Internal east-west traffic peaks at 30,000 requests per second, and each request crosses two proxies. At 0.4 vCPU per 1,000 requests per second per hop:</p>
+<pre><code>30,000 / 1,000 × 2 hops × 0.4 vCPU = 24 vCPU at peak</code></pre>
+<p>That is spread across the fleet, and it is real money, but it is predictable. TLS handshakes are the spiky part. Each new mTLS connection costs an asymmetric signature on both sides. A mass reconnect after a deploy or a certificate rotation can briefly cost far more CPU than steady-state traffic. Long-lived pooled connections are what keep the steady state cheap.</p>
+
+<h3 id=dd-sidecar-sizing-latency level=3>Latency adds per hop, not per call</h3>
+<p>The lesson's figure is about 0.5 ms per sidecar, or 1 ms per call across two. How that adds up depends on the call graph's <em>depth</em>, not on its width.</p>
+<ul>
+<li>The mobile BFF fans out 6 calls in parallel. Each pays about 1 ms extra, but they overlap, so the BFF's response gets about 1 ms slower, not 6.</li>
+<li>Checkout calls Pricing, which calls Promotions, which calls Catalog. That is a chain of depth 4, so it adds about 4 ms to the end-to-end time.</li>
+</ul>
+<p>The p99 grows more than the p50, because proxy queueing, CPU throttling and garbage pauses in the app now have one more place to land. When you set a latency budget, measure p99 per hop with and without the sidecar on a canary, and multiply by the depth of your deepest critical path.</p>
+
+<h2 id=dd-sidecar-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-sidecar-fm-retry-amp level=3>1. Retries multiply across layers</h3>
+<p><strong>Symptom.</strong> Inventory has a 30-second slowdown. Its request rate jumps to 27 times normal, and the slowdown becomes an outage that lasts ten minutes.</p>
+<p><strong>Mechanism.</strong> The Checkout code still has its old client library with 3 attempts. The new sidecar policy also does 3 attempts. That is 9 requests per logical call. Checkout's caller, the BFF, also retries 3 times, so each user action can now produce 27 calls to Inventory. Moving retries into the sidecar only helps if you remove them from the code.</p>
+<p><strong>Detect.</strong> Compare request rate at the receiver with request rate at the original caller. Envoy also exports per-cluster retry counters (<code>upstream_rq_retry</code> and related stats). A retry ratio above a few percent during an incident is a warning.</p>
+<p><strong>Fix.</strong> Retry in exactly one layer, usually the sidecar nearest the failing call, and remove application retries as you migrate. Use retry budgets, which cap retries at a share of live traffic (Envoy supports a budget as a percentage of active requests), instead of a fixed count. Then retry only idempotent calls. The <a href="#retry-with-exponential-backoff">retry</a> lesson's amplification math applies to every layer you add.</p>
+
+<h3 id=dd-sidecar-fm-overflow level=3>2. 503s under load, with healthy upstreams</h3>
+<p><strong>Symptom.</strong> During a sale, Checkout gets bursts of 503s from Inventory. Inventory's own metrics show it is healthy and under half its capacity.</p>
+<p><strong>Mechanism.</strong> Envoy's per-cluster circuit breakers have thresholds, and they reject requests locally once a threshold is crossed. Envoy's defaults are 1,024 maximum connections, 1,024 pending requests and 1,024 active requests per cluster, plus a limit of 3 concurrent retries. A busy caller with slow responses can cross the pending-request limit while the upstream is fine. The 503 never leaves the calling pod.</p>
+<p><strong>Detect.</strong> Envoy access logs carry <em>response flags</em>. <code>UO</code> means upstream overflow: the local circuit breaker rejected the request. Compare that with <code>UF</code> (upstream connection failure), <code>UH</code> (no healthy upstream) and <code>URX</code> (retry limit reached). Put response flags into your logs and dashboards before your first incident. They answer "app or proxy?" in seconds.</p>
+<p><strong>Fix.</strong> Set circuit-breaker thresholds deliberately for hot paths, sized from Little's law: concurrent requests ≈ request rate × latency. At 3,000 requests per second and 300 ms latency during a slowdown, that is 900 in flight, uncomfortably close to 1,024. Raise the limits for that path, and keep the breaker as a real <a href="#bulkhead">bulkhead</a> rather than a hidden default.</p>
+
+<h3 id=dd-sidecar-fm-idle level=3>3. Sporadic 503s on reused connections</h3>
+<p><strong>Symptom.</strong> A low, steady rate of 503s, around 0.05%, between two services. They cluster after quiet periods. Retrying always works.</p>
+<p><strong>Mechanism.</strong> The upstream app server closes idle keep-alive connections after 5 seconds. The sidecar's pool keeps connections idle longer than that. Now and then, the sidecar sends a request on a connection at the exact moment the server closes it. The request dies with a connection reset.</p>
+<p><strong>Detect.</strong> Response flag <code>UC</code> (upstream connection termination) in the caller's sidecar logs, and the clustering after idle periods.</p>
+<p><strong>Fix.</strong> Make the proxy's upstream idle timeout shorter than the app server's keep-alive timeout, so the proxy always closes first. Or raise the app's keep-alive above the proxy's. This class of bug was already possible with any load balancer. A sidecar fleet just makes it appear between every pair of services at once.</p>
+
+<h3 id=dd-sidecar-fm-server-first level=3>4. Database connections hang after sidecar injection</h3>
+<p><strong>Symptom.</strong> After a namespace is added to the mesh, a service's connections to MySQL take several seconds to establish, or time out. HTTP traffic is fine.</p>
+<p><strong>Mechanism.</strong> MySQL is server-first: the server sends its handshake greeting before the client speaks. The sidecar is sniffing the protocol and waits for client bytes. The client is waiting for the greeting. Both wait until the sniffing timeout passes.</p>
+<p><strong>Detect.</strong> Connection-establishment latency on the database client, and sidecar logs showing protocol detection timeouts. Ports with no declared protocol are a lint finding.</p>
+<p><strong>Fix.</strong> Declare the port as TCP (<code>appProtocol: tcp</code>, or a <code>tcp-</code> port name), or exclude that destination port from interception. Make "every port declares its protocol" a deploy-time check.</p>
+
+<h3 id=dd-sidecar-fm-oom level=3>5. Sidecars OOM as the mesh grows</h3>
+<p><strong>Symptom.</strong> Months after rollout, sidecars across unrelated services start getting OOMKilled. Nothing changed in those services.</p>
+<p><strong>Mechanism.</strong> Every new service and every new endpoint in the mesh adds configuration to every sidecar, as the sizing section showed. The memory limit that fit at 11 services does not fit at 200. And a config push for a big change hits all sidecars at once.</p>
+<p><strong>Detect.</strong> Sidecar memory usage plotted against mesh size (services and endpoints), not against the pod's own traffic. A slow upward drift in every pod at once is the tell. Also watch config push size and push frequency from the control plane.</p>
+<p><strong>Fix.</strong> Scope configuration so that each sidecar only knows what it calls. Then size limits from measured usage plus headroom, per workload class. This is a <a href="#service-mesh">mesh</a> concern, but it shows up as a sidecar crash.</p>
+
+<h3 id=dd-sidecar-fm-source-ip level=3>6. The app sees every caller as 127.0.0.1</h3>
+<p><strong>Symptom.</strong> After injection, the admin service's IP allowlist blocks everyone or allows everyone. Access logs show every request coming from <code>127.0.0.1</code>.</p>
+<p><strong>Mechanism.</strong> The inbound sidecar ends the caller's connection and opens a new one to the app over localhost. The app now sees the sidecar as its peer. Its source-IP logic is checking the wrong thing.</p>
+<p><strong>Detect.</strong> A sudden collapse in the number of distinct client IPs in app logs after injection.</p>
+<p><strong>Fix.</strong> Stop authorising by IP inside the mesh. Authorise by the verified workload identity, which the sidecar can enforce or pass along in a header the app trusts only from localhost. For logging, read the forwarded-for header the proxy adds. Some meshes offer a transparent mode (TPROXY) that preserves the original source address, at the cost of more complex setup.</p>
+
+<h3 id=dd-sidecar-fm-shutdown level=3>7. The last messages are lost on every deploy</h3>
+<p><strong>Symptom.</strong> A queue consumer loses a few acknowledgements on each rolling deploy. Those messages are redelivered and processed twice.</p>
+<p><strong>Mechanism.</strong> On pod deletion, both containers get SIGTERM. The sidecar drains and exits within a second or two. The consumer is still finishing its batch, and its final ack call to the broker fails because the network path is gone.</p>
+<p><strong>Detect.</strong> Connection errors in app logs in the last seconds before exit, aligned with deploy events. Redelivery counts that spike on deploys.</p>
+<p><strong>Fix.</strong> Use native sidecars, which stop after the app. On older setups, give the proxy a drain period longer than the app's graceful shutdown, or add a <code>preStop</code> hook that waits for the app. And keep the handlers <a href="#idempotency">idempotent</a> anyway, because redelivery will happen for other reasons too.</p>
+
+<h2 id=dd-sidecar-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Option<th>Where the logic runs<th>Per-pod cost<th>L7 features (HTTP retries, routing)<th>Main risk<tbody>
+<tr><td>In-process library<td>Inside the app<td>None extra<td>Yes, per language<td>Drift across languages and teams
+<tr><td>Proxyless gRPC (xDS in the client library)<td>Inside the app, configured by the control plane<td>None extra<td>Yes, for gRPC only<td>Only for gRPC languages with xDS support
+<tr><td>Proxy sidecar<td>Separate container in each pod<td>Memory, CPU, ~0.5 ms per hop<td>Yes, uniformly<td>Lifecycle bugs, fleet-wide resource cost
+<tr><td>Per-node proxy (e.g. ambient ztunnel)<td>One proxy per node, shared<td>Small, amortised<td>L4 only (mTLS, identity); L7 needs a separate proxy<td>Shared failure domain per node; noisy neighbours
+<tr><td>Per-node L4 plus L7 "waypoint" per service<td>Node proxy plus a shared proxy per service or namespace<td>Small, plus waypoint pods<td>Yes, where a waypoint is deployed<td>An extra network hop to the waypoint; newer operational model
+<tr><td>eBPF in the kernel (e.g. Cilium)<td>Kernel programs on each node<td>Smallest<td>L3/L4 policy natively; L7 via a node proxy<td>Kernel-version dependence; harder to debug
+</tbody></table></div></div>
+
+<h3 id=dd-sidecar-var-guidance level=3>How to choose</h3>
+<ul>
+<li><strong>Need only encryption and identity?</strong> A per-node L4 option gives mTLS without a proxy in every pod. That is much cheaper at 440 pods.</li>
+<li><strong>Need HTTP-aware behaviour for a few services?</strong> Add L7 processing only where you need it: a waypoint, or sidecars on those workloads alone. Not every service needs header-based routing.</li>
+<li><strong>Mostly gRPC, in languages with good xDS support?</strong> Proxyless gRPC gives sidecar-like policy with no extra hop. You lose uniformity for non-gRPC traffic.</li>
+<li><strong>Few languages, one team?</strong> The library remains the right answer, as the lesson says. None of these options is free.</li>
+<li><strong>Multi-tenant nodes with strict isolation?</strong> Per-pod sidecars keep each workload's keys and failure inside its own pod. A shared node proxy holds keys for every workload on that node. Some security teams will accept that and some will not, so ask early.</li>
+</ul>
+
+<h2 id=dd-sidecar-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>How is traffic intercepted: init container with <code>NET_ADMIN</code>, CNI plugin, or explicit localhost calls? Who is allowed to bypass it?</li>
+<li>Does every Service port declare its protocol? Which ports are server-first, and how are they handled?</li>
+<li>How is startup ordered (native sidecar or hold-until-ready), and how is shutdown ordered for long-running and batch workloads?</li>
+<li>Which layer owns retries now? Have application retries been removed, and is there a retry budget?</li>
+<li>What are the per-cluster circuit-breaker thresholds on the hot paths, and how were they sized?</li>
+<li>Are idle and keep-alive timeouts set so the proxy always closes first?</li>
+<li>What are the CPU and memory requests per workload class, measured from real usage? How much cluster capacity do they reserve in total?</li>
+<li>How does sidecar configuration size scale with the mesh, and is it scoped per workload?</li>
+<li>Do access logs include proxy response flags, and can on-call tell app errors from proxy errors in one query?</li>
+<li>How are health probes routed with strict mTLS, and what does a failed probe mean now?</li>
+<li>What does the app use for client identity now that the source IP is localhost?</li>
+<li>What is the rollout and rollback plan for a sidecar version upgrade across the fleet?</li>
+</ol>
+
+<h2 id=dd-sidecar-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"The app calls inventory:8080 and was never changed. How does the traffic reach the sidecar?"</summary>
+<p>The containers in a pod share a network namespace. Before the app starts, an init container or CNI plugin installs iptables NAT rules in that namespace. Outbound TCP is redirected to the proxy's outbound port, and inbound TCP to its inbound port. Traffic from the proxy's own user ID is excluded, so its upstream connections are not looped back. The proxy reads the original destination from the socket and routes from there. The app never knows.</p>
+</details>
+<details>
+<summary>"You moved retries into the sidecar. Why did the incident get worse?"</summary>
+<p>Because the application's own retries were still there, so the attempts multiplied: 3 in the app times 3 in the sidecar is 9 per call, and more if a caller further up also retries. A short slowdown became a self-inflicted overload. Retries must live in exactly one layer, with a budget capped as a share of traffic, and only for idempotent operations.</p>
+</details>
+<details>
+<summary>"Inventory is healthy but Checkout sees 503s. How do you tell whether it's the proxy?"</summary>
+<p>Look at the proxy's access log response flags on the calling side. <code>UO</code> means the local circuit breaker rejected the request: upstream overflow. <code>UF</code> means the connection to the upstream failed. <code>UC</code> means the upstream closed a connection mid-request. <code>UH</code> means no healthy endpoints. A 503 with no flag came from the upstream app itself. Then compare with the upstream's request count. If the requests never arrived, it is the proxy.</p>
+</details>
+<details>
+<summary>"Why do sidecars use more memory in a big mesh even when the pod's traffic didn't change?"</summary>
+<p>Because by default each sidecar is given config for every service and endpoint in the mesh, in case the pod calls any of them. Memory and config-push volume grow with the mesh, not with the pod's own work. Scope each sidecar to the services it actually calls. That brings memory back near baseline and cuts the control plane's push traffic.</p>
+</details>
+<details>
+<summary>"What changed with native sidecar containers in Kubernetes?"</summary>
+<p>A sidecar can now be declared as an init container with <code>restartPolicy: Always</code>. It starts before the app containers and must pass its startup probe first. It keeps running alongside them, and it is stopped after they finish. That fixes the startup race, the shutdown race where the proxy dies before the app's final calls, and Jobs that never complete because the proxy keeps running.</p>
+</details>
+<details>
+<summary>"When would you choose a per-node proxy instead of a sidecar?"</summary>
+<p>When the requirement is mostly mTLS and workload identity, and per-pod cost matters. A per-node L4 proxy gives both with far less memory and no per-pod lifecycle. Add L7 proxies only for the services that need HTTP routing or retries. The trade-offs are a shared failure and key domain per node, and a newer operational model. If a security review requires per-workload key isolation, stay with sidecars.</p>
+</details>
+<details>
+<summary>"A team says the sidecar adds 1 ms, so their 6-call fan-out will add 6 ms. Right?"</summary>
+<p>Not if the calls are parallel. Each call pays about 1 ms, but they overlap, so the fan-out adds roughly 1 ms plus a little p99 widening. What adds up is depth: a chain of 4 sequential hops adds about 4 ms. Budget sidecar overhead by the depth of the critical path, and measure p99, not p50, on a canary with and without the sidecar.</p>
+</details>

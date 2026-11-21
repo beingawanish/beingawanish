@@ -1,0 +1,196 @@
+<h2 id=dd-api-gateway-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson sets the boundary: routing, authentication once, shared policy, the observability root, and "policy yes, product no". A design review goes one level down. What does the gateway hold in memory? What does it check on each request, in what order? And how does a change to its config reach a fleet of instances without breaking everyone at once? Products differ (Kong, Envoy-based gateways, AWS API Gateway, Apigee), but they all share the same few moving parts.</p>
+
+<h3 id=dd-api-gateway-planes level=3>Two planes: the config you write and the proxy that runs it</h3>
+<p>Every serious gateway splits into a <strong>control plane</strong> and a <strong>data plane</strong>. The control plane holds the desired config: routes, upstream services, plugins, consumers and their credentials. The data plane is the fleet of proxy instances that receive traffic. Each instance holds a compiled, in-memory copy of the config and never consults a database on the hot path.</p>
+<ul>
+<li>Envoy-based gateways receive config over the xDS APIs: listeners (LDS), routes (RDS), clusters (CDS) and endpoints (EDS). An update replaces the in-memory route table without a restart.</li>
+<li>Kong can run with a database, where nodes poll for changes, or DB-less, where each node loads a declarative YAML file. Hybrid mode puts the database behind a control plane that pushes config to data-plane nodes.</li>
+<li>Managed gateways hide the split, but it is still there. A "deploy" of a stage is a config push to the provider's fleet.</li>
+</ul>
+<p>This matters for two reasons. If the control plane is down, the data plane should keep serving the last good config, so check that it does. And config pushes are the most common way gateways cause outages, because one bad push reaches every instance. More on that in the failure modes.</p>
+
+<h3 id=dd-api-gateway-pipeline level=3>The request pipeline, in order</h3>
+<p>A request passes through a fixed sequence of filters (Envoy's term) or plugin phases (Kong's). The order is a design decision. Cheap checks that reject the most traffic go first, so attackers pay before you do.</p>
+<ol>
+<li><strong>TLS and connection limits.</strong> Terminate TLS, apply per-IP connection caps. Clients that cannot finish a handshake never reach the router.</li>
+<li><strong>Normalise the path.</strong> Decode percent-encoding once, collapse <code>//</code>, resolve <code>/./</code> and <code>/../</code>, and decide on case and trailing slashes. Do this <em>before</em> matching routes and auth rules. Envoy exposes options such as <code>normalize_path</code> and <code>merge_slashes</code>; other gateways have equivalents. Skipping this step is how <code>/%61dmin</code> slips past a rule written for <code>/admin</code>.</li>
+<li><strong>Match the route.</strong> Routes are matched by host, then path (exact, prefix or regex), sometimes method and headers. Most gateways evaluate routes in a defined order or by specificity, and the first match wins. A broad prefix such as <code>/</code> placed too early swallows everything after it.</li>
+<li><strong>Coarse limits.</strong> Request size, header size, and an IP-level rate limit for anonymous traffic. These are cheap and need no identity.</li>
+<li><strong>Authenticate.</strong> Validate the credential (details below) and attach the identity to the request context.</li>
+<li><strong>Identity-based limits and quotas.</strong> Now the limiter can key on the API key or account, which is the key the <a href="#rate-limiting">rate limiting</a> lesson recommends.</li>
+<li><strong>Validate.</strong> Optional schema validation of the body against an OpenAPI or JSON Schema document. Useful for public APIs, but it costs CPU per byte. Most teams validate only shape and size at the gateway and leave semantic checks to the service.</li>
+<li><strong>Rewrite and forward.</strong> Strip any client-supplied identity headers, add the verified identity, add <code>traceparent</code> and a request ID, rewrite the path for the upstream, pick an endpoint, forward with a per-route timeout.</li>
+<li><strong>Log and emit metrics</strong> after the response, tagged with route, consumer, status and upstream latency.</li>
+</ol>
+
+<h3 id=dd-api-gateway-authn level=3>Authenticating once: JWTs, JWKS and the revocation problem</h3>
+<p>The lesson's incident was a service that ignored revocation. Fixing it at the gateway means deciding how the gateway knows a token is revoked, and that depends on the token type.</p>
+<p><strong>Self-contained tokens (JWTs).</strong> The gateway verifies the signature locally with the issuer's public key, then checks <code>exp</code>, <code>nbf</code>, <code>iss</code> and <code>aud</code>. Keys come from the issuer's JWKS endpoint. The gateway caches them and picks one by the token's <code>kid</code> header. Verification is local and costs microseconds of CPU, with no network call. The catch is that a valid signature says nothing about revocation. A stolen JWT works until it expires. You have three tools:</p>
+<ul>
+<li><strong>Short lifetimes.</strong> Access tokens of 5 to 15 minutes, renewed with a refresh token that the identity provider can revoke. Revocation takes effect within one access-token lifetime.</li>
+<li><strong>A denylist.</strong> The identity provider publishes revoked token IDs (<code>jti</code>) or "revoked before time T for user U" events. The gateway keeps them in memory or a shared store until each token's expiry. The list stays small because entries expire with the tokens.</li>
+<li><strong>Introspection for sensitive routes.</strong> For admin or payment routes, call the issuer's introspection endpoint (RFC 7662) and cache the answer for a few seconds.</li>
+</ul>
+<p><strong>Opaque tokens.</strong> The token is a random string, and only the issuer knows what it means. The gateway must introspect, which costs a network call, so it caches results for a short time. Revocation is as fast as that cache TTL. Opaque tokens are simpler to revoke and leak less information. JWTs are cheaper to verify. Many systems use opaque tokens on the outside and mint a short-lived internal JWT at the gateway.</p>
+<p><strong>API keys.</strong> For partners, a key is looked up in a local cache of hashed keys pushed from the control plane. Store hashes, not keys, so a leaked config does not leak credentials.</p>
+
+<h3 id=dd-api-gateway-identity level=3>Passing identity inward without making it forgeable</h3>
+<p>After authentication, the gateway tells the service who the caller is. The naive way is a plain header, <code>X-User-Id: 4521</code>. It is safe only if two conditions both hold. The gateway must strip any <code>X-User-Id</code> the client sent. And the service must accept traffic only from the gateway. Break either one and any client, or any compromised internal service, can claim to be anyone.</p>
+<p>Stronger options, in order of effort:</p>
+<ul>
+<li><strong>mTLS between gateway and services</strong>, so a service can verify the header came from the gateway's workload identity. A mesh gives you this.</li>
+<li><strong>A signed internal token.</strong> The gateway mints a short-lived JWT (a minute or so) with the user ID, tenant, scopes and the original token's ID, signed with a key only the gateway holds. Services verify it locally. This is a form of token exchange (RFC 8693 describes the standard flow). It survives hops: service A can forward it to service B, and B still knows the original user.</li>
+</ul>
+<p>Either way, the external token should not travel past the gateway. Services that never see raw customer tokens cannot leak them into logs.</p>
+
+<h3 id=dd-api-gateway-timeouts level=3>Timeouts, retries and the budget</h3>
+<p>The gateway is the outermost server-side layer, so it owns the outermost deadline. Give each route its own timeout, sized from that route's latency SLO, not one global 60 s. Pass the remaining deadline inward (gRPC does this with <code>grpc-timeout</code>; for HTTP, a header such as <code>X-Request-Deadline</code> is a common convention) so services stop working on requests the client has given up on.</p>
+<p>Retries at the gateway need a cap. Envoy's <code>retry_budget</code> limits retries to a percentage of active requests (for example 20%) rather than a fixed count per request, which stops a struggling service from receiving 3 times its traffic. And retry only idempotent methods, or requests with an idempotency key, which is the same rule as for the reverse proxy.</p>
+
+<h3 id=dd-api-gateway-config-example level=3>A route, written as code</h3>
+<p>The lesson says routing should be team-owned and self-service. In practice that means each team owns a small declarative file, and CI validates and merges it into the gateway config. A Kong-style example for the orders split from the walkthrough:</p>
+<pre><code>services:
+  - name: orders
+    url: http://orders.internal:8080
+    connect_timeout: 1000      # ms
+    read_timeout: 3000
+    retries: 0                 # Kong defaults to 5; POST /orders is not idempotent
+    routes:
+      - name: orders-public
+        paths: ["/v1/orders"]
+        strip_path: false
+    plugins:
+      - name: jwt
+      - name: rate-limiting
+        config: { minute: 600, policy: redis, limit_by: consumer }
+      - name: request-size-limiting
+        config: { allowed_payload_size: 1 }   # MB
+
+  - name: fulfillment
+    url: http://fulfillment.internal:8080
+    routes:
+      - name: fulfillment-public
+        paths: ["~/v1/orders/(?&lt;id&gt;\\d+)/shipments"]   # "~" marks a regex path</code></pre>
+<p>A CI job should reject a file that adds a route outside the team's path prefix, removes authentication from a route, or sets a timeout above the route's SLO. Those three checks catch most of the dangerous changes.</p>
+
+<h2 id=dd-api-gateway-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions for the bookstore's gateway:</p>
+<ul>
+<li>Peak 20,000 requests per second of north-south traffic, after the CDN has absorbed static content.</li>
+<li>Mostly small JSON requests and responses (2 KB / 8 KB).</li>
+<li>Per request: TLS on a warm connection, route match, JWT verify, one rate-limit check in Redis, header rewrite, forward, log.</li>
+<li>Three availability zones.</li>
+</ul>
+
+<h3 id=dd-api-gateway-sizing-cpu level=3>CPU per request and instance count</h3>
+<p>Measure on your hardware, but a reasonable first budget for that pipeline is 0.2 to 0.5 ms of CPU per request. A plain proxy hop is a fraction of that. Verifying an RS256 or ES256 signature costs tens of microseconds. Logging, metrics and plugins written in a scripting language (Lua in Kong, for example) add the rest.</p>
+<ul>
+<li>At 0.4 ms per request: 20,000 × 0.0004 = 8 cores busy at peak.</li>
+<li>Run cores at no more than about 50% at peak so latency stays flat and a zone can fail: 16 cores in total.</li>
+<li>Spread across three zones, if one zone fails the other two must carry everything. So each zone needs 8 cores' worth of headroom: 3 zones × 8 cores = 24 cores, for example 6 instances of 4 cores.</li>
+</ul>
+<p>Two things can blow this budget up. New TLS handshakes during a reconnect storm, such as a mobile release, cost far more CPU than requests on warm connections. And body-level work, like schema validation or response transformation, costs CPU per byte rather than per request. A 1 MB body validated against a schema can cost more than a thousand ordinary requests.</p>
+
+<h3 id=dd-api-gateway-sizing-latency level=3>Where the 1 to 2 ms goes</h3>
+<p>The lesson quotes 1 to 2 ms per request. A typical breakdown:</p>
+<ul>
+<li>Proxy processing and route match: under 0.2 ms.</li>
+<li>JWT verification with cached keys: well under 0.1 ms.</li>
+<li>Rate-limit check in shared Redis in the same zone: about 0.5 ms round trip.</li>
+<li>Hop to the service over a pooled connection: a few hundred microseconds inside a zone, more across zones.</li>
+</ul>
+<p>The biggest single item is usually the rate-limit call. If 0.5 ms matters, use local buckets with periodic sync for protection limits and keep Redis only for exact quota counting. The other trap is synchronous calls to an external auth service on every request. That turns 1 ms into 10 ms and makes the auth service's availability your API's availability.</p>
+
+<h3 id=dd-api-gateway-sizing-connections level=3>Connections</h3>
+<p>The gateway holds two sets of connections. Downstream: one per active client, which can be large for mobile apps with long keep-alive, plus long-lived WebSocket or SSE connections that pin memory and file descriptors for hours. Upstream: pools to each service. With 40 routes to 11 services, 6 gateway instances and, say, 8 worker threads each holding 32 idle connections per service, that is 6 × 8 × 32 = 1,536 connections into each service. Check that number against the service's own connection limits and its database pool. Gateways can overload services just by holding connections open.</p>
+
+<h3 id=dd-api-gateway-sizing-availability level=3>Availability arithmetic</h3>
+<p>The gateway sits in series with everything. If each service has 99.95% availability and the gateway has 99.95%, a request that needs one service sees about 99.9%. That is why the gateway's own target is usually set higher than any service's, and why "keep it thin" is an availability argument. Most gateway downtime comes from changes, not hardware. Fewer, safer changes are the cheapest nines you can buy.</p>
+
+<h2 id=dd-api-gateway-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-api-gateway-fm-config-push level=3>1. One config push breaks every route</h3>
+<p><strong>Symptom:</strong> every API call returns 404 or 503 within a minute of a routine change. <strong>Mechanism:</strong> a team added a route with a broad prefix (<code>/v1</code>) that matched before more specific ones. Or a typo in an upstream name produced a cluster with no endpoints. The control plane validated the syntax, not the effect, and pushed it to every instance at once. <strong>Detect:</strong> a sharp change in 404/503 rates per route right after a config version change. Tag every metric with the config version so the correlation is obvious. <strong>Fix:</strong> validate routing changes in CI against a suite of known requests ("<code>GET /v1/orders/7</code> must reach orders"). Roll config out to one instance or one zone first, watch error rates, then continue. Keep the previous config one command away.</p>
+
+<h3 id=dd-api-gateway-fm-jwks level=3>2. Key rotation logs everyone out</h3>
+<p><strong>Symptom:</strong> a burst of 401s across all routes, starting when the identity team rotated signing keys. <strong>Mechanism:</strong> new tokens carry a new <code>kid</code>. The gateway's cached JWKS does not contain it, and either it does not refetch on an unknown <code>kid</code>, or it refetches but the identity provider published the key only at the moment of rotation. Some gateway instances got the new set and some did not. <strong>Detect:</strong> 401s broken down by reason ("unknown kid" versus "expired" versus "bad signature"). Without the reason, this looks like an attack. <strong>Fix:</strong> publish new keys in the JWKS well before signing with them, and keep old keys until every token they signed has expired. Make the gateway refetch on an unknown <code>kid</code>, rate-limited so attackers cannot force a refetch on every request. Serve from the last good key set if the JWKS endpoint is down.</p>
+
+<h3 id=dd-api-gateway-fm-header-spoof level=3>3. A client becomes another user with one header</h3>
+<p><strong>Symptom:</strong> a penetration test reads another customer's orders by sending <code>X-User-Id: 1</code>. <strong>Mechanism:</strong> the gateway added <code>X-User-Id</code> for authenticated routes but did not remove one sent by the client on a route where auth was optional. Or a service was reachable without going through the gateway, through an internal load balancer or a debug port. <strong>Detect:</strong> a test in CI that sends forged identity headers to every route and expects them gone; network policy audits for service ports reachable from outside the gateway. <strong>Fix:</strong> strip all identity headers unconditionally at the first filter. Prefer a signed internal token over plain headers. Enforce with network policy or mTLS that services accept requests only from the gateway or the mesh.</p>
+
+<h3 id=dd-api-gateway-fm-path-confusion level=3>4. An admin route is reachable through an encoded path</h3>
+<p><strong>Symptom:</strong> requests to <code>/internal/admin</code> are blocked, but <code>/internal/%61dmin</code> or <code>/internal//admin</code> reach the admin handler. <strong>Mechanism:</strong> the gateway matched the raw path against its deny rule, then forwarded it. The service's framework decoded and normalised the path and routed it to the admin handler. Two parsers disagreed. <strong>Detect:</strong> fuzz tests with encoded, doubled-slash and dot-segment paths against protected routes; logs showing non-normalised paths reaching services. <strong>Fix:</strong> normalise once at the gateway before matching, reject ambiguous paths (encoded slashes, for example) rather than guessing, and forward the normalised path. Better still, do not rely on path-based deny rules for internal endpoints. Keep them off the public listener entirely.</p>
+
+<h3 id=dd-api-gateway-fm-retry-amplification level=3>5. A slow service becomes a dead service</h3>
+<p><strong>Symptom:</strong> the reviews service slows from 50 ms to 2 s, and within minutes its traffic is several times normal and it stops responding entirely. <strong>Mechanism:</strong> retry amplification. The client SDK retries 3 times, the gateway retries 2 times, and the service's own client retries its database. One user action becomes up to 3 × 3 = 9 requests at the service, all arriving while it is already struggling. <strong>Detect:</strong> compare requests received at the service with unique request IDs; a ratio well above 1 means retries. Envoy reports retry counters per cluster. <strong>Fix:</strong> retry at one layer only, usually the client with backoff and jitter. If the gateway retries, use a retry budget (a percentage of traffic) and never retry on timeout for non-idempotent methods. Add a circuit breaker per upstream so the gateway fails fast while the service recovers.</p>
+
+<h3 id=dd-api-gateway-fm-noisy-route level=3>6. One route's traffic slows every route</h3>
+<p><strong>Symptom:</strong> a partner's bulk export endpoint is busy, and checkout latency at the gateway rises even though the checkout service is healthy. <strong>Mechanism:</strong> the gateway's workers or connection slots are shared. Large, slow responses from the export route hold workers, buffers and upstream connections. Envoy's per-cluster limits apply per upstream, but CPU and memory are shared by the whole process. <strong>Detect:</strong> gateway-side latency (total time minus upstream time) rising for routes whose upstreams are fine; per-route active request counts. <strong>Fix:</strong> cap concurrency per route or per consumer; move bulk and streaming traffic to a separate gateway pool or listener; serve large exports from object storage with a signed URL instead of streaming them through the gateway.</p>
+
+<h3 id=dd-api-gateway-fm-auth-dependency level=3>7. The identity provider's outage becomes a full outage</h3>
+<p><strong>Symptom:</strong> the identity provider has a 10-minute incident, and the entire API returns 401 or 503 for 10 minutes, including public catalog reads. <strong>Mechanism:</strong> the gateway calls an external auth service or introspection endpoint on every request, with no cache and no fallback. Public routes went through the same auth plugin with "optional" auth that still made the call. <strong>Detect:</strong> correlation between auth-service latency and gateway error rate; the auth call's share of gateway latency. <strong>Fix:</strong> verify JWTs locally with cached keys; cache introspection results for a short time; skip auth entirely on public routes rather than making it optional; decide per route whether to fail open or fail closed when the auth dependency is down, and write that decision down.</p>
+
+<h2 id=dd-api-gateway-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Hosting<td>Managed gateway (cloud provider)<td>Self-hosted (Kong, Envoy-based, nginx-based)<td>Your team is small, traffic fits the pricing, and the built-in features are enough. Self-host when per-request pricing gets expensive at volume, you need custom filters, or you run across clouds and on-premises.
+<tr><td>Token type at the edge<td>JWT verified locally<td>Opaque token + introspection<td>Latency and independence from the identity provider matter, and short lifetimes plus a denylist give acceptable revocation. Choose opaque when instant revocation matters most and you can cache introspection.
+<tr><td>Identity to services<td>Signed internal token<td>Trusted header + mTLS / network policy<td>Identity must survive multiple hops and services should verify it themselves. Headers are fine when the mesh enforces that only the gateway can reach services.
+<tr><td>Auth logic location<td>In-process plugin<td>External auth service (Envoy <code>ext_authz</code>, forward auth)<td>Checks are standard (JWT, API key) and latency matters. Choose external when policy is complex or shared with other systems, and cache its answers.
+<tr><td>Topology<td>One shared gateway<td>Gateway per domain or per team<td>One platform team can keep it thin and self-service. Per-domain gateways spread risk and ownership, but you then need shared policy modules so authentication does not drift again.
+<tr><td>Layers<td>Single edge gateway<td>CDN/WAF edge + regional gateway<td>Traffic is regional and moderate. Put coarse IP limits, bot filtering and TLS at the CDN, and identity-aware policy at the gateway, when you face global traffic or attacks.
+<tr><td>Config model<td>Declarative files in Git (GitOps)<td>Admin API / console changes<td>Almost always: changes are reviewed, tested and reversible. Console changes are fine for experiments, never as the source of truth.
+<tr><td>Protocol<td>REST/JSON at the edge<td>gRPC or GraphQL at the edge<td>Clients are browsers and partners. gRPC fits internal or mobile clients you control; GraphQL brings its own gateway concerns (query cost, depth limits) that belong in a dedicated layer.
+</tbody></table></div></div>
+<p>The decision that matters most over time is topology. A single gateway owned by a platform team works well while that team says no to product logic and makes routing self-service. It fails when it becomes the approval queue the lesson warns about. If you split into per-domain gateways, keep one thing shared: a common authentication and identity module, versioned and enforced in CI. Otherwise you rebuild the eleven-implementations incident, with gateways instead of services.</p>
+<p>On fail-open versus fail-closed: there is no universal answer, so decide per policy. Authentication fails closed. Nobody gets in on a broken token check. Protection rate limits usually fail open, because an unavailable Redis should not block all customers. Billing quotas often fail open with reconciliation later. Write the choice for each dependency into the design doc, because during the incident nobody will have time to debate it.</p>
+
+<h2 id=dd-api-gateway-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>List every plugin or filter on a typical route, in order. Do the cheapest rejections run first?</li>
+<li>Where is the path normalised, and do the gateway and the services interpret paths identically?</li>
+<li>How does a revoked token stop working, and within how many seconds? What happens on signing-key rotation?</li>
+<li>How is identity passed to services, and what prevents a client or another service from forging it?</li>
+<li>Can any service be reached without going through the gateway or the mesh?</li>
+<li>What is each route's timeout, and is it shorter than the client's and longer than the service's? Which layer retries, with what budget?</li>
+<li>How is config changed: who can change it, how is it tested, how is it rolled out in stages, and how fast can it be rolled back?</li>
+<li>What happens when the control plane, the identity provider or the rate-limit store is down? Fail open or closed, per policy?</li>
+<li>What is the CPU budget per request, and what is the headroom after losing one zone and during a reconnect storm?</li>
+<li>Which routes carry large bodies or long-lived connections, and are they isolated from interactive traffic?</li>
+<li>What is in the gateway that uses a domain word? Who approved it, and when will it move out?</li>
+<li>Do logs carry route, consumer, config version, upstream latency and the request ID that traces use?</li>
+</ol>
+
+<h2 id=dd-api-gateway-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"JWTs are verified locally. How do you revoke a stolen one before it expires?"</summary>
+<p>Keep access tokens short (5 to 15 minutes) so the problem is bounded, and revoke the refresh token at the identity provider. For faster revocation, the provider publishes revoked token IDs or "revoked before T for user U" events, and the gateway holds them in memory until the tokens' expiry, so the list stays small. For the most sensitive routes, introspect with a short cache. You cannot get instant revocation and zero network calls at the same time; pick per route.</p>
+</details>
+<details>
+<summary>"The gateway forwards X-User-Id. Why isn't that enough?"</summary>
+<p>A plain header is only as trustworthy as the path it travelled. If the gateway fails to strip a client-supplied copy on any route, or a service is reachable without the gateway, anyone can claim any identity. Strip unconditionally, and either enforce gateway-only reachability with mTLS or network policy, or send a short-lived token signed by the gateway that services verify. The signed token also survives service-to-service hops.</p>
+</details>
+<details>
+<summary>"Where should the request timeout be set: client, gateway or service?"</summary>
+<p>All three, nested. The client's deadline is the longest, the gateway's per-route timeout sits inside it, and the service's calls to its dependencies sit inside that. The gateway should pass the remaining deadline inward so services stop working on abandoned requests. If the order is reversed, the gateway returns 504 while the service carries on, and a client retry can duplicate a write.</p>
+</details>
+<details>
+<summary>"Should the gateway retry failed requests?"</summary>
+<p>Only in a limited way. Retrying a connection failure before any bytes were sent is safe and hides instance churn. Retrying timeouts or 5xx on non-idempotent methods can duplicate writes. Retrying at several layers multiplies load on a struggling service. If the gateway retries, use a budget (for example, retries may add at most 20% to traffic) and make the client the main retry layer, with backoff and jitter.</p>
+</details>
+<details>
+<summary>"Gateway CPU is 30% but p99 latency is up. What do you look at?"</summary>
+<p>First, split total time into gateway time and upstream time in the logs. If upstream time is up, it is not the gateway. If gateway time is up, look at synchronous calls made by plugins (rate-limit store, auth service, introspection), connection pool exhaustion toward one upstream (requests waiting for a connection), large bodies being buffered or validated, and garbage collection or scripting overhead in plugins. A shared resource held by one noisy route is a common cause.</p>
+</details>
+<details>
+<summary>"How do you stop the gateway from becoming a release bottleneck for 30 teams?"</summary>
+<p>Make routine changes self-service. Each team owns a config file for its own path prefix. CI checks it (no routes outside the prefix, auth required, timeouts within limits) and merges it without the platform team. The platform team owns the pipeline, the shared plugins and the rules. It does not own each route. Anything that needs a custom plugin with domain logic gets redirected to a BFF or the service.</p>
+</details>
+<details>
+<summary>"The identity provider is down. Should the gateway fail open?"</summary>
+<p>Not for authentication. If you cannot verify a credential, you cannot let the request in. But design so that an identity provider outage does not stop verification. Verify JWTs locally with cached keys, keep the last good JWKS if the endpoint is unreachable, and cache introspection results briefly. Then the outage blocks only new logins, not existing sessions. Public routes should not touch auth at all.</p>
+</details>
+<details>
+<summary>"A rule says 'premium customers get the fast search index'. Gateway or service?"</summary>
+<p>Service, or a BFF. "Premium" and "search index" are domain words, so the rule is product behaviour. The gateway can forward the verified plan as part of the identity, and it can apply a higher rate limit for the premium tier, because that is policy stated without domain words. But choosing which index to query belongs in the search service, where the search team can test and change it.</p>
+</details>

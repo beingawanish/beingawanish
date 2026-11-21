@@ -1,0 +1,209 @@
+<h2 id=dd-feature-flags-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's one-liner is <code>if flags.enabled("wishlist-sharing", user)</code>. Behind that line sit four things: a flag's stored definition, the context it is evaluated against, the algorithm that turns the two into a value, and the delivery system that gets definitions to every process. Each has decisions that show up later as incidents.</p>
+
+<h3 id=dd-feature-flags-model level=3>What a flag actually is: the stored definition</h3>
+<p>A flag is not a boolean in a database. It is a small rules document, and every serious flag system stores roughly the same fields:</p>
+<ul>
+<li><strong>Key.</strong> <code>wishlist-sharing</code>. Unique for all time, never reused (the lesson's Knight Capital rule).</li>
+<li><strong>Variations.</strong> The values the flag can return. For a release flag, <code>true</code> and <code>false</code>. For an experiment or a config flag, strings or JSON, such as <code>"prompt-v2"</code> or <code>{"page_size": 50}</code>.</li>
+<li><strong>Off variation.</strong> What the flag returns when it is switched off entirely, regardless of rules.</li>
+<li><strong>Ordered targeting rules.</strong> "If <code>email</code> ends with <code>@bookstore.example</code>, serve true." "If user is in segment <code>beta-optin</code>, serve true." Rules are evaluated top to bottom, and the first match wins.</li>
+<li><strong>Fallthrough.</strong> What to serve when no rule matches. Often a percentage rollout: 10% true, 90% false.</li>
+<li><strong>Salt and bucketing key.</strong> The inputs to the hash that makes the percentage stable.</li>
+<li><strong>Prerequisites.</strong> "Only evaluate this flag if <code>new-cart</code> is on." Useful, and a dependency graph you now have to reason about.</li>
+<li><strong>Metadata.</strong> Owner, type (release, ops, experiment, permission), creation date, expiry, linked ticket. The lesson's hygiene rules only work if these fields exist and are required.</li>
+<li><strong>Version.</strong> A counter that increases on every change, so an SDK can ignore an update older than the one it has.</li>
+</ul>
+<p>There is also a second default, and it lives in the code, not the flag service: the value passed at the call site, as in <code>enabled("wishlist-sharing", user, default=False)</code>. That code default is what runs when the SDK has no rules at all. Keeping the stored off-variation and the code default straight is the source of several failure modes below.</p>
+
+<h3 id=dd-feature-flags-evaluation level=3>Evaluation: context in, value and reason out</h3>
+<p>The input is an <strong>evaluation context</strong>: a targeting key (usually the user ID) plus attributes like plan, country, app version and tenant. OpenFeature, the vendor-neutral API, standardises this. Its evaluation returns not just a value but resolution details: the value, the variant name, an error code if any, and a <strong>reason</strong> such as <code>TARGETING_MATCH</code>, <code>SPLIT</code>, <code>DEFAULT</code>, <code>DISABLED</code> or <code>ERROR</code>.</p>
+<p>The reason is the field most teams ignore and later wish they had logged. "Why did this user get the old checkout?" has three very different answers: a rule matched, the percentage put them out, or the SDK had no data and fell back to the code default. Only the reason tells them apart.</p>
+<p>Percentage rollouts use the same bucketing idea as the canary lesson's cohort. Hash the flag key, a salt and the user's key together, map the hash to a number between 0 and 1 (or 0 and 99,999), and compare it with the rollout percentage. Including the flag key in the hash matters. Without it, the same 10% of users would get every new feature first. Their experience would be a pile-up of half-tested features, and every experiment run on them would be contaminated by the others. Some systems let you deliberately share a bucketing group across related flags, so the same users see a feature and its follow-up together.</p>
+<p>Here is a minimal evaluator in Python stdlib that shows the moving parts, including the fail-static behaviour.</p>
+<pre><code>import hashlib, json, threading
+
+class Flags:
+    def __init__(self, bootstrap_path):
+        self._lock = threading.Lock()
+        self._rules = {}
+        self._version = -1
+        try:                                   # fail static: start from the last known rules
+            with open(bootstrap_path) as f:
+                self.apply(json.load(f))
+        except (OSError, ValueError):
+            pass                               # no rules yet: code defaults apply
+
+    def apply(self, snapshot):                 # called by the streaming or polling thread
+        if snapshot["version"] &lt;= self._version:
+            return                             # ignore stale or replayed updates
+        with self._lock:
+            self._rules, self._version = snapshot["flags"], snapshot["version"]
+
+    @staticmethod
+    def _bucket(flag_key, salt, user_key):
+        h = hashlib.sha256(f"{flag_key}.{salt}.{user_key}".encode()).digest()
+        return int.from_bytes(h[:8], "big") / 2**64          # stable value in [0, 1)
+
+    def evaluate(self, key, ctx, default):
+        flag = self._rules.get(key)
+        if flag is None:
+            return default, "DEFAULT"          # unknown flag or no data: code default
+        if not flag["on"]:
+            return flag["off_value"], "DISABLED"
+        for rule in flag["rules"]:             # ordered, first match wins
+            if ctx.get(rule["attr"]) in rule["values"]:
+                return rule["value"], "TARGETING_MATCH"
+        b = self._bucket(key, flag["salt"], ctx["key"])
+        return (True, "SPLIT") if b &lt; flag["rollout"] else (False, "SPLIT")</code></pre>
+<p>Nothing in <code>evaluate</code> touches the network, takes a lock on the hot path, or allocates much. That is why local evaluation runs in microseconds. Real SDKs add segments, prerequisites, semantic-version comparisons and event recording, but the shape is the same.</p>
+
+<h3 id=dd-feature-flags-delivery level=3>Delivery: getting rules to every process</h3>
+<p>Server-side SDKs fetch the full ruleset at start-up and then keep it current. There are two ways to do that.</p>
+<ul>
+<li><strong>Streaming.</strong> The SDK holds a long-lived connection, often server-sent events, and receives each change as a patch. Changes arrive in roughly a second. The cost is one open connection per process, and a reconnect storm if the stream endpoint restarts.</li>
+<li><strong>Polling.</strong> The SDK fetches the ruleset on an interval, typically 10 to 60 seconds, using an ETag so unchanged rulesets cost a 304. Simple and cache-friendly. The worst-case delay is the interval itself, which matters for a kill switch.</li>
+</ul>
+<p>Between the SDKs and the vendor's service, larger setups run a <strong>relay</strong> inside their own network (LaunchDarkly's Relay Proxy and Unleash Edge are examples). The relay holds one upstream connection and fans out to hundreds of local SDKs. It can also write the ruleset to a persistent store such as Redis, so a process that starts while the vendor is unreachable can still load real rules.</p>
+<p>That last point is the one to press on in a review. "Fail static" protects processes that are already running. A process that starts during an outage has nothing to be static about. Without a relay, a persistent store or a bootstrap file baked into the image, it runs on code defaults alone.</p>
+
+<h3 id=dd-feature-flags-client level=3>Client-side flags: evaluate on the server, ship the answers</h3>
+<p>Browsers and mobile apps should not receive the full rules. The rules contain targeting data: lists of beta users' emails, enterprise customer IDs, the existence of unreleased features. Anyone can read what you ship to a browser.</p>
+<p>So client SDKs work differently. The client sends its context to an evaluation endpoint, which returns only the evaluated values for that user: <code>{"wishlist-sharing": true, "new-search": false}</code>. The client caches those values on the device and refreshes them on app start, on login, and on a stream or interval.</p>
+<p>Two consequences follow. First, a mobile app that has been offline for three weeks still has three-week-old flag values, so a kill switch does not reach it until it reconnects. Second, flag values become part of the client's identity flow. When an anonymous user logs in, the context key changes, and every percentage-based flag can flip. Flag SDKs handle this with an identify or alias step; skipping it is a bug factory.</p>
+
+<h2 id=dd-feature-flags-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-feature-flags-sizing-eval level=3>Evaluation cost: why the network call is impossible</h3>
+<p>Take the bookstore's 40,000 req/s across 40 pods, with 20 flag checks per request. That is 800,000 evaluations a second.</p>
+<ul>
+<li><strong>Local evaluation</strong> at a few microseconds each, say 5 µs, costs 800,000 × 5 µs = 4 CPU-seconds per second. That is 4 cores across the fleet, or a tenth of a core per pod. Cheap.</li>
+<li><strong>A remote call per check</strong> at 1 ms each would add 20 ms to every request if done in sequence, and send 800,000 req/s to the flag service. That is twenty times the bookstore's own front-door traffic, aimed at a service whose outage would now take down every request.</li>
+</ul>
+<p>Those two lines are the entire argument for local evaluation. They are also why "evaluate once per request and pass the result down" is good practice even with local SDKs: an evaluation inside a loop over 500 cart items is 500 evaluations, plus 500 analytics events if exposure tracking is on.</p>
+
+<h3 id=dd-feature-flags-sizing-memory level=3>Ruleset size: the targeting list trap</h3>
+<p>A ruleset of 500 flags at about 2 KB each is 1 MB per process. Fine.</p>
+<p>Now someone targets a flag at a list of 200,000 user IDs pasted into a rule. At about 40 bytes per ID with overhead, that one flag is 8 MB. Every one of 300 server processes holds it, so 2.4 GB of fleet memory. Every edit to the flag re-sends the whole 8 MB to every process, which is 2.4 GB of fan-out per change. Mobile clients are spared only if they get evaluated values.</p>
+<p>The fix is to keep large lists out of the ruleset. Define them as segments stored server-side and looked up by key, or turn the list into an attribute on the user (<code>beta_cohort = true</code>) so the rule stays one line. Some vendors offer "big segment" features that do exactly this with an external store.</p>
+
+<h3 id=dd-feature-flags-sizing-propagation level=3>Propagation time: what "off in 30 seconds" really needs</h3>
+<p>The lesson's operator turns wishlist off in 30 seconds. Break that budget down:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Step</th><th>Streaming</th><th>Polling every 30 s</th></tr></thead><tbody>
+<tr><td>Human finds the flag and clicks (with an approval if required)</td><td>15 to 25 s</td><td>15 to 25 s</td></tr>
+<tr><td>Flag service to relay</td><td>under 1 s</td><td>under 1 s</td></tr>
+<tr><td>Relay to SDK</td><td>under 1 s</td><td>0 to 30 s, mean 15 s</td></tr>
+<tr><td>In-flight requests finish on the old value</td><td>up to the request timeout</td><td>up to the request timeout</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>about 20 to 30 s</strong></td><td><strong>about 30 to 60 s</strong></td></tr>
+</tbody></table></div></div>
+<p>So a 30-second kill-switch target needs streaming, or a poll interval of a few seconds. It also needs the flag to be findable in seconds by someone who did not create it: a runbook that names the kill switch for each risky feature, not a search through 3,000 flags during an incident. Mobile clients add their own refresh interval on top, and offline devices are unbounded.</p>
+
+<h3 id=dd-feature-flags-sizing-fanout level=3>Fan-out to clients</h3>
+<p>Servers are easy: 300 processes behind a relay is 300 connections. Clients are not. Two million active app sessions holding streaming connections is two million connections. At even 20 KB of memory each across the stream servers, that is about 40 GB, before TLS buffers. Many teams therefore stream only to servers and let clients poll an evaluation endpoint behind a CDN-friendly cache, accepting a minute or two of delay for client flags. If a mobile feature needs a faster kill switch than that, the server should be able to refuse the feature's API calls, which turns a client-side flag into a server-side one in an emergency.</p>
+
+<h3 id=dd-feature-flags-sizing-debt level=3>Flag inventory: Little's law for debt</h3>
+<p>The number of live release flags follows Little's law: inventory equals creation rate times average lifetime. A team creating 8 release flags a month that removes each within 3 months of launch carries about 24. The same team with an average lifetime of 18 months carries 144, and nothing about the creation rate changed. Lifetime is the knob. That is why expiry dates and deletion as the definition of done (the lesson's hygiene rules) are the real control, and why a dashboard of flag age percentiles per team tells you more than a total count.</p>
+<p>The combinatorics follow from inventory. Thirty live flags give 2³⁰, about a billion, theoretical states. Nobody tests that. What you can test is each flag in both states against the current production values of the others (60 configurations), plus pairs that touch the same code. If most flags are isolated, the risky pairs are few. If 30 flags all wrap parts of checkout, the pairs number 435, and that is the signal to delete flags, not to write more tests.</p>
+
+<h2 id=dd-feature-flags-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-feature-flags-fm-coldstart level=3>1. The fleet splits in two during a flag-service outage</h3>
+<p><strong>Symptom.</strong> During a vendor outage, autoscaling adds 15 pods for the evening peak. Users report that the new checkout appears and disappears between page loads.</p>
+<p><strong>Mechanism.</strong> Running pods keep their cached rules: new checkout on. New pods start without any rules and use the code default: off. The load balancer mixes the two. Fail static worked for old processes and did nothing for new ones.</p>
+<p><strong>Detect.</strong> An SDK metric for "initialised with data" per pod, and a count of evaluations whose reason is <code>DEFAULT</code> or <code>ERROR</code>. Either rising during an outage is this failure.</p>
+<p><strong>Fix.</strong> A relay with a persistent store inside your network, or a ruleset snapshot written at deploy time and baked into the image as a bootstrap file. Optionally make readiness wait briefly for SDK initialisation, with a timeout, so pods do not serve before they have rules.</p>
+
+<h3 id=dd-feature-flags-fm-default level=3>2. The code default contradicts production</h3>
+<p><strong>Symptom.</strong> A feature that has been at 100% for nine months vanishes for everyone during a flag-service incident.</p>
+<p><strong>Mechanism.</strong> The call site still says <code>default=False</code>. That was the right default on launch day. Nine months later, "off" is the risky state, because support docs, other features and user habits now assume the feature exists. Kill switches fail the opposite way: a default of "expensive feature enabled" means the switch cannot protect you when the flag service itself is down.</p>
+<p><strong>Detect.</strong> A lint or report that compares each flag's code default with its current production value and flags any mismatch older than a few weeks.</p>
+<p><strong>Fix.</strong> When a release flag reaches 100%, delete it. If it must stay, flip the code default to match. For kill switches, choose the default that keeps the site up under load.</p>
+
+<h3 id=dd-feature-flags-fm-badrule level=3>3. A bad rule reaches every instance in two seconds</h3>
+<p><strong>Symptom.</strong> Search results break for all users at 14:02. No deploy happened.</p>
+<p><strong>Mechanism.</strong> Someone meant to raise <code>new-ranking</code> from 1% to 10% and typed 100. Or a rule said <code>country != "US"</code> instead of <code>==</code>. The streaming system that makes kill switches fast makes mistakes fast too.</p>
+<p><strong>Detect.</strong> Flag changes as annotations on every dashboard, and in the incident tool's change list next to deploys. The first question in any incident should be "what changed?", and flag changes are changes.</p>
+<p><strong>Fix.</strong> Treat production flag changes like deploys: approvals for risky flags, an audit log, scheduled changes, and percentage ramps that move in steps automatically. Some platforms can guard a rollout with metrics and revert it, which is a canary for configuration.</p>
+
+<h3 id=dd-feature-flags-fm-inconsistent level=3>4. Two services disagree about the same user</h3>
+<p><strong>Symptom.</strong> The web page shows a "Share wishlist" button. Clicking it returns 404 from the API.</p>
+<p><strong>Mechanism.</strong> The frontend evaluated the flag with the anonymous device ID; the API evaluated it with the logged-in user ID. Different keys land in different buckets. Or the two services received the rule change a few seconds apart. Either way, one flag gave two answers within a single user action.</p>
+<p><strong>Detect.</strong> Record evaluated flags as span attributes. A trace in which the frontend span says <code>wishlist-sharing=true</code> and the API span says <code>false</code> is this failure.</p>
+<p><strong>Fix.</strong> Use one stable key per user across services, with an identify step at login. For user-visible features that span services, evaluate once at the edge and propagate the decision in a header or <code>baggage</code>, so downstream services follow it instead of re-deciding.</p>
+
+<h3 id=dd-feature-flags-fm-reshuffle level=3>5. Users flip in and out of a rollout at login</h3>
+<p><strong>Symptom.</strong> An experiment's results look odd: users in the treatment group show a lower purchase rate after login than before.</p>
+<p><strong>Mechanism.</strong> Before login, the bucketing key is the device ID. After login, it is the user ID. Half the treatment users are reassigned to control at the moment they are most likely to buy. The same thing happens if someone edits a flag's salt, which reshuffles every user.</p>
+<p><strong>Detect.</strong> Exposure logs that show one person in two variants. A sample-ratio check (the observed split should match the configured one) catches many bucketing bugs.</p>
+<p><strong>Fix.</strong> Alias anonymous and logged-in identities, or bucket experiments on the logged-in key only. Make the salt immutable once a flag has served traffic.</p>
+
+<h3 id=dd-feature-flags-fm-events level=3>6. Exposure events overload the pipeline</h3>
+<p><strong>Symptom.</strong> After a refactor, the analytics pipeline lags by hours and the SDK logs "event queue full, dropping events." Experiment results become unusable.</p>
+<p><strong>Mechanism.</strong> A flag check moved inside a loop over cart items. Each evaluation records an exposure event, so one request now emits hundreds. Event volume rises a hundredfold with no change in traffic.</p>
+<p><strong>Detect.</strong> Evaluations per request, per flag. A sudden step in that number points at a code change, not at load.</p>
+<p><strong>Fix.</strong> Evaluate once per request near the top and pass the value down. Most SDKs summarise or deduplicate events; check that yours does and that its buffer limits are monitored.</p>
+
+<h3 id=dd-feature-flags-fm-killswitch level=3>7. The kill switch does not work when it is needed</h3>
+<p><strong>Symptom.</strong> Under a traffic spike, on-call flips <code>disable-recommendations</code>. The page now throws errors instead of hiding the panel.</p>
+<p><strong>Mechanism.</strong> Nobody had exercised the off path in a year. The fallback still called an endpoint that was removed in the spring. A permanent flag whose off state is never run is dead code with a big red button attached.</p>
+<p><strong>Detect.</strong> You only find this by flipping it. A scheduled drill, in production at a quiet hour or in a staging environment with real traffic replay, is the detection.</p>
+<p><strong>Fix.</strong> Test both states of every ops kill-switch in CI. Run regular production drills for the ones the runbooks rely on, and record the date of the last successful flip on the flag itself.</p>
+
+<h2 id=dd-feature-flags-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision</th><th>Options</th><th>What you trade</th></tr></thead><tbody>
+<tr><td>Build or buy</td><td>Homemade table plus cache; open source (Unleash, Flagsmith, flagd); commercial service</td><td>A homemade system is a weekend to build and years to get right: audit logs, approvals, targeting UI, SDKs in every language, relay, analytics. Buying moves the hard parts to a vendor and adds a dependency you must plan to survive.</td></tr>
+<tr><td>Where rules live</td><td>Flag service with UI; files in Git (flags as code); environment variables</td><td>Git gives review, history and rollback for free, but every change is a merge and a sync, which is slow for kill switches. A service gives instant changes and targeting, and needs its own change control.</td></tr>
+<tr><td>Delivery</td><td>Streaming; polling; read at start-up only</td><td>Streaming gives seconds and costs connections. Polling is simpler and slower. Start-up-only is just configuration, and cannot be a kill switch.</td></tr>
+<tr><td>Where evaluation happens</td><td>Each service locally; once at the edge, propagated; remote evaluation API</td><td>Local is fast and independent but can disagree between services. Edge-once is consistent but needs every service to forward the decision. Remote evaluation suits clients, never server hot paths.</td></tr>
+<tr><td>Bucketing unit</td><td>User; device; tenant or account; request</td><td>B2B products usually want tenant, so one company sees one behaviour. Request-level bucketing is only right for invisible changes, such as a new cache path.</td></tr>
+<tr><td>What it is really for</td><td>Release flag; ops switch; experiment; entitlement</td><td>The lesson's taxonomy. Entitlements belong in a billing or entitlement service with authorisation checks, not in the release flag tool.</td></tr>
+</tbody></table></div></div>
+<p><strong>A sensible starting point</strong> for a team the size of the bookstore's: OpenFeature as the API in code, so the provider can change later. A hosted or open-source service with streaming to servers. A relay with a persistent store inside the cluster. Release flags with mandatory owner and expiry. Kill switches documented in runbooks. Entitlements kept out of it entirely.</p>
+<p><strong>Flags as code</strong> earns its place for flags that change rarely and matter a lot, such as region-wide behaviour or anything a regulator might ask about. The review trail is the point. It is a poor fit for kill switches, because a 30-second response cannot wait for a merge.</p>
+<p><strong>Flags versus a canary.</strong> They overlap at "send a new code path to 1%," and teams sometimes ask which to use. Use the canary for every binary, because it catches what you did not know you changed. Use a flag when you know which feature is risky and want to control its audience and timing separately. The canary lesson's numbers apply to flag rollouts too: a 1% flag rollout has the same statistical limits as a 1% canary.</p>
+
+<h2 id=dd-feature-flags-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What type is each new flag (release, ops, experiment, permission), who owns it, and when does it expire?</li>
+<li>What is the code default at every call site, and is it the safe value if the flag service is unreachable for an hour?</li>
+<li>How does a process that starts during a flag-service outage get rules: relay, persistent store, bootstrap file, or nothing?</li>
+<li>Is evaluation local, and how many evaluations happen per request on the hottest path?</li>
+<li>How long, end to end, from a click to every server and every client seeing the change? Does that meet the kill-switch target?</li>
+<li>Which services evaluate this flag, with which key? Can two of them disagree for one user, and what does the user see if they do?</li>
+<li>Does any rule embed a large user list, and how big is the ruleset per process?</li>
+<li>Who can change production flags, is there an approval for risky ones, and do changes appear on dashboards and in the incident change log?</li>
+<li>Are both states of every kill switch tested in CI, and when was each last flipped in production?</li>
+<li>Do traces and logs record evaluated flag values and reasons, so a request's behaviour can be explained later?</li>
+<li>Is any flag being used for authorisation or for a schema change? If so, what replaces it?</li>
+<li>What is the deletion plan: which ticket removes the <code>if</code> and the dead branch, and what reminds the owner?</li>
+</ol>
+
+<h2 id=dd-feature-flags-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"The flag service is down and you need to scale out. What happens to the new pods?"</summary>
+<p>Running pods are fine, because they evaluate their cached rules. New pods have no cache, so they run on code defaults, and the fleet now behaves two ways at once. The fix is to give new pods real rules without the vendor: a relay inside your network backed by a persistent store, or a ruleset snapshot baked into the image at deploy time. It also helps if code defaults match current production values, which is one more reason to delete flags that reached 100%.</p>
+</details>
+<details>
+<summary>"Why hash the flag key into the bucket? Hashing the user ID alone would be simpler."</summary>
+<p>Because then every 10% rollout picks the same 10% of users. They would get every new feature at once, interactions between unrelated features would land on the same people, and every experiment's treatment group would overlap with every other's. Including the flag key (and a salt) makes each flag's cohort independent. You can still share a bucketing group deliberately when two flags should move together.</p>
+</details>
+<details>
+<summary>"Your frontend and backend evaluate the same flag. How do you keep them consistent?"</summary>
+<p>First, use the same key everywhere and handle the anonymous-to-logged-in transition explicitly. Second, accept that rule changes arrive at slightly different times, so for user-visible features spanning services, evaluate once at the edge and propagate the decision. Third, make the backend tolerant: if it receives a call for a feature it thinks is off, decide whether to serve it or return a clear error the UI can handle, rather than a bare 404.</p>
+</details>
+<details>
+<summary>"Why not just store flags in the main database and read them with a cache?"</summary>
+<p>You can, and many teams start there. The gaps appear later: cache TTL becomes your kill-switch latency, the database becomes a dependency of every flag check at cold start, and there is no audit log, approval flow, targeting UI or percentage bucketing unless you build them. It is fine for a dozen flags with one team. Past that, the operational features are the product, and building them is a project.</p>
+</details>
+<details>
+<summary>"A flag change took down search. Isn't that the risk flags were supposed to remove?"</summary>
+<p>Flags remove deploy risk from releases, and add configuration risk in its place. A rule change reaches every instance in seconds, which is a blast radius of 100% by default. So production flag changes need the same controls as deploys: review for risky flags, automatic percentage ramps, guarded rollouts with metrics, an audit log and change annotations on dashboards. The lesson's point that source code no longer fully describes production is exactly this.</p>
+</details>
+<details>
+<summary>"How would you use flags for a mobile feature that must be killable within a minute?"</summary>
+<p>The client flag alone cannot guarantee it, because apps refresh flags on their own schedule and offline devices never do. Put a server-side check behind the feature's API calls as well. The client flag hides the UI on the next refresh. The server flag rejects the calls immediately, with a response the app already knows how to handle gracefully. The server is the real kill switch; the client flag is for tidiness.</p>
+</details>
+<details>
+<summary>"Your company has 4,000 flags. Where do you start?"</summary>
+<p>Measure before deleting. Classify by type and age, and find release flags that have served one value to 100% of traffic for more than 30 days; those are deletion candidates and the platform can list them. Find flags with no evaluations at all in 30 days; their code may already be gone. Assign owners to orphans by code ownership of the call sites. Then fix the inflow: required owner and expiry at creation, reminders, and lifetime per team on a dashboard. By Little's law, cutting average lifetime is what shrinks inventory.</p>
+</details>

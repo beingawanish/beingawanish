@@ -1,0 +1,274 @@
+<h2 id=dd-gpu-autoscaling-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's layers (signal, warm pool, schedule, boot engineering, degradation, drain, quota) are the right list. This section looks at how each one is built, on Kubernetes because that is where most self-hosted GPU fleets run, though the same pieces exist on any platform. The thread running through all of it: every step in the scale-up chain has its own lag, and the lags add.</p>
+
+<h3 id=dd-gpu-autoscaling-control-loop level=3>The control loop, link by link</h3>
+<p>A scale-up decision passes through a chain of separate controllers. Each one polls on its own interval.</p>
+<ol>
+<li><strong>The engine exports metrics.</strong> vLLM-class engines expose running and waiting request counts, KV cache usage and token counters on a Prometheus endpoint. Metric names change between versions, so pin them in your dashboards and alerts.</li>
+<li><strong>Prometheus scrapes</strong> every 15–30 seconds, typically.</li>
+<li><strong>The autoscaler reads the metric.</strong> With KEDA, every <code>pollingInterval</code> (30 s by default). With the Horizontal Pod Autoscaler (HPA) and a metrics adapter, every sync period (15 s by default). The HPA computes <code>desired = ceil(current_replicas x current_value / target_value)</code> and ignores changes within a tolerance band, 10% by default.</li>
+<li><strong>The scheduler places the new pod.</strong> If no node has a free GPU, the pod stays <em>Pending</em>.</li>
+<li><strong>A node provisioner</strong> (Cluster Autoscaler or Karpenter) sees the pending pod and requests a GPU instance from the cloud. This is the 3–8 minute step, when capacity exists.</li>
+<li><strong>The node boots</strong>: OS, GPU driver, the device plugin that advertises GPUs to Kubernetes.</li>
+<li><strong>The pod starts</strong>: image pull, container start, weight load, engine warm-up.</li>
+<li><strong>The readiness probe passes</strong>, and the load balancer adds the pod to rotation.</li>
+</ol>
+<p>Steps 1–3 are detection lag: 30–90 seconds once you add them up. Steps 4–8 are boot lag. Web autoscaling usually skips steps 5 and 6, because spare nodes have room. GPU fleets almost never have a spare GPU sitting on a running node, so every scale-up pays for a new machine.</p>
+
+<h3 id=dd-gpu-autoscaling-signal level=3>Building the signal</h3>
+<p>The lesson's rule is queue depth and backlog age, never CPU. In practice you choose among four engine-level numbers.</p>
+<ul>
+<li><strong>Waiting requests per replica.</strong> Direct, cheap, and zero until the replica is full. Good for "we are short right now." Bad at predicting, because it reads zero right up to the moment it does not.</li>
+<li><strong>KV cache usage.</strong> Rises before the queue does, since it measures how full the running batch is. A useful early warning. It also saturates near 100% under normal heavy load, so it can't tell "full" from "very full."</li>
+<li><strong>Token demand versus capacity.</strong> Incoming tokens per second (prompt plus expected output), divided by what one replica sustains at its latency target. This is the most honest number: replicas needed = demand / per-replica capacity. It needs a measured per-replica capacity, which you get from load tests and refresh after every engine or model change.</li>
+<li><strong>Backlog age</strong>, the wait time of the oldest queued request. The alarm, as the lesson says. It belongs on a pager more than in the scaling formula, because a single stuck request inflates it.</li>
+</ul>
+<p>A common working combination: scale on token demand (or on waiting requests where demand is hard to measure), with KV usage as an early trigger and backlog age as the alert. A KEDA <code>ScaledObject</code> on waiting requests looks like this:</p>
+<pre><code>apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: assistant
+spec:
+  scaleTargetRef:
+    name: assistant-vllm
+  minReplicaCount: 2          # the overnight floor
+  maxReplicaCount: 24         # set from quota, not from hope
+  pollingInterval: 15
+  cooldownPeriod: 600
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies: [{type: Pods, value: 4, periodSeconds: 60}]
+        scaleDown:
+          stabilizationWindowSeconds: 900
+          policies: [{type: Pods, value: 1, periodSeconds: 300}]
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring:9090
+      query: sum(vllm:num_requests_waiting{app="assistant"})
+      threshold: "4"          # target waiting requests per replica</code></pre>
+<p>The asymmetry is the point. Scale up immediately and in large steps. Scale down slowly, one replica at a time, after 15 minutes of calm. Up is cheap to get wrong; down costs a cold start if you are wrong.</p>
+
+<h3 id=dd-gpu-autoscaling-warm-tiers level=3>Warm pools are a ladder, not a switch</h3>
+<p>"Warm" can mean several different states. Each costs a different amount and gets you to serving in a different time.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Readiness tier</th><th>What exists</th><th>Time to serving</th><th>Standing cost</th><th>Capacity guaranteed?</th></tr></thead><tbody>
+<tr><td>Cold</td><td>Nothing</td><td>8–12 min (engineered: ~2–4 min)</td><td>None</td><td>No</td></tr>
+<tr><td>Stopped instance, image and weights on its disk</td><td>A disk</td><td>Boot plus load: ~1–3 min</td><td>Storage only</td><td>Usually no: a stopped GPU instance gives up its GPU</td></tr>
+<tr><td>Running node, pod not started</td><td>A GPU node with image cached</td><td>Container start plus weight load: ~30–90 s</td><td>Full GPU price</td><td>Yes</td></tr>
+<tr><td>Hot standby: model loaded, out of rotation</td><td>A ready replica</td><td>Seconds</td><td>Full GPU price</td><td>Yes</td></tr>
+<tr><td>In rotation (headroom)</td><td>A serving replica, under-filled</td><td>Zero</td><td>Full GPU price</td><td>Yes</td></tr>
+</tbody></table></div></div>
+<p>The second row deserves a warning. Cloud warm-pool features for instance groups can keep instances <em>stopped</em>, which is cheap. But in many clouds, a stopped instance does not hold its GPU. Restarting it during a regional shortage can fail with the same "insufficient capacity" error as a fresh launch. The lesson's "the max is not yours" applies to your warm pool too. If you need guaranteed capacity, you pay for it running or reserved. The cheap tiers buy speed, not certainty.</p>
+<p>The hot-standby tier is easy to build on Kubernetes. Run the extra replicas as normal pods with a label the load balancer's selector excludes, or a readiness gate held false. Admission becomes a label flip, which takes seconds. Another common trick is <strong>placeholder pods</strong>: low-priority pods that request a GPU and do nothing. They keep nodes provisioned. When a real replica needs the GPU, the scheduler preempts the placeholder, and the real pod lands on an already-booted node. That buys the "running node" tier without custom tooling.</p>
+
+<h3 id=dd-gpu-autoscaling-boot-anatomy level=3>Anatomy of a boot</h3>
+<p>Boot engineering starts with measuring each stage. Here is a plausible breakdown for the assistant's 7B model, before and after the lesson's techniques.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-gpu-autoscaling-svg-title dd-gpu-autoscaling-svg-desc" viewBox="0 0 720 260" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-gpu-autoscaling-svg-title">GPU replica boot time, default versus engineered</title>
+<desc id="dd-gpu-autoscaling-svg-desc">Two horizontal timelines on a scale of 0 to 12 minutes. The default boot: node provisioning about 5 minutes, driver and device plugin about 1 minute, image pull about 2.5 minutes, weight download and load about 1.5 minutes, engine warm-up about 1 minute, total about 11 minutes. The engineered boot onto a pre-provisioned node: streamed image about 15 seconds, weights from local NVMe about 15 seconds, engine warm-up about 45 seconds, total about 75 seconds.</desc>
+<rect x="0" y="0" width="720" height="260" fill="#ffffff"/>
+<text x="20" y="40" font-size="13" fill="#1c2430">Default</text>
+<rect x="110" y="25" width="225" height="26" fill="#f8ebee" stroke="#c898a4"/><text x="222" y="43" font-size="11" fill="#1c2430" text-anchor="middle">provision node ~5 min</text>
+<rect x="335" y="25" width="45" height="26" fill="#e4eef8" stroke="#7ea4c8"/><text x="357" y="43" font-size="11" fill="#1c2430" text-anchor="middle">driver</text>
+<rect x="380" y="25" width="112" height="26" fill="#e4eef8" stroke="#7ea4c8"/><text x="436" y="43" font-size="11" fill="#1c2430" text-anchor="middle">pull 15 GB image</text>
+<rect x="492" y="25" width="68" height="26" fill="#e4eef8" stroke="#7ea4c8"/><text x="526" y="43" font-size="11" fill="#1c2430" text-anchor="middle">weights</text>
+<rect x="560" y="25" width="45" height="26" fill="#e5f3ec" stroke="#7eae96"/><text x="582" y="43" font-size="11" fill="#1c2430" text-anchor="middle">warm</text>
+<text x="612" y="43" font-size="12" fill="#1c2430">~11 min</text>
+<text x="20" y="100" font-size="13" fill="#1c2430">Engineered</text>
+<rect x="110" y="85" width="11" height="26" fill="#e4eef8" stroke="#7ea4c8"/>
+<rect x="121" y="85" width="11" height="26" fill="#e4eef8" stroke="#7ea4c8"/>
+<rect x="132" y="85" width="34" height="26" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="175" y="103" font-size="12" fill="#1c2430">~75 s: streamed image, weights from local NVMe, warm-up</text>
+<text x="110" y="132" font-size="11" fill="#5c6b7c">(node already provisioned by a placeholder pod or reservation)</text>
+<line x1="110" y1="170" x2="650" y2="170" stroke="#1c2430"/>
+<g font-size="11" fill="#5c6b7c" text-anchor="middle">
+<text x="110" y="188">0</text><text x="200" y="188">2</text><text x="290" y="188">4</text><text x="380" y="188">6</text><text x="470" y="188">8</text><text x="560" y="188">10</text><text x="650" y="188">12 min</text>
+</g>
+<text x="20" y="230" font-size="12" fill="#1c2430">The biggest single bar is getting a machine. Boot engineering only reaches it by keeping machines around.</text>
+</svg>
+<figcaption>Each technique attacks one bar. Image streaming and local weights shrink the middle; placeholder pods or reservations remove the first bar entirely.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Image pull.</strong> A 15 GB image at around 100–200 MB/s from a registry takes one to two and a half minutes. Lazy-loading snapshotters (stargz, SOCI, Nydus and similar) start the container before the full image arrives, fetching files as they are read. Simpler still: keep CUDA and the engine in the node's base image, and keep the container small.</li>
+<li><strong>Weights.</strong> 14 GB from object storage at a few hundred MB/s is 30–60 seconds, more if many nodes download at once. Local NVMe reads at several GB/s, cutting it to seconds. Formats built for fast loading (safetensors, memory-mapped) avoid an extra copy through CPU memory.</li>
+<li><strong>Engine warm-up.</strong> The engine profiles memory to size the KV pool and may capture CUDA graphs for common batch sizes. That can take tens of seconds. Some engines can skip or cache parts of it; check the trade, since skipping graph capture can slow steady-state decoding.</li>
+<li><strong>Readiness.</strong> The probe should pass only after a real test generation succeeds. "Process is listening" is not ready.</li>
+</ul>
+
+<h3 id=dd-gpu-autoscaling-drain level=3>Scale-down as a protocol</h3>
+<p>Kubernetes terminates a pod like this: it marks the pod as terminating, runs its <code>preStop</code> hook, sends SIGTERM, waits up to <code>terminationGracePeriodSeconds</code> (30 seconds by default), then sends SIGKILL. Endpoint removal happens in parallel and takes a moment to reach every load balancer. For a web server, 30 seconds is plenty. For an LLM replica, it is not.</p>
+<p>A replica's longest possible in-flight request is its queue wait plus <code>max_tokens</code> times TPOT. At 800 tokens and 50 ms per token, that is 40 seconds of decoding. Add queueing, and 60–90 seconds is realistic. The drain protocol:</p>
+<ol>
+<li>Stop admission. Fail readiness, or remove the serving label, so no new requests arrive. Wait a few seconds for every load balancer to notice.</li>
+<li>Let running generations finish. The engine's running count falls to zero.</li>
+<li>Return the replica to the hot-standby pool if the pool is below target, or terminate it.</li>
+<li>Set the grace period above the worst case, for example 120 seconds, so the kill never arrives first.</li>
+</ol>
+<p>Multi-turn stickiness adds a wrinkle. A conversation whose KV prefix lives on the draining replica will move on its next turn. That costs one cold prefill, not a broken answer, so it is acceptable. Breaking an answer mid-stream is not.</p>
+
+<h3 id=dd-gpu-autoscaling-quiet-hours level=3>Using the quiet hours</h3>
+<p>The lesson's preemptible night batch needs three Kubernetes pieces: a <code>PriorityClass</code> for interactive replicas that is higher than the batch class, batch jobs that checkpoint often (every few minutes), and a scheduled stop. Stop admitting batch work before the morning pre-warm begins, so interactive replicas do not have to wait while batch jobs save checkpoints. The same machinery lets batch work run on cloud spot or preemptible capacity, which can be reclaimed at short notice. Notice periods vary by provider, from about thirty seconds to a couple of minutes.</p>
+
+<h2 id=dd-gpu-autoscaling-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions: baseline 20 requests per second on 5 GPUs. Each GPU sustains about 7 requests per second at the latency target, so the fleet tops out near 35. The morning-show spike ramps linearly from 20 to 80 requests per second over 15 minutes, which is +4 per minute. A GPU costs about $4 per hour, or $35K per year.</p>
+
+<h3 id=dd-gpu-autoscaling-reactive-math level=3>What reactive-only costs, in requests</h3>
+<p>Demand at minute <em>t</em> is 20 + 4<em>t</em>. It crosses the fleet's 35 at <em>t</em> = 3.75. Say detection takes one minute and a cold boot takes ten. New capacity arrives near minute 14.75. Until then, the excess is (20 + 4<em>t</em>) − 35 = 4<em>t</em> − 15 requests per second. Integrate that from 3.75 to 14.75 minutes:</p>
+<pre><code>backlog = ∫ (4t − 15) dt from 3.75 to 14.75     (t in minutes, rate per second)
+        = [2t² − 15t] from 3.75 to 14.75
+        = (435.1 − 221.3) − (28.1 − 56.3)
+        ≈ 242 request-seconds per second·minute
+        ≈ 242 x 60 ≈ 14,500 requests waiting at minute 14.75</code></pre>
+<p>Fourteen and a half thousand people waiting, by the time the first new GPU arrives. And the fleet is still short: demand is 79 per second against 35 plus whatever just arrived. Most of those users have left. This is the lesson's "always too late" turned into a count.</p>
+
+<h3 id=dd-gpu-autoscaling-pool-math level=3>Sizing the warm pool</h3>
+<p>The lesson's rule is pool ≥ spike arrival rate x boot time. Here demand grows 4 requests per second each minute. That is 4/7 ≈ 0.6 GPUs' worth of new demand per minute.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Boot time (from decision to serving)</th><th>Pool = 0.6 GPU/min x boot</th><th>Rounded, plus one for overlap</th><th>Standing cost per year</th></tr></thead><tbody>
+<tr><td>11 min (default)</td><td>6.6</td><td>8</td><td>~$280K</td></tr>
+<tr><td>4 min (streamed image, local weights, cold node)</td><td>2.4</td><td>4</td><td>~$140K</td></tr>
+<tr><td>75 s (pre-provisioned node)</td><td>0.75</td><td>2</td><td>~$70K, plus placeholder node cost</td></tr>
+</tbody></table></div></div>
+<p>Boot engineering is a cost lever, not only a latency one. Cutting boot from 11 minutes to 75 seconds shrinks the pool by six GPUs, about $210K a year. The 75-second row has a catch: its nodes must already exist. Placeholder pods hold them, and those cost GPU-hours. So the honest total for that row is the pool plus the placeholder nodes. The engineered boot still wins, because a placeholder node waiting for a pod is a smaller and more flexible commitment than a fully loaded replica.</p>
+<p>The pool covers the <em>surprise</em> part of the ramp only. Scheduled pre-warming covers the known part. The pool also refills as it drains, so it has to bridge only one boot time, not the whole spike.</p>
+
+<h3 id=dd-gpu-autoscaling-floor-math level=3>The overnight floor, and the scale-to-zero breakeven</h3>
+<p>Overnight, from 23:00 to 07:00, traffic averages 0.5 requests per second. A floor of 2 GPUs costs 2 x 8 hours x $4 = $64 per night, about $23K per year. At zero, the first user each morning, and everyone behind them, waits a full cold start: up to 11 minutes default, about 4 minutes engineered.</p>
+<p>The breakeven is a product question in numbers. How many overnight and early-morning users do you have, and what is one abandoned session worth? At 0.5 requests per second, 11 minutes is about 330 users who hit a wall at the first scale-up. If a few of them are paying customers, $64 a night is cheap. For an internal tool with ten night users a month, zero is right. The answer depends on traffic shape, not on a rule.</p>
+<p>There is a middle option: a floor of one replica of the <em>smaller</em> model overnight. It answers night traffic with a labeled lesser model and keeps the cold start off the critical path. The full model pre-warms on schedule before the morning ramp.</p>
+
+<h3 id=dd-gpu-autoscaling-prewarm-math level=3>Pre-warm lead time</h3>
+<p>The morning ramp starts at 08:30 and reaches 2x baseline by 09:15. Capacity must be serving <em>before</em> demand needs it, so the lead time is the boot time plus a margin for failed boots and stockouts. With a 4-minute boot and a 10% chance of a launch failing in a busy morning region, start at 08:10. That gives room for a retry, or for a second instance type, before the ramp. The cost is about twenty extra GPU-minutes per added replica each morning, which is trivial.</p>
+
+<h3 id=dd-gpu-autoscaling-herd-math level=3>The pull herd</h3>
+<p>Scale up 12 replicas at once. Each pulls a 15 GB image and 14 GB of weights: 29 GB x 12 ≈ 350 GB in a burst. If the registry or bucket serves the cluster at 2 GB/s in total, that alone takes about three minutes. Meanwhile, the engineered 75-second boot assumed each node had the bandwidth to itself. Fan-out kills the boot time you measured with one node. Pre-pulled base images, node-local weight caches and peer-to-peer distribution restore it.</p>
+
+<h3 id=dd-gpu-autoscaling-spot-math level=3>Spot capacity, if you use it</h3>
+<p>Spot or preemptible GPUs are often much cheaper than on-demand, though discounts and availability vary widely by region, GPU type and time. They can be reclaimed at short notice. For the interactive fleet, that is a risk to price, not a free saving. A reclaim mid-answer is the same cutoff as a bad scale-down, with no chance to drain. A reasonable split: the floor and the warm pool on on-demand or reserved capacity, burst capacity on spot with a fast drain on notice, and the night batch entirely on spot.</p>
+
+<h2 id=dd-gpu-autoscaling-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-gpu-autoscaling-fm-grace level=3>1. The 30-second guillotine</h3>
+<p><strong>Symptom.</strong> Users report answers that stop mid-sentence, only during scale-down. The team had already "fixed" this by adding a drain.</p>
+<p><strong>Mechanism.</strong> The drain works, but the pod uses Kubernetes' default 30-second grace period. Long answers need 40–90 seconds. SIGKILL arrives before generations finish. The engine also handled SIGTERM by exiting at once, instead of waiting for running sequences.</p>
+<p><strong>Detect.</strong> Streams ending without a final event, correlated with pod terminations. Count requests in flight at SIGKILL time; it should be zero.</p>
+<p><strong>Fix.</strong> A grace period above <code>max_tokens</code> x TPOT plus queueing. A <code>preStop</code> hook that removes the pod from rotation and then waits for the running count to reach zero. An engine shutdown path that finishes running sequences. Check in staging that killing a pod mid-answer still completes the answer.</p>
+
+<h3 id=dd-gpu-autoscaling-fm-cold-herd level=3>2. The new replica that gets flattened</h3>
+<p><strong>Symptom.</strong> Every scale-up causes a short spike in TTFT, and the new replica's first minute shows preemptions and high latency.</p>
+<p><strong>Mechanism.</strong> The load balancer routes on queue depth. A new replica shows zero, so the balancer sends it everything at once. Its prefix cache is empty, so every request pays full prefill. Its warm-up may also still be capturing graphs for batch sizes it has not seen. The new replica ends up worse off than the old ones it was meant to relieve.</p>
+<p><strong>Detect.</strong> Per-replica TTFT and preemption rate for the first few minutes after joining.</p>
+<p><strong>Fix.</strong> Slow start: ramp the new replica's weight over a minute or two (many load balancers support this directly). Readiness only after a test generation. Optionally, pre-warm the prefix cache by replaying the common system prompts before admission.</p>
+
+<h3 id=dd-gpu-autoscaling-fm-flap level=3>3. The fleet that breathes</h3>
+<p><strong>Symptom.</strong> Replica count oscillates every 20 minutes even under steady traffic. Each cycle includes a brief latency bump.</p>
+<p><strong>Mechanism.</strong> The autoscaler targets waiting requests. When it adds replicas, the queue drains to zero, which reads as "too many replicas." It scales down. The queue returns. Queue depth measures shortfall, not demand, so it falls to zero at any capacity above demand.</p>
+<p><strong>Detect.</strong> Replica count plotted against request rate. Oscillation in one with a flat other is control-loop instability.</p>
+<p><strong>Fix.</strong> Scale on demand (token rate divided by per-replica capacity), with queue depth as an additive trigger for shortfall. Long scale-down stabilization windows. Scale down only when KV usage is also low, not just when the queue is empty.</p>
+
+<h3 id=dd-gpu-autoscaling-fm-stockout level=3>4. Pending forever</h3>
+<p><strong>Symptom.</strong> The autoscaler wants 14 replicas; there are 9. Five pods have been Pending for 25 minutes. Dashboards show the autoscaler "working."</p>
+<p><strong>Mechanism.</strong> The cloud returned insufficient capacity for the instance type in every zone the node pool allows. The provisioner retries with backoff, quietly. Nothing told the degradation sequence that the capacity was never coming.</p>
+<p><strong>Detect.</strong> Age of the oldest Pending GPU pod, as an alert at a few minutes. Provisioner errors that mention capacity. The gap between desired and ready replicas.</p>
+<p><strong>Fix.</strong> Let node pools use several GPU types and zones that the model can run on. Keep reservations for the floor and the pool. Most importantly, wire the "desired minus ready" gap into the gateway, so overflow goes to another region or a provider API after a few minutes instead of waiting. See <a href="#llm-gateway">LLM Gateway</a>.</p>
+
+<h3 id=dd-gpu-autoscaling-fm-blind level=3>5. The autoscaler goes blind</h3>
+<p><strong>Symptom.</strong> During a Prometheus outage, the GPU fleet scales down to its minimum in the middle of the day.</p>
+<p><strong>Mechanism.</strong> The query returned no data. Depending on configuration, the autoscaler treats that as zero, holds steady, or uses a fallback. This one read zero, judged the fleet idle and scaled down.</p>
+<p><strong>Detect.</strong> Alert on the scaling metric being absent, not just high or low. Watch the autoscaler's own error events.</p>
+<p><strong>Fix.</strong> Configure an explicit fallback. KEDA's <code>fallback</code> block, for example, sets a replica count to use after repeated metric failures. Make queries fail loudly on missing data. Run the metrics path for scaling with the same care as the serving path, because it is part of the serving path.</p>
+
+<h3 id=dd-gpu-autoscaling-fm-pull-herd level=3>6. The boot that was fast in testing</h3>
+<p><strong>Symptom.</strong> Measured boot time is 75 seconds. During a real spike, new replicas take 6 minutes.</p>
+<p><strong>Mechanism.</strong> The pull herd from the sizing section. Twelve nodes start at once, all pulling image layers and weights from the same registry and bucket. Shared bandwidth, rate limits and throttling stretch every boot.</p>
+<p><strong>Detect.</strong> Boot time broken down by stage, for every scale-up, plotted against how many nodes started together.</p>
+<p><strong>Fix.</strong> Bake the heavy layers into node images. Cache weights on node-local disks or a cluster-local cache. Use peer-to-peer distribution for images. Test boot time at your real scale-up step size, not with one node.</p>
+
+<h3 id=dd-gpu-autoscaling-fm-batch-squat level=3>7. The night batch that would not leave</h3>
+<p><strong>Symptom.</strong> On Mondays, the morning ramp runs short of capacity for 20 minutes, though the pre-warm fired on time.</p>
+<p><strong>Mechanism.</strong> The weekend summarization batch was larger than usual. The pre-warmed interactive pods were scheduled, but they had to preempt batch pods first. The batch pods had a long grace period for checkpointing, so eviction took minutes. Or the batch jobs ran at the same priority, and nothing was preempted at all.</p>
+<p><strong>Detect.</strong> Interactive pods Pending while batch pods hold GPUs. Time from preemption request to GPU free.</p>
+<p><strong>Fix.</strong> A clear priority order, with interactive above batch. Batch jobs that checkpoint every few minutes and accept a short grace period. A scheduled cut-off that stops admitting batch work before the pre-warm, so the GPUs are already empty when they're needed.</p>
+
+<h2 id=dd-gpu-autoscaling-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-gpu-autoscaling-choose-signal level=3>Choosing the scaling signal</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Signal</th><th>Leads or lags?</th><th>Fails how</th><th>Use as</th></tr></thead><tbody>
+<tr><td>Host CPU</td><td>Unrelated</td><td>Idle while users wait</td><td>Never, for GPU work</td></tr>
+<tr><td>GPU utilization</td><td>Saturates early</td><td>Near 100% under continuous batching, whatever the queue</td><td>Capacity planning, not scaling</td></tr>
+<tr><td>KV cache usage</td><td>Leads the queue slightly</td><td>Pinned near 100% at healthy high load</td><td>Early trigger; scale-down guard</td></tr>
+<tr><td>Waiting requests</td><td>Lags: zero until short</td><td>Causes flapping on its own</td><td>Shortfall trigger</td></tr>
+<tr><td>Token demand / per-replica capacity</td><td>Tracks demand directly</td><td>Wrong when capacity numbers go stale</td><td>Primary target</td></tr>
+<tr><td>Backlog age</td><td>Lags, but is what users feel</td><td>Inflated by one stuck request</td><td>The alert</td></tr>
+<tr><td>Forecast or calendar</td><td>Leads by design</td><td>Blind to surprises</td><td>Pre-warm floor under the reactive loop</td></tr>
+</tbody></table></div></div>
+
+<h3 id=dd-gpu-autoscaling-choose-unit level=3>Choosing the scaling unit</h3>
+<p>For a model on one GPU, the unit is a replica, and everything above applies. For models split across a whole 8-GPU node with tensor parallelism, the unit is a node. That makes every step coarser. Scale-up steps are 8 GPUs at a time, the warm pool holds whole nodes, quota is counted in nodes, and a wrong decision costs eight times as much. Large-model fleets lean harder on scheduling and reservations, and less on reactive scaling, for exactly this reason. Smaller models in a fleet are easier to scale. That is one more argument for routing cheap tiers to small models.</p>
+
+<h3 id=dd-gpu-autoscaling-choose-capacity level=3>Choosing how capacity is held</h3>
+<ul>
+<li><strong>Reserved or committed capacity</strong> for the floor and the warm pool. You pay whether you use it or not, and in return you get it.</li>
+<li><strong>On-demand</strong> for the reactive burst, with several instance types and zones allowed.</li>
+<li><strong>Spot</strong> for batch, and for interactive burst only if drains on reclaim notice are fast and tested.</li>
+<li><strong>Provider API overflow</strong> through the gateway, for anything above your quota. It costs more per token, but you only pay for it during the spike.</li>
+</ul>
+<p>Most mature fleets use all four, layered. The design question is the size of each layer, and that comes from the traffic curve: the floor from the overnight minimum, the reservation from the daily peak, on-demand from typical surprises, and the API overflow for the rest.</p>
+
+<h2 id=dd-gpu-autoscaling-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What exact metric does the autoscaler target, what is the per-replica target value, and when was the per-replica capacity last measured?</li>
+<li>What happens when the metric is missing: hold, fallback count, or scale to zero?</li>
+<li>What is the measured boot time per stage, and was it measured at the real scale-up step size?</li>
+<li>Which warm tier is the pool in, and does it actually guarantee GPU capacity during a regional shortage?</li>
+<li>How was the pool sized: spike rate times boot time, with the numbers written down?</li>
+<li>What is scheduled or predicted, and how far ahead of the ramp does pre-warming start?</li>
+<li>Is the termination grace period longer than the worst in-flight generation, and does the engine finish running sequences on SIGTERM?</li>
+<li>Do new replicas get a slow start and a readiness check that includes a real generation?</li>
+<li>Are scale-down windows long enough to avoid flapping, and guarded by more than queue depth?</li>
+<li>What alerts on Pending GPU pods, and at what age does overflow go to another region or provider?</li>
+<li>Is the overnight floor justified by a breakeven calculation, and has it been revisited this quarter?</li>
+<li>If batch work uses quiet hours, is it lower priority, checkpointed, and cut off before the morning pre-warm?</li>
+</ol>
+
+<h2 id=dd-gpu-autoscaling-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"You scale on queue depth and the fleet oscillates. Why?"</summary>
+<p>Queue depth measures shortfall, not demand. Above demand, it reads zero at any capacity, so "zero" looks like "too many replicas," the autoscaler scales down, and the queue comes back. Scale on demand instead: token rate divided by measured per-replica capacity. Keep queue depth as an extra trigger for real shortfall, and make scale-down slow and guarded by KV usage too.</p>
+</details>
+
+<details>
+<summary>"Your warm pool is stopped instances with weights on disk. Is that enough for a launch-day spike?"</summary>
+<p>It buys speed, not certainty. In many clouds a stopped instance gives up its GPU, so restarting can fail with insufficient capacity exactly when the region is busiest. If the spike is known, reserve capacity or run hot standbys. If it is unknown, size a small running pool for certainty and use stopped instances as a cheaper second tier behind it.</p>
+</details>
+
+<details>
+<summary>"Boot time is 75 seconds in testing and 6 minutes in production. Where did the time go?"</summary>
+<p>Most likely, contention. Many nodes pulled the same image and weights at once from a shared registry and bucket, so each got a fraction of the bandwidth. The second suspect is node provisioning, which testing on an existing node skipped. Measure each stage on every real scale-up, test at the real step size, and move heavy bytes closer to nodes: baked images, local weight caches, peer distribution.</p>
+</details>
+
+<details>
+<summary>"How long should the termination grace period be for an LLM replica?"</summary>
+<p>Longer than the worst in-flight request: queue wait plus <code>max_tokens</code> times TPOT, plus a margin. At 800 tokens and 50 ms per token, that is 40 seconds of decoding alone, so 90–120 seconds is reasonable. The default 30 seconds cuts answers. The grace period also only helps if the preStop hook removes the pod from rotation first and the engine waits for running sequences instead of exiting on SIGTERM.</p>
+</details>
+
+<details>
+<summary>"The autoscaler wants 14 replicas, and 5 have been Pending for 20 minutes. What should already have happened?"</summary>
+<p>An alert at a few minutes of Pending age, and automatic overflow. The gap between desired and ready replicas is a capacity signal that the gateway should consume, sending the excess to another region or a provider API. The node pool should also have allowed alternative GPU types and zones. Waiting on one instance type in one region is hoping, not planning.</p>
+</details>
+
+<details>
+<summary>"Why does boot-time engineering save money, not just latency?"</summary>
+<p>Because the warm pool is sized as spike rate times boot time. Halve the boot and you halve the pool. In the worked example, cutting boot from 11 minutes to 75 seconds shrinks an 8-GPU pool to 2, roughly $210K a year at $35K per GPU-year. Every other layer gets cheaper when the constant underneath it shrinks.</p>
+</details>
+
+<details>
+<summary>"Would you put the interactive fleet on spot GPUs?"</summary>
+<p>Not the floor or the warm pool. A spot reclaim mid-answer is a forced cutoff with a short notice period, often too short to drain a long generation. Burst capacity on spot can work if the drain on notice is fast and tested, and if overflow to on-demand or an API absorbs the loss. Batch work belongs on spot by default.</p>
+</details>

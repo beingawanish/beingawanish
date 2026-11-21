@@ -1,0 +1,225 @@
+<h2 id=dd-lambda-and-kappa-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson frames Lambda and Kappa as two answers to one question: how does a correct answer get recomputed? Underneath, both designs are built from the same few parts. There is an immutable record of events, a way to compute views from it, a boundary between "settled" and "recent", and a way to replace a view without readers noticing. The differences are in where each part lives and who triggers it.</p>
+
+<h3 id=dd-lambda-and-kappa-master-dataset level=3>The master dataset: what both designs actually depend on</h3>
+<p>Marz's original Lambda description starts with a <strong>master dataset</strong>: raw events, stored append-only, never updated. Kreps' Kappa starts with a retained log. These are the same idea in two storage systems. Everything else in either design is a view that can be thrown away and rebuilt from it.</p>
+<p>Three properties make the raw record usable for recomputation:</p>
+<ul>
+<li><strong>Complete.</strong> It holds every event, including the ones the streaming job dropped as late. If late events are discarded before storage, no recomputation can recover them.</li>
+<li><strong>Immutable.</strong> Corrections are new events ("order 8412 amount corrected"), not edits. An edited history cannot reproduce last month's report as it was.</li>
+<li><strong>Carries its own time.</strong> Each event has its event time and an ingestion time. Recomputation is then a function of the data, not of when it runs.</li>
+</ul>
+<p>Most "we cannot reprocess" incidents are really failures of the master dataset. The log was compacted, retention was short, or the raw files were overwritten by a cleaning job.</p>
+
+<h3 id=dd-lambda-and-kappa-serving level=3>Lambda's serving layer: the boundary is the design</h3>
+<p>The lesson says the serving layer stitches "recent hours from the speed layer and settled history from the batch layer". The interesting part is the line between them. Call it the <strong>batch boundary</strong>: the latest point in time that the most recent batch run fully covers.</p>
+<p>A read for "revenue, last 7 days" is answered as:</p>
+<pre><code>batch_view[ start .. boundary )  +  speed_view[ boundary .. now ]</code></pre>
+<p>For this to be correct, four rules must hold.</p>
+<ol>
+<li><strong>One time axis.</strong> The boundary and both views use the same clock, normally event time. If the batch covers events by event time but the speed layer is bucketed by processing time, events near the boundary are counted twice or not at all.</li>
+<li><strong>The boundary moves only when a batch view is published.</strong> Publishing must be atomic: the new batch view and the new boundary appear together. Table formats help, since an Iceberg or Delta commit, or a view swap, changes both in one step.</li>
+<li><strong>The speed layer keeps state past the boundary.</strong> Its results for a period can be dropped only after a published batch view covers that period. So the speed layer's retention is at least the batch cycle plus the batch runtime plus slack for a failed run.</li>
+<li><strong>Late events after the cutoff have a home.</strong> An event for Tuesday that arrives Thursday, after Tuesday's batch already ran, is in neither view, unless the next batch run reprocesses Tuesday. The batch layer therefore usually recomputes a trailing window of days, not just "yesterday".</li>
+</ol>
+<p>Rule 4 is why batch runs in real Lambda systems often recompute the last 3 to 7 days every night. It is also where the "automatic overwrite" earns its keep: each run restates every recent day, so late data and speed-layer bugs both get corrected without anyone deciding to.</p>
+
+<h3 id=dd-lambda-and-kappa-retention level=3>Kappa's log: retention, compaction and tiered storage</h3>
+<p>Kappa needs the log to hold history as long as the <strong>reprocessing horizon</strong>, the furthest back you would ever recompute. In Kafka that is topic configuration, and three settings matter.</p>
+<ul>
+<li><code>retention.ms</code> and <code>retention.bytes</code> set how long, or how much, the topic keeps. <code>retention.ms=-1</code> keeps data forever.</li>
+<li><code>cleanup.policy</code>. <code>delete</code> drops whole old segments by age or size. <code>compact</code> keeps only the latest record per key. Compaction is perfect for state ("current price of product X") and fatal for Kappa over events. A compacted orders topic cannot replay last month's revenue, because the intermediate events are gone.</li>
+<li><strong>Tiered storage</strong> (KIP-405, available in recent Kafka releases, and in other log systems such as Redpanda and Pulsar) moves closed segments to object storage. The broker keeps only a short local tail, set by <code>local.retention.ms</code>. Consumers that read old offsets fetch them from object storage transparently.</li>
+</ul>
+<p>A topic set up for Kappa might look like this:</p>
+<pre><code># orders topic: 400 days of history, 3 days on broker disk
+cleanup.policy=delete
+retention.ms=34560000000          # 400 days
+remote.storage.enable=true        # tiered storage on (broker must enable it too)
+local.retention.ms=259200000      # keep 3 days on local disk
+min.insync.replicas=2</code></pre>
+<p>Check your broker version and vendor before relying on the exact names; tiered storage has moved quickly across releases.</p>
+
+<h3 id=dd-lambda-and-kappa-replay level=3>A Kappa replay, step by step</h3>
+<p>The lesson gives four steps. Here is what each one means in practice.</p>
+<ol>
+<li><strong>Start v2 as a separate job with its own consumer group.</strong> It must not share offsets or state with v1. Set its starting position by time. In Flink that is a source option (start from timestamp); for a plain consumer group it is a reset:
+<pre><code>kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+  --group revenue-v2 --topic orders \
+  --reset-offsets --to-datetime 2026-11-16T00:00:00.000 --execute</code></pre></li>
+<li><strong>Write v2's output somewhere new.</strong> A new topic or table, such as <code>revenue_daily_v2</code>. Never let v2 overwrite v1's output while v1 is still serving.</li>
+<li><strong>Let v2 catch up, then compare.</strong> When v2's lag reaches near zero, both versions run on live data. Compare outputs per metric and per period. Differences should appear only where the logic change was meant to change results.</li>
+<li><strong>Switch readers, then retire v1.</strong> Repoint a view, alias or config entry from v1's output to v2's. Keep v1's output for a while in case you need to switch back.</li>
+</ol>
+<p>Two engine properties make the replay give the right answer. First, the logic must be <strong>event-time based</strong>. During replay, months of events stream past in an hour; any processing-time window or <code>now()</code> call produces nonsense. Second, <strong>enrichment must be reproducible</strong>. If the job joins orders to the <em>current</em> customer table or calls a currency API for today's rate, replaying last month uses today's values. Correct replays need versioned (temporal) joins, or the enrichment data must be in the log too.</p>
+
+<h3 id=dd-lambda-and-kappa-restatement level=3>How downstream sees a restatement</h3>
+<p>Both designs change history. Lambda overwrites last week's numbers every night. Kappa switches to a v2 that disagrees with v1 about last month. Every consumer of the output must handle that, and there are two ways to deliver it.</p>
+<ul>
+<li><strong>Overwrite in place.</strong> The output is keyed by <code>(metric, period)</code>, and new values upsert over old ones. Dashboards that re-query see the new numbers. Consumers that copied the old numbers somewhere, such as an export to finance, do not.</li>
+<li><strong>Versioned outputs.</strong> Each run or version writes to a new table or snapshot, and readers move via an alias. Old versions remain queryable, which makes audits and rollbacks easy. The cost is storage and an explicit switch.</li>
+</ul>
+<p>Either way, a downstream consumer that is <em>incremental</em> (it reads only new rows) will miss restatements, or double count them. That consumer needs either a change feed of corrections or a full re-read after each restatement. Write this down as part of the metric's contract.</p>
+
+<h3 id=dd-lambda-and-kappa-convergence level=3>Convergence: one definition, two execution modes</h3>
+<p>The lesson ends on convergence. Concretely, there are three ways teams get to "one logic source" today.</p>
+<ul>
+<li><strong>One engine, two modes.</strong> Flink runs the same DataStream or SQL program in streaming mode or batch mode over bounded input. Apache Beam pipelines run on batch or streaming runners. Spark's DataFrame API serves both batch and Structured Streaming. The code is shared; the runtime differs.</li>
+<li><strong>The table is the log.</strong> Streaming jobs write into a lakehouse table (Iceberg, Delta, Hudi). Batch queries read the same table. Reprocessing is a batch job over the table's files, which is cheaper than replaying a broker. Snapshots give each run a pinned, reproducible input. This is often called a Kappa-like design without long log retention.</li>
+<li><strong>Shared definitions, separate engines.</strong> Metric logic lives in one place, such as a SQL definition, a metrics or semantic layer, or a library, and is compiled or imported into both the warehouse job and the streaming job. Drift is then limited to differences between engines, which tests can catch.</li>
+</ul>
+<p>The third option is the most common and the most fragile. Engines disagree in small ways: NULL handling in aggregates, time zone of date truncation, decimal rounding, how a late event is treated. "Shared definitions" needs shared <em>tests</em> to mean anything.</p>
+
+<h2 id=dd-lambda-and-kappa-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Two workloads: the orders stream (400 events/s average, about 500 bytes each) and the clickstream (100 MB/s at peak; assume 40 MB/s averaged over a day). Storage prices vary by provider and region, so the cost figures below use stated, illustrative prices; plug in your own.</p>
+
+<h3 id=dd-lambda-and-kappa-size-retention level=3>What retention costs</h3>
+<p><strong>Orders.</strong> 400/s × 500 B = 200 KB/s ≈ <strong>17 GB per day</strong>. A 90-day horizon is 1.5 TB; 400 days is 7 TB. Kept on broker disks with replication factor 3, 400 days means 21 TB of broker disk. With tiered storage, brokers keep 3 days locally (about 150 GB with replication), and object storage holds a single logical copy of 7 TB.</p>
+<p><strong>Clickstream.</strong> 40 MB/s average ≈ <strong>3.5 TB per day</strong>. 90 days is 310 TB of raw log. On broker disks with replication factor 3, that is over 900 TB. Even tiered, it is 310 TB in object storage. Compressed columnar files in a lakehouse might be 3–10x smaller than the raw log, depending on the data.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Stream, horizon<th>Logical size<th>Broker disk, RF 3<th>Tiered (object storage)<th>Monthly at illustrative prices<tbody><tr><td>Orders, 90 days<td>1.5 TB<td>4.5 TB<td>1.5 TB<td>Broker ~$450; tiered ~$30<tr><td>Orders, 400 days<td>7 TB<td>21 TB<td>7 TB<td>Broker ~$2,100; tiered ~$140<tr><td>Clickstream, 90 days<td>310 TB<td>930 TB<td>310 TB<td>Broker ~$93,000; tiered ~$6,200</table></div></div>
+<p>The illustrative prices are $0.10 per GB-month for broker block storage and $0.02 per GB-month for object storage. The conclusion survives large changes in price. For the orders stream, Kappa retention is cheap enough to stop arguing about. For the clickstream, keeping 90 days of raw log is a real budget line, and a lakehouse table is the more natural master dataset.</p>
+
+<h3 id=dd-lambda-and-kappa-size-replay level=3>How fast a replay runs</h3>
+<p>Replay speed is set by the slowest of three things: log read throughput, the job's processing rate, and the sink's write rate.</p>
+<p><strong>Orders, 2 days (the lesson's bug).</strong> 34 GB. If the replay job processes 50 MB/s, that is about 11 minutes. The lesson's "50x live rate" is conservative here: 50 MB/s is 250x the 200 KB/s live rate. At that speed, two days of history takes roughly 11 minutes.</p>
+<p><strong>Orders, 400 days.</strong> 7 TB at 50 MB/s is about 39 hours. At 500 MB/s, with 10x the parallelism, about 4 hours. That is fine for a planned migration, and too slow for an incident.</p>
+<p><strong>Clickstream, 90 days.</strong> 310 TB at 2 GB/s is about 43 hours, and 2 GB/s needs a large cluster and a broker or object store that can serve it. This is the case the lesson's "Kappa does not suit enormous history" warns about. Reprocess from a columnar lakehouse table in batch mode instead, where the job reads only the columns it needs.</p>
+<p>The general formula, for planning:</p>
+<pre><code>replay_hours = horizon_bytes / replay_throughput_bytes_per_s / 3600
+catch_up adds: (replay_hours × live_rate) / (replay_throughput − live_rate)</code></pre>
+<p>The second line is small when replay throughput is many times the live rate, which is usually true for business events and often false for high-volume telemetry.</p>
+
+<h3 id=dd-lambda-and-kappa-size-lambda level=3>What Lambda costs</h3>
+<p>The compute is easy to count. A nightly batch that recomputes 7 trailing days of orders reads 7 × 17 GB = 120 GB, which is minutes on a modest cluster or a warehouse. The speed layer runs all the time. For the orders stream both are small.</p>
+<p>The expensive part is people. Assume 40 metrics, each changing twice a year, and each change taking one engineer-day in one codebase. In Lambda, each change is two implementations plus a reconciliation check: about 2.5 engineer-days. That is 40 × 2 × 1.5 = 120 extra engineer-days per year, or about half an engineer, spent keeping two codebases in step. That is before any drift incident. This is the number to put next to Kappa's retention bill.</p>
+
+<h3 id=dd-lambda-and-kappa-size-reconcile level=3>How much disagreement is normal</h3>
+<p>The opening incident's two numbers differ by $325 on $413,205, which is 0.08%. Is that a bug? Work out the expected gap first.</p>
+<ul>
+<li>The streaming job's watermark covers, say, the p99 of lateness, so about 1% of events arrive after their window closed. If its late policy drops them, the dashboard undercounts by up to about 1% of the count, and less of revenue if late orders are smaller.</li>
+<li>Deploy gaps add their own amount: a one-minute gap is 1/1,440 of a day, or 0.07%.</li>
+</ul>
+<p>So a gap between 0% and about 1% is <em>expected</em> from the design, and the reconciliation alert should use a threshold derived from these numbers, say 1.5%. A gap above that, or a gap that changes sign, or one that grows day over day, is drift. Without this arithmetic, teams either alert on every honest difference or ignore real bugs.</p>
+
+<h3 id=dd-lambda-and-kappa-size-speed-state level=3>Speed-layer retention in Lambda</h3>
+<p>The speed layer must hold results from the batch boundary to now. With a nightly batch that starts at 02:00, covers through midnight, and takes up to 3 hours: the speed layer holds at least 24 + 2 + 3 = 29 hours. Add one failed run, and it needs 53 hours. Size it for at least two missed batch runs. Otherwise a single failed night creates a gap that neither layer can answer.</p>
+
+<h2 id=dd-lambda-and-kappa-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-lambda-and-kappa-fm-boundary level=3>1. Revenue that jumps at 3 AM</h3>
+<p><strong>Symptom.</strong> Every night when the batch view publishes, the dashboard's "last 7 days" total jumps, sometimes up and sometimes down, by a few hundred dollars. Finance asks which number to use.</p>
+<p><strong>Mechanism.</strong> The batch layer covers events by event time through midnight. The speed layer's view is bucketed by processing time, and the serving query cuts it at midnight by processing time. Orders placed at 23:59 and received at 00:01 are in the batch view and in the speed layer's post-boundary bucket: counted twice. Orders whose processing time is before midnight but whose event time is after are in neither. The jump is the size of that overlap and gap.</p>
+<p><strong>Detect.</strong> Compare the dashboard total just before and just after each publication. A healthy Lambda's jump is the small, one-directional correction of late events. A two-directional jump of similar size every night points at the boundary.</p>
+<p><strong>Fix.</strong> Put both layers on event time. Cut the speed view at the batch boundary by event time. Publish the boundary with the batch view atomically. Then the only nightly change is the genuine correction.</p>
+
+<h3 id=dd-lambda-and-kappa-fm-batch-stalled level=3>2. The overwrite that stopped happening</h3>
+<p><strong>Symptom.</strong> A speed-layer bug from two weeks ago is still visible on the dashboard. Everyone assumed the nightly batch would have erased it.</p>
+<p><strong>Mechanism.</strong> The batch job has failed every night for twelve days on a schema change in one input table. The serving layer kept stitching from an ever older batch boundary, and the speed layer filled the rest, bug included. Nothing looked broken, because the serving layer is designed to hide which layer an answer came from. The Lambda safety net was gone, and nothing said so.</p>
+<p><strong>Detect.</strong> Alert on <strong>batch boundary age</strong>: now minus the boundary of the newest published batch view. It should never exceed one batch cycle plus the runtime. Show the boundary on the dashboard itself ("settled through Nov 19").</p>
+<p><strong>Fix.</strong> Treat the batch layer as production: on-call, an SLO on boundary age, and schema checks that fail loudly. Size speed-layer retention for several missed runs, as in the sizing section, so that a stalled batch degrades rather than corrupts.</p>
+
+<h3 id=dd-lambda-and-kappa-fm-replay-starves level=3>3. The replay that slowed checkout</h3>
+<p><strong>Symptom.</strong> An engineer starts a 90-day Kappa replay at 14:00. By 14:10, live consumers on the same cluster show rising lag, and the order-confirmation service's p99 latency doubles.</p>
+<p><strong>Mechanism.</strong> The replay reads old segments as fast as the brokers can serve them. On brokers without tiered storage, those reads come from disk and push recent data out of the page cache. Live consumers, which normally read from memory, now hit disk too. With tiered storage, the broker spends its network and threads fetching from object storage. Either way, the replay competes with live traffic for the same brokers.</p>
+<p><strong>Detect.</strong> Broker fetch request latency and remote-fetch metrics. Live consumer lag rising at the same moment a new consumer group appears with a large lag. Disk read throughput on brokers jumping.</p>
+<p><strong>Fix.</strong> Put a byte-rate <strong>quota</strong> on the replay's client ID, so it cannot take more than a set share of broker bandwidth. Run large replays off-peak. Better still, replay from a copy: a lakehouse table built from the topic, or a separate cluster mirrored for analytics, so the operational cluster never sees the replay at all.</p>
+
+<h3 id=dd-lambda-and-kappa-fm-retention level=3>4. The replay that could not go back far enough</h3>
+<p><strong>Symptom.</strong> A bug in the revenue logic has been live since early August. In November, the team plans a Kappa replay and discovers the orders topic holds only 30 days.</p>
+<p><strong>Mechanism.</strong> Someone set retention to 7 days when the topic was created, then raised it to 30 days during a disk-space review. Or the topic was switched to compaction to save space, keeping only the latest record per order. Kappa's recovery plan existed in the architecture document and nowhere in the topic configuration.</p>
+<p><strong>Detect.</strong> Monitor the timestamp of the earliest available offset per topic, and alert when it is newer than the declared reprocessing horizon. Audit <code>cleanup.policy</code> on topics that are meant to be a master dataset.</p>
+<p><strong>Fix.</strong> Write the horizon down as a requirement per topic and enforce it in configuration management, not by hand. Archive to object storage, via tiered storage or a sink job into a lakehouse table, so history outlives broker configuration mistakes. For this incident: rebuild the older months from whatever raw source still exists, often the database itself or warehouse snapshots, and replay the log for the recent part.</p>
+
+<h3 id=dd-lambda-and-kappa-fm-nondeterministic level=3>5. v2 disagrees with v1 on metrics nobody changed</h3>
+<p><strong>Symptom.</strong> A replay meant to fix the discount rule also changes revenue for orders with no discount. The comparison step shows thousands of small differences in "unchanged" metrics.</p>
+<p><strong>Mechanism.</strong> The job converts order amounts to USD by joining with a rates table, using the <em>current</em> rate. v1 computed each day with that day's rates. v2, replaying in an hour, used today's rates for everything. Other common causes: a processing-time window somewhere in the job, a lookup of the customer's current country, or a library upgrade that changed rounding.</p>
+<p><strong>Detect.</strong> That is exactly what the comparison step is for. Compare per metric and per period, and expect differences only in the metrics the change touched. Any other difference stops the switch.</p>
+<p><strong>Fix.</strong> Make the job a function of the log only. Join with versioned data on event time (a temporal join against a rates changelog), or record the rate on the event when it is produced. Remove processing-time logic. Pin library versions across v1 and v2 unless the upgrade is the intended change.</p>
+
+<h3 id=dd-lambda-and-kappa-fm-restatement level=3>6. The finance export that counted the replay twice</h3>
+<p><strong>Symptom.</strong> After a successful v2 switch, the finance ledger shows October revenue at almost twice the real figure.</p>
+<p><strong>Mechanism.</strong> An export job reads new rows from the revenue output and appends them to the ledger. When v2 took over, its output contained every period again. The export treated restated October rows as new rows and appended them. The same failure happens in Lambda when a nightly overwrite is published as new rows instead of replacements.</p>
+<p><strong>Detect.</strong> Ledger totals compared to the source of truth per period. A sudden jump in rows exported right after a switch or a batch publication.</p>
+<p><strong>Fix.</strong> Make every consumer's handling of restatements explicit. Upsert on <code>(metric, period)</code> instead of appending. Or have the output publish a corrections feed, or give each restatement a version number that downstream jobs compare. Add downstream owners to the switch checklist, so they know a restatement is coming.</p>
+
+<h3 id=dd-lambda-and-kappa-fm-shared-drift level=3>7. Shared definitions that drifted anyway</h3>
+<p><strong>Symptom.</strong> The team moved to one shared metric library for the warehouse and streaming jobs. Six months later, the gap between them is back.</p>
+<p><strong>Mechanism.</strong> The two jobs pin different versions of the library, because they deploy on separate schedules. Even at the same version, the engines differ. The warehouse truncates dates in UTC, and the streaming job in the server's local time zone. One engine's <code>SUM</code> ignores NULLs, and a hand-written streaming aggregate treats NULL as zero, which happens to be the same; its <code>AVG</code> does not behave the same. "One logic source" held for the code, and failed for its execution.</p>
+<p><strong>Detect.</strong> A daily per-metric reconciliation with a threshold derived as in the sizing section. Record which library version produced each output.</p>
+<p><strong>Fix.</strong> Golden tests: a fixed set of tricky input events (late, NULL, near midnight, multi-currency) run through <em>both</em> engines in CI, with results compared to expected outputs. Deploy the library to both jobs together. Set time zones explicitly in the definitions.</p>
+
+<h2 id=dd-lambda-and-kappa-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-lambda-and-kappa-choose-architecture level=3>Five real options</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th>Full Lambda<th>Kappa on the log<th>Kappa on a lakehouse table<th>Unified engine, two modes<th>Dual path, shared definitions<tbody><tr><td>Master dataset<td>Raw files in object storage<td>Retained topic (tiered)<td>Streaming-written table<td>Topic for live, table or files for history<td>Topic for live, warehouse for history<tr><td>Logic copies<td>Two<td>One<td>One (often SQL)<td>One program<td>One definition, two engines<tr><td>Who triggers correction<td>The schedule<td>A person (replay)<td>A person or a scheduled backfill<td>Either<td>A scheduled backfill<tr><td>Reprocessing cost<td>Nightly batch<td>Broker read throughput<td>Columnar batch scan<td>Batch mode run<td>Warehouse query<tr><td>Main risk<td>Drift; boundary bugs<td>Retention and replay load<td>Table maintenance; small files<td>Engine limits in one mode<td>Engine differences<tr><td>Good fit<td>Strict correctness, small metric count, a team for both<td>Log-native teams, modest volume<td>High-volume telemetry, long history<td>Teams on Flink, Beam or Spark already<td>Warehouse-centric companies</table></div></div>
+<p>A practical decision order:</p>
+<ol>
+<li><strong>How far back must you recompute, and how many bytes is that?</strong> If the answer is "months of a high-volume stream", replaying a broker is the wrong tool. Keep history in a table.</li>
+<li><strong>Where does the company's analysis already happen?</strong> If finance lives in the warehouse, the warehouse will stay authoritative. Choose the dual path with shared definitions and make the streaming side clearly operational.</li>
+<li><strong>Can you test the logic in both modes?</strong> If yes, a unified engine or shared definitions keeps one source of logic. If not, you have two codebases whatever the diagram says, so add Lambda's scheduled overwrite to bound the damage.</li>
+</ol>
+
+<h3 id=dd-lambda-and-kappa-choose-restatement level=3>Choosing how corrections reach readers</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach<th>Reader effort<th>Audit trail<th>Rollback<th>Watch out for<tbody><tr><td>Upsert in place by (metric, period)<td>None for re-querying readers<td>Lost unless logged<td>Hard<td>Incremental consumers miss changes<tr><td>Versioned output + alias swap<td>None; alias moves<td>Full: old versions remain<td>Move the alias back<td>Storage; clean-up of old versions<tr><td>Corrections feed (deltas)<td>Must apply deltas<td>Full<td>Apply reverse deltas<td>Every consumer must implement it<tr><td>Snapshot pinning (table formats)<td>Readers pin or follow latest<td>Full, by snapshot ID<td>Time travel<td>Snapshot expiry breaks old pins</table></div></div>
+<p>For most teams: versioned outputs with an alias for Kappa switches, upserts for Lambda's nightly overwrite, and a corrections feed only for consumers that must keep their own copy, such as a ledger.</p>
+
+<h3 id=dd-lambda-and-kappa-choose-authority level=3>Deciding which output is authoritative</h3>
+<p>The lesson's invariant is one definition, one logic source and one owner per metric. In practice there is a fourth item: <strong>one authoritative output per use</strong>. The dashboard may legitimately show provisional numbers, while finance must read settled ones. Write it down as a table in the metric catalogue: metric, definition, owner, the authoritative output for reporting, and the provisional output for operations. When the two disagree beyond the tolerance, the owner is paged, not a meeting called.</p>
+
+<h2 id=dd-lambda-and-kappa-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the master dataset, where does it live, and is it complete (including late events), immutable and stamped with event time?</li>
+<li>What is the reprocessing horizon, and do the topic's retention and cleanup policy actually meet it? Who would notice if they changed?</li>
+<li>How many bytes is a full-horizon replay, how long does it take at a stated throughput, and where does the replay read from?</li>
+<li>How is a replay kept from hurting live consumers: quotas, off-peak scheduling, or a separate copy?</li>
+<li>Is the logic a pure function of the log? Are enrichment joins versioned by event time, and is there any processing-time logic?</li>
+<li>For Lambda: what is the batch boundary, are both layers on event time, and is the boundary published atomically with the batch view?</li>
+<li>For Lambda: how long does the speed layer keep results, and does that survive two failed batch runs? Is boundary age alerted on?</li>
+<li>How do restatements reach each downstream consumer, and which consumers are incremental?</li>
+<li>For each metric: who owns it, where is its one definition, and which output is authoritative for which use?</li>
+<li>What gap between provisional and settled numbers is expected from the watermark and deploy gaps, and what threshold pages someone?</li>
+<li>If logic is shared across engines, what golden tests run both engines on the same tricky inputs, and are versions deployed together?</li>
+<li>When was the last replay or backfill actually run end to end? A recovery path that has never been exercised is a hope, not a plan.</li>
+</ol>
+
+<h2 id=dd-lambda-and-kappa-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"In Lambda, how exactly does the serving layer avoid double counting at the boundary?"</summary>
+<p>It keeps a single boundary timestamp, in event time, that marks how far the newest published batch view is complete. Reads take the batch view before the boundary and the speed view from the boundary on, and both views are bucketed by event time. The batch view and the boundary are published in one atomic step, such as a table commit or a view swap. The speed layer keeps its results until a published batch view covers them. If either layer uses processing time, events near the boundary get counted twice or missed.</p>
+</details>
+
+<details>
+<summary>"Why can't you run Kappa on a compacted topic?"</summary>
+<p>Compaction keeps only the latest record per key. That is ideal for state, such as the current version of each product. Reprocessing needs every event: all the order updates, so that a revenue rule can be applied to each one as it happened. After compaction, the intermediate events are gone, and a replay computes from final states only. Kappa needs <code>cleanup.policy=delete</code> with retention at least as long as the reprocessing horizon. A compacted topic can still be useful <em>alongside</em> the event topic, as a fast way to bootstrap current state.</p>
+</details>
+
+<details>
+<summary>"Your replay of last month gave different results for metrics you did not change. What are the likely causes?"</summary>
+<p>Something in the job depends on when it runs rather than on the events. The common ones: an enrichment join against current data (today's exchange rate, the customer's current region), processing-time windows or <code>now()</code> calls, and library or engine version differences in rounding or time zones. The fix is to make the job a pure function of the log: temporal joins by event time against versioned reference data, event-time windows only, and pinned versions. The comparison step should block the switch until every difference is explained.</p>
+</details>
+
+<details>
+<summary>"Clickstream is 100 MB/s at peak and you need 90 days of reprocessing. Kappa or not?"</summary>
+<p>Not Kappa on the broker. 90 days is roughly 300 TB at a 40 MB/s daily average. Keeping that on brokers is expensive, and replaying it at even 2 GB/s takes about two days and heavy cluster load. I would have the streaming job write the raw events into a lakehouse table. Live processing reads the topic; reprocessing runs the same logic in batch mode over the table, reading only the needed columns. That keeps one logic source, Kappa's goal, without making the broker the archive.</p>
+</details>
+
+<details>
+<summary>"The dashboard and the finance report differ by 0.3%. Is that a bug?"</summary>
+<p>Not necessarily. Compute the expected gap first. If the streaming watermark covers p99 lateness and the dashboard drops late events, it can undercount by up to about 1% of events. A one-minute deploy gap is another 0.07% of a day. So 0.3% in the expected direction is the design working. A gap above the derived threshold, a gap in the wrong direction, or a gap that grows each day is drift, and should page the metric's owner.</p>
+</details>
+
+<details>
+<summary>"Why would you keep a nightly batch in a Kappa design?"</summary>
+<p>Because in Kappa, correction needs someone to decide to replay. A scheduled backfill, recomputing the last few days every night from the same log or table with the same code, bounds the lifetime of any error without a human noticing it first. It also catches late events beyond the watermark and gives finance a settled cutoff. It is Lambda's best idea, the overwrite, without Lambda's worst one, the second codebase.</p>
+</details>
+
+<details>
+<summary>"How do you move readers from v1 to v2 safely?"</summary>
+<p>v2 writes to its own output, never v1's. When v2 has caught up, I compare outputs per metric and per period, expecting differences only where the change should cause them. Then I move readers with one switch: a view, an alias or a config flag. I keep v1 running or its output retained for a rollback window. Before switching, I check which downstream consumers are incremental, since they will see a restatement of history, and either rebuild them or give them a corrections feed.</p>
+</details>
+
+<details>
+<summary>"A team says they share one SQL definition between Spark batch and Flink streaming, so drift is impossible. What do you ask?"</summary>
+<p>Three things. Are both jobs deployed with the same version of the definitions at the same time? Do golden tests run both engines on the same tricky inputs, covering NULLs, late events, events near midnight and time zones, and compare the outputs? And how do the two engines treat late data: does the streaming job drop events the batch includes? Shared text is not shared behaviour. Without tests across both engines, they have two implementations that happen to look alike.</p>
+</details>

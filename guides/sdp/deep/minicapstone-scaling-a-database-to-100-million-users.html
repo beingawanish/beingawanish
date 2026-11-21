@@ -1,0 +1,205 @@
+<h2 id=dd-minicapstone-scaling-a-database-to-100-million-users-capacity level=2>Deep Dive: The Capacity Plan at 100 Million Users</h2>
+<p>The capstone tells the story one limit at a time. A review panel looks at the end state and asks a blunter question: how many machines, of what size, and why that many? This section builds the plan from stated assumptions, so you can change any one of them and redo the math.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-assumptions level=3>Assumptions</h3>
+<ul>
+<li><strong>Users:</strong> 100 million registered, 10 million active on a given day.</li>
+<li><strong>Writes:</strong> Stage 2 had 2,500 writes per second at 5 million users. Growth in writes is usually slower than growth in users, because later users are less active than early adopters. Assume 30,000 writes per second at the evening peak, not the 50,000 that straight-line scaling would give.</li>
+<li><strong>Reads:</strong> still 96% of traffic, so about 24 reads per write: roughly 720,000 reads per second at peak. Caches and the CDN absorb most of the product-page traffic. Assume 200,000 reads per second actually reach a database or a read model.</li>
+<li><strong>Orders:</strong> 3 million a day, 12 events each at about 300 bytes (the event sourcing lesson's numbers). Customers average 15 orders over their lifetime: 1.5 billion orders in total.</li>
+<li><strong>Write-side data:</strong> about 20 TB including indexes, after CQRS removed the read-only indexes and moved search and analytics out.</li>
+</ul>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-shard-count level=3>How many shards</h3>
+<p>Set a budget per shard primary, then divide. Two limits matter, and the larger result wins.</p>
+<ul>
+<li><strong>Write rate.</strong> The Stage 2 primary saturated at 2,500 writes per second on the biggest machine available, with 14 indexes. With 3 indexes it can do far more. Still, plan each shard for no more than 1,000 writes per second at peak. That leaves room for a hot customer, a backfill, and a failover onto a replica that is a little behind. 30,000 / 1,000 = 30 shards.</li>
+<li><strong>Data size.</strong> Keep each shard near 500 GB, so its hot indexes fit in memory and a replica can be rebuilt in under an hour. 20 TB / 500 GB = 40 shards.</li>
+</ul>
+<p>Size wins: 40. Add 20% headroom for growth between resizes and you get <strong>48 shards</strong>. Each is a primary with two replicas, so 144 database machines. With about 150 virtual nodes per shard, the ring has about 7,200 points. Losing one shard spreads its load in small slices across the other 47, which is the point of virtual nodes.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-reads level=3>Read capacity</h3>
+<p>Of the 200,000 database-bound reads per second, assume half go to CQRS read models (the orders page, search, dashboards) and half to shard replicas (profiles, carts, addresses). That puts 100,000 reads per second across 96 replicas: about 1,050 each. Comfortable. It also means a replica can absorb its partner's load during a rebuild, which you want to be true before the drill, not during it.</p>
+<p>The orders page projection serves 1.5 billion orders. At about 600 bytes a row with indexes, that is roughly 900 GB. It is too big for one comfortable machine and too read-heavy for one primary, so it is itself sharded by <code>customer_id</code>, using the same ring. The patterns stack again: a CQRS read model that is sharded and replicated.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-wal level=3>WAL, backups and recovery time</h3>
+<ul>
+<li><strong>WAL rate per shard.</strong> 30,000 writes per second across 48 shards is 625 per shard at peak. Assume about 3 KB of WAL per write (the row, 3 index entries, and full-page images after each checkpoint). That is about 1.9 MB/s at peak. If the daily average is 40% of peak, that is about 65 GB of WAL per shard per day.</li>
+<li><strong>PITR retention.</strong> Seven days of WAL is about 450 GB per shard before compression, plus a weekly base backup of about 500 GB. Across 48 shards that is roughly 45 TB of backup storage. This number belongs in the budget, and someone has to own its expiry.</li>
+<li><strong>Recovery time.</strong> PITR restores a base backup, then replays WAL. If the base backup is 6 days old and replay runs at, say, 50 MB/s, six days of WAL (about 390 GB) takes over 2 hours to replay, on top of the restore. Daily base backups cut that to about 20 minutes. Backup frequency is a recovery-time decision, not a storage decision.</li>
+<li><strong>Replica rebuild.</strong> Copying 500 GB at 200 MB/s takes about 42 minutes. During that time the shard runs with one replica, so the next failure is more dangerous. That is one more reason the 500 GB budget matters.</li>
+</ul>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-es-cdc level=3>The event store and the change streams</h3>
+<p>Event sourcing sounds expensive at this scale. The append rate says otherwise. 3 million orders × 12 events is 36 million events a day: about 420 per second on average, or about 9 per second per shard. The order streams live on the same shard as the customer, so appends join ordinary transactions.</p>
+<p>The cost is size and rebuilds. 1.5 billion orders × 12 events is 18 billion events. A projector that applies 20,000 events per second per shard, running on all 48 shards in parallel, rebuilds the orders page in about 18 billion / 960,000 ≈ 19,000 s: a bit over 5 hours. On a single worker it would take more than 10 days. The shard key that made writes scale is also what makes rebuilds parallel.</p>
+<p>For CDC there is one connector and one replication slot per shard primary: 48 of each. Raw change volume is about 30,000 events per second, around 30 MB/s into Kafka. Kafka handles that easily. The operational load is 48 slots, each of which can fill its primary's disk if its connector stops.</p>
+
+<h2 id=dd-minicapstone-scaling-a-database-to-100-million-users-seams level=2>Deep Dive: Where the Patterns Meet</h2>
+<p>Each lesson treated its pattern alone. Most production bugs in this architecture live at the seams between two patterns. A reviewer will push on each of these.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-ids level=3>IDs without a global sequence</h3>
+<p>On one machine, <code>BIGSERIAL</code> gave every order a unique, increasing number. With 48 primaries, each would hand out its own 1, 2, 3. Two common answers:</p>
+<ul>
+<li><strong>Time-ordered UUIDs</strong> (UUIDv7): 128 bits, a millisecond timestamp in the high bits, random bits after it. They are unique without coordination, and they sort roughly by time, so index inserts stay near the end of the B-tree instead of scattering across it.</li>
+<li><strong>64-bit Snowflake-style IDs</strong>: timestamp, worker number and a per-worker counter in one integer. Smaller than a UUID, and they need each worker to have a unique number, which is one more thing to assign and protect.</li>
+</ul>
+<p>Then comes the subtle part. Support types in order ID <code>7f3a</code> with no customer attached. Which shard has it? With modulo routing, teams used to embed the shard number in the ID. With a ring that is a trap, because the order moves shards on the next resize and the embedded number becomes a lie. The better options are to embed the customer's hash bucket (stable across resizes, since the ring maps buckets, not machines) or to keep a small global directory from order ID to customer ID.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-unique level=3>Uniqueness across shards</h3>
+<p>"One account per email" was a unique index on one machine. Now customers with different IDs live on different shards, so no single index sees every email. The fix is a second, small dataset sharded by email itself: <code>email → customer_id</code>. Registration claims the email there first (a conditional insert), then creates the customer on their shard, then marks the claim confirmed. A claim that stays unconfirmed for a few minutes is released by a cleanup job. This is the reservation pattern from the event sourcing deep dive, used for the same reason: no transaction spans both places.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-order level=3>No global order, anywhere</h3>
+<p>Each shard's WAL is ordered. There is no order <em>between</em> shards, so the 48 change streams interleave arbitrarily in Kafka. For per-customer read models this does not matter, because everything about one customer comes from one shard. For global read models, it matters a lot. Consider "revenue so far today": shard 9's stream may be five minutes behind the others. The dashboard will happily show a total that is about 2% low, with no error.</p>
+<p>The fix is a <strong>watermark per shard</strong>. Each projector records the latest commit time it has applied from each shard. A global result is only "complete up to T" when every shard's watermark has passed T. The dashboard shows that time, or flags the shards holding it back.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-failover-cdc level=3>Failover and the CDC slot</h3>
+<p>Primary-replica failover and CDC were designed separately, and they collide. A logical replication slot lives on the primary. When a replica is promoted, the slot may not exist there. On older Postgres versions logical slots were not carried to standbys at all, so after every failover the connector had to re-snapshot that shard or risk a gap. Postgres 17 can synchronize logical slots to a standby when configured to. Whatever version you run, the failover runbook must say what happens to CDC, and the drill must test it.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-colocation level=3>Colocation is the shard key's real payoff</h3>
+<p>Choosing <code>customer_id</code> as the shard key put a customer's orders, cart, addresses, order event streams and snapshots on one shard. That one decision keeps checkout a single-machine transaction. It lets an order append and its reservation-table insert commit together. It also makes PITR per shard safe, because no transaction ever needed two shards to agree. Every later pattern got cheaper because Stage 2 picked the key carefully. Most "we need distributed transactions" conversations are really "our shard key does not match our transactions."</p>
+
+<h2 id=dd-minicapstone-scaling-a-database-to-100-million-users-resharding level=2>Deep Dive: Resharding Without Downtime</h2>
+<p>Consistent hashing reduces <em>how much</em> data moves. It says nothing about <em>how</em> to move it while 625 writes per second keep landing on each shard. Here is the procedure for adding shard 49.</p>
+<ol>
+<li><strong>Plan the ranges.</strong> Add shard 49's virtual nodes to a <em>proposed</em> ring. List the ring ranges whose owner changes: about 1/49 of the keyspace, roughly 410 GB, taken in small slices from many existing shards.</li>
+<li><strong>Copy.</strong> For each range, take a consistent snapshot of its rows on the old owner and load them into shard 49. Throttle the whole move to about 50 MB/s so production latency does not move. At that rate 410 GB takes a little over 2 hours.</li>
+<li><strong>Catch up.</strong> Stream changes for those key ranges from the old owners' WAL into shard 49 until the lag is a second or less.</li>
+<li><strong>Cut over, one range at a time.</strong> Briefly block writes to that range on the old owner (typically well under a second). Wait for the last changes to arrive. Then publish the new ring with a higher <strong>epoch number</strong>.</li>
+<li><strong>Fence the old owner.</strong> Every write carries the epoch its router used. A shard rejects writes for a key it no longer owns, or with an old epoch. Routers with stale caches get an error telling them to refresh, rather than silently writing to the wrong place.</li>
+<li><strong>Verify, then clean up.</strong> Compare row counts and checksums per range on both sides. Keep the old copies for a day as a rollback, then delete them.</li>
+</ol>
+<p>Steps 4 and 5 are where real incidents happen (see Drill 5). Ring math is easy. Making sure exactly one machine accepts writes for each key at every moment is the hard part, and it is the same fencing problem as primary failover, one level up.</p>
+
+<h2 id=dd-minicapstone-scaling-a-database-to-100-million-users-drills level=2>Deep Dive: Failure Drills</h2>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-drill1 level=3>Drill 1: A shard primary dies at the evening peak</h3>
+<p>Shard 17's primary loses its disk at 20:30. Replication is asynchronous, and the best replica is 200 ms behind. At 625 writes per second, about 125 acknowledged writes exist only on the dead machine. Some are orders.</p>
+<ul>
+<li><strong>What happens:</strong> the failover manager confirms the primary is gone, fences it (cuts its network or revokes its storage, so it cannot come back and accept writes), and promotes the most up-to-date replica. About 2% of customers see errors for 10–30 seconds.</li>
+<li><strong>What the drill exposes:</strong> the 125 writes. For carts that is tolerable. For orders and payments it is not.</li>
+<li><strong>The fix:</strong> synchronous replication to at least one replica on the shards that hold orders. In Postgres, <code>synchronous_standby_names = 'ANY 1 (replica_a, replica_b)'</code> makes each commit wait for either replica to confirm. The cost is one network round trip per commit: well under a millisecond within a zone, several milliseconds across zones. Using ANY 1 of two means one slow replica does not stall writes.</li>
+<li><strong>Also check:</strong> the CDC connector for shard 17 resumed without a gap (see the slot seam above), and read models for shard 17's customers caught up.</li>
+</ul>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-drill2 level=3>Drill 2: The hot tenant</h3>
+<p>The capstone's "extend it" question. One enterprise customer is now 8% of all traffic. With 48 shards, an average shard carries about 2%, so this one customer is four shards' worth of load on one shard. Consistent hashing spreads <em>keys</em>. It cannot split a single key.</p>
+<ul>
+<li><strong>What fails first:</strong> the shard primary's write capacity (2,400 writes per second against a 1,000 budget). Then its replicas fall behind applying the same stream. Then every other customer on that shard, about 2 million people, gets slow checkouts. The noisy neighbor is the real incident.</li>
+<li><strong>The fix:</strong> a <strong>routing override</strong> checked before the ring. That tenant moves to its own group of shards, with a compound key inside it, such as <code>(tenant_id, store_id)</code> or <code>(tenant_id, order_id)</code>. Everyone else stays on the ring. The trade-off is that the tenant's cross-store queries become scatter-gather over its own shards, which is acceptable because they are a few large queries, not millions of small ones.</li>
+<li><strong>Detect it early:</strong> traffic share per customer, with an alert well before 8% (say at 2%, one average shard). The move is far easier when planned.</li>
+</ul>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-drill3 level=3>Drill 3: A bad deploy corrupts data on every shard</h3>
+<p>The Stage 4 incident again, at 48× the size. A deploy at 14:00 writes wrong totals for two hours, on all shards.</p>
+<ul>
+<li><strong>The Stage 4 answer, scaled:</strong> PITR each shard to 13:59, then re-apply legitimate changes from the window. Because no transaction spans shards, restoring each shard to its own 13:59 is consistent enough. That is the colocation payoff again. It is still 48 restores, 48 sets of WAL replay, and a lot of hand-repair.</li>
+<li><strong>The better answer since Stage 5:</strong> the orders are event-sourced. The events record what customers did, and only the computed totals are wrong. Do not restore anything. Fix the code, query the event log for affected orders, append <code>OrderTotalCorrected</code> compensating events, and rebuild the affected projections. Nothing is lost, and the audit trail shows exactly what happened.</li>
+<li><strong>Lesson for the review:</strong> PITR remains the tool for the plain tables (carts, profiles). For event-sourced domains, corruption of derived values is a rebuild, not a restore. Make sure the runbook says which tool applies to which data.</li>
+</ul>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-drill4 level=3>Drill 4: CDC stops on one shard for six hours</h3>
+<p>Shard 9's connector hangs on a malformed change after a schema migration.</p>
+<ul>
+<li><strong>Effect on users:</strong> about 2% of customers see stale orders pages and stale search. Global dashboards undercount by about 2%, silently, unless they use per-shard watermarks.</li>
+<li><strong>Effect on the database:</strong> shard 9's slot retains six hours of WAL. At about 1.9 MB/s peak and less off peak, that is roughly 25–40 GB. Survivable, but a weekend at the same rate would not be.</li>
+<li><strong>Detect:</strong> lag per connector and retained WAL per slot. An average across 48 connectors hides one stuck one, so alert on the maximum.</li>
+<li><strong>Fix:</strong> route the bad change to a dead-letter topic and resume, then repair it by hand. Set <code>max_slot_wal_keep_size</code> so the worst case is a re-snapshot of one shard's read models, never a full disk on a primary.</li>
+</ul>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-drill5 level=3>Drill 5: Two owners for one range during a resize</h3>
+<p>During the cutover for shard 49, a few app servers keep the old ring in cache for 30 seconds. They write to the old owner while the rest write to the new one.</p>
+<ul>
+<li><strong>Effect:</strong> some customers' carts and orders split across two shards. Later reads see one half or the other.</li>
+<li><strong>Mechanism:</strong> the old owner accepted writes for a range it had handed off, because nothing told it not to.</li>
+<li><strong>Detect:</strong> writes rejected for wrong epoch (expected and harmless) versus writes <em>accepted</em> by a shard for a range it does not own (must be zero). The second number needs its own counter.</li>
+<li><strong>Fix:</strong> epoch fencing in the database layer, not just in routers. The shard itself checks ownership on every write. If it is enforced only in routers, the drill will eventually find the router that missed the update.</li>
+</ul>
+
+<h2 id=dd-minicapstone-scaling-a-database-to-100-million-users-debates level=2>Deep Dive: The Trade-off Debates a Panel Will Have</h2>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-build-buy level=3>Hand-sharded Postgres or a distributed database?</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Option<th>What you get<th>What you pay<th>Fits when…<tbody>
+<tr><td>Hand-sharded Postgres (this capstone)<td>Full control, familiar tools, single-shard transactions at single-machine speed<td>You build routing, resharding, fencing and cross-shard tooling yourself<td>The shard key matches nearly all transactions, and you have a team to own the platform
+<tr><td>Sharding layer over Postgres or MySQL (Citus, Vitess)<td>Routing, resharding workflows and some cross-shard queries built in<td>Another layer to learn and run; some SQL features restricted or slower across shards<td>You want this capstone's architecture without writing its plumbing
+<tr><td>Distributed SQL (Spanner, CockroachDB, YugabyteDB)<td>Automatic splitting and moving of ranges, cross-shard transactions, SQL<td>Consensus on every write adds latency, especially across regions; costs and failure modes differ from Postgres<td>Transactions genuinely cross entities, or the team cannot own a sharding platform
+</tbody></table></div></div>
+<p>A reasonable opinion: if <code>customer_id</code> really does cover 95% of your transactions, a sharding layer over a database you know is the best balance. Distributed SQL earns its latency cost when cross-entity transactions are central, as in a marketplace where buyer and seller must update together. Rebuilding Vitess in-house is rarely the right answer, though it is what many companies did before those tools matured.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-ring-vs-slots level=3>A ring, or a fixed slot map?</h3>
+<p>The capstone uses a hash ring with virtual nodes, as Cassandra does. Many systems instead hash keys into a fixed number of slots and keep a table from slots to machines. Redis Cluster uses 16,384 slots. A team might choose 4,096 for its own shards.</p>
+<p>Both move about 1/N of the data on a resize. The slot map is easier to reason about: a slot is a named unit you can move, pause and verify, and the routing table is a small, explicit document. The ring needs no table and spreads load well with enough virtual nodes, but "which keys move?" is computed rather than written down. For a database you move by hand, many teams prefer slots for their operational clarity. Either is a sound answer in an interview, as long as you can explain the movement and the fencing.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-sync-async level=3>Synchronous or asynchronous replication?</h3>
+<p>Drill 1 forces this one. Asynchronous replication loses the last few hundred milliseconds of writes on a failover. Synchronous adds a round trip to every commit and can stall writes if replicas are unhealthy. The mature answer is per data class. Use synchronous ANY 1 of two for orders and payments. Asynchronous is fine for carts, sessions and anything you can rebuild. Write the expected data loss on failover (the RPO) for each class into the design doc, so it is a decision rather than a surprise.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-scope level=3>How much should be event-sourced?</h3>
+<p>Someone on every panel will propose moving profiles and the catalog to event streams "for consistency." The capstone's line is right: orders and payments are ledgers, everything else is current state. At this scale the cost of extending it is concrete: more storage, more projections to rebuild in a 5-hour window, more upcasters to maintain forever. CDC already gives a full change history of the plain tables for analytics. Push back unless someone can name the dispute or audit the history would settle.</p>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-multiregion level=3>Going multi-region</h3>
+<p>The second "extend it" question. The patterns extend unevenly:</p>
+<ul>
+<li><strong>Give every customer a home region.</strong> EU customers live on shards physically in the EU. The routing key becomes <code>(region, customer_id)</code>: a directory maps each customer to a region, and each region has its own ring. This also answers the regulator.</li>
+<li><strong>Writes go to the home region.</strong> A European customer traveling in the US writes across the ocean, adding perhaps 80–150 ms. That is acceptable for checkout. Multi-primary writes for the same customer in two regions would need conflict resolution, which is a different course module and rarely worth it for orders.</li>
+<li><strong>Reads can be local.</strong> Cross-region replicas of non-regulated data, and CQRS read models built in each region from the change streams, serve local reads with seconds of lag. Read-your-writes now spans regions, and the position-token approach still works.</li>
+<li><strong>The global directory</strong> (email to customer, customer to region) is the one dataset every region needs. It is small, read-mostly, and a good candidate for a distributed SQL store or a carefully replicated table.</li>
+</ul>
+
+<h3 id=dd-minicapstone-scaling-a-database-to-100-million-users-vector level=3>The semantic search read model</h3>
+<p>The third "extend it" question has a short, satisfying answer. The vector index is one more CQRS projection. It is fed from the order event streams and the complaint text via the same change stream. A projector embeds each new document and upserts the vector with a version guard. When the embedding model changes, every vector is wrong at once. The rebuild routine from the CQRS deep dive applies directly: build <code>complaints_v2</code> beside the live index from position 0, verify on a sample of queries, swap the alias. Because the index is disposable, changing models is a rebuild job, not a migration. The cost to watch is embedding throughput, not database throughput: re-embedding hundreds of millions of documents can take days and cost real money, so measure it before you promise a quarterly model upgrade.</p>
+
+<h2 id=dd-minicapstone-scaling-a-database-to-100-million-users-evolution level=2>Deep Dive: The Evolution Path, With Hindsight</h2>
+<p>The capstone's order of limits is realistic. What a senior engineer adds is a list of cheap things to do <em>early</em>, so each later stage is smaller:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Do this at<th>Cheap step<th>What it saves later<tbody>
+<tr><td>Day one<td>Put <code>customer_id</code> on every customer-owned table and in every query's <code>WHERE</code><td>Stage 2 becomes a data move, not a rewrite of every query
+<tr><td>Day one<td>Use UUIDv7 or another coordination-free ID instead of a sequence<td>No ID migration when sharding begins
+<tr><td>Stage 1<td>Rehearse failover quarterly; write down the RPO per data class<td>Drill 1 is a routine event, not a first-time adventure
+<tr><td>Stage 1<td>Write events to an outbox table, even with no consumer yet<td>Stage 6 has a contract-based change stream ready
+<tr><td>Stage 2<td>Use many logical shards (slots or virtual nodes) from the start, even on 4 machines<td>Stage 3 never happens as an incident; a resize is moving slots
+<tr><td>Stage 2<td>Track traffic share per customer<td>The hot tenant is spotted at 2%, not at 8%
+<tr><td>Stage 4<td>Test a PITR restore monthly, timed, on a real shard<td>Recovery time is known, not hoped
+<tr><td>Stage 6<td>Reconciliation jobs and per-shard watermarks for every read model<td>Silent drift and silent undercounts are caught in hours, not weeks
+</tbody></table></div></div>
+<p>The rule from the debrief still holds: add a pattern only when a measured limit demands it. These early steps are not patterns. They are habits that cost an afternoon each and keep the patterns cheap when their day comes. The one most worth stealing is logical shards from the start. Stage 3's weekend migration exists only because Stage 2 chose <code>% 4</code>.</p>
+
+<h2 id=dd-minicapstone-scaling-a-database-to-100-million-users-review level=2>Deep Dive: Design-Review Questions</h2>
+<ol>
+<li>What are the per-shard budgets for writes and data size, and which one sets the shard count today?</li>
+<li>What fraction of transactions touch more than one shard? List them and say how each is handled.</li>
+<li>How are IDs generated, and how do you find an order's shard from its ID alone after a resize?</li>
+<li>How is global uniqueness (email, username) enforced across shards?</li>
+<li>What is the expected data loss on a primary failure for orders, payments and carts? Which shards use synchronous replication?</li>
+<li>What happens to each shard's CDC slot when its primary fails over? When was that last tested?</li>
+<li>How is a resize fenced, so exactly one shard accepts writes for each key at every moment? Is ownership checked in the database or only in the routers?</li>
+<li>How are hot tenants detected, and what is the override path before one becomes 8% of traffic?</li>
+<li>How do global read models know they are complete up to a time T across all 48 shards?</li>
+<li>Which data is recovered by PITR, and which by compensating events and rebuilds? What is the measured time for each?</li>
+<li>How long does the largest projection take to rebuild, in parallel, and from where does it read?</li>
+<li>What is the multi-region plan for regulated data, and where does the global directory live?</li>
+</ol>
+
+<h2 id=dd-minicapstone-scaling-a-database-to-100-million-users-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Why 48 shards and not 30?"</summary>
+<p>Two budgets per shard: about 1,000 peak writes per second and about 500 GB of data. Writes alone need 30 shards. Size needs 40, because 20 TB at 500 GB each is 40. Size wins, and 20% headroom gives 48. The size budget exists because of recovery: a 500 GB replica rebuilds in under an hour, and a 2 TB one would leave the shard with one replica for most of a day.</p>
+</details>
+<details>
+<summary>"A query needs orders across all customers. Where does it run?"</summary>
+<p>Not on the shards, unless it is rare and small. Scatter-gather over 48 primaries puts 48 machines' worth of load on one report and is as slow as the slowest shard. Global queries go to a CQRS read model or the warehouse, fed by all 48 change streams, with per-shard watermarks so the result says how complete it is.</p>
+</details>
+<details>
+<summary>"Consistent hashing means a resize moves only 1/N of the data. So resizing is easy?"</summary>
+<p>It is smaller, not easy. You still have to copy the moving ranges under live traffic, stream their changes until caught up, cut over each range with a brief write block, and fence the old owner with an epoch so stale routers cannot write there. The data volume problem is solved by the ring. The correctness problem, one owner per key at every moment, is solved by fencing, and that is where resize incidents come from.</p>
+</details>
+<details>
+<summary>"A bad deploy corrupted order totals on every shard. Do you run PITR on 48 shards?"</summary>
+<p>For event-sourced orders, no. The events record what customers did, and only the derived totals are wrong. Fix the code, append compensating events for affected orders, and rebuild the projections, losing nothing. PITR stays the tool for plain tables like carts. It is safe per shard, because the shard key keeps every transaction on one shard, so each shard can be restored to its own 13:59 without breaking a cross-shard invariant.</p>
+</details>
+<details>
+<summary>"Your biggest customer is 8% of traffic. Why can't the ring fix that?"</summary>
+<p>The ring spreads keys, and this is one key. Every request for that customer hashes to the same place, so one shard carries four shards' worth of load, and the 2 million other customers on it suffer. The fix is a routing override checked before the ring: give the tenant its own shard group and a compound key inside it, such as <code>(tenant_id, store_id)</code>. Alert on per-customer share long before it reaches one shard's worth.</p>
+</details>
+<details>
+<summary>"If you started over, what would you do differently on day one?"</summary>
+<p>Put the shard key on every table and in every query, use coordination-free IDs, write an outbox from the first event, and choose many logical shards even while running on one machine. None of these is a pattern you need yet. Each one turns a later stage from a rewrite into a data move, and the last one removes Stage 3's incident entirely.</p>
+</details>

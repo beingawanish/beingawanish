@@ -1,0 +1,236 @@
+<h2 id=dd-sharding-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's design has three parts: a shard key, a routing rule and something that does the routing. A real sharded system needs four more things the diagram leaves out. It needs a layer between keys and machines so data can move. It needs a way to find rows by something other than the shard key. It needs IDs that are unique without a single counter. And it needs a way to move data while the system runs. Every mature sharded database has an answer for each, and the answers are surprisingly similar.</p>
+
+<h3 id=dd-sharding-logical-shards level=3>Logical shards: the layer that makes moving possible</h3>
+<p>The lesson routes with <code>hash(customer_id) % 4</code>, so the formula names a machine. Almost no production system does that. Instead, they hash keys into a large, fixed number of <strong>logical shards</strong> (also called buckets, partitions, chunks, vshards or slots), and keep a small map from logical shards to physical machines.</p>
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-sharding-svg-title dd-sharding-svg-desc" viewBox="0 0 720 260" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-sharding-svg-title">Two-step routing through logical shards</title>
+<desc id="dd-sharding-svg-desc">A customer ID is hashed. The hash modulo 4,096 gives a logical shard number, which never changes. A small directory maps ranges of logical shards to physical hosts: 0 to 1,023 on host A, 1,024 to 2,047 on host B, 2,048 to 3,071 on host C, and 3,072 to 4,095 on host D. Resharding moves whole logical shards between hosts and updates only the directory.</desc>
+<defs><marker id="dd-sharding-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="260" fill="#ffffff"/>
+<rect x="20" y="70" width="130" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="85" y="96" font-size="14" fill="#1c2430" text-anchor="middle">customer_id</text>
+<text x="85" y="116" font-size="12" fill="#5c6b7c" text-anchor="middle">8412</text>
+<rect x="190" y="70" width="160" height="60" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="270" y="96" font-size="14" fill="#1c2430" text-anchor="middle">hash % 4096</text>
+<text x="270" y="116" font-size="12" fill="#5c6b7c" text-anchor="middle">logical shard 1377</text>
+<line x1="150" y1="100" x2="186" y2="100" stroke="#1c2430" marker-end="url(#dd-sharding-arrow)"/>
+<rect x="390" y="30" width="170" height="160" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="475" y="54" font-size="14" fill="#1c2430" text-anchor="middle">Directory</text>
+<text x="405" y="84" font-size="12" fill="#1c2430">0–1023 → A</text>
+<text x="405" y="110" font-size="12" fill="#1c2430" font-weight="bold">1024–2047 → B</text>
+<text x="405" y="136" font-size="12" fill="#1c2430">2048–3071 → C</text>
+<text x="405" y="162" font-size="12" fill="#1c2430">3072–4095 → D</text>
+<line x1="350" y1="100" x2="386" y2="100" stroke="#1c2430" marker-end="url(#dd-sharding-arrow)"/>
+<rect x="610" y="20" width="90" height="34" rx="6" fill="#ffffff" stroke="#7ea4c8"/>
+<text x="655" y="42" font-size="13" fill="#1c2430" text-anchor="middle">Host A</text>
+<rect x="610" y="66" width="90" height="34" rx="6" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="655" y="88" font-size="13" fill="#1c2430" text-anchor="middle">Host B</text>
+<rect x="610" y="112" width="90" height="34" rx="6" fill="#ffffff" stroke="#7ea4c8"/>
+<text x="655" y="134" font-size="13" fill="#1c2430" text-anchor="middle">Host C</text>
+<rect x="610" y="158" width="90" height="34" rx="6" fill="#ffffff" stroke="#7ea4c8"/>
+<text x="655" y="180" font-size="13" fill="#1c2430" text-anchor="middle">Host D</text>
+<line x1="560" y1="106" x2="606" y2="86" stroke="#1c2430" marker-end="url(#dd-sharding-arrow)"/>
+<text x="360" y="232" font-size="12" fill="#5c6b7c" text-anchor="middle">Step 1 never changes. Resharding edits only step 2: move logical shards, update the directory.</text>
+</svg>
+<figcaption>Two-step routing. The hash picks a logical shard forever; the directory says where that logical shard lives today.</figcaption>
+</figure>
+<p>This one idea removes most of the resharding pain from the lesson. Adding a fifth host means moving some whole logical shards to it and editing a few directory rows. No key's logical shard ever changes, so nothing is re-hashed. It also gives operators a handle for hot spots: a busy logical shard can be moved to a quiet host on its own.</p>
+<p>The real systems all do a version of this:</p>
+<ul>
+<li><strong>Instagram</strong> (as described in its 2012 engineering post) created several thousand logical shards as Postgres schemas spread over far fewer physical servers. Its 64-bit IDs pack 41 bits of milliseconds, 13 bits of logical shard ID and 10 bits of per-shard sequence, so any ID tells you where its row lives.</li>
+<li><strong>Vitess</strong> divides a keyspace by ranges of a hashed key, written as keyranges such as <code>-80</code> and <code>80-</code> (the lower and upper halves of the hash space). The function that maps a column to that hash is a <strong>vindex</strong>. The VTGate proxy routes queries, and the shard map lives in a topology service such as etcd.</li>
+<li><strong>Citus</strong> splits each distributed table into shards (<code>citus.shard_count</code>, 32 by default) placed on worker nodes. Tables sharded on the same column with the same count are <strong>co-located</strong>: shard 7 of <code>orders</code> and shard 7 of <code>order_items</code> sit on the same node, so joins on the key stay local.</li>
+<li><strong>MongoDB</strong> splits a collection into <strong>chunks</strong> of key ranges (128 MB target size since 6.0), and a balancer moves chunks between shards. Config servers hold the map; <code>mongos</code> routers cache it.</li>
+<li><strong>DynamoDB</strong> hides the layer entirely. It splits partitions as they grow and documents limits per partition of about 3,000 read units, 1,000 write units and 10 GB. Your partition key's spread is what lets it split usefully.</li>
+</ul>
+<p>Pick the logical shard count once, and pick it large. It caps how many hosts you can ever spread across, and changing it later is the same painful re-hash you were avoiding. 1,024 to 16,384 is a common range. The cost of too many is small: a larger directory, and per-shard overhead if each logical shard is a real database object like a schema.</p>
+
+<h3 id=dd-sharding-secondary-lookups level=3>Finding rows by something other than the key</h3>
+<p>The store is sharded by <code>customer_id</code>. Then login arrives: "find the customer with this email." The email does not tell you the shard. You have three options.</p>
+<ul>
+<li><strong>Local index, scatter the query.</strong> Each shard indexes email for its own rows. A lookup asks every shard. Correct and simple, but every login now costs N queries.</li>
+<li><strong>Global index as its own sharded table.</strong> Keep a table <code>email → customer_id</code>, sharded by email. A login does two single-shard lookups: email to customer, then customer to data. Vitess calls this a <strong>lookup vindex</strong>, and DynamoDB's global secondary indexes are the managed version. The catch is that the index lives on a different shard from the row, so keeping it consistent is a cross-shard write. DynamoDB updates GSIs asynchronously; Vitess can update lookup tables in the same transaction using its own multi-shard commit. Either way, think about what a stale index entry does.</li>
+<li><strong>Embed the shard in the identifier.</strong> Instagram-style IDs carry the shard, so any ID routes itself. This works for IDs you generate, never for email or phone numbers.</li>
+</ul>
+<p>The same problem appears as <strong>uniqueness</strong>. A <code>UNIQUE (email)</code> constraint on each shard guarantees uniqueness per shard only. Two sign-ups with the same email that hash to different customer IDs land on different shards, and both succeed. Global uniqueness needs the global index table, with the unique constraint on <em>its</em> shard key.</p>
+
+<h3 id=dd-sharding-ids level=3>IDs without one counter</h3>
+<p>An auto-increment column is a single counter on a single machine. Sharded systems need IDs that every shard can mint independently. The usual choices:</p>
+<ul>
+<li><strong>Snowflake-style</strong>: 41 bits of timestamp, 10 bits of machine ID and 12 bits of sequence. IDs sort roughly by time, which keeps B-tree inserts at the right edge of the index and cheap. Machine IDs must be assigned without collision, and a clock that jumps backward can mint duplicates unless the generator refuses to run.</li>
+<li><strong>Shard-embedded</strong>, as at Instagram: the shard bits double as routing.</li>
+<li><strong>UUIDv7</strong>: 128 bits with a timestamp prefix. No coordination at all, and it still sorts by time. Random UUIDv4 keys scatter inserts across the whole index, which costs cache and write amplification on large tables.</li>
+</ul>
+<p>Note the trap: time-ordered IDs are good for index locality but terrible as a <em>range</em> shard key. Every new row has the largest ID, so every insert goes to the last range. Hash them if you shard on them.</p>
+
+<h3 id=dd-sharding-cross-shard-queries level=3>What scatter-gather really does</h3>
+<p>A query without the shard key goes to every shard, and the router merges the answers. Some operations merge cleanly, and some do not:</p>
+<ul>
+<li><strong>Filters, counts and sums</strong> merge exactly: add the per-shard results.</li>
+<li><strong>Averages</strong> merge only if each shard returns sum and count, not its own average.</li>
+<li><strong><code>ORDER BY … LIMIT 10</code></strong> needs the top 10 from each shard, then a merge. Fine for page 1. For page 50 with 20 rows per page, each shard must return its top 1,000 rows, which the router sorts to keep 20.</li>
+<li><strong>Distinct counts and percentiles</strong> do not merge from per-shard answers. You need sketches (HyperLogLog for distinct counts, t-digest for percentiles) or a separate analytics system.</li>
+<li><strong>Joins</strong> work only when both tables are co-located on the join key, or when one side is a small <strong>reference table</strong> copied to every shard (Citus's term; countries, currencies, product categories).</li>
+</ul>
+
+<h3 id=dd-sharding-online-resharding level=3>Moving data while the system runs</h3>
+<p>Every online move, whether Vitess's <code>Reshard</code> workflow, MongoDB's chunk migration or a hand-built one, follows the same five steps:</p>
+<ol>
+<li><strong>Copy</strong> a consistent snapshot of the moving logical shard to the target, throttled to protect production.</li>
+<li><strong>Catch up</strong> by streaming changes from the source's log (binlog, WAL, oplog) that happened after the snapshot. Keep streaming until the target is seconds behind.</li>
+<li><strong>Verify</strong> by comparing row counts and checksums between source and target. Vitess ships <code>VDiff</code> for this.</li>
+<li><strong>Cut over.</strong> Briefly stop writes to that logical shard, let the target apply the last changes, flip the directory, and resume. Done well, writes pause for seconds, and only for keys in the moving shard.</li>
+<li><strong>Keep a way back.</strong> Vitess starts reverse replication from new to old at cutover, so rolling back is another directory flip. Delete the source copy only after a quiet period.</li>
+</ol>
+<p>The dangerous step is cutover, because routing state is cached in many places. Any router that missed the directory change keeps writing to the old location. Correct systems attach a version (an epoch) to the directory and make the old shard reject writes for keys it no longer owns. The failure modes section shows what happens without that.</p>
+
+<h2 id=dd-sharding-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-sharding-shard-count level=3>Choosing the shard count from three limits</h3>
+<p>The lesson split 2,500 writes per second and 4 TB over four shards. That sizes for today. A design review asks what the system needs in two years, and what each shard can hold. Assumptions: writes grow 50% a year, data grows 1.5 TB a year, and one primary handles about 2,000 writes per second of this workload before latency degrades.</p>
+<ul>
+<li><strong>Writes.</strong> In two years: 2,500 × 1.5 × 1.5 = about 5,600 per second. Run each primary at no more than half its limit, so 1,000 per second, leaving room for spikes and failover. That needs 6 shards.</li>
+<li><strong>Data.</strong> In two years: 4 + 3 = 7 TB. Cap each shard at about 1 TB so hot indexes fit in memory and a full restore stays short (see below). That needs 7 shards.</li>
+<li><strong>Memory.</strong> If the hot working set is 15% of data, 1 TB per shard means 150 GB of hot pages, which fits a 256 GB machine. At 2 TB per shard it would not.</li>
+</ul>
+<p>The largest answer wins, rounded up: 8 physical shards, on 4,096 logical shards, 512 per host. Each physical shard is a primary with two replicas, so the cluster runs 24 databases. That count is the operational cost: 24 backup schedules, and at a rough two failovers per host per year, a failover about every two weeks somewhere in the fleet. Automation is not optional at this size.</p>
+
+<h3 id=dd-sharding-restore-time level=3>Why shard size is a recovery decision</h3>
+<p>Restoring a shard from backup is mostly copying bytes. At a sustained 500 MB per second, which is optimistic for many cloud volumes:</p>
+<ul>
+<li>1 TB restores in about 35 minutes, plus log replay.</li>
+<li>4 TB, the unsharded table, takes about 2.3 hours, plus log replay.</li>
+</ul>
+<p>The blast radius shrinks too. A failed 1 TB shard out of 8 affects one-eighth of customers for 35 minutes. Small shards make every bad day smaller and shorter. That benefit is often worth as much as the write capacity.</p>
+
+<h3 id=dd-sharding-hot-tenant-math level=3>The floor that no shard count can lower</h3>
+<p>Hashing spreads keys, not load. Suppose the largest tenant produces 12% of all traffic. With 8 shards, the average shard carries 12.5%. The shard holding the big tenant carries the tenant's 12% plus its share of everyone else: 12% + 88% / 8 = 23%. That shard runs at 1.84 times the average.</p>
+<p>Now go to 64 shards. The average falls to 1.6%, but the big tenant's shard still carries 12% + 88% / 64 = 13.4%, more than 8 times the average. Adding shards makes the hot shard <em>relatively</em> worse. Once one key exceeds roughly 1/N of the load, the fix has to change how that key is stored. More shards will not help.</p>
+
+<h3 id=dd-sharding-fanout-math level=3>Scatter-gather: load and tail latency</h3>
+<p>Fan-out multiplies load. A dashboard query without the shard key, at 500 requests per second across 8 shards, is 4,000 shard queries per second. Move to 32 shards and it becomes 16,000, with no new users.</p>
+<p>Fan-out also multiplies tail latency. A scatter-gather query is as slow as its slowest shard. If each shard independently has a 1% chance of a slow response (its p99), the chance at least one is slow is 1 − 0.99<sup>N</sup>:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Shards queried<th>Requests that hit at least one shard's p99<tbody><tr><td>1<td>1%<tr><td>4<td>3.9%<tr><td>8<td>7.7%<tr><td>16<td>15%<tr><td>64<td>47%</table></div></div>
+<p>At 64 shards, a shard's p99 has become nearly the query's median. Hedged requests (send to a replica too if the first is slow) and per-shard timeouts with partial results help. Keeping hot queries single-shard helps more.</p>
+<p>Deep pagination is the same effect in rows. Page 50 at 20 rows per page means each of 8 shards returns 1,000 rows, so the router sorts 8,000 rows to return 20. Use keyset pagination ("after this sort value") instead, as in <a href="#cursorbased-pagination">Cursor-Based Pagination</a>; each shard then returns only 20 rows past the cursor.</p>
+
+<h3 id=dd-sharding-move-math level=3>How long a resharding move takes</h3>
+<p>Going from 4 to 8 hosts with logical shards moves half the logical shards: 2 TB, rather than re-hashing everything.</p>
+<ul>
+<li>Throttle each copy to 100 MB per second so production latency holds. Four source hosts copying in parallel give 400 MB per second.</li>
+<li>2 TB / 400 MB/s is about 1.4 hours of pure copy. In practice, plan for a day or two: copies pause at peak, verification takes time, and you cut over a few logical shards at a time.</li>
+<li>Catch-up must outrun new writes. Each source produces its normal change stream (about 1/4 of 2,500 writes per second) while the copy runs, so the stream to catch up on is small compared with copy bandwidth.</li>
+<li>Each cutover pauses writes for one logical shard (1/4,096 of keys) for a few seconds. Users almost never notice.</li>
+</ul>
+
+<h2 id=dd-sharding-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-sharding-fm-hot-tenant level=3>1. The giant tenant's shard</h3>
+<p><strong>Symptom.</strong> Shard 5 runs at 90% CPU while the other seven idle at 20%. Latency is fine for most customers and terrible for everyone who happens to share shard 5 with one large account.</p>
+<p><strong>Mechanism.</strong> The key is <code>company_id</code>, and one company grew to a seventh of total traffic. Every one of its rows hashes to the same logical shard. The balancer can move that logical shard to an empty host, but it cannot split it, because every key in it is the same key.</p>
+<p><strong>Detect.</strong> Per-shard QPS, CPU and p99 on one dashboard, so the outlier is obvious. Then find the key: sample queries and count the top shard-key values (top-k), or use the database's per-key stats where available. A shard whose load is high while its row count is normal points to a hot key, not a big one.</p>
+<p><strong>Fix.</strong> In order of effort: cache the tenant's hot reads; move its logical shard to a dedicated host; then change the key for that tenant only, for example <code>(company_id, user_id)</code> for its large tables, so its data spreads across many logical shards. Budget for the last step whenever tenants vary by orders of magnitude, which in B2B they always do.</p>
+
+<h3 id=dd-sharding-fm-monotonic level=3>2. The newest shard does all the work</h3>
+<p><strong>Symptom.</strong> After moving the events table to range sharding on <code>created_at</code>, one shard handles all writes. The balancer moves data all day, and inserts slow down whenever it does.</p>
+<p><strong>Mechanism.</strong> Every new row has the largest timestamp, so it lands in the last range. MongoDB keeps splitting that last chunk and migrating the pieces, but writes always chase the newest one. The cluster pays migration costs and still writes to one machine. The same happens with an auto-increment ID or a Snowflake ID used as a range key.</p>
+<p><strong>Detect.</strong> Per-shard insert rate (one shard near 100%), chunk migration count, and range boundaries that keep growing at the top.</p>
+<p><strong>Fix.</strong> Hash the key, or put a well-spread field first: <code>(device_id, created_at)</code> keeps each device's history in time order while spreading devices across shards. If you need time-range scans, accept scatter-gather for them or send them to a separate analytics store.</p>
+
+<h3 id=dd-sharding-fm-fanout level=3>3. One deploy multiplies the whole cluster's load</h3>
+<p><strong>Symptom.</strong> Right after a release, CPU rises on all 8 shards at once. No single shard is hot. Database QPS has gone up eightfold for one endpoint.</p>
+<p><strong>Mechanism.</strong> A new "recent orders" widget queries <code>orders</code> by <code>status</code> and <code>updated_at</code>, without <code>customer_id</code>. The router cannot pick a shard, so it scatters every call to all shards. On a single database this would be one index scan; here it is eight, and it will be thirty-two after the next expansion.</p>
+<p><strong>Detect.</strong> Track fan-out per query shape. Vitess exposes scatter query counts; with your own router, log the number of shards each query touched and alert on new query shapes that touch all of them. A code review rule helps: every query on a sharded table names the shard key or justifies why not.</p>
+<p><strong>Fix.</strong> Add the key to the query if the caller knows it. If not, build a global index table for the access path, or serve the widget from a read model fed by change data capture.</p>
+
+<h3 id=dd-sharding-fm-stale-routing level=3>4. Writes split across two shards during a move</h3>
+<p><strong>Symptom.</strong> After a resharding cutover, a few hundred customers see missing orders, and some carts show two different states depending on which page they load.</p>
+<p><strong>Mechanism.</strong> The directory flipped logical shard 1,377 from host B to host E. Most routers refreshed within a second. Three application instances had a routing cache with a 5-minute TTL and kept writing to host B. Those writes landed on a copy no reader consulted any more, and reverse replication later conflicted with them.</p>
+<p><strong>Detect.</strong> Writes arriving at a shard for keys it no longer owns. That is cheap to check on the database side if each shard knows its own key ranges. Also compare row counts and checksums between old and new locations after cutover.</p>
+<p><strong>Fix.</strong> Version the directory. Every request carries the version its router used, and each shard rejects requests with a stale version or for keys it does not own. MongoDB does this with shard versioning: a <code>mongos</code> with a stale map gets an error and refreshes. Routers then retry with the new map. Rejecting is safe; silently accepting is how data forks.</p>
+
+<h3 id=dd-sharding-fm-uniqueness level=3>5. Two accounts with the same email</h3>
+<p><strong>Symptom.</strong> Password reset emails go to the wrong person. Support finds pairs of accounts with the same email address, even though the column has a unique constraint.</p>
+<p><strong>Mechanism.</strong> The unique index exists on each shard, so it only checks rows on that shard. Two sign-ups with the same email got different customer IDs, which hashed to different shards. Each shard saw a unique email. The constraint that used to be global became per-shard the day the table was split, and nobody noticed because tests run against a single database.</p>
+<p><strong>Detect.</strong> A periodic job that joins all shards' emails and counts duplicates. The first run after sharding usually finds some.</p>
+<p><strong>Fix.</strong> A global uniqueness table sharded by the unique value itself (<code>email → customer_id</code>), with the unique constraint there. Sign-up claims the email first, then creates the customer. If the second step fails, release or reuse the claim. Also run integration tests against a multi-shard setup, so per-shard semantics show up before production.</p>
+
+<h3 id=dd-sharding-fm-schema-drift level=3>6. The migration that reached 23 of 24 shards</h3>
+<p><strong>Symptom.</strong> One customer in eight gets errors on checkout after a release. The errors mention a missing column.</p>
+<p><strong>Mechanism.</strong> A migration added a column on every shard, one after another. Shard 6 was mid-failover when its turn came, the migration timed out, and the deploy pipeline logged a warning and continued. The new code assumes the column exists everywhere.</p>
+<p><strong>Detect.</strong> A schema fingerprint per shard (a hash of the catalog for the sharded tables), compared across the fleet and checked before deploys.</p>
+<p><strong>Fix.</strong> Treat schema changes as fleet operations with all-or-nothing reporting. Use an expand-and-contract sequence: add the column everywhere, verify every shard, deploy code that uses it, then remove old columns later. Tools such as Vitess's online DDL track migration state per shard for exactly this reason.</p>
+
+<h3 id=dd-sharding-fm-unsplittable level=3>7. The partition that cannot be split</h3>
+<p><strong>Symptom.</strong> In Cassandra, reads for one sensor time out and compaction falls behind on three nodes. In MongoDB, the balancer reports a <strong>jumbo chunk</strong> it cannot move.</p>
+<p><strong>Mechanism.</strong> All rows for one key value live in one partition. A sensor that has reported every second for three years has about 95 million rows in a single Cassandra partition, far past the commonly cited guideline of keeping partitions around 100 MB or less. In MongoDB, a chunk whose rows all share one shard key value cannot be split, so it cannot be balanced either.</p>
+<p><strong>Detect.</strong> Partition size histograms (<code>nodetool tablehistograms</code> in Cassandra), warnings about large partitions in logs, and jumbo flags in MongoDB's chunk metadata.</p>
+<p><strong>Fix.</strong> Add a bucket to the key so no single value grows without bound: <code>(sensor_id, month)</code> for time series, or <code>(key, hash(id) % 16)</code> for write-heavy single keys. Reads then query the few buckets they need. Choose the bucket size from the expected rows per key per period.</p>
+
+<h2 id=dd-sharding-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-sharding-choose-routing level=3>The routing rule</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Rule<th>Data moved when adding a host<th>Range scans<th>Hot-spot handling<th>Extra parts<th>Examples<tbody><tr><td><code>hash % N</code> on hosts<td>Most of it<td>Scattered<td>None<td>None<td>Early hand-built systems<tr><td>Hash into fixed logical shards + directory<td>Only the logical shards you choose to move<td>Scattered<td>Move a hot logical shard to its own host<td>Small directory, cached by routers<td>Vitess, Citus, Redis Cluster, Instagram<tr><td>Range + directory<td>Only the ranges you move or split<td>Natural<td>Split a hot range; fails on one hot key<td>Directory and a balancer<td>MongoDB ranged keys, Bigtable, HBase, Spanner<tr><td>Consistent hash ring<td>About 1/N, automatically<td>Scattered<td>None built in<td>Membership list<td>Cassandra, DynamoDB lineage, cache clients<tr><td>Tenant directory<td>Per tenant<td>Within a tenant<td>Pin big tenants to dedicated hosts<td>Tenant map, often in a database<td>B2B SaaS cell architectures<tr><td>Geographic<td>Per region<td>Within a region<td>Limited<td>Region map, data residency rules<td>Global apps with residency needs</table></div></div>
+<p>The default for a new transactional system is hashing into a fixed set of logical shards with a directory. It spreads load like hashing, moves data like a directory, and leaves room to special-case hot tenants. Use range routing when ordered scans are the main access path. Use consistent hashing without a directory when membership changes often and nobody wants to operate a metadata service, as in a cache. See <a href="#consistent-hashing">Consistent Hashing</a> for that trade.</p>
+
+<h3 id=dd-sharding-choose-where level=3>Where the routing lives</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Option<th>Strength<th>Weakness<th>Choose when<tbody><tr><td>Application library<td>No extra hop; full control<td>Every service and language must route identically; resharding means coordinated client updates<td>One main service, one language<tr><td>Proxy (VTGate, ProxySQL-style, mongos)<td>Apps see one database; routing changes in one place; scatter-gather done for you<td>An extra hop and tier to scale and keep available<td>Many services or languages share the data<tr><td>Database-native (Citus, CockroachDB, Spanner, DynamoDB)<td>Distributed SQL, rebalancing and often cross-shard transactions built in<td>Less control over placement; cost and performance of cross-shard features can surprise<td>You would rather buy the hard parts than build them</table></div></div>
+
+<h3 id=dd-sharding-choose-key level=3>Shard keys by domain</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Domain<th>Usual key<th>Why<th>Known risk<tbody><tr><td>B2C commerce<td><code>customer_id</code><td>Cart, orders, addresses stay together<td>Seller-side and product-wide queries scatter<tr><td>B2B SaaS<td><code>tenant_id</code><td>Nearly every query is within a tenant<td>Tenant sizes differ by orders of magnitude<tr><td>Social<td><code>user_id</code><td>Profile and own posts together<td>Celebrities; feeds read across many users<tr><td>Messaging<td><code>conversation_id</code><td>A conversation's messages together, in order<td>Huge group channels<tr><td>IoT and metrics<td><code>(device_id, time bucket)</code><td>Spreads writes, bounds partition size<td>Fleet-wide queries scatter<tr><td>Ride-hailing<td>Region or geo cell<td>Matching is local<td>Hot cells at rush hour; trips that cross cells</table></div></div>
+<p>When the shard key is wrong for a frequent access path, do not fight it with scatter-gather. Add a second copy of the data keyed the other way: a global index table, a read model fed by <a href="#change-data-capture">Change Data Capture</a>, or a search index. One write path, several read shapes.</p>
+
+<h2 id=dd-sharding-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Have vertical scaling, replicas, archiving and a functional split been exhausted, with numbers showing which limit (writes, data, memory) forces sharding?</li>
+<li>What is the shard key, and what fraction of queries by volume include it? List the top queries that do not.</li>
+<li>Is there a logical shard layer, how many logical shards, and what is the maximum host count that implies?</li>
+<li>What is the largest single key's share of load and data today, and what happens when it doubles?</li>
+<li>How are secondary lookups and unique constraints handled across shards: global index tables, scatter, or embedded IDs? Who keeps global indexes consistent?</li>
+<li>How are IDs generated without a central counter, and what happens on clock skew?</li>
+<li>Which operations cross shards, and what replaces the transaction: a saga, an outbox, or a database-native distributed commit? See <a href="#saga">Saga</a> and <a href="#twophase-commit">Two-Phase Commit</a>.</li>
+<li>What is the resharding procedure (copy, catch up, verify, cut over, roll back), and has it been run in staging with production-sized data?</li>
+<li>How do routers learn about directory changes, and what stops a stale router from writing to the old location?</li>
+<li>How are schema migrations applied across the fleet, and how is a partial migration detected?</li>
+<li>Is there a per-shard dashboard (QPS, CPU, p99, size) and a top-k view of hot keys?</li>
+<li>Where do analytics and cross-shard reports run, so they do not scatter against production shards?</li>
+</ol>
+
+<h2 id=dd-sharding-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Why not just pick 64 shards on day one so you never have to reshard?"</summary>
+<p>Because physical shards cost money and operations from day one: 64 primaries with replicas, 64 backup schedules, failovers every few days, and every scatter-gather query fanning out 64 ways, with worse tail latency. The right version of that instinct is <em>logical</em> shards: create 4,096 logical shards on day one and place them on 4 hosts. Growth then means moving logical shards, not re-hashing, and you pay for physical hosts only as you need them.</p>
+</details>
+
+<details>
+<summary>"How do you look up a user by email when you shard by user ID?"</summary>
+<p>Either scatter the lookup to all shards, which is fine for rare queries but not for login, or keep a global index table <code>email → user_id</code>, sharded by email. Login becomes two single-shard reads. The unique constraint on email moves to that table, because a per-shard constraint only checks one shard. The cost is a cross-shard write at sign-up and email change, so decide what a temporarily stale index entry means and design the order of writes so the failure is harmless, for example by claiming the email first.</p>
+</details>
+
+<details>
+<summary>"Walk me through moving a logical shard to a new host without downtime."</summary>
+<p>Snapshot-copy it to the new host, throttled. Stream changes from the source's log to catch up. Verify with counts and checksums. Then cut over: pause writes for that logical shard only, apply the final changes, flip the directory entry with a new version, and resume. Start reverse replication so rollback is another flip. The part people miss is stale routers: each shard must reject writes for keys it no longer owns, or for stale directory versions, so a router with an old cache gets an error and refreshes instead of writing to the old copy.</p>
+</details>
+
+<details>
+<summary>"Your top tenant is 15% of traffic. Will doubling the shard count help?"</summary>
+<p>No. That tenant's shard carries at least 15% of load at any shard count, so going from 8 to 16 shards lowers the average to about 6% while the hot shard stays above 15%. You need to change how that tenant is stored: cache its reads, give it a dedicated host, or shard its large tables by a finer key such as <code>(tenant_id, user_id)</code>. Many SaaS companies end up with a tenant directory, so big tenants can be placed by hand.</p>
+</details>
+
+<details>
+<summary>"A transfer debits an account on shard A and credits one on shard B. The credit fails. Now what?"</summary>
+<p>First, notice it should be rare: a good key keeps most transactions single-shard. When it is unavoidable, there are two families. A distributed commit (two-phase commit, which Citus and some Vitess setups provide) makes both shards commit or neither, at the cost of locks held across a network round trip and blocking if the coordinator dies. A saga records the debit, then the credit, each as a local transaction, with a compensating refund if the credit fails permanently. Each step must be idempotent, and the intent should be written to an outbox in the same local transaction as the debit, so a crash cannot leave the debit without the follow-up.</p>
+</details>
+
+<details>
+<summary>"Hash or range for an orders table that is queried by customer and by date?"</summary>
+<p>Hash on <code>customer_id</code>, because customer queries are the hot path and need to stay single-shard. Inside each shard, index <code>(customer_id, created_at)</code> so "this customer's orders this month" is a short range scan on one shard. Date queries across all customers belong in analytics, fed by change data capture, not on the production shards. Range-sharding on date would send all new orders to one shard and scatter every customer query.</p>
+</details>
+
+<details>
+<summary>"What changes about testing once you shard?"</summary>
+<p>Single-database tests stop representing production. Per-shard unique constraints, scatter queries, cross-shard transactions and routing changes all behave differently with more than one shard. Run integration tests against at least two or three shards, include a test that moves a logical shard mid-run, and fail tests that issue queries without the shard key on sharded tables unless they are explicitly allowed.</p>
+</details>
