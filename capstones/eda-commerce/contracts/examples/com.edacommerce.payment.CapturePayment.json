@@ -1,0 +1,25 @@
+{
+  "envelope": {
+    "eventId": "c6e7cc37-cca0-5b37-ae39-ce35cc251e33",
+    "type": "com.edacommerce.payment.CapturePayment",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "b421e3ea-5f62-5edb-888e-190fc3c6d9df",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "order-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Payment",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "paymentId": "8bcc3436-a018-5834-ae97-e7f9787ccbca",
+  "amount": {
+    "amountMinor": 1999,
+    "currency": "EUR"
+  }
+}

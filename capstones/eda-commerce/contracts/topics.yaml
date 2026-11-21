@@ -40,6 +40,7 @@ topics:
   # ---------------------------------------------------------------- state (compacted)
   - name: catalog.product.v1
     kind: state
+    aggregate: Product
     description: Latest snapshot of every product. Consumers rebuild a full catalog read model by reading from offset 0.
     key: sku
     partitions: 6
@@ -52,6 +53,7 @@ topics:
 
   - name: catalog.price.v1
     kind: state
+    aggregate: Price
     description: Current price per SKU in the default price list.
     key: sku
     partitions: 6
@@ -64,6 +66,7 @@ topics:
 
   - name: inventory.stock-level.v1
     kind: state
+    aggregate: StockLevel
     description: Network-wide availability per SKU, for product pages and cart validation. Advisory only; the reservation is the real check.
     key: sku
     partitions: 6
@@ -77,6 +80,7 @@ topics:
   # ---------------------------------------------------------------- order flow events
   - name: checkout.events.v1
     kind: events
+    aggregate: Checkout
     description: Facts from the checkout context. CheckoutSubmitted starts the order saga.
     key: orderId
     partitions: 12
@@ -89,6 +93,7 @@ topics:
 
   - name: order.events.v1
     kind: events
+    aggregate: Order
     description: Lifecycle of the order aggregate. The public story of an order.
     key: orderId
     partitions: 12
@@ -108,6 +113,7 @@ topics:
 
   - name: payment.events.v1
     kind: events
+    aggregate: Payment
     description: Replies from payment-svc to authorise, capture, void and refund commands.
     key: orderId
     partitions: 12
@@ -127,6 +133,7 @@ topics:
 
   - name: inventory.events.v1
     kind: events
+    aggregate: Reservation
     description: Reservation lifecycle and restocks.
     key: orderId
     partitions: 12
@@ -145,6 +152,7 @@ topics:
 
   - name: fulfilment.events.v1
     kind: events
+    aggregate: Fulfilment
     description: Warehouse progress for outbound orders and inbound returns.
     key: orderId
     partitions: 12
@@ -165,6 +173,7 @@ topics:
 
   - name: shipping.events.v1
     kind: events
+    aggregate: Shipment
     description: Carrier bookings and normalised carrier webhooks, both directions.
     key: orderId
     partitions: 12
@@ -181,6 +190,7 @@ topics:
 
   - name: returns.events.v1
     kind: events
+    aggregate: Return
     description: Lifecycle of a return (reverse saga).
     key: orderId
     partitions: 12
@@ -198,6 +208,7 @@ topics:
 
   - name: notification.events.v1
     kind: events
+    aggregate: Notification
     description: Audit trail of customer messages, shown on the order timeline.
     key: orderId
     partitions: 6
@@ -211,6 +222,7 @@ topics:
   # ---------------------------------------------------------------- commands (point to point)
   - name: payment.commands.v1
     kind: commands
+    aggregate: Payment
     description: Commands to payment-svc. Only payment-svc consumes this topic.
     key: orderId
     partitions: 12
@@ -227,6 +239,7 @@ topics:
 
   - name: inventory.commands.v1
     kind: commands
+    aggregate: Reservation
     description: Commands to inventory-svc.
     key: orderId
     partitions: 12
@@ -243,6 +256,7 @@ topics:
 
   - name: fulfilment.commands.v1
     kind: commands
+    aggregate: Fulfilment
     description: Commands to fulfilment-svc.
     key: orderId
     partitions: 12
@@ -258,6 +272,7 @@ topics:
 
   - name: shipping.commands.v1
     kind: commands
+    aggregate: Shipment
     description: Commands to shipping-svc.
     key: orderId
     partitions: 6

@@ -1,0 +1,30 @@
+{
+  "envelope": {
+    "eventId": "714754e3-bc79-5a1c-b4b2-5ff8c7a2664a",
+    "type": "com.edacommerce.fulfilment.ExpectReturn",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "3a58143a-980a-55c4-93f1-3ecc450a03b5",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "order-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Fulfilment",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "returnId": "c3cb55da-cd15-5be1-a95d-bf6fadd6425b",
+  "rmaNumber": "RMA-2026-000042",
+  "lines": [
+    {
+      "lineId": "9635d8a0-41ad-5eb8-a27b-8ec5113f57ce",
+      "sku": "SKU-1001",
+      "quantity": 2
+    }
+  ],
+  "expectedBy": 1795000000000
+}

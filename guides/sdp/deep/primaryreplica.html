@@ -136,7 +136,7 @@
 <li>During an 8-second lag spike: 8 × 300 = 2,400 writes at risk.</li>
 <li>During the 4-minute import lag above: the import's own writes plus every order taken in those minutes.</li>
 </ul>
-<p>That is why "async loses about 200 ms" is a typical number, not a bound. It is also why Patroni's <code>maximum_lag_on_failover</code> exists. Refusing to fail over automatically to a replica that is minutes behind is often the right call; a human should choose between "down for a while" and "lose four minutes of orders."</p>
+<p>That is why "async loses about 200 ms" is a typical number, not a bound. It is also why Patroni's <code>maximum_lag_on_failover</code> exists. Refusing to fail over automatically to a replica that is minutes behind is often the right call. A human should choose between "down for a while" and "lose four minutes of orders."</p>
 
 <h3 id=dd-primaryreplica-sync-cost level=3>What synchronous replication costs per commit</h3>
 <p>Synchronous commit adds one network round trip, plus the replica's fsync for <code>on</code>, plus replay for <code>remote_apply</code>. Rough round-trip times (they vary by provider and region):</p>
@@ -234,7 +234,7 @@
 
 <details>
 <summary>"Why not just make all replication synchronous and be done with data loss?"</summary>
-<p>Because every write then waits for the slowest required replica, and a replica problem becomes a write outage. Fully synchronous to every replica also means one sick replica stalls everything. The practical answer is quorum: wait for one of two or more candidates (<code>ANY 1</code>), keep others async for read scaling, and set the guarantee per transaction, so a page-view counter does not pay the checkout's price. And remember the latency cost: cross-zone adds a few milliseconds per commit, cross-region adds tens.</p>
+<p>Because every write then waits for the slowest required replica, and a replica problem becomes a write outage. Fully synchronous to every replica also means one sick replica stalls everything. The practical answer is quorum: wait for one of two or more candidates (<code>ANY 1</code>), keep others async for read scaling. Then set the guarantee per transaction, so a page-view counter does not pay the checkout's price. And remember the latency cost: cross-zone adds a few milliseconds per commit, cross-region adds tens.</p>
 </details>
 
 <details>

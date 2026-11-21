@@ -3510,6 +3510,173 @@ CREATE TABLE inbox (                          -- one row per handled message
 <tr><td>Late reply after cancel<td>Event illegal in current state<td>Handle explicitly, alert<td>Return parcel to stock<td>Nothing
 <tr><td>Duplicate message<td>Redelivery after crash<td>Inbox and state check drop it<td>None<td>Nothing
 </table></div></div>
+<p>For completeness, here is the orchestrator's handler in the DB-backed style, using Python's standard-library <code>sqlite3</code> to keep it self-contained. A production version would use Postgres and <code>SELECT ... FOR UPDATE</code>, but the shape is identical.</p>
+<pre><code>import json, sqlite3, uuid
+
+TRANSITIONS = {   # (state, event type) -&gt; (next state, command to send, undo to push)
+    ("AWAITING_PAYMENT", "payment.authorized.v1"): ("AWAITING_STOCK", "inventory.reserve.v1", "payment.void.v1"),
+    ("AWAITING_STOCK",   "stock.reserved.v1"):     ("AWAITING_PACK",  "fulfilment.request.v1", "inventory.release.v1"),
+    # ... the rest of the happy path, plus the failure transitions
+}
+
+def handle(db: sqlite3.Connection, msg: dict) -&gt; None:
+    with db:  # one transaction: inbox, saga, outbox
+        try:
+            db.execute("INSERT INTO inbox VALUES ('orchestrator', ?, datetime('now'))", (msg["message_id"],))
+        except sqlite3.IntegrityError:
+            return                                    # duplicate: already handled
+        row = db.execute("SELECT state, version, compensations FROM order_saga WHERE order_id = ?",
+                         (msg["data"]["order_id"],)).fetchone()
+        state, version, comps = row
+        step = TRANSITIONS.get((state, msg["type"]))
+        if step is None:
+            park_unexpected(db, msg, state)           # illegal in this state: record and alert
+            return
+        nxt, command, undo = step
+        stack = json.loads(comps) + [{"type": undo, "ref": msg["data"]}]
+        updated = db.execute(
+            "UPDATE order_saga SET state=?, version=version+1, compensations=?, attempt=0, "
+            "step_deadline_at=datetime('now', '+2 minutes'), last_message_id=? "
+            "WHERE order_id=? AND version=?",
+            (nxt, json.dumps(stack), msg["message_id"], msg["data"]["order_id"], version)).rowcount
+        if updated != 1:
+            raise RuntimeError("concurrent update; let the broker redeliver")
+        db.execute("INSERT INTO outbox (message_id, topic, key, type, causation_id, payload) "
+                   "VALUES (?, ?, ?, ?, ?, ?)",
+                   ("cmd_" + uuid.uuid4().hex, command.split(".")[0] + ".commands",
+                    msg["data"]["order_id"], command, msg["message_id"], json.dumps(msg["data"])))
+    # only after commit: acknowledge the broker offset</code></pre>
+<p>The transition table is the workflow. Reviewers can read it, tests can enumerate it, and a missing row (an event with no legal transition in some state) shows up as a parked message rather than a silent drop.</p>
+
+<h2 id=dd-eventdriven-architecture-adv-large-payloads level=2>Deep Dive: Large Payloads</h2>
+<p>Sooner or later someone asks to put a 4 MB thing in an event. A scanned invoice, a product's full image set, a model's feature vector, a 3,000-line order from a wholesale customer. The broker refuses, or worse, accepts it and gets slower for everyone. This section covers why the limits exist, what to do instead, and how the alternatives fail.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-limits level=3>Broker limits, and why they exist</h3>
+<p>Every broker caps message size. The exact numbers change between versions and providers, so check current documentation before you design around them. The order of magnitude is stable, though:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Broker<th>Default or hard cap (approximate)<th>Notes<tbody>
+<tr><td>Apache Kafka<td>About 1 MB by default<td>Configurable. Several settings must agree: broker <code>message.max.bytes</code> (or topic <code>max.message.bytes</code>), producer <code>max.request.size</code>, consumer <code>max.partition.fetch.bytes</code> and <code>fetch.max.bytes</code>, and replica fetch sizes
+<tr><td>Amazon SQS / SNS / EventBridge<td>Historically 256 KB; AWS has raised some of these limits<td>Check the current quota for your service; billing is per 64 KB chunk on SQS
+<tr><td>Amazon Kinesis Data Streams<td>About 1 MB per record historically<td>Per-shard write throughput limits make large records expensive anyway
+<tr><td>Google Cloud Pub/Sub<td>About 10 MB per message<td>Large messages still count against throughput quotas
+<tr><td>Azure Service Bus<td>256 KB on Standard; much larger on Premium<td>Event Hubs is around 1 MB
+<tr><td>RabbitMQ<td>Large configurable cap (tens to hundreds of MB depending on version)<td>The cap is not the practical limit; memory alarms and flow control are
+</table></div></div>
+<p>The limits are not arbitrary. A broker is built around the assumption that messages are small and many, and large ones break that assumption in five places.</p>
+<ul>
+<li><strong>Memory per request.</strong> Producers batch records in memory, and brokers and consumers allocate fetch buffers sized by configuration. A 50 MB record forces every one of those buffers up, on every client, for one outlier.</li>
+<li><strong>Replication.</strong> Followers copy the leader's log in fetch requests. A huge record makes those fetches slow, which can push followers out of the in-sync set and, with <code>acks=all</code>, slow every producer on the partition.</li>
+<li><strong>Head-of-line blocking.</strong> A partition is consumed in order. One 40 MB record that takes 2 seconds to download and parse delays every small record queued behind it, including ones for other keys.</li>
+<li><strong>Timeouts.</strong> Request and session timeouts are tuned for kilobyte-scale messages. A large message plus a slow network can exceed them, causing retries that resend the same large message, and sometimes consumer-group rebalances.</li>
+<li><strong>Page cache and retention cost.</strong> Brokers serve recent data from the OS page cache. A topic full of multi-megabyte records pushes hot small data out of cache. And every byte is stored times the replication factor for the whole retention period.</li>
+</ul>
+<p>So raising the limit is a real option, but it is a trade. A topic that carries 2–5 MB records with its own tuned clients can work fine. Raising the cluster-wide default so one team can send blobs puts the cost on everyone else.</p>
+<p>A quick sanity check before deciding: size the topic. At 200 events per second and 3 MB each, the topic ingests 600 MB/s. With replication factor 3, that is 1.8 GB/s of disk writes and replication traffic, and about 155 TB per day before retention. The same events at 3 KB with a claim check cost 1,000 times less on the broker, plus 600 MB/s into object storage. That is still large, but object storage is built for it.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-claim-check level=3>The claim check, done properly</h3>
+<p>The <strong>claim-check pattern</strong> stores the large payload in object storage and sends an event that carries a reference to it, like a coat-check ticket. The first deep dive introduced the idea. Here are the details that decide whether it works.</p>
+<svg role="img" aria-labelledby="dd-eventdriven-architecture-adv-cc-title dd-eventdriven-architecture-adv-cc-desc" viewBox="0 0 720 250" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-eventdriven-architecture-adv-cc-title">Claim-check flow with integrity and lifecycle</title>
+<desc id="dd-eventdriven-architecture-adv-cc-desc">The producer first uploads the payload to object storage under a content-addressed key, then writes a small event through its outbox containing the key, size, SHA-256 hash and content type. Consumers read the event from the topic, fetch the object with their own read permission, and verify the hash. A lifecycle rule deletes objects after the topic retention plus a safety margin.</desc>
+<rect x="0" y="0" width="720" height="250" fill="var(--paper, #ffffff)"/>
+<g stroke="var(--accent, #1f5f99)" fill="var(--paper, #ffffff)">
+<rect x="16" y="40" width="150" height="80" rx="6"/>
+<rect x="270" y="20" width="190" height="60" rx="6"/>
+<rect x="270" y="140" width="190" height="60" rx="6"/>
+<rect x="560" y="70" width="146" height="90" rx="6"/>
+</g>
+<g fill="var(--ink, #1c2430)">
+<text x="28" y="62" font-weight="bold">Producer</text>
+<text x="28" y="82">1. PUT object</text>
+<text x="28" y="100">2. outbox: event</text>
+<text x="282" y="42" font-weight="bold">Object storage</text>
+<text x="282" y="62">key = sha256 of bytes</text>
+<text x="282" y="162" font-weight="bold">Topic (small event)</text>
+<text x="282" y="182">key, size, sha256, type</text>
+<text x="572" y="92" font-weight="bold">Consumer</text>
+<text x="572" y="112">3. read event</text>
+<text x="572" y="130">4. GET object</text>
+<text x="572" y="148">5. verify hash</text>
+</g>
+<g stroke="var(--muted, #5c6b7c)" stroke-width="1.5" fill="none">
+<line x1="166" y1="66" x2="266" y2="50"/><line x1="166" y1="100" x2="266" y2="168"/>
+<line x1="460" y1="170" x2="556" y2="130"/><line x1="556" y1="100" x2="464" y2="50"/>
+</g>
+<g fill="var(--muted, #5c6b7c)">
+<polygon points="265,46 270,49 266,54"/><polygon points="264,163 270,169 263,171"/>
+<polygon points="552,127 560,128 555,135"/><polygon points="467,46 460,49 465,54"/>
+</g>
+<text x="16" y="225" fill="var(--muted, #5c6b7c)">Lifecycle rule: delete objects after topic retention + longest replay window + margin. Write the object before the event, never after.</text>
+</svg>
+<p><strong>Write order.</strong> Upload the object first. Only after the upload succeeds, write the event (through the outbox, as usual). The other order publishes a reference to something that does not exist yet. If the upload fails after the event commits, every consumer hits a missing object. An upload that succeeds with no event behind it is an orphan, which the lifecycle rule cleans up. Orphans cost a little storage. Dangling references cost incidents.</p>
+<p><strong>Keys.</strong> Two schemes work well.</p>
+<ul>
+<li><strong>Content-addressed</strong>: the key is the SHA-256 of the bytes, for example <code>blobs/sha256/9f/86d0…</code>. Identical payloads dedupe for free, retries of the upload are naturally idempotent, and the key itself proves integrity. The cost is that you cannot tell from a key what owns it, so deletion for privacy needs an index.</li>
+<li><strong>Entity-addressed</strong>: <code>orders/ord_7f3a/invoice/evt_01J8QF2A.pdf</code>. Easy to reason about, easy to delete everything for one customer or order, and easy to scope access by prefix. Include the event ID or a version so a newer payload never overwrites one a slow consumer has yet to read.</li>
+</ul>
+<p>Never reuse a key for different bytes. A consumer that fetches "the invoice for this order" and gets a newer one than the event describes has a correctness bug that only shows up under lag.</p>
+<p><strong>What the event carries.</strong> The reference alone is not enough. Carry what a consumer needs to decide whether to fetch, and to check what it got:</p>
+<pre><code>"data": {
+  "order_id": "ord_7f3a",
+  "invoice": {
+    "uri": "s3://bookstore-events-blobs/orders/ord_7f3a/invoice/evt_01J8QF2A.pdf",
+    "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "size_bytes": 4194304,
+    "content_type": "application/pdf",
+    "encryption": "kms:alias/orders-blobs",
+    "expires_at": "2027-02-18T00:00:00Z"
+  },
+  "total_cents": 14200, "currency": "USD", "line_count": 3    // the facts most consumers need, inline
+}</code></pre>
+<p>The hash catches truncated uploads, the wrong object, and tampering. The size lets a consumer refuse something absurd before downloading it. <code>expires_at</code> tells a replaying consumer up front that the object may be gone, so it can choose a different recovery path.</p>
+<p><strong>Encryption and access control.</strong> Encrypt at rest with a managed key (on AWS, SSE-KMS with a key dedicated to this data set). Then access needs both bucket permission and key permission, which gives you two independent controls and an audit trail of decrypt calls. Grant each consuming service read access to the prefixes it needs, using its own identity. Avoid putting pre-signed URLs in events: they are bearer tokens that live as long as the topic retains the event, and anyone who can read the topic can use them. If you must pass a pre-signed URL, keep its expiry short and accept that replay will need a fresh one.</p>
+<p><strong>Lifecycle and TTL.</strong> Set an object lifecycle rule that deletes objects after a period. That period must be longer than three things added together: the topic's retention, the longest replay you might run, and a margin. If <code>order.events</code> keeps 30 days and you replay at most 7 days behind real time, a 45-day lifecycle is reasonable. If the topic is compacted and keeps the latest event per key forever, the object it points to must live as long as that event does. Then a time-based lifecycle is wrong, and deletion has to follow the event (see the GC race below).</p>
+<p><strong>Consistency.</strong> Amazon S3 has provided strong read-after-write consistency for new objects since late 2020, and Google Cloud Storage and Azure Blob Storage offer strong consistency for object reads too. So a consumer that reads the event after the upload completes will find the object. Older advice about "retry the GET a few times because S3 is eventually consistent" is out of date for these services. Other object stores and caching layers in front of them may behave differently, so check yours.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-chunking level=3>Chunking, and why it is usually wrong</h3>
+<p>The other obvious approach is to split a large payload into chunks, send them as separate messages, and reassemble at the consumer. Some systems have done this. LinkedIn's engineers, for example, have spoken publicly about weighing chunking against reference-based approaches for large Kafka messages. It works only under narrow conditions, and the costs are easy to underestimate:</p>
+<ul>
+<li><strong>Every chunk must land in the same partition</strong>, so they share a key. A partition carrying a 200-chunk message is blocked for every other key in it until the last chunk arrives.</li>
+<li><strong>The consumer must hold reassembly state</strong>: which chunks it has, in memory or on disk. A rebalance moves the partition to another instance that has none of that state, so it must either re-read from the first chunk or keep state externally.</li>
+<li><strong>Offset commits get subtle.</strong> You cannot commit past the first chunk until the last one is processed, or a crash loses the half-assembled message.</li>
+<li><strong>Partial failure is a new state.</strong> A producer crash after chunk 37 of 80 leaves a message that will never complete. The consumer needs timeouts and cleanup for it.</li>
+<li><strong>Compaction and retention break it.</strong> Log compaction keeps the latest record per key, which destroys chunk sequences. Time-based retention can delete the first chunks of a message whose last chunks are still retained.</li>
+<li><strong>Every consumer needs the reassembly logic</strong>, in every language the company uses. A claim check needs only an object-store client, which every language already has.</li>
+</ul>
+<p>Chunking is defensible when object storage is unavailable or forbidden and the payloads are only a few times the limit. Otherwise, use a claim check.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-compression level=3>Compression: the cheap first step</h3>
+<p>Before any of this, turn on compression. Kafka producers compress whole batches with <code>compression.type</code> set to <code>gzip</code>, <code>snappy</code>, <code>lz4</code> or <code>zstd</code>. JSON events with repeated field names compress well, often by several times; zstd tends to give the best ratio for reasonable CPU and lz4 the lowest latency. Measure on your own data, because ratios vary a lot.</p>
+<p>Two caveats. First, the size checks are applied at different points. In Kafka the broker's limit applies to the record batch as written, which is compressed. The producer's <code>max.request.size</code> check applies to the serialized record before batching, and that check is on the uncompressed size in common client versions. So a record that compresses under the broker limit can still be rejected by the producer. Second, compression helps throughput and storage, not head-of-line blocking or consumer memory: the consumer still decompresses the full record. Compression turns a 1.5 MB problem into a 300 KB non-problem. It does not make a 50 MB payload a good idea.</p>
+<p>Encrypted or already-compressed payloads (images, PDFs, ciphertext) do not compress further. If a team encrypts payloads at the field level, compression of those fields does nothing, which is one more reason to keep large blobs out of the event.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-state-vs-thin level=3>Event-carried state, thin events, and fetch-on-read</h3>
+<p>The lesson framed this as notification versus full state. With large payloads, the decision becomes per field, and there are four options rather than two:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Option<th>Event carries<th>Consumer gets the rest by<th>Good for<th>Failure it invites<tbody>
+<tr><td>Full state inline<td>Everything<td>Nothing to fetch<td>Small entities, many consumers<td>Size creep; personal data spread
+<tr><td>Key facts + claim check<td>Common fields, plus a blob reference<td>Object storage GET<td>Large, immutable attachments<td>Dangling references; access sprawl
+<tr><td>Key facts + reference by ID<td>Common fields, plus an entity ID<td>Calling the owner's API<td>Sensitive or rarely needed detail<td>Callback storm if many consumers fetch
+<tr><td>Thin notification<td>ID and type only<td>Calling the owner's API<td>Cache invalidation, low volume<td>Callback storm; reads newer state than the event
+</table></div></div>
+<p>The last row hides a correctness trap worth naming. A thin event says "order 7f3a changed". By the time the consumer calls the API, the order may have changed again. The consumer reads version 5 while processing the event for version 3. For a cache invalidation that is fine, even desirable. For an audit trail it is wrong: you have recorded the wrong facts against the event. So fetch-on-read needs a way to ask for a specific version (<code>GET /orders/ord_7f3a?version=3</code>), or the consumer must accept that it sees the latest state, not the state at the event.</p>
+<p><strong>Reference by ID versus snapshot.</strong> When an order event mentions the customer, should it carry <code>customer_id</code> or a copy of the customer's name and tier? A reference keeps the event small and avoids copying personal data. It also means the consumer sees the customer as they are <em>now</em>. A snapshot records the customer as they were <em>when the order was placed</em>. For many business facts that is what you want: the shipping address at the time of the order, the price at the time of the order, the loyalty tier that determined the discount. A useful rule: snapshot the values that the fact depends on, and reference everything else.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-small-schemas level=3>Designing schemas that stay small</h3>
+<p>Most oversized events were not designed big. They grew, one "just add it" field at a time. A few habits keep them in check.</p>
+<ul>
+<li><strong>Set a size budget per event type</strong>, and enforce it in CI: serialize a realistic worst-case example and fail the build above, say, 64 KB. Track the p99 size in production as a metric per type.</li>
+<li><strong>Bound every collection.</strong> An order with 3 lines is 2 KB. A wholesale order with 4,000 lines is 2 MB. Decide the maximum in the schema. Above it, switch to a summary event plus a claim check for the line list, or emit per-line events.</li>
+<li><strong>Don't embed related entities.</strong> An order event should not contain the full product records for each line. Carry the SKU and the price that applied. Product details live on the product topic.</li>
+<li><strong>Use a binary format at volume.</strong> Avro and Protobuf drop field names from every record and encode numbers compactly. The registry keeps the schema, so the record does not have to.</li>
+<li><strong>Prefer IDs and enums over free text.</strong> <code>"reason": "out_of_stock"</code>, not a paragraph.</li>
+<li><strong>Keep derivable data out.</strong> If <code>total_cents</code> is in the event, the consumer does not need <code>total_dollars_formatted</code> as well.</li>
+</ul>
+
+<h3 id=dd-eventdriven-architecture-adv-payload-failures level=3>Costs and failure modes</h3>
+<p><strong>Dangling references.</strong> The event says the invoice is at a key, and the object is not there. Causes: the producer wrote the event before the upload finished; a lifecycle rule shorter than a replay; a manual cleanup; a cross-region consumer reading a bucket that has not replicated yet. Detect with a counter of 404s on claim-check fetches, per producer and per event type. A healthy system has zero. Fix by enforcing upload-before-event in the producer library, lifecycle periods derived from retention, and replication-aware reads in other regions (wait for replication, or read from the source region).</p>
+<p><strong>The GC race.</strong> A garbage-collection job deletes objects that "nobody needs any more", decided by checking whether the latest event still references them. Meanwhile a consumer is 3 days behind and about to read an older event that points at the deleted object. The fix is to make the deletion condition about consumers, not events: an object can go once its event is older than the slowest consumer group's committed position on every topic that references it, plus margin. Most teams settle for the simpler rule: time-based lifecycle well beyond retention, and accept the storage cost.</p>
+<p><strong>Privacy deletion.</strong> A deletion request for customer <code>c_91</code> now covers object storage too. Entity-addressed keys make this a prefix delete. Content-addressed keys need an index from customer to hashes. One technique worth knowing is <em>crypto-shredding</em>: encrypt each customer's blobs with a per-customer key, and delete the key to make every copy unreadable at once, including copies in backups. It is more machinery, but it is often the only practical way to cover retained topics and backups.</p>
+<p><strong>Cost shape.</strong> Claim checks move cost from broker storage to object storage requests. Object storage is cheap per byte but charges per request, and a fan-out to 10 consumer groups means 10 GETs per event. At 1,000 events per second with 10 consumers, that is 10,000 GETs per second, around 26 billion a month. At typical published request prices that is a five-figure monthly bill, often more than the storage. Check your provider's pricing. If many consumers need the same blob, a shared cache or a consumer that fetches once and republishes the needed fields can be cheaper.</p>
+<p><strong>Latency and availability.</strong> Every claim-check consumer now depends on object storage being available and fast. Its p99 latency (tens to hundreds of milliseconds) enters the consumer's processing time. And an object-storage outage stops consumers even while the broker is healthy. Consumers should keep processing events that do not need the blob, and retry the ones that do through a retry topic, rather than blocking the partition.</p>
 <h2 id=h2-12-tldr level=2>12. TL;DR</h2>
 <div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th><tbody><tr><td><strong>Problem</strong><td>Notification-only events send every consumer back to the producer's API for details, so the coupling and the load return asynchronously.<tr><td><strong>Mechanism</strong><td>Put the facts in the event. Each consumer acts from a local view that it can rebuild by replay. Facts have one owner, and views are copies, never the truth.<tr><td><strong>Costs</strong><td>Data copied into every subscriber, views that always lag slightly, personal data that spreads and makes deletion a project, and an even heavier public-schema contract.<tr><td><strong>Skip it when</strong><td>You are inside one service, the read must be exactly current, it is really a synchronous call or a workflow, or the team cannot yet support schema rules, tracing, and alerts.<tr><td><strong>30-second answer</strong><td>The event's contents are the architecture: carry enough state that consumers act from their own replayable local views instead of calling back, send exactly-current reads to the single owning service, keep sensitive fields out of the event, and govern the schema like the public API it is.</table></div></div>
 
@@ -5203,7 +5370,7 @@ category(name, class)                             -- class: security | transacti
 <li>During an 8-second lag spike: 8 × 300 = 2,400 writes at risk.</li>
 <li>During the 4-minute import lag above: the import's own writes plus every order taken in those minutes.</li>
 </ul>
-<p>That is why "async loses about 200 ms" is a typical number, not a bound. It is also why Patroni's <code>maximum_lag_on_failover</code> exists. Refusing to fail over automatically to a replica that is minutes behind is often the right call; a human should choose between "down for a while" and "lose four minutes of orders."</p>
+<p>That is why "async loses about 200 ms" is a typical number, not a bound. It is also why Patroni's <code>maximum_lag_on_failover</code> exists. Refusing to fail over automatically to a replica that is minutes behind is often the right call. A human should choose between "down for a while" and "lose four minutes of orders."</p>
 
 <h3 id=dd-primaryreplica-sync-cost level=3>What synchronous replication costs per commit</h3>
 <p>Synchronous commit adds one network round trip, plus the replica's fsync for <code>on</code>, plus replay for <code>remote_apply</code>. Rough round-trip times (they vary by provider and region):</p>
@@ -5301,7 +5468,7 @@ category(name, class)                             -- class: security | transacti
 
 <details>
 <summary>"Why not just make all replication synchronous and be done with data loss?"</summary>
-<p>Because every write then waits for the slowest required replica, and a replica problem becomes a write outage. Fully synchronous to every replica also means one sick replica stalls everything. The practical answer is quorum: wait for one of two or more candidates (<code>ANY 1</code>), keep others async for read scaling, and set the guarantee per transaction, so a page-view counter does not pay the checkout's price. And remember the latency cost: cross-zone adds a few milliseconds per commit, cross-region adds tens.</p>
+<p>Because every write then waits for the slowest required replica, and a replica problem becomes a write outage. Fully synchronous to every replica also means one sick replica stalls everything. The practical answer is quorum: wait for one of two or more candidates (<code>ANY 1</code>), keep others async for read scaling. Then set the guarantee per transaction, so a page-view counter does not pay the checkout's price. And remember the latency cost: cross-zone adds a few milliseconds per commit, cross-region adds tens.</p>
 </details>
 
 <details>
@@ -5661,12 +5828,12 @@ category(name, class)                             -- class: security | transacti
 
 <details>
 <summary>"How do you look up a user by email when you shard by user ID?"</summary>
-<p>Either scatter the lookup to all shards, which is fine for rare queries but not for login, or keep a global index table <code>email → user_id</code>, sharded by email. Login becomes two single-shard reads. The unique constraint on email moves to that table, because a per-shard constraint only checks one shard. The cost is a cross-shard write at sign-up and email change, so decide what a temporarily stale index entry means and design the order of writes so the failure is harmless, for example by claiming the email first.</p>
+<p>Either scatter the lookup to all shards, which is fine for rare queries but not for login, or keep a global index table <code>email → user_id</code>, sharded by email. Login becomes two single-shard reads. The unique constraint on email moves to that table, because a per-shard constraint only checks one shard. The cost is a cross-shard write at sign-up and email change. Decide what a temporarily stale index entry means, and order the writes so a failure is harmless, for example by claiming the email first.</p>
 </details>
 
 <details>
 <summary>"Walk me through moving a logical shard to a new host without downtime."</summary>
-<p>Snapshot-copy it to the new host, throttled. Stream changes from the source's log to catch up. Verify with counts and checksums. Then cut over: pause writes for that logical shard only, apply the final changes, flip the directory entry with a new version, and resume. Start reverse replication so rollback is another flip. The part people miss is stale routers: each shard must reject writes for keys it no longer owns, or for stale directory versions, so a router with an old cache gets an error and refreshes instead of writing to the old copy.</p>
+<p>Snapshot-copy it to the new host, throttled. Stream changes from the source's log to catch up. Verify with counts and checksums. Then cut over: pause writes for that logical shard only, apply the final changes, flip the directory entry with a new version, and resume. Start reverse replication so rollback is another flip. The part people miss is stale routers. Each shard must reject writes for keys it no longer owns, or with a stale directory version. A router with an old cache then gets an error and refreshes, instead of writing to the old copy.</p>
 </details>
 
 <details>
@@ -6043,7 +6210,7 @@ vnodes= 1000  moved=20.2%  busiest/average=1.01</code></pre>
 
 <details>
 <summary>"A cache node is unreachable for ten minutes and then returns. What can go wrong?"</summary>
-<p>Two things. During the outage, its keys move to neighbours, which miss and refill; writes and invalidations go there. When it returns, keys route back to it, and it still has the values from ten minutes ago, which it serves as hits. That is stale data with no error anywhere. Flush the node or bump a key generation before it rejoins, keep TTLs as the backstop, and consider not removing it from the ring at all for short outages: treat its keys as misses while it is down so ownership never changes.</p>
+<p>Two things. During the outage, its keys move to neighbours, which miss and refill; writes and invalidations go there. When it returns, keys route back to it, and it still has the values from ten minutes ago, which it serves as hits. That is stale data with no error anywhere. Flush the node or bump a key generation before it rejoins, and keep TTLs as the backstop. For short outages, consider not removing it from the ring at all. Treat its keys as misses while it is down, so ownership never changes.</p>
 </details>
 
 <details>
@@ -6053,7 +6220,7 @@ vnodes= 1000  moved=20.2%  busiest/average=1.01</code></pre>
 
 <details>
 <summary>"Design a load balancer that keeps each LLM conversation on the GPU that holds its KV cache, while autoscaling."</summary>
-<p>Hash by conversation ID with a consistent scheme in the balancer: ring hash or Maglev. Scaling events then move only about 1/N of conversations, which lose their warm cache and pay a prefill. Add bounded loads, because some conversations are much heavier, and a pure hash would overload a GPU that happens to own several long ones; overflow sends a request to the next GPU, which costs one cold prefill rather than a queue. Drain servers before removal so in-flight streams finish. Measure cache hit rate per scaling event to tune the balance factor.</p>
+<p>Hash by conversation ID with a consistent scheme in the balancer: ring hash or Maglev. Scaling events then move only about 1/N of conversations, which lose their warm cache and pay a prefill. Add bounded loads, because some conversations are much heavier, and a pure hash would overload a GPU that happens to own several long ones. Overflow sends a request to the next GPU, which costs one cold prefill rather than a queue. Drain servers before removal so in-flight streams finish. Measure cache hit rate per scaling event to tune the balance factor.</p>
 </details>
 
 <details>
@@ -6177,6 +6344,225 @@ vnodes= 1000  moved=20.2%  busiest/average=1.01</code></pre>
 <li><strong><a href="#change-data-capture">Change Data Capture</a></strong>: later in the course. Tools read the WAL directly and turn your database's changes into an event stream for other systems.</li>
 <li><strong><a href="#message-queue">Message Queue</a></strong>: Kafka is this pattern as a standalone product: only the log, with consumers doing the replay.</li>
 </ul>
+<h2 id=dd-writeahead-log-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's rule is short: append the record, fsync it, then acknowledge. A real database needs a few more rules to make that safe. It has to stop a data page from reaching disk before its log record does. It has to survive a torn data page, not only a torn log record. It needs to know where replay starts, and it has to decide what "fsync" means on hardware that sometimes lies. PostgreSQL shows all of this clearly, so we start there, then compare InnoDB, SQLite, LSM engines and the systems that skip fsync on purpose.</p>
+
+<h3 id=dd-writeahead-log-postgres-records level=3>PostgreSQL: records, LSNs and the page rule</h3>
+<p>Postgres writes its log as a sequence of 16 MB <strong>segment files</strong> in <code>pg_wal/</code> (the size is set at <code>initdb</code>). Every record has a <strong>log sequence number</strong> (LSN), its byte position in the endless logical log. A record's header carries its total length, the transaction ID, the LSN of the previous record, which subsystem it belongs to (heap, B-tree index, transaction commit and so on) and a CRC-32C checksum over the whole record. The previous-record pointer and the checksum together let recovery tell a valid next record from leftover bytes.</p>
+<p>Every 8 KB data page also stores an LSN in its header: the LSN of the last record that changed it. That enables the rule that makes the whole design work, usually called the <strong>WAL rule</strong>. Before the buffer manager writes a dirty page to disk, it makes sure the WAL is flushed at least up to that page's LSN. So a data page can never be on disk with changes whose log record is not. Pages can be written lazily, in any order, at any time, and recovery can always redo them.</p>
+<p>In database theory this is the "steal, no-force" policy from the ARIES family of algorithms. <em>Steal</em>: dirty pages may be written before their transaction commits. <em>No-force</em>: committed pages need not be written at commit. The log makes both safe. ARIES also uses an undo log to roll back stolen pages of transactions that aborted. Postgres does not need undo for that, because MVCC never overwrites a row in place. An aborted transaction's new row versions simply stay invisible until vacuum removes them.</p>
+
+<h3 id=dd-writeahead-log-torn-pages level=3>Torn data pages: full-page writes and doublewrite</h3>
+<p>The lesson's checksum protects log records. But the WAL rule lets data pages be written at any time, and an 8 KB database page is several 4 KB disk sectors. A power cut mid-write can leave a page half old and half new. Redo cannot fix that by replaying a small "change byte 312" record, because the rest of the page is garbage.</p>
+<p>Postgres solves it with <strong>full-page writes</strong> (<code>full_page_writes = on</code>, the default). The first time a page is modified after each checkpoint, the WAL record carries a full image of the page. Recovery restores that image and replays later changes on top, so a torn page is simply overwritten. The cost is WAL volume, and the sizing section shows how large it can get. <code>wal_compression</code> (with <code>lz4</code> or <code>zstd</code> in PostgreSQL 15 and later) shrinks these images.</p>
+<p>InnoDB takes a different route, the <strong>doublewrite buffer</strong>. Before writing pages into their real places, it writes them sequentially to a doublewrite area and syncs that. If a real write tears, recovery takes the intact copy from the doublewrite area. Both designs pay to make torn pages repairable. Postgres pays in log volume, InnoDB in a second data write.</p>
+
+<h3 id=dd-writeahead-log-checkpoints level=3>Checkpoints and where replay starts</h3>
+<p>A Postgres checkpoint does not stop the world. It records a <strong>redo point</strong> (the current WAL position), then writes out every page that was dirty at that moment, spreading the writes over time. When done, it writes a checkpoint record and updates <code>pg_control</code>, a small file that tells recovery where the latest checkpoint is. On restart, recovery reads <code>pg_control</code>, jumps to that checkpoint's redo point, and replays forward until the next record fails to validate. That is the end of the log.</p>
+<p>The knobs:</p>
+<ul>
+<li><code>checkpoint_timeout</code> (5 minutes by default): the longest time between checkpoints.</li>
+<li><code>max_wal_size</code> (1 GB by default): a soft limit on WAL between checkpoints. Reaching it triggers a checkpoint early. If that happens more often than <code>checkpoint_warning</code> (30 seconds), the log says "checkpoints are occurring too frequently."</li>
+<li><code>checkpoint_completion_target</code> (0.9 by default since PostgreSQL 14): spread the page writes over 90% of the interval to avoid I/O bursts.</li>
+</ul>
+<p>These three settings trade four things: recovery time, full-page-write volume, I/O smoothness and disk used by <code>pg_wal</code>. The sizing section works through them.</p>
+
+<h3 id=dd-writeahead-log-commit-path level=3>The commit path and group commit</h3>
+<p>Backends do not each write their own WAL file. Each one inserts its records into shared <strong>WAL buffers</strong> in memory. At commit, the backend asks for WAL to be flushed up to its commit record. If another backend's flush already covered that position, it is done without any disk work. Group commit therefore happens on its own: one <code>fdatasync</code> covers every commit record written before it. (<code>wal_sync_method</code> defaults to <code>fdatasync</code> on Linux.) <code>commit_delay</code> can make a backend wait a few microseconds to gather more company, but on modern hardware the natural batching is usually enough.</p>
+<p><code>synchronous_commit = off</code> lets a commit return before its flush. A background <strong>WAL writer</strong> flushes every <code>wal_writer_delay</code> (200 ms by default), and the documentation puts the worst-case loss at three times that, about 600 ms. The database stays consistent after a crash; only the most recent commits may be missing. This is a session-level setting, so you can use it for the click log and keep full durability for orders.</p>
+
+<h3 id=dd-writeahead-log-other-engines level=3>Other engines, other defaults</h3>
+<ul>
+<li><strong>MySQL/InnoDB</strong> keeps a redo log (sized by <code>innodb_redo_log_capacity</code> since 8.0.30) and separate undo logs for rollback and MVCC. <code>innodb_flush_log_at_trx_commit</code> decides durability: <code>1</code> (the default) writes and flushes at every commit; <code>2</code> writes to the OS at commit and flushes about once a second, so it survives a MySQL crash but not a power cut; <code>0</code> writes and flushes about once a second. MySQL also has the binlog, a second log for replication. <code>sync_binlog = 1</code> is needed for the binlog to be durable too, and an internal two-phase commit keeps the two logs in agreement.</li>
+<li><strong>SQLite</strong> in WAL mode appends to a <code>-wal</code> file and copies pages back into the database at checkpoints (by default once the WAL reaches 1,000 pages). With <code>synchronous=FULL</code> each commit is fsynced. With <code>synchronous=NORMAL</code> in WAL mode, the database stays consistent after a power loss, but the most recent commits may roll back.</li>
+<li><strong>LSM engines</strong> such as RocksDB write to a WAL, then a sorted in-memory table (memtable). When the memtable is flushed to an on-disk sorted file, the WAL it covers can be deleted. RocksDB's <code>WriteOptions.sync</code> defaults to <code>false</code>. A write then survives a process crash, because it is in the OS page cache, but not a machine crash. Applications that need power-loss durability must ask for it.</li>
+<li><strong>Cassandra</strong> appends to a commit log, but by default (<code>commitlog_sync: periodic</code>, every 10 seconds) it acknowledges before fsync. Durability comes from replication: a write acknowledged at <code>QUORUM</code> sits in the memory of several machines. <code>batch</code> and <code>group</code> modes fsync before acknowledging.</li>
+<li><strong>Kafka</strong> does not fsync each message by default either. It relies on replication (<code>acks=all</code> with <code>min.insync.replicas</code>) and the OS page cache. A message is safe once several brokers have it, even if none has flushed it.</li>
+<li><strong>etcd</strong> fsyncs its WAL for every batch, because Raft's safety depends on it. Its documentation treats disk fsync latency as a primary health signal and suggests p99 <code>wal_fsync_duration</code> under about 10 ms.</li>
+<li><strong>Redis</strong> AOF offers <code>appendfsync always</code>, <code>everysec</code> (the default) and <code>no</code>. With <code>everysec</code>, Redis documents a typical loss of up to one second of writes, and up to about two seconds if fsync is slow.</li>
+</ul>
+<p>The pattern across that list: "durable" can mean on one disk, or in the memory of several machines. Both are legitimate. What fails is assuming one when the system does the other.</p>
+
+<h3 id=dd-writeahead-log-fsync-truth level=3>What fsync actually promises</h3>
+<p><code>fsync(fd)</code> asks the kernel to push a file's dirty data and metadata to the device and wait for the device to confirm. Four details catch people who write their own logs:</p>
+<ul>
+<li><strong>New files need a directory fsync.</strong> Creating or renaming a file changes the directory. If you fsync the file but not its parent directory, a crash can leave a perfectly synced file with no name pointing at it. Log rotation must fsync the directory.</li>
+<li><strong>Device write caches.</strong> Many drives have a volatile cache. The kernel sends a cache-flush command on fsync, and correct drives honour it. Some consumer devices, some RAID controllers without batteries, and virtual disks configured with an unsafe cache mode do not. They make fsync fast by not doing it. Enterprise SSDs with <strong>power-loss protection</strong> (capacitors that let the drive finish cached writes) are both fast and honest.</li>
+<li><strong>fsync errors are not retryable.</strong> In 2018 PostgreSQL developers found that on Linux, after a failed write-back, the kernel could mark the pages clean and clear the error. A retried fsync then "succeeded" even though data was lost. Since PostgreSQL 12 (and matching minor releases of older versions) Postgres treats an fsync failure as fatal (<code>PANIC</code>) and recovers from the WAL instead of retrying. The episode is often called "fsyncgate."</li>
+<li><strong><code>O_DIRECT</code> is not durability.</strong> Bypassing the page cache does not bypass the device cache. You still need <code>O_DSYNC</code> or an explicit flush.</li>
+</ul>
+<p>Here is the lesson's write path as runnable Python, with group commit and torn-tail handling. It is a teaching sketch, not a storage engine; a real one also needs the directory fsync above, segment rotation and checkpoints.</p>
+<pre><code>import os, struct, zlib
+
+HEADER = struct.Struct(">II")   # payload length, CRC-32 of payload
+
+def append(fd, records: list[bytes]) -> None:
+    """Group commit: write every record in the batch, then one fsync."""
+    buf = b"".join(HEADER.pack(len(r), zlib.crc32(r)) + r for r in records)
+    os.write(fd, buf)
+    os.fsync(fd)            # only now may the callers hear "saved"
+
+def recover(path: str) -> list[bytes]:
+    """Replay complete records; stop at the first torn or corrupt one."""
+    out, data, pos = [], open(path, "rb").read(), 0
+    while pos + HEADER.size &lt;= len(data):
+        length, crc = HEADER.unpack_from(data, pos)
+        body = data[pos + HEADER.size : pos + HEADER.size + length]
+        if len(body) &lt; length or zlib.crc32(body) != crc:
+            break           # torn tail: never acknowledged, safe to drop
+        out.append(body)
+        pos += HEADER.size + length
+    return out
+
+path = "orders.wal"
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+append(fd, [b'{"order":"7f3a","status":"paid"}', b'{"order":"7f3b","status":"paid"}'])
+os.write(fd, HEADER.pack(40, 12345) + b'{"order":"7f3c"')   # crash mid-write
+os.close(fd)
+print(recover(path))   # the two acknowledged records, nothing else</code></pre>
+<p>Note the one judgement call in <code>recover</code>: it stops at the first bad record. That is right for a torn <em>tail</em>. A bad record in the <em>middle</em> of the log, followed by valid ones, means real corruption, and silently stopping there would discard acknowledged writes. Production engines tell the two apart (Postgres checks the previous-record pointer and page headers) and refuse to start rather than guess.</p>
+
+<h2 id=dd-writeahead-log-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>We use shard 2 from the lesson: 625 order writes per second, each transaction touching one table row and two indexes.</p>
+
+<h3 id=dd-writeahead-log-fsync-latency level=3>fsync latency sets the commit budget</h3>
+<p>Rough orders of magnitude for one small fsync; measure yours with <code>pg_test_fsync</code> or <code>fio</code>, because they vary widely:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Device<th>Typical fsync latency<th>Serial commits per second, one stream<tbody><tr><td>7,200 rpm hard disk<td>several ms (rotation-bound)<td>100 to 200<tr><td>Consumer SSD without power-loss protection<td>roughly 0.5 to a few ms (must reach flash)<td>hundreds to 2,000<tr><td>Cloud network block volume<td>roughly 0.5 to 2 ms, with occasional spikes<td>500 to 2,000<tr><td>Enterprise SSD with power-loss protection<td>tens of microseconds<td>tens of thousands</table></div></div>
+<p>A consumer SSD reporting 50,000 fsyncs per second is a warning sign. It probably is not flushing its cache.</p>
+<p>Group commit is what makes a slow device usable. With a 1 ms fsync, one connection committing serially gets at most 1,000 commits per second. With 64 connections committing at once, each fsync covers many commit records, and the same disk can sustain tens of thousands of commits per second, until CPU or WAL bandwidth limits it. Shard 2's 625 commits per second is easy either way. The latency floor still applies to every single commit: a client never hears "saved" in less than one fsync.</p>
+
+<h3 id=dd-writeahead-log-fpw-math level=3>WAL volume: where full-page writes dominate</h3>
+<p>The raw change records for one order transaction (row, two index entries, commit record) come to roughly 500 bytes. At 625 per second, that is about 0.3 MB per second.</p>
+<p>Now add full-page images. Assume the hot set touched within any few minutes is 250,000 pages (2 GB of table and index pages). After every checkpoint, the first change to each of those pages logs the whole 8 KB page.</p>
+<ul>
+<li>Checkpoint every 5 minutes: up to 250,000 × 8 KB = 2 GB of page images per 300 seconds, about 6.7 MB per second.</li>
+<li>Checkpoint every 30 minutes: the same 2 GB per 1,800 seconds, about 1.1 MB per second.</li>
+</ul>
+<p>At 5-minute checkpoints, page images are about 20 times the size of the actual changes. That surprises most teams the first time they look. You can see it in <code>pg_stat_wal</code> (<code>wal_fpi</code> against <code>wal_records</code>), or per record type with <code>pg_waldump --stats</code>. Longer checkpoint intervals and <code>wal_compression</code> are the two big levers. Both also shrink what replicas must receive and what archives must store.</p>
+
+<h3 id=dd-writeahead-log-recovery-math level=3>Recovery time from checkpoint settings</h3>
+<p>Recovery replays all WAL from the last checkpoint's redo point. In the worst case that is about one full checkpoint interval of WAL, more if the crash hits while a spread checkpoint is still writing. Replay speed depends heavily on whether pages it touches are in memory. Postgres replays in one process, and reading cold pages is the slow part. Assume 100 MB per second as a planning figure and measure your own.</p>
+<ul>
+<li>Defaults (5 minutes, <code>max_wal_size</code> 1 GB) at about 7 MB per second of WAL: around 2 GB of WAL per cycle. Since <code>max_wal_size</code> caps it near 1 GB, checkpoints trigger early, every couple of minutes. Replay: about 10 seconds.</li>
+<li>Tuned for less WAL (30 minutes, <code>max_wal_size</code> 8 GB) at 1.4 MB per second: about 2.5 GB per cycle. Replay: about 25 seconds.</li>
+<li>Over-tuned (2 hours, <code>max_wal_size</code> 64 GB) during a bulk load producing 20 MB per second: up to 64 GB to replay. At 100 MB per second that is 11 minutes, and much longer if replay is reading cold pages from disk.</li>
+</ul>
+<p>The middle row is usually the sweet spot: far less WAL than the defaults, and recovery still under a minute. Set the target from the recovery-time objective, then confirm it by killing a test instance under load and timing the restart.</p>
+
+<h3 id=dd-writeahead-log-pitr-math level=3>Point-in-time recovery storage</h3>
+<p>Archived WAL plus base backups let you restore to any second. Assume shard 2 produces about 1.4 MB per second of WAL after tuning, around 120 GB per day.</p>
+<ul>
+<li>14 days of WAL archive: about 1.7 TB before compression. WAL often compresses well; how well depends on the data, so measure.</li>
+<li>Base backups of the 1 TB shard: weekly, keeping two, is 2 TB. Daily, keeping 14, is 14 TB, though incremental backups (native in PostgreSQL 17, and in tools like pgBackRest) cut that sharply.</li>
+<li>Restore time is base restore plus replay to the target time. With weekly base backups, restoring to day 6 replays about 720 GB of WAL: roughly 2 hours at 100 MB per second. With daily backups, under 20 minutes.</li>
+</ul>
+<p>So backup frequency is really a restore-time decision, not a storage decision. Storage is cheap; hours of replay during an incident are not.</p>
+
+<h2 id=dd-writeahead-log-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-writeahead-log-fm-lying-disk level=3>1. The disk that says yes too quickly</h3>
+<p><strong>Symptom.</strong> After a power cut in a small office deployment, Postgres starts, but orders acknowledged in the last few seconds are missing. A week later, another power cut leaves an index that returns wrong rows.</p>
+<p><strong>Mechanism.</strong> The SSD has a volatile write cache and no power-loss protection, and it acknowledges cache flushes before data reaches flash. Or a virtual machine's disk is set to a cache mode that ignores guest flushes. fsync returns in microseconds, so the database believes the WAL rule holds. The power cut erases the cache, and with it log records the database already promised, sometimes along with data pages written in the wrong order.</p>
+<p><strong>Detect.</strong> Before production, run <code>pg_test_fsync</code>: tens of thousands of flushes per second on a device without power-loss protection is not believable. For a real check, run a pull-the-plug test with a tool such as <code>diskchecker.pl</code>, which records acknowledged writes on a second machine and verifies them after power returns.</p>
+<p><strong>Fix.</strong> Use drives with power-loss protection, or turn off the volatile write cache. Use a safe hypervisor cache mode. In the cloud, trust the provider's block storage semantics, but never a local ephemeral disk as the only copy.</p>
+
+<h3 id=dd-writeahead-log-fm-fsyncgate level=3>2. A write error that a retry "fixed"</h3>
+<p><strong>Symptom.</strong> Weeks after a storage hiccup, a query returns a row with old data. Checksums flag a page. Nobody remembers any database error.</p>
+<p><strong>Mechanism.</strong> A transient storage error made a write-back fail during a checkpoint. On older kernels and database versions, the first fsync reported the error, and the database retried the checkpoint. The second fsync succeeded, because the kernel had already dropped the failed dirty pages and cleared the error flag. The checkpoint completed, the WAL before it was recycled, and the lost page write could no longer be redone.</p>
+<p><strong>Detect.</strong> Kernel logs with I/O errors (<code>dmesg</code>, "Buffer I/O error", "lost async page write") should page someone even when the database looks fine. Enable data checksums (<code>initdb --data-checksums</code>) so damaged pages are detected on read.</p>
+<p><strong>Fix.</strong> Run a PostgreSQL version that panics on fsync failure, and leave <code>data_sync_retry</code> off. A panic forces crash recovery from WAL, which redoes the lost writes. For anything homegrown, the lesson is the same: never treat a failed fsync as retryable. Crash, and recover from the log.</p>
+
+<h3 id=dd-writeahead-log-fm-archive-full level=3>3. A broken archive fills the WAL disk</h3>
+<p><strong>Symptom.</strong> Writes start failing with "could not write to file pg_wal/…: No space left on device", and the database shuts down. The data volume has plenty of room.</p>
+<p><strong>Mechanism.</strong> <code>archive_command</code> copies each finished WAL segment to object storage. A rotated credential made it fail on every segment. Postgres must keep every segment until it is archived, so <code>pg_wal</code> grew at the full WAL rate for two days. An abandoned replication slot does the same thing (see <a href="#primaryreplica">Primary-Replica</a>).</p>
+<p><strong>Detect.</strong> <code>pg_stat_archiver</code>: alert when <code>failed_count</code> rises or <code>last_archived_time</code> is more than a few minutes old. Alert on <code>pg_wal</code> volume use at 50 to 60%, with an estimate of hours left at the current WAL rate.</p>
+<p><strong>Fix.</strong> Monitor the archive like a production dependency, because it is one. Put WAL on its own volume, sized for a day or more of archive outage at peak WAL rate. Test the archive with real restores, not just successful uploads.</p>
+
+<h3 id=dd-writeahead-log-fm-checkpoint-spikes level=3>4. Latency spikes every few minutes</h3>
+<p><strong>Symptom.</strong> p99 query latency jumps on a steady rhythm, every 2 to 5 minutes. The log contains "checkpoints are occurring too frequently."</p>
+<p><strong>Mechanism.</strong> A write-heavy period fills <code>max_wal_size</code> quickly, so checkpoints trigger early and close together. Each one must write out dirty pages fast to finish in time, competing with queries for I/O. Each also restarts full-page writes, so WAL volume jumps right after it, which fills <code>max_wal_size</code> again even sooner. That feedback loop is why the spikes repeat.</p>
+<p><strong>Detect.</strong> <code>log_checkpoints = on</code> (default in recent versions) shows each checkpoint's trigger, duration and pages written. In <code>pg_stat_bgwriter</code> (or <code>pg_stat_checkpointer</code> in PostgreSQL 17), checkpoints requested by WAL size should be rare next to timed ones.</p>
+<p><strong>Fix.</strong> Raise <code>max_wal_size</code> so checkpoints are time-driven, keep <code>checkpoint_completion_target</code> at 0.9, and re-check the recovery-time math. Enable <code>wal_compression</code> if CPU allows.</p>
+
+<h3 id=dd-writeahead-log-fm-fsync-latency level=3>5. Slow fsync, and the cluster starts electing leaders</h3>
+<p><strong>Symptom.</strong> Commit latency p99 goes from 2 ms to 300 ms in the afternoon, with no change in traffic. In the Kubernetes control plane on the same storage class, etcd logs leader elections and "slow fdatasync" warnings.</p>
+<p><strong>Mechanism.</strong> The cloud volume ran out of burst credits, or a noisy neighbour saturated the shared storage. Every commit waits for one fsync, so commit latency is fsync latency. etcd is stricter: a leader that cannot persist its log in time misses heartbeats, followers call an election, and the cluster churns.</p>
+<p><strong>Detect.</strong> fsync latency as a first-class metric: etcd's <code>etcd_disk_wal_fsync_duration_seconds</code>, and in Postgres <code>pg_stat_wal</code> sync time with <code>track_wal_io_timing</code> on (moved to <code>pg_stat_io</code> in newer versions). Also watch the volume's burst balance and queue depth.</p>
+<p><strong>Fix.</strong> Provisioned-IOPS volumes, or local disks with power-loss protection for the log. Put WAL on its own volume so data-file I/O cannot delay commits. For etcd, follow its hardware guidance and keep it off shared, burstable storage.</p>
+
+<h3 id=dd-writeahead-log-fm-long-recovery level=3>6. The restart that took 40 minutes</h3>
+<p><strong>Symptom.</strong> After a kernel panic, the machine is back in 2 minutes, but Postgres takes 40 minutes before it accepts connections. Failover did not trigger because this was a single-node analytics database "that doesn't need it."</p>
+<p><strong>Mechanism.</strong> Someone set <code>checkpoint_timeout</code> to 1 hour and <code>max_wal_size</code> to 100 GB to cut WAL volume during nightly loads. The crash came near the end of a load. Recovery had 80 GB to replay in one process, reading data pages that were no longer in memory after the reboot.</p>
+<p><strong>Detect.</strong> Measure, before production: crash a staging instance at peak write rate and time the restart. In production, watch the WAL distance since the last checkpoint's redo point; that is the replay you would face right now.</p>
+<p><strong>Fix.</strong> Choose checkpoint settings from the recovery-time objective. Enable <code>recovery_prefetch</code> (PostgreSQL 15 and later) to overlap page reads during replay. Where minutes matter, run a replica and fail over, so recovery time stops being user-facing.</p>
+
+<h3 id=dd-writeahead-log-fm-default-durability level=3>7. The store that was durable "per process," not per power cut</h3>
+<p><strong>Symptom.</strong> After a host reboot in a power event, a service built on an embedded key-value engine has lost the last several seconds of acknowledged writes. The engine "has a WAL."</p>
+<p><strong>Mechanism.</strong> The engine wrote every record to its WAL, but with its default <code>sync = false</code>, so records went to the OS page cache and fsync happened later. That survives the process crashing, since the kernel still has the data. It does not survive the kernel or the power going away. The same gap exists with Redis <code>appendfsync everysec</code>, Cassandra's periodic commit log sync, and Kafka's default flush policy. Those last two are designed around replication; a single-node deployment of them has no such backstop.</p>
+<p><strong>Detect.</strong> Read the durability settings of every store in the request path, and write down what each acknowledgement means: in memory, in the page cache, on one disk, or on a quorum. Kill-and-power-cut tests in staging confirm it.</p>
+<p><strong>Fix.</strong> Turn on per-write sync where the data matters (<code>WriteOptions.sync = true</code>, <code>appendfsync always</code>, <code>commitlog_sync: batch</code> or <code>group</code>), or make replication the durability mechanism and acknowledge only after a quorum has the write. Either is fine. Not knowing which one you have is the bug.</p>
+
+<h2 id=dd-writeahead-log-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-writeahead-log-choose-durability level=3>What an acknowledgement waits for</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Policy<th>Examples<th>Survives process crash<th>Survives power loss<th>Survives losing the machine<th>Commit latency<tbody><tr><td>fsync per commit, with group commit<td>Postgres default, InnoDB <code>=1</code>, SQLite <code>FULL</code>, etcd<td>Yes<td>Yes<td>No, unless replicated<td>One fsync<tr><td>Write to OS per commit, fsync periodically<td>InnoDB <code>=2</code>, RocksDB default, Redis <code>everysec</code><td>Yes<td>Loses up to the period (about 1 s)<td>No<td>Memory speed<tr><td>Asynchronous commit<td>Postgres <code>synchronous_commit=off</code>, InnoDB <code>=0</code><td>Loses up to about a second<td>Loses up to about a second<td>No<td>Memory speed<tr><td>Replicate to a quorum, fsync lazily<td>Kafka defaults, Cassandra periodic at <code>QUORUM</code><td>Yes<td>Yes, unless all replicas lose power together<td>Yes<td>One network round trip<tr><td>fsync locally and synchronously replicate<td>Postgres with a sync standby, Raft systems<td>Yes<td>Yes<td>Yes<td>fsync plus a round trip</table></div></div>
+<p>Two points shape the choice. First, lazy fsync plus replication is a real durability design, but it assumes replicas fail independently. Replicas in one rack on one power feed share a failure. Second, durability is a per-write decision in most databases. Orders and payments take the top or bottom row. Click logs and metrics can take the middle rows and save a lot of I/O, as long as someone wrote that decision down.</p>
+
+<h3 id=dd-writeahead-log-choose-structure level=3>How engines structure the log</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Design<th>Examples<th>What the log holds<th>Torn-page defence<th>Trade<tbody><tr><td>Physical/physiological redo log<td>Postgres WAL, InnoDB redo<td>Page-level changes<td>Full-page images (Postgres) or doublewrite (InnoDB)<td>Fast, exact replay; log is tied to the storage format and version<tr><td>Logical log<td>MySQL row-based binlog, Postgres logical decoding output, Redis AOF<td>Row or command changes<td>Not its job; the engine's own log handles it<td>Portable, readable by other systems; slower to replay<tr><td>WAL + LSM<td>RocksDB, Cassandra, LevelDB<td>Recent writes not yet in sorted files<td>Immutable files are never overwritten<td>WAL stays short; write amplification moves to compaction<tr><td>No WAL: copy-on-write tree<td>LMDB, Btrfs-style designs<td>No log; new pages, then an atomic root-pointer switch<td>Old pages are never overwritten<td>Very fast reads and simple recovery; random writes and one writer at a time</table></div></div>
+<p>Copy-on-write is the honest alternative to a WAL: it gets atomicity by never overwriting and flipping one root pointer at the end. It is excellent for read-heavy embedded stores. For write-heavy servers, the WAL's sequential appends and lazy page writes still win, which is why nearly every server database uses one.</p>
+
+<h2 id=dd-writeahead-log-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>For each store in the write path, what does an acknowledgement mean: in memory, in the page cache, on one disk, or on a quorum? Is it written down?</li>
+<li>Which data is allowed relaxed durability (async commit, periodic fsync), and who signed off on the loss window?</li>
+<li>Has the storage been checked for honest flushes: power-loss protection, write-cache settings, hypervisor cache mode? Has anyone pulled the plug in staging?</li>
+<li>What is the measured fsync latency, p50 and p99, on the production volume, and is it alerted on?</li>
+<li>Is the WAL on its own volume, sized for the worst write burst plus a day of archive or replica outage?</li>
+<li>What are the checkpoint settings, and what recovery time do they imply at peak write rate? Has a crash-restart been timed?</li>
+<li>How much of WAL volume is full-page images, and is <code>wal_compression</code> or a longer checkpoint interval worth it?</li>
+<li>Is WAL archived continuously, monitored for failure, and proven by a recent restore to a chosen timestamp?</li>
+<li>What is the restore-time objective, and does the base-backup frequency meet it given replay speed?</li>
+<li>Are data checksums on, and do kernel I/O errors page someone?</li>
+<li>Does anything in the system write its own append-only log? If so, does it fsync directories, distinguish a torn tail from mid-log corruption, and crash on fsync failure?</li>
+</ol>
+
+<h2 id=dd-writeahead-log-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"The WAL is fsynced at commit, but data pages are written later in any order. What stops a page from reaching disk with changes the log doesn't have?"</summary>
+<p>The WAL rule in the buffer manager. Each page stores the LSN of the last record that changed it. Before writing a dirty page, the database flushes the WAL up to that LSN. So the log is always at least as new as any page on disk, and recovery can redo every change it finds on a page. Without that rule, a page could hold changes from a transaction whose commit record never made it, and redo-only recovery would have nothing to undo them with.</p>
+</details>
+
+<details>
+<summary>"The log record has a checksum. Why does Postgres also need full-page writes?"</summary>
+<p>The checksum protects log records. Full-page writes protect data pages. A data page write can tear halfway, leaving a page mixed from old and new versions. A small redo record like "insert this tuple at offset 312" cannot repair a page whose other half is garbage. So after each checkpoint, the first change to a page logs its full image; recovery restores that image and replays from there. InnoDB solves the same problem with its doublewrite buffer instead.</p>
+</details>
+
+<details>
+<summary>"Kafka doesn't fsync every message by default. Is it less durable than Postgres?"</summary>
+<p>It uses a different durability mechanism. With <code>acks=all</code> and <code>min.insync.replicas=2</code>, a message is acknowledged once several brokers have it in memory or page cache, so losing one machine loses nothing. It would lose data if all in-sync replicas lost power at once before flushing, which is why they should sit in different zones. Postgres defaults to "on this disk," so a single machine survives power loss, but losing the disk itself needs replication. Each is durable against a different failure; neither is durable against everything without the other.</p>
+</details>
+
+<details>
+<summary>"How does group commit raise throughput without breaking the 'fsync before ack' rule?"</summary>
+<p>One fsync makes every byte written to the log before it durable. If 50 commit records are in the WAL buffer when one backend flushes, all 50 are durable after that single fsync, and all 50 clients can be acknowledged. Nobody is told "saved" before their record is on disk; they just share the flush. The cost is that a commit may wait a little for the flush already in progress, so per-commit latency rises slightly while throughput rises a lot.</p>
+</details>
+
+<details>
+<summary>"Recovery hits a record with a bad checksum in the middle of the log, with valid records after it. What should happen?"</summary>
+<p>Stop and refuse to start, rather than treat it as the end of the log. A bad record at the tail is expected after a crash: it was being written, so it was never acknowledged. A bad record followed by valid ones means the log itself was damaged after it was written. Truncating there would discard acknowledged commits; skipping it would replay later changes without an earlier one. Either silently corrupts data. The correct move is to fail loudly and restore from a replica or backup plus archived WAL.</p>
+</details>
+
+<details>
+<summary>"Why can't you just retry a failed fsync?"</summary>
+<p>Because on Linux the failed pages may already be gone. After a write-back error, the kernel could mark the dirty pages clean and clear the error, so the next fsync reports success with nothing written. A database that retries then believes data is on disk that never got there, and may recycle the WAL that could have redone it. Since 2018 Postgres panics on fsync failure, and recovery replays from the WAL, which still holds the changes. Any system with its own log should do the same.</p>
+</details>
+
+<details>
+<summary>"An LSM engine also has a WAL. How is its job different from Postgres's?"</summary>
+<p>In an LSM engine, writes go to the WAL and an in-memory table, then the memtable is written out as an immutable sorted file. Files are never modified in place, so torn data pages are not a problem, and the WAL only needs to cover the current memtable; once flushed, that part of the WAL is deleted. Recovery means replaying a short WAL into a new memtable. The write amplification that Postgres pays in full-page writes and checkpoints, an LSM pays later in compaction, rewriting sorted files as they merge.</p>
+</details>
 <h2 id=h2-12-tldr level=2>12. TL;DR</h2>
 <div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th><tbody><tr><td><strong>Problem</strong><td>A single logical write touches many scattered disk locations, and power can fail between any two of them. In-place writing therefore cannot deliver "saved means saved" at any speed.<tr><td><strong>Mechanism</strong><td>Append one checksummed record describing the whole change to an append-only log, fsync it, then acknowledge. Apply to the real structures later, and replay from the last checkpoint after a crash. Group commit covers many writes with one fsync.<tr><td><strong>Costs</strong><td>Every change written twice, an fsync latency floor per commit, log housekeeping (checkpoints, retention, disk), and recovery time bounded by your checkpoint interval.<tr><td><strong>Skip it when</strong><td>The data is truly disposable (caches), or a bulk load that you can redo justifies relaxing it temporarily. Always do this on purpose, never by accident.<tr><td><strong>30-second answer</strong><td>Write the intent to an fsynced append-only log before acknowledging, apply to the real structures later, and replay after crashes. Durability and speed come from one sequential stream, and replication and point-in-time recovery come from the same log.</table></div></div>
 

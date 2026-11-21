@@ -1,0 +1,162 @@
+openapi: 3.1.0
+info:
+  title: eda-commerce shared HTTP components
+  version: 1.0.0
+  description: |
+    Components shared by every public API. Not an API by itself; other documents reference it.
+    Conventions (ADR-012):
+    - JSON bodies, camelCase fields, money as integer minor units plus ISO 4217 currency.
+    - Errors are RFC 9457 problem details (application/problem+json).
+    - Every unsafe POST accepts an Idempotency-Key header.
+    - Long-running work returns 202 Accepted with a Location header to poll.
+paths: {}
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Client-generated unique key (UUID recommended), at most 255 characters. The server stores the
+        first response for 24 hours, keyed by (caller, key). A retry with the same key and the same body
+        returns the stored response with header Idempotent-Replayed: true. The same key with a different
+        body returns 422. A retry while the first request is still running returns 409.
+      schema:
+        type: string
+        maxLength: 255
+    TraceParent:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C trace context. Propagated into every event the request produces.
+      schema:
+        type: string
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+  headers:
+    IdempotentReplayed:
+      description: Present and true when the response was replayed from the idempotency store.
+      schema:
+        type: boolean
+    Location:
+      description: URL of the resource to poll.
+      schema:
+        type: string
+        format: uri-reference
+    RetryAfter:
+      description: Seconds the client should wait before polling again.
+      schema:
+        type: integer
+    ETag:
+      description: Version of the resource, for optimistic concurrency with If-Match.
+      schema:
+        type: string
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+    Money:
+      type: object
+      required: [amountMinor, currency]
+      properties:
+        amountMinor:
+          type: integer
+          format: int64
+          description: Amount in minor units. 1999 with EUR is 19.99 EUR.
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+      additionalProperties: false
+    Address:
+      type: object
+      description: Personal data. Never logged.
+      required: [recipientName, line1, city, postalCode, countryCode]
+      properties:
+        recipientName: {type: string, maxLength: 200}
+        line1: {type: string, maxLength: 200}
+        line2: {type: [string, 'null'], maxLength: 200}
+        city: {type: string, maxLength: 100}
+        region: {type: [string, 'null'], maxLength: 100}
+        postalCode: {type: string, maxLength: 20}
+        countryCode: {type: string, pattern: '^[A-Z]{2}$'}
+        phone: {type: [string, 'null'], maxLength: 30}
+      additionalProperties: false
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          examples: ['https://errors.edacommerce.example/out-of-stock']
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        instance: {type: string, format: uri-reference}
+        traceId:
+          type: string
+          description: Trace id of the failing request, for support.
+        errors:
+          type: array
+          description: Field-level validation errors.
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field: {type: string}
+              message: {type: string}
+  responses:
+    BadRequest:
+      description: The request is malformed or fails validation.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Forbidden:
+      description: The token is valid but may not access this resource.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotFound:
+      description: No such resource, or it belongs to another customer.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    IdempotencyConflict:
+      description: A request with this Idempotency-Key is still being processed.
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    IdempotencyMismatch:
+      description: This Idempotency-Key was already used with a different request body.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    PreconditionFailed:
+      description: If-Match did not match the current ETag.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    TooManyRequests:
+      description: Rate limit exceeded.
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+  securitySchemes:
+    oidc:
+      type: openIdConnect
+      openIdConnectUrl: http://localhost:8180/realms/edacommerce/.well-known/openid-configuration
+      description: Customer and staff tokens from the OIDC provider (Keycloak locally). Services validate JWTs against the JWKS.

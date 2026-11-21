@@ -1,0 +1,27 @@
+{
+  "envelope": {
+    "eventId": "37f5e857-1fb6-576f-b8bf-d42f034a2fb4",
+    "type": "com.edacommerce.notification.NotificationSent",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "d0fbe06e-f0a0-5be0-8127-bc0d2d159590",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "notification-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Notification",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "notificationId": "10802f4c-fde4-5669-b449-42d5cfddb757",
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "customerId": "b4578d7d-29a2-519b-bb62-154906b053f4",
+  "channel": "EMAIL",
+  "template": "order-confirmed.v1",
+  "sourceEventId": "73c22524-cabd-513e-8cef-5526137c6703",
+  "attachmentCount": 1,
+  "sentAt": 1795000000000
+}

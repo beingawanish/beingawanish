@@ -207,12 +207,12 @@
 
 <details>
 <summary>"How do you look up a user by email when you shard by user ID?"</summary>
-<p>Either scatter the lookup to all shards, which is fine for rare queries but not for login, or keep a global index table <code>email → user_id</code>, sharded by email. Login becomes two single-shard reads. The unique constraint on email moves to that table, because a per-shard constraint only checks one shard. The cost is a cross-shard write at sign-up and email change, so decide what a temporarily stale index entry means and design the order of writes so the failure is harmless, for example by claiming the email first.</p>
+<p>Either scatter the lookup to all shards, which is fine for rare queries but not for login, or keep a global index table <code>email → user_id</code>, sharded by email. Login becomes two single-shard reads. The unique constraint on email moves to that table, because a per-shard constraint only checks one shard. The cost is a cross-shard write at sign-up and email change. Decide what a temporarily stale index entry means, and order the writes so a failure is harmless, for example by claiming the email first.</p>
 </details>
 
 <details>
 <summary>"Walk me through moving a logical shard to a new host without downtime."</summary>
-<p>Snapshot-copy it to the new host, throttled. Stream changes from the source's log to catch up. Verify with counts and checksums. Then cut over: pause writes for that logical shard only, apply the final changes, flip the directory entry with a new version, and resume. Start reverse replication so rollback is another flip. The part people miss is stale routers: each shard must reject writes for keys it no longer owns, or for stale directory versions, so a router with an old cache gets an error and refreshes instead of writing to the old copy.</p>
+<p>Snapshot-copy it to the new host, throttled. Stream changes from the source's log to catch up. Verify with counts and checksums. Then cut over: pause writes for that logical shard only, apply the final changes, flip the directory entry with a new version, and resume. Start reverse replication so rollback is another flip. The part people miss is stale routers. Each shard must reject writes for keys it no longer owns, or with a stale directory version. A router with an old cache then gets an error and refreshes, instead of writing to the old copy.</p>
 </details>
 
 <details>

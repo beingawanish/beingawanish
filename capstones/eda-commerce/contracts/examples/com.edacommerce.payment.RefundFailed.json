@@ -1,0 +1,26 @@
+{
+  "envelope": {
+    "eventId": "2d5d6f25-2cfa-5086-bc58-50e28e698c4a",
+    "type": "com.edacommerce.payment.RefundFailed",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "340f6292-ff96-59b0-ba01-f7f64f1e1a6b",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "payment-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Payment",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "paymentId": "fa67fc15-f637-5af4-aa0f-b9b6c747df05",
+  "refundId": "be36e5c1-549e-5af1-bb9e-be8966c84654",
+  "returnId": "1f35512c-9f12-59c2-aeca-156277068174",
+  "reason": "example-reason",
+  "retryable": false,
+  "failedAt": 1795000000000
+}

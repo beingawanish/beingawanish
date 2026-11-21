@@ -1,0 +1,34 @@
+{
+  "envelope": {
+    "eventId": "95b333b2-8057-5d93-92b4-8404da8731cf",
+    "type": "com.edacommerce.catalog.ProductUpserted",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "ce044580-63b7-5970-9489-509088a0af8f",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "catalog-svc",
+    "partitionKey": "SKU-1001",
+    "aggregateType": "Product",
+    "aggregateId": "SKU-1001",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "sku": "SKU-1001",
+  "name": "Trail Running Shoe",
+  "description": "example-description",
+  "brand": "example-brand",
+  "categoryPath": [
+    "example-categoryPath"
+  ],
+  "attributes": {
+    "colour": "red"
+  },
+  "status": "ACTIVE",
+  "weightGrams": 1,
+  "imageUrls": [
+    "example-imageUrls"
+  ]
+}

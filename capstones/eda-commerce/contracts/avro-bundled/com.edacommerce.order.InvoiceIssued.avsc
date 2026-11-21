@@ -1,0 +1,215 @@
+{
+  "type": "record",
+  "name": "InvoiceIssued",
+  "namespace": "com.edacommerce.order",
+  "doc": "An invoice PDF was rendered and stored. The event carries a claim check, not the PDF.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": {
+        "type": "record",
+        "name": "Envelope",
+        "namespace": "com.edacommerce.common",
+        "doc": "Metadata carried by every event and command. The same values are mirrored into Kafka headers (see docs/implementation-guide.md) so that routers and tracing can read them without deserialising the body.",
+        "fields": [
+          {
+            "name": "eventId",
+            "type": "string",
+            "doc": "UUIDv7 of this message. Primary key of the producer's outbox row and of every consumer's inbox row."
+          },
+          {
+            "name": "type",
+            "type": "string",
+            "doc": "Fully qualified Avro record name, e.g. com.edacommerce.order.OrderPlaced."
+          },
+          {
+            "name": "version",
+            "type": "int",
+            "doc": "Major version of the message contract. Matches the .vN suffix of the topic.",
+            "default": 1
+          },
+          {
+            "name": "occurredAt",
+            "type": {
+              "type": "long",
+              "logicalType": "timestamp-millis"
+            },
+            "doc": "When the fact happened in the producing service (UTC). Used to compute event age."
+          },
+          {
+            "name": "correlationId",
+            "type": "string",
+            "doc": "Identifier of the whole business flow. For the order flow it is the orderId; for returns it is the returnId."
+          },
+          {
+            "name": "causationId",
+            "type": [
+              "null",
+              "string"
+            ],
+            "doc": "eventId of the message that caused this one. Null only for messages started by an HTTP request or a timer.",
+            "default": null
+          },
+          {
+            "name": "traceparent",
+            "type": [
+              "null",
+              "string"
+            ],
+            "doc": "W3C trace context of the producing span.",
+            "default": null
+          },
+          {
+            "name": "tracestate",
+            "type": [
+              "null",
+              "string"
+            ],
+            "doc": "W3C tracestate, if any.",
+            "default": null
+          },
+          {
+            "name": "producer",
+            "type": "string",
+            "doc": "Logical service name, e.g. order-svc. Not the language or the host."
+          },
+          {
+            "name": "partitionKey",
+            "type": "string",
+            "doc": "The Kafka record key this message was published with. Copied here so that the key survives re-publication to retry and DLQ topics."
+          },
+          {
+            "name": "aggregateType",
+            "type": "string",
+            "doc": "Aggregate that emitted the event, e.g. Order, Payment, Reservation."
+          },
+          {
+            "name": "aggregateId",
+            "type": "string",
+            "doc": "Identifier of that aggregate instance."
+          },
+          {
+            "name": "aggregateVersion",
+            "type": "long",
+            "doc": "Monotonic version of the aggregate after this change. Read models discard anything at or below the version they already hold.",
+            "default": 0
+          },
+          {
+            "name": "tenantId",
+            "type": [
+              "null",
+              "string"
+            ],
+            "doc": "Reserved for multi-tenant reuse of the template. Null in the single-tenant shop.",
+            "default": null
+          },
+          {
+            "name": "expiresAt",
+            "type": [
+              "null",
+              {
+                "type": "long",
+                "logicalType": "timestamp-millis"
+              }
+            ],
+            "doc": "Commands only: a consumer that receives the command after this instant must reply with a rejection instead of acting on it.",
+            "default": null
+          }
+        ]
+      },
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "invoiceId",
+      "type": "string"
+    },
+    {
+      "name": "invoiceNumber",
+      "type": "string",
+      "doc": "Gapless, human-readable number, e.g. INV-2026-000123."
+    },
+    {
+      "name": "total",
+      "type": {
+        "type": "record",
+        "name": "Money",
+        "namespace": "com.edacommerce.common",
+        "doc": "An amount in minor units (cents, pence). Never a float, never an Avro decimal: integer minor units are identical in every language.",
+        "fields": [
+          {
+            "name": "amountMinor",
+            "type": "long",
+            "doc": "Amount in the currency's minor unit. 1999 with EUR means 19.99 EUR."
+          },
+          {
+            "name": "currency",
+            "type": "string",
+            "doc": "ISO 4217 alphabetic code, upper case."
+          }
+        ]
+      }
+    },
+    {
+      "name": "document",
+      "type": {
+        "type": "record",
+        "name": "ClaimCheck",
+        "namespace": "com.edacommerce.common",
+        "doc": "Pointer to a large payload stored in object storage (ADR-009). The event carries the pointer and a hash, never the bytes.",
+        "fields": [
+          {
+            "name": "store",
+            "type": "string",
+            "doc": "Storage scheme. 's3' for MinIO and AWS S3.",
+            "default": "s3"
+          },
+          {
+            "name": "bucket",
+            "type": "string"
+          },
+          {
+            "name": "objectKey",
+            "type": "string"
+          },
+          {
+            "name": "contentType",
+            "type": "string",
+            "doc": "MIME type, e.g. application/pdf."
+          },
+          {
+            "name": "sizeBytes",
+            "type": "long"
+          },
+          {
+            "name": "sha256",
+            "type": "string",
+            "doc": "Lower-case hex SHA-256 of the object. Consumers verify it after download."
+          },
+          {
+            "name": "expiresAt",
+            "type": [
+              "null",
+              {
+                "type": "long",
+                "logicalType": "timestamp-millis"
+              }
+            ],
+            "doc": "When the lifecycle policy deletes the object. Null means retained under legal hold rules.",
+            "default": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "issuedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

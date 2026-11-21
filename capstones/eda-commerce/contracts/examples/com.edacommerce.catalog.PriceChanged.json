@@ -1,0 +1,31 @@
+{
+  "envelope": {
+    "eventId": "804fcb8b-65f8-53a7-a794-1903f7eabcfa",
+    "type": "com.edacommerce.catalog.PriceChanged",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "16d2dc55-d2be-5061-b9f5-b01377ecb82c",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "catalog-svc",
+    "partitionKey": "SKU-1001",
+    "aggregateType": "Price",
+    "aggregateId": "SKU-1001",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "sku": "SKU-1001",
+  "priceListId": "retail-eu",
+  "listPrice": {
+    "amountMinor": 1999,
+    "currency": "EUR"
+  },
+  "salePrice": {
+    "amountMinor": 1999,
+    "currency": "EUR"
+  },
+  "validFrom": 1795000000000,
+  "validUntil": 1795000000000
+}

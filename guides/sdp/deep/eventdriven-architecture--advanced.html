@@ -283,3 +283,170 @@ CREATE TABLE inbox (                          -- one row per handled message
 <tr><td>Late reply after cancel<td>Event illegal in current state<td>Handle explicitly, alert<td>Return parcel to stock<td>Nothing
 <tr><td>Duplicate message<td>Redelivery after crash<td>Inbox and state check drop it<td>None<td>Nothing
 </table></div></div>
+<p>For completeness, here is the orchestrator's handler in the DB-backed style, using Python's standard-library <code>sqlite3</code> to keep it self-contained. A production version would use Postgres and <code>SELECT ... FOR UPDATE</code>, but the shape is identical.</p>
+<pre><code>import json, sqlite3, uuid
+
+TRANSITIONS = {   # (state, event type) -&gt; (next state, command to send, undo to push)
+    ("AWAITING_PAYMENT", "payment.authorized.v1"): ("AWAITING_STOCK", "inventory.reserve.v1", "payment.void.v1"),
+    ("AWAITING_STOCK",   "stock.reserved.v1"):     ("AWAITING_PACK",  "fulfilment.request.v1", "inventory.release.v1"),
+    # ... the rest of the happy path, plus the failure transitions
+}
+
+def handle(db: sqlite3.Connection, msg: dict) -&gt; None:
+    with db:  # one transaction: inbox, saga, outbox
+        try:
+            db.execute("INSERT INTO inbox VALUES ('orchestrator', ?, datetime('now'))", (msg["message_id"],))
+        except sqlite3.IntegrityError:
+            return                                    # duplicate: already handled
+        row = db.execute("SELECT state, version, compensations FROM order_saga WHERE order_id = ?",
+                         (msg["data"]["order_id"],)).fetchone()
+        state, version, comps = row
+        step = TRANSITIONS.get((state, msg["type"]))
+        if step is None:
+            park_unexpected(db, msg, state)           # illegal in this state: record and alert
+            return
+        nxt, command, undo = step
+        stack = json.loads(comps) + [{"type": undo, "ref": msg["data"]}]
+        updated = db.execute(
+            "UPDATE order_saga SET state=?, version=version+1, compensations=?, attempt=0, "
+            "step_deadline_at=datetime('now', '+2 minutes'), last_message_id=? "
+            "WHERE order_id=? AND version=?",
+            (nxt, json.dumps(stack), msg["message_id"], msg["data"]["order_id"], version)).rowcount
+        if updated != 1:
+            raise RuntimeError("concurrent update; let the broker redeliver")
+        db.execute("INSERT INTO outbox (message_id, topic, key, type, causation_id, payload) "
+                   "VALUES (?, ?, ?, ?, ?, ?)",
+                   ("cmd_" + uuid.uuid4().hex, command.split(".")[0] + ".commands",
+                    msg["data"]["order_id"], command, msg["message_id"], json.dumps(msg["data"])))
+    # only after commit: acknowledge the broker offset</code></pre>
+<p>The transition table is the workflow. Reviewers can read it, tests can enumerate it, and a missing row (an event with no legal transition in some state) shows up as a parked message rather than a silent drop.</p>
+
+<h2 id=dd-eventdriven-architecture-adv-large-payloads level=2>Deep Dive: Large Payloads</h2>
+<p>Sooner or later someone asks to put a 4 MB thing in an event. A scanned invoice, a product's full image set, a model's feature vector, a 3,000-line order from a wholesale customer. The broker refuses, or worse, accepts it and gets slower for everyone. This section covers why the limits exist, what to do instead, and how the alternatives fail.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-limits level=3>Broker limits, and why they exist</h3>
+<p>Every broker caps message size. The exact numbers change between versions and providers, so check current documentation before you design around them. The order of magnitude is stable, though:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Broker<th>Default or hard cap (approximate)<th>Notes<tbody>
+<tr><td>Apache Kafka<td>About 1 MB by default<td>Configurable. Several settings must agree: broker <code>message.max.bytes</code> (or topic <code>max.message.bytes</code>), producer <code>max.request.size</code>, consumer <code>max.partition.fetch.bytes</code> and <code>fetch.max.bytes</code>, and replica fetch sizes
+<tr><td>Amazon SQS / SNS / EventBridge<td>Historically 256 KB; AWS has raised some of these limits<td>Check the current quota for your service; billing is per 64 KB chunk on SQS
+<tr><td>Amazon Kinesis Data Streams<td>About 1 MB per record historically<td>Per-shard write throughput limits make large records expensive anyway
+<tr><td>Google Cloud Pub/Sub<td>About 10 MB per message<td>Large messages still count against throughput quotas
+<tr><td>Azure Service Bus<td>256 KB on Standard; much larger on Premium<td>Event Hubs is around 1 MB
+<tr><td>RabbitMQ<td>Large configurable cap (tens to hundreds of MB depending on version)<td>The cap is not the practical limit; memory alarms and flow control are
+</table></div></div>
+<p>The limits are not arbitrary. A broker is built around the assumption that messages are small and many, and large ones break that assumption in five places.</p>
+<ul>
+<li><strong>Memory per request.</strong> Producers batch records in memory, and brokers and consumers allocate fetch buffers sized by configuration. A 50 MB record forces every one of those buffers up, on every client, for one outlier.</li>
+<li><strong>Replication.</strong> Followers copy the leader's log in fetch requests. A huge record makes those fetches slow, which can push followers out of the in-sync set and, with <code>acks=all</code>, slow every producer on the partition.</li>
+<li><strong>Head-of-line blocking.</strong> A partition is consumed in order. One 40 MB record that takes 2 seconds to download and parse delays every small record queued behind it, including ones for other keys.</li>
+<li><strong>Timeouts.</strong> Request and session timeouts are tuned for kilobyte-scale messages. A large message plus a slow network can exceed them, causing retries that resend the same large message, and sometimes consumer-group rebalances.</li>
+<li><strong>Page cache and retention cost.</strong> Brokers serve recent data from the OS page cache. A topic full of multi-megabyte records pushes hot small data out of cache. And every byte is stored times the replication factor for the whole retention period.</li>
+</ul>
+<p>So raising the limit is a real option, but it is a trade. A topic that carries 2–5 MB records with its own tuned clients can work fine. Raising the cluster-wide default so one team can send blobs puts the cost on everyone else.</p>
+<p>A quick sanity check before deciding: size the topic. At 200 events per second and 3 MB each, the topic ingests 600 MB/s. With replication factor 3, that is 1.8 GB/s of disk writes and replication traffic, and about 155 TB per day before retention. The same events at 3 KB with a claim check cost 1,000 times less on the broker, plus 600 MB/s into object storage. That is still large, but object storage is built for it.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-claim-check level=3>The claim check, done properly</h3>
+<p>The <strong>claim-check pattern</strong> stores the large payload in object storage and sends an event that carries a reference to it, like a coat-check ticket. The first deep dive introduced the idea. Here are the details that decide whether it works.</p>
+<svg role="img" aria-labelledby="dd-eventdriven-architecture-adv-cc-title dd-eventdriven-architecture-adv-cc-desc" viewBox="0 0 720 250" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-eventdriven-architecture-adv-cc-title">Claim-check flow with integrity and lifecycle</title>
+<desc id="dd-eventdriven-architecture-adv-cc-desc">The producer first uploads the payload to object storage under a content-addressed key, then writes a small event through its outbox containing the key, size, SHA-256 hash and content type. Consumers read the event from the topic, fetch the object with their own read permission, and verify the hash. A lifecycle rule deletes objects after the topic retention plus a safety margin.</desc>
+<rect x="0" y="0" width="720" height="250" fill="var(--paper, #ffffff)"/>
+<g stroke="var(--accent, #1f5f99)" fill="var(--paper, #ffffff)">
+<rect x="16" y="40" width="150" height="80" rx="6"/>
+<rect x="270" y="20" width="190" height="60" rx="6"/>
+<rect x="270" y="140" width="190" height="60" rx="6"/>
+<rect x="560" y="70" width="146" height="90" rx="6"/>
+</g>
+<g fill="var(--ink, #1c2430)">
+<text x="28" y="62" font-weight="bold">Producer</text>
+<text x="28" y="82">1. PUT object</text>
+<text x="28" y="100">2. outbox: event</text>
+<text x="282" y="42" font-weight="bold">Object storage</text>
+<text x="282" y="62">key = sha256 of bytes</text>
+<text x="282" y="162" font-weight="bold">Topic (small event)</text>
+<text x="282" y="182">key, size, sha256, type</text>
+<text x="572" y="92" font-weight="bold">Consumer</text>
+<text x="572" y="112">3. read event</text>
+<text x="572" y="130">4. GET object</text>
+<text x="572" y="148">5. verify hash</text>
+</g>
+<g stroke="var(--muted, #5c6b7c)" stroke-width="1.5" fill="none">
+<line x1="166" y1="66" x2="266" y2="50"/><line x1="166" y1="100" x2="266" y2="168"/>
+<line x1="460" y1="170" x2="556" y2="130"/><line x1="556" y1="100" x2="464" y2="50"/>
+</g>
+<g fill="var(--muted, #5c6b7c)">
+<polygon points="265,46 270,49 266,54"/><polygon points="264,163 270,169 263,171"/>
+<polygon points="552,127 560,128 555,135"/><polygon points="467,46 460,49 465,54"/>
+</g>
+<text x="16" y="225" fill="var(--muted, #5c6b7c)">Lifecycle rule: delete objects after topic retention + longest replay window + margin. Write the object before the event, never after.</text>
+</svg>
+<p><strong>Write order.</strong> Upload the object first. Only after the upload succeeds, write the event (through the outbox, as usual). The other order publishes a reference to something that does not exist yet. If the upload fails after the event commits, every consumer hits a missing object. An upload that succeeds with no event behind it is an orphan, which the lifecycle rule cleans up. Orphans cost a little storage. Dangling references cost incidents.</p>
+<p><strong>Keys.</strong> Two schemes work well.</p>
+<ul>
+<li><strong>Content-addressed</strong>: the key is the SHA-256 of the bytes, for example <code>blobs/sha256/9f/86d0…</code>. Identical payloads dedupe for free, retries of the upload are naturally idempotent, and the key itself proves integrity. The cost is that you cannot tell from a key what owns it, so deletion for privacy needs an index.</li>
+<li><strong>Entity-addressed</strong>: <code>orders/ord_7f3a/invoice/evt_01J8QF2A.pdf</code>. Easy to reason about, easy to delete everything for one customer or order, and easy to scope access by prefix. Include the event ID or a version so a newer payload never overwrites one a slow consumer has yet to read.</li>
+</ul>
+<p>Never reuse a key for different bytes. A consumer that fetches "the invoice for this order" and gets a newer one than the event describes has a correctness bug that only shows up under lag.</p>
+<p><strong>What the event carries.</strong> The reference alone is not enough. Carry what a consumer needs to decide whether to fetch, and to check what it got:</p>
+<pre><code>"data": {
+  "order_id": "ord_7f3a",
+  "invoice": {
+    "uri": "s3://bookstore-events-blobs/orders/ord_7f3a/invoice/evt_01J8QF2A.pdf",
+    "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "size_bytes": 4194304,
+    "content_type": "application/pdf",
+    "encryption": "kms:alias/orders-blobs",
+    "expires_at": "2027-02-18T00:00:00Z"
+  },
+  "total_cents": 14200, "currency": "USD", "line_count": 3    // the facts most consumers need, inline
+}</code></pre>
+<p>The hash catches truncated uploads, the wrong object, and tampering. The size lets a consumer refuse something absurd before downloading it. <code>expires_at</code> tells a replaying consumer up front that the object may be gone, so it can choose a different recovery path.</p>
+<p><strong>Encryption and access control.</strong> Encrypt at rest with a managed key (on AWS, SSE-KMS with a key dedicated to this data set). Then access needs both bucket permission and key permission, which gives you two independent controls and an audit trail of decrypt calls. Grant each consuming service read access to the prefixes it needs, using its own identity. Avoid putting pre-signed URLs in events: they are bearer tokens that live as long as the topic retains the event, and anyone who can read the topic can use them. If you must pass a pre-signed URL, keep its expiry short and accept that replay will need a fresh one.</p>
+<p><strong>Lifecycle and TTL.</strong> Set an object lifecycle rule that deletes objects after a period. That period must be longer than three things added together: the topic's retention, the longest replay you might run, and a margin. If <code>order.events</code> keeps 30 days and you replay at most 7 days behind real time, a 45-day lifecycle is reasonable. If the topic is compacted and keeps the latest event per key forever, the object it points to must live as long as that event does. Then a time-based lifecycle is wrong, and deletion has to follow the event (see the GC race below).</p>
+<p><strong>Consistency.</strong> Amazon S3 has provided strong read-after-write consistency for new objects since late 2020, and Google Cloud Storage and Azure Blob Storage offer strong consistency for object reads too. So a consumer that reads the event after the upload completes will find the object. Older advice about "retry the GET a few times because S3 is eventually consistent" is out of date for these services. Other object stores and caching layers in front of them may behave differently, so check yours.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-chunking level=3>Chunking, and why it is usually wrong</h3>
+<p>The other obvious approach is to split a large payload into chunks, send them as separate messages, and reassemble at the consumer. Some systems have done this. LinkedIn's engineers, for example, have spoken publicly about weighing chunking against reference-based approaches for large Kafka messages. It works only under narrow conditions, and the costs are easy to underestimate:</p>
+<ul>
+<li><strong>Every chunk must land in the same partition</strong>, so they share a key. A partition carrying a 200-chunk message is blocked for every other key in it until the last chunk arrives.</li>
+<li><strong>The consumer must hold reassembly state</strong>: which chunks it has, in memory or on disk. A rebalance moves the partition to another instance that has none of that state, so it must either re-read from the first chunk or keep state externally.</li>
+<li><strong>Offset commits get subtle.</strong> You cannot commit past the first chunk until the last one is processed, or a crash loses the half-assembled message.</li>
+<li><strong>Partial failure is a new state.</strong> A producer crash after chunk 37 of 80 leaves a message that will never complete. The consumer needs timeouts and cleanup for it.</li>
+<li><strong>Compaction and retention break it.</strong> Log compaction keeps the latest record per key, which destroys chunk sequences. Time-based retention can delete the first chunks of a message whose last chunks are still retained.</li>
+<li><strong>Every consumer needs the reassembly logic</strong>, in every language the company uses. A claim check needs only an object-store client, which every language already has.</li>
+</ul>
+<p>Chunking is defensible when object storage is unavailable or forbidden and the payloads are only a few times the limit. Otherwise, use a claim check.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-compression level=3>Compression: the cheap first step</h3>
+<p>Before any of this, turn on compression. Kafka producers compress whole batches with <code>compression.type</code> set to <code>gzip</code>, <code>snappy</code>, <code>lz4</code> or <code>zstd</code>. JSON events with repeated field names compress well, often by several times; zstd tends to give the best ratio for reasonable CPU and lz4 the lowest latency. Measure on your own data, because ratios vary a lot.</p>
+<p>Two caveats. First, the size checks are applied at different points. In Kafka the broker's limit applies to the record batch as written, which is compressed. The producer's <code>max.request.size</code> check applies to the serialized record before batching, and that check is on the uncompressed size in common client versions. So a record that compresses under the broker limit can still be rejected by the producer. Second, compression helps throughput and storage, not head-of-line blocking or consumer memory: the consumer still decompresses the full record. Compression turns a 1.5 MB problem into a 300 KB non-problem. It does not make a 50 MB payload a good idea.</p>
+<p>Encrypted or already-compressed payloads (images, PDFs, ciphertext) do not compress further. If a team encrypts payloads at the field level, compression of those fields does nothing, which is one more reason to keep large blobs out of the event.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-state-vs-thin level=3>Event-carried state, thin events, and fetch-on-read</h3>
+<p>The lesson framed this as notification versus full state. With large payloads, the decision becomes per field, and there are four options rather than two:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Option<th>Event carries<th>Consumer gets the rest by<th>Good for<th>Failure it invites<tbody>
+<tr><td>Full state inline<td>Everything<td>Nothing to fetch<td>Small entities, many consumers<td>Size creep; personal data spread
+<tr><td>Key facts + claim check<td>Common fields, plus a blob reference<td>Object storage GET<td>Large, immutable attachments<td>Dangling references; access sprawl
+<tr><td>Key facts + reference by ID<td>Common fields, plus an entity ID<td>Calling the owner's API<td>Sensitive or rarely needed detail<td>Callback storm if many consumers fetch
+<tr><td>Thin notification<td>ID and type only<td>Calling the owner's API<td>Cache invalidation, low volume<td>Callback storm; reads newer state than the event
+</table></div></div>
+<p>The last row hides a correctness trap worth naming. A thin event says "order 7f3a changed". By the time the consumer calls the API, the order may have changed again. The consumer reads version 5 while processing the event for version 3. For a cache invalidation that is fine, even desirable. For an audit trail it is wrong: you have recorded the wrong facts against the event. So fetch-on-read needs a way to ask for a specific version (<code>GET /orders/ord_7f3a?version=3</code>), or the consumer must accept that it sees the latest state, not the state at the event.</p>
+<p><strong>Reference by ID versus snapshot.</strong> When an order event mentions the customer, should it carry <code>customer_id</code> or a copy of the customer's name and tier? A reference keeps the event small and avoids copying personal data. It also means the consumer sees the customer as they are <em>now</em>. A snapshot records the customer as they were <em>when the order was placed</em>. For many business facts that is what you want: the shipping address at the time of the order, the price at the time of the order, the loyalty tier that determined the discount. A useful rule: snapshot the values that the fact depends on, and reference everything else.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-small-schemas level=3>Designing schemas that stay small</h3>
+<p>Most oversized events were not designed big. They grew, one "just add it" field at a time. A few habits keep them in check.</p>
+<ul>
+<li><strong>Set a size budget per event type</strong>, and enforce it in CI: serialize a realistic worst-case example and fail the build above, say, 64 KB. Track the p99 size in production as a metric per type.</li>
+<li><strong>Bound every collection.</strong> An order with 3 lines is 2 KB. A wholesale order with 4,000 lines is 2 MB. Decide the maximum in the schema. Above it, switch to a summary event plus a claim check for the line list, or emit per-line events.</li>
+<li><strong>Don't embed related entities.</strong> An order event should not contain the full product records for each line. Carry the SKU and the price that applied. Product details live on the product topic.</li>
+<li><strong>Use a binary format at volume.</strong> Avro and Protobuf drop field names from every record and encode numbers compactly. The registry keeps the schema, so the record does not have to.</li>
+<li><strong>Prefer IDs and enums over free text.</strong> <code>"reason": "out_of_stock"</code>, not a paragraph.</li>
+<li><strong>Keep derivable data out.</strong> If <code>total_cents</code> is in the event, the consumer does not need <code>total_dollars_formatted</code> as well.</li>
+</ul>
+
+<h3 id=dd-eventdriven-architecture-adv-payload-failures level=3>Costs and failure modes</h3>
+<p><strong>Dangling references.</strong> The event says the invoice is at a key, and the object is not there. Causes: the producer wrote the event before the upload finished; a lifecycle rule shorter than a replay; a manual cleanup; a cross-region consumer reading a bucket that has not replicated yet. Detect with a counter of 404s on claim-check fetches, per producer and per event type. A healthy system has zero. Fix by enforcing upload-before-event in the producer library, lifecycle periods derived from retention, and replication-aware reads in other regions (wait for replication, or read from the source region).</p>
+<p><strong>The GC race.</strong> A garbage-collection job deletes objects that "nobody needs any more", decided by checking whether the latest event still references them. Meanwhile a consumer is 3 days behind and about to read an older event that points at the deleted object. The fix is to make the deletion condition about consumers, not events: an object can go once its event is older than the slowest consumer group's committed position on every topic that references it, plus margin. Most teams settle for the simpler rule: time-based lifecycle well beyond retention, and accept the storage cost.</p>
+<p><strong>Privacy deletion.</strong> A deletion request for customer <code>c_91</code> now covers object storage too. Entity-addressed keys make this a prefix delete. Content-addressed keys need an index from customer to hashes. One technique worth knowing is <em>crypto-shredding</em>: encrypt each customer's blobs with a per-customer key, and delete the key to make every copy unreadable at once, including copies in backups. It is more machinery, but it is often the only practical way to cover retained topics and backups.</p>
+<p><strong>Cost shape.</strong> Claim checks move cost from broker storage to object storage requests. Object storage is cheap per byte but charges per request, and a fan-out to 10 consumer groups means 10 GETs per event. At 1,000 events per second with 10 consumers, that is 10,000 GETs per second, around 26 billion a month. At typical published request prices that is a five-figure monthly bill, often more than the storage. Check your provider's pricing. If many consumers need the same blob, a shared cache or a consumer that fetches once and republishes the needed fields can be cheaper.</p>
+<p><strong>Latency and availability.</strong> Every claim-check consumer now depends on object storage being available and fast. Its p99 latency (tens to hundreds of milliseconds) enters the consumer's processing time. And an object-storage outage stops consumers even while the broker is healthy. Consumers should keep processing events that do not need the blob, and retry the ones that do through a retry topic, rather than blocking the partition.</p>

@@ -1,0 +1,52 @@
+{
+  "envelope": {
+    "eventId": "38cb9a72-2892-5381-9e63-b64c4df6ec87",
+    "type": "com.edacommerce.fulfilment.OrderPacked",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "91c2db77-f802-553a-8424-05ce9d1bc30b",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "fulfilment-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Fulfilment",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "fulfilmentId": "b04cd2ed-7960-55de-97e0-82305ee8fa3d",
+  "warehouseId": "82457bf5-6012-558d-a87e-b5eec6d6d820",
+  "parcels": [
+    {
+      "parcelId": "a032c944-dec6-5523-a656-968bb3c2ab8e",
+      "weightGrams": 1,
+      "lengthMm": 1,
+      "widthMm": 1,
+      "heightMm": 1
+    }
+  ],
+  "manifest": {
+    "store": "s3",
+    "bucket": "invoices",
+    "objectKey": "order/2026/11/6ed9d0ed-127a-524b-b079-a06e34f3ec73/invoice.pdf",
+    "contentType": "application/pdf",
+    "sizeBytes": 48213,
+    "sha256": "50d858e0985ecc7f60418aaf0cc5ab587f42c2570a884095a9e8ccacd0f6545c",
+    "expiresAt": 1795000000000
+  },
+  "shipTo": {
+    "recipientName": "Jane Doe",
+    "line1": "Invalidenstrasse 1",
+    "line2": "example-line2",
+    "city": "Berlin",
+    "region": "example-region",
+    "postalCode": "10115",
+    "countryCode": "DE",
+    "phone": "example-phone"
+  },
+  "shippingMethod": "STANDARD",
+  "packedAt": 1795000000000
+}

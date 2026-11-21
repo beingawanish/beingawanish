@@ -245,7 +245,7 @@ vnodes= 1000  moved=20.2%  busiest/average=1.01</code></pre>
 
 <details>
 <summary>"A cache node is unreachable for ten minutes and then returns. What can go wrong?"</summary>
-<p>Two things. During the outage, its keys move to neighbours, which miss and refill; writes and invalidations go there. When it returns, keys route back to it, and it still has the values from ten minutes ago, which it serves as hits. That is stale data with no error anywhere. Flush the node or bump a key generation before it rejoins, keep TTLs as the backstop, and consider not removing it from the ring at all for short outages: treat its keys as misses while it is down so ownership never changes.</p>
+<p>Two things. During the outage, its keys move to neighbours, which miss and refill; writes and invalidations go there. When it returns, keys route back to it, and it still has the values from ten minutes ago, which it serves as hits. That is stale data with no error anywhere. Flush the node or bump a key generation before it rejoins, and keep TTLs as the backstop. For short outages, consider not removing it from the ring at all. Treat its keys as misses while it is down, so ownership never changes.</p>
 </details>
 
 <details>
@@ -255,7 +255,7 @@ vnodes= 1000  moved=20.2%  busiest/average=1.01</code></pre>
 
 <details>
 <summary>"Design a load balancer that keeps each LLM conversation on the GPU that holds its KV cache, while autoscaling."</summary>
-<p>Hash by conversation ID with a consistent scheme in the balancer: ring hash or Maglev. Scaling events then move only about 1/N of conversations, which lose their warm cache and pay a prefill. Add bounded loads, because some conversations are much heavier, and a pure hash would overload a GPU that happens to own several long ones; overflow sends a request to the next GPU, which costs one cold prefill rather than a queue. Drain servers before removal so in-flight streams finish. Measure cache hit rate per scaling event to tune the balance factor.</p>
+<p>Hash by conversation ID with a consistent scheme in the balancer: ring hash or Maglev. Scaling events then move only about 1/N of conversations, which lose their warm cache and pay a prefill. Add bounded loads, because some conversations are much heavier, and a pure hash would overload a GPU that happens to own several long ones. Overflow sends a request to the next GPU, which costs one cold prefill rather than a queue. Drain servers before removal so in-flight streams finish. Measure cache hit rate per scaling event to tune the balance factor.</p>
 </details>
 
 <details>
