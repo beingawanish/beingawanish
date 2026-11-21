@@ -38,8 +38,10 @@ Optional where it earns its place: one small inline SVG diagram of the internal 
 (`role="img"`, `<title>`/`<desc>`, readable at 720px, the course's palette from its CSS variables),
 or a short code/config snippet (Python stdlib preferred; real config syntax for Kafka/nginx/etc.).
 
-Length: roughly 2,500–4,000 words per pattern lesson; capstones 2,000–3,000 focusing on the end-to-end
-deep-dive discussion (capacity plan, failure drills, evolution path). Accuracy over breadth: if unsure
+Length: depth matters more than word count. Pattern lessons typically land at 4,000–6,000 words; capstones
+and Module 12 designs 3,000–5,000, focused on the end-to-end deep-dive discussion (capacity plan with numbers,
+failure drills, evolution path, the trade-off debates a review panel would have). Foundations lessons
+(Module 1) go deep on method: worked estimation drills, common reasoning errors, how seniors run the room. Accuracy over breadth: if unsure
 of a default or limit, say it varies or leave it out. No vendor marketing.
 
 ## Output
@@ -53,3 +55,9 @@ of a default or limit, say it varies or leave it out. No vendor marketing.
   build.py, or other agents' files. No git.
 
 Report: files created, sections, word count, anything you were unsure of.
+
+## Reference: the finished Module 2 deep dives
+
+`guides/sdp/deep/message-queue.html` and `guides/sdp/deep/webhooks.html` are the accepted style.
+Skim one before you start. Lessons without a TL;DR h2 get the fragment at the end of the lesson.
+Write each lesson's file as soon as it is done (don't batch), so work survives interruptions.
