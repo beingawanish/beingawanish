@@ -1,0 +1,221 @@
+<h2 id=dd-the-five-questions-inside-the-method level=2>Deep Dive: Inside the Method</h2>
+<p>The lesson gives you the five questions and one worked example. This section opens each question up. It shows the sub-questions a senior engineer actually asks, the artefact each question leaves on the whiteboard, and how the questions feed back into each other. The procedure looks linear on paper. In practice it loops.</p>
+
+<h3 id=dd-the-five-questions-subquestions level=3>What each question really asks</h3>
+<p>Each of the five questions is a heading over a handful of sharper questions. Each one also needs a specific number, and produces a specific thing you can point at.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Question<th>Sharper sub-questions<th>Number it needs<th>Artefact it produces<tbody>
+<tr><td>1. How does data move?<td>Who waits? Is it one-to-one or one-to-many? Does it cross a company boundary? Is it a request or a continuous flow? Who starts the conversation?<td>Latency budget per user action; fan-out factor<td>Arrows, each labelled sync, async, broadcast or stream
+<tr><td>2. Where does data live?<td>What is the source of truth for each entity? What are the main access patterns? Is history needed? What must be consistent with what?<td>Rows per day, row size, retention, read:write ratio<td>Stores, each with its owner, key and size
+<tr><td>3. How is it served fast?<td>Which reads repeat? How stale may each type be? What happens on a miss of a hot key? Where are the users?<td>Repeat rate, hit ratio, staleness budget per data type<td>Caches and CDN, each with TTL and invalidation rule
+<tr><td>4. What happens when it fails?<td>For each arrow: timeout, retry, idempotency, behaviour during a 10-minute outage, what the user sees. For each store: what if it is lost or lagging?<td>Availability target per path; dependency p99<td>The failure matrix (below) and the degraded modes
+<tr><td>5. How does it grow?<td>What breaks first at 10x? Which parts scale by adding machines? Which need a redesign? Is load spiky or steady?<td>Growth rate; peak-to-average ratio; single-node limits<td>The first bottleneck and the planned next step
+</table></div></div>
+<p>The "number it needs" column is the link to <a href="#backofenvelope-math">back-of-the-envelope math</a>. If you cannot fill that cell, the answer to the question will be a guess. Ask for the number, or state an assumption and move on.</p>
+
+<h3 id=dd-the-five-questions-failure-matrix level=3>The failure matrix: Question 4 done properly</h3>
+<p>Question 4 is the one people skip. It is also the one most often answered too vaguely: "we'll add retries and a circuit breaker." That sentence says nothing about any particular arrow. The fix is a small table with one row per arrow from Question 1.</p>
+<p>Here it is for the URL shortener from the lesson:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Arrow<th>Timeout<th>Retry?<th>Idempotent?<th>If down for 10 minutes<th>User sees<tbody>
+<tr><td>Client → API (redirect)<td>Client's own<td>Browser may retry<td>Yes (read)<td>Total outage of the product<td>Error page
+<tr><td>API → cache<td>~5-10 ms<td>No, fall through to replica<td>Yes<td>All traffic hits replicas, at maybe 100x normal load<td>Slower redirects, if the replicas survive
+<tr><td>API → replica<td>~50 ms<td>Once, to a different replica<td>Yes<td>Cache hits still work; misses fail<td>Popular links work, rare ones fail
+<tr><td>API → primary (create link)<td>~200 ms<td>Yes, with idempotency key<td>Only with a key<td>No new links<td>"Try again shortly"
+<tr><td>API → analytics queue<td>~20 ms<td>No, drop the event<td>N/A<td>Click counts lost for 10 minutes<td>Nothing
+</table></div></div>
+<p>Three things fall out of this table that the vague answer missed. First, a cache outage moves the cache's load onto the replicas. At a 99% hit ratio, that is 100 times their normal read load, so the cache needs its own redundancy. Second, the analytics arrow should drop events rather than retry, because blocking a redirect for a click count is a bad trade. Third, link creation needs an idempotency key, or a retried create returns two different short codes for the same request.</p>
+<p>The timeout values here are illustrative. Set real ones from the dependency's measured p99 plus a margin, as the <a href="#timeout">timeout</a> lesson explains.</p>
+
+<h3 id=dd-the-five-questions-loops level=3>Where the questions loop back</h3>
+<p>The order matters because each answer constrains the next. But later questions often send you back to change an earlier answer. Expect these loops:</p>
+<ul>
+<li><strong>Question 4 → Question 1.</strong> You discover that a synchronous call to a flaky provider can't meet the availability target. The fix is to make that arrow asynchronous. The failure question changed the data-movement answer.</li>
+<li><strong>Question 5 → Question 2.</strong> The growth estimate shows writes will outgrow one primary in 18 months. Now the storage answer needs a shard key, and the choice of key depends on the main query from Question 2.</li>
+<li><strong>Question 3 → Question 4.</strong> A cache with a 99% hit ratio protects the database. That same cache is now a dependency whose failure multiplies database load. It needs its own row in the failure matrix.</li>
+<li><strong>Question 2 → Question 3.</strong> If data is stored as events (<a href="#event-sourcing">event sourcing</a>), reads need a projection. That projection is effectively a cache, with its own staleness question.</li>
+</ul>
+<p>Saying "this changes my earlier answer" out loud is a strength, not a weakness. It shows the design is a set of connected decisions you can revisit, not a script.</p>
+
+<h3 id=dd-the-five-questions-running-the-room level=3>Running the room</h3>
+<p>The questions also work as a timebox. In a 45-minute interview, a plan like this keeps you from spending 30 minutes on boxes and arrows:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Minutes<th>Activity<th>What you say<tbody>
+<tr><td>0-5<td>Requirements and scope<td>"Which features are in scope? Who are the users? What matters most: latency, correctness or cost?"
+<tr><td>5-10<td>Numbers<td>"Let me estimate traffic, storage and the read:write ratio."
+<tr><td>10-15<td>Q1 and Q2<td>"Here are the paths and the stores."
+<tr><td>15-20<td>Q3<td>"Here is what we cache and how stale each thing may be."
+<tr><td>20-30<td>Q4<td>"Let me go arrow by arrow through failures."
+<tr><td>30-35<td>Q5<td>"At 10x, this breaks first, and here is the next step."
+<tr><td>35-45<td>Deep dive on the interviewer's choice<td>"Which part would you like me to go deeper on?"
+</table></div></div>
+<p>The plan is a guide. Many interviewers steer early, and you should follow them. The value of the agenda is that when the steering stops, you know exactly where you are and what comes next.</p>
+<p>In a design review at work, the same questions run differently. The author has already answered them in a document, so the reviewer uses them as a coverage check. A good habit is to read the doc once, then fill in the five-row table yourself. Blank cells are your review comments.</p>
+
+<h2 id=dd-the-five-questions-three-systems level=2>Deep Dive: Three More Systems, Worked</h2>
+<p>The lesson applied the questions to a URL shortener, which is read-heavy and simple. The three systems below stress different questions. The bookstore stresses storage and caching. Group chat stresses data movement and connections. A concert ticket sale stresses failure and growth under a spike. Every number is an assumption you should say out loud, not a fact.</p>
+
+<h3 id=dd-the-five-questions-sys-bookstore level=3>System 1: The bookstore's catalog and checkout</h3>
+<p><strong>The numbers.</strong> Assume 2 million visits a day, 20 page views per visit, and 5 queries per page view. That is 40 million page views a day, about 400 a second on average and 1,600 at a 4x peak. The database would see 8,000 queries a second at peak without a cache. The catalog has 5 million titles at about 5 KB of metadata each, which is 25 GB. Each title has 5 images in 4 sizes at about 100 KB on average, so images total 5 million x 20 x 100 KB = 10 TB. Orders run at about 100,000 a day: roughly 1 a second, 4 at peak.</p>
+<ol>
+<li><strong>How does data move?</strong> Browsing and checkout are synchronous: the shopper is waiting. Order confirmation email, the warehouse pick list and search re-indexing don't need to block checkout, so the order service publishes an <code>OrderPlaced</code> event. Several teams consume it, so this is <a href="#publishsubscribe">pub/sub</a>, written through an outbox so the event can't be lost after the order commits. The payment provider is across a company boundary. It returns the final result by <a href="#webhooks">webhook</a>.</li>
+<li><strong>Where does data live?</strong> One relational primary holds orders, customers and inventory, because checkout needs transactions across them. 25 GB of catalog plus a few hundred GB of orders fits comfortably on one machine. A replica serves as failover and takes reporting queries. Images go to object storage, never the database. Search has its own index, fed from the product-change events. It is a derived copy, not a source of truth.</li>
+<li><strong>How is it served fast?</strong> Images go through a <a href="#cdn">CDN</a>: they are identical for everyone and are the bulk of the bytes. Product pages use <a href="#cacheaside">cache-aside</a>. Title, author and description may be an hour stale. Price may be seconds stale with delete-on-update invalidation. Stock shows as "in stock / low / out" from a cached count. The checkout page always re-reads price and stock from the primary. With a 95% hit ratio, the 8,000 peak queries drop to about 400 on the database.</li>
+<li><strong>What happens when it fails?</strong> Payment gets a timeout from its p99, an idempotency key per checkout attempt, and a <a href="#circuit-breaker">circuit breaker</a>. If payment is down, the order is saved as "pending payment" and the shopper is told by email when it completes. If search is down, the site <a href="#graceful-degradation">degrades</a> to category browsing. If the cache is down, the database must survive 8,000 queries a second for a while. Either that is tested, or the cache gets replicas. The email provider being down delays emails. It never blocks an order.</li>
+<li><strong>How does it grow?</strong> On a 10x sale day, reads scale through the CDN and cache. The first thing to break is probably a hot bestseller's inventory row: thousands of checkouts decrementing one counter. Options are row-level locking with short transactions (often enough at tens of orders a second on one row), splitting stock into several counter rows, or reserving stock in batches. The database primary's write load, at about 40 orders a second, is still not the problem.</li>
+</ol>
+<p><strong>What dominated:</strong> Questions 2 and 3. Getting the source of truth right for price and stock, and deciding how stale each field may be, are the decisions that matter. Nothing here needs sharding.</p>
+
+<h3 id=dd-the-five-questions-sys-chat level=3>System 2: Group chat</h3>
+<p><strong>The numbers.</strong> Assume 50 million daily active users. Each sends 40 messages a day, so there are 2 billion messages a day: about 20,000 a second on average and perhaps 60,000 at peak. Average group size is 20, so each message is delivered to about 20 devices. That is 400,000 deliveries a second on average, around 1.2 million at peak. A message with metadata is about 500 bytes, so storage grows by 2 billion x 500 B = 1 TB a day, or about 365 TB a year before replication. If 20% of daily users are online at peak, that is 10 million open connections.</p>
+<ol>
+<li><strong>How does data move?</strong> Clients hold a long-lived connection to a gateway tier, because the server must push new messages. That points to <a href="#bidirectional-streaming">bidirectional streaming</a> (WebSockets or similar). Sending is a request on that connection; the server acknowledges once the message is stored. Delivery is a fan-out from the conversation to each member's gateway. Offline members get a push notification through the platform's push service, which is a separate, rate-limited, cross-company arrow.</li>
+<li><strong>Where does data live?</strong> Messages are written once, read mostly in recent order, and never updated (except edits and deletes, which can be new events). The main query is "the last N messages of conversation C." So the key is <code>(conversation_id, sequence_number)</code>, partitioned by conversation_id. A wide-column store or a sharded relational store both fit. At 1 TB a day, this is sharded from day one. Membership (who is in which group) is small and read on every send. It lives separately and is heavily cached.</li>
+<li><strong>How is it served fast?</strong> Most reads are "open a conversation, show the last page." A cache of recent messages per active conversation serves those. Membership lists are cached, because every send needs them for fan-out. Unread counts are kept as per-user counters rather than computed from messages.</li>
+<li><strong>What happens when it fails?</strong> A gateway server holding 100,000 connections dies. All 100,000 clients reconnect at once, and if they all hit the same moment, that is a thundering herd on login and history sync. Clients need jittered reconnect backoff. Delivery is at-least-once, because a send can time out after the server stored it. So each message carries a client-generated ID and recipients deduplicate on it. Ordering within a conversation comes from a sequence number assigned by one owner per conversation, not from client clocks, which drift.</li>
+<li><strong>How does it grow?</strong> Three limits arrive at different times. Connection count grows with online users: at an assumed 100,000 connections per gateway, 10 million connections need about 100 gateways, plus headroom for a failed zone. Storage grows linearly forever, so retention and tiering to cheaper storage matter. And very large groups (say 100,000 members) make per-message fan-out cost 5,000 times that of an average group. They need a different delivery path, such as members pulling on open rather than being pushed every message.</li>
+</ol>
+<p><strong>What dominated:</strong> Questions 1 and 4. The connection model and what happens when a connection or gateway dies decide the design. The connection-memory figure is the most uncertain number here. Per-connection memory varies widely by language, framework and buffer settings, so measure it before sizing the fleet.</p>
+
+<h3 id=dd-the-five-questions-sys-tickets level=3>System 3: A concert ticket on-sale</h3>
+<p><strong>The numbers.</strong> A stadium has 50,000 seats. Sales open at 10:00, and 2 million fans are waiting. If each refreshes once a second, that is 2 million requests a second for the first few minutes, against a normal day of perhaps 200. The peak-to-average ratio is around 10,000, not the usual 3-5. Buyers average 2 tickets, so there are about 25,000 successful purchases. If checkout takes about 5 minutes per buyer, then by Little's law, admitting 2,000 buyers a minute means about 10,000 are in checkout at once. At that rate, the tickets are gone in roughly 12-15 minutes, allowing for drop-outs.</p>
+<ol>
+<li><strong>How does data move?</strong> The front door is a virtual waiting room: every fan gets a position, and the system admits them at a controlled rate. That is a <a href="#message-queue">queue</a> in the shape of a user experience, combined with <a href="#rate-limiting">rate limiting</a>. Admitted users get a signed token. Seat selection and holds are synchronous calls. Payment crosses a company boundary. Confirmation emails go through a queue.</li>
+<li><strong>Where does data live?</strong> Seat state (free, held until time T, sold) must be strongly consistent: two fans must never hold the same seat. That rules out eventually consistent stores for the hold itself. Each seat is a row, and a hold is a conditional update ("set held where state is free"). Partition by event and section, so contention spreads across many rows and no single counter takes every write. Avoid a single "seats remaining" row; it would be the hottest key in the system.</li>
+<li><strong>How is it served fast?</strong> The seat map is shown to thousands of people at once and changes constantly. Serve it from a cache that is a second or two stale, and accept that a fan may click a seat that was just taken. The hold attempt is the authoritative check, and its failure message ("just taken, pick another") is part of the design. Static assets and the waiting-room page go through a <a href="#cdn">CDN</a>, because that is where the 2 million requests a second land.</li>
+<li><strong>What happens when it fails?</strong> Holds expire after a fixed time (say 8 minutes), so abandoned or crashed checkouts return seats automatically. Hold and purchase calls carry idempotency keys, so a retry after a timeout doesn't hold two seats or charge twice. If the payment provider slows down, the hold timer is extended for users already in payment, otherwise slow payments turn into lost seats and angry fans. If the inventory store struggles, the waiting room lowers its admission rate. That is <a href="#backpressure">backpressure</a> applied to people.</li>
+<li><strong>How does it grow?</strong> The growth problem here isn't next year. It is 10:00 today. <a href="#autoscaling">Autoscaling</a> reacts in minutes, and the spike arrives in seconds, so capacity is provisioned before the sale. Everything outside the admission gate (the CDN and waiting room) must absorb the full crowd. Everything inside it only needs to handle the admitted rate. That split is the whole design: the waiting room turns an unbounded problem into a sized one.</li>
+</ol>
+<p><strong>What dominated:</strong> Questions 4 and 5, and they merged. The spike is the failure mode. Contention on seat rows is the storage problem. The admission rate is the knob that ties them together.</p>
+
+<h3 id=dd-the-five-questions-sys-compare level=3>What the four systems teach together</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>System<th>Hardest question<th>Key number<th>The decision it forced<tbody>
+<tr><td>URL shortener (lesson)<td>Q3: served fast<td>100:1 read:write, 99% hit ratio<td>Cache with no expiry for hot links
+<tr><td>Bookstore<td>Q2 and Q3<td>Staleness budget per field<td>Checkout re-reads price and stock from the primary
+<tr><td>Group chat<td>Q1 and Q4<td>10 million connections, 20x fan-out<td>Gateway tier, client dedupe, per-conversation sequence
+<tr><td>Ticket on-sale<td>Q4 and Q5<td>Peak-to-average around 10,000<td>Waiting room with a controlled admission rate
+</table></div></div>
+<p>The procedure didn't change between systems. The weight did. You always ask all five, but the numbers tell you where to spend the minutes.</p>
+
+<h2 id=dd-the-five-questions-failure-modes level=2>Deep Dive: How the Procedure Goes Wrong</h2>
+<p>A fixed procedure can fail in fixed ways. These are the ones that show up most in interviews and design reviews, each with its tell and its fix.</p>
+
+<h3 id=dd-the-five-questions-fm-no-numbers level=3>1. Asking the questions without the numbers</h3>
+<p><strong>Symptom.</strong> Every answer is generic. "We'll cache the hot data." "We'll shard if needed."</p>
+<p><strong>Mechanism.</strong> Without traffic, size and ratio, no answer can be wrong, so none can be right. The questions point at problems, but the numbers say whether a problem is real at this scale.</p>
+<p><strong>How you detect it.</strong> Look for a conditional with no threshold: "if needed," "at scale," "eventually."</p>
+<p><strong>Fix.</strong> Spend the five minutes on numbers first, as the lesson says. If the interviewer won't give them, state assumptions and write them in a corner of the board where you can point back to them.</p>
+
+<h3 id=dd-the-five-questions-fm-global-q4 level=3>2. Answering Question 4 for the whole system at once</h3>
+<p><strong>Symptom.</strong> "We'll add retries, timeouts and circuit breakers everywhere."</p>
+<p><strong>Mechanism.</strong> Different arrows need different answers. Retrying a click-analytics event is a waste. Retrying a payment without an idempotency key is a bug. A blanket answer hides both.</p>
+<p><strong>How you detect it.</strong> Point at one arrow and ask, "What happens if this one is down for 10 minutes?" A global answer usually can't say.</p>
+<p><strong>Fix.</strong> Build the failure matrix from the first deep dive. One row per arrow, five columns. It takes two minutes and is the most persuasive thing you can put on a whiteboard.</p>
+
+<h3 id=dd-the-five-questions-fm-out-of-order level=3>3. Caching before you know where data lives</h3>
+<p><strong>Symptom.</strong> The design adds Redis in the first minute, before the stores or access patterns are clear.</p>
+<p><strong>Mechanism.</strong> A cache is a copy of something. If you don't know the source of truth, you can't say how the copy is invalidated, how stale it may get, or what a miss costs. The answers to Question 3 depend on Question 2.</p>
+<p><strong>How you detect it.</strong> Ask "what is this a cache of, and what invalidates it?" If the answer is unclear, the order was skipped.</p>
+<p><strong>Fix.</strong> Keep the order. If a cache idea comes early, park it in a corner ("probably a cache here, revisit at Q3") and carry on.</p>
+
+<h3 id=dd-the-five-questions-fm-q1-sink level=3>4. Spending the whole session on Question 1</h3>
+<p><strong>Symptom.</strong> Thirty minutes in, the diagram has fifteen services with beautiful arrows. Nothing has been said about failure or growth.</p>
+<p><strong>Mechanism.</strong> Boxes and arrows feel like progress, and they are the most visible part of the design. But a design with every arrow labelled and no failure handling is the weakest kind of answer at senior level.</p>
+<p><strong>How you detect it.</strong> Check the clock against the timebox. If you're past minute 15 and haven't started Question 3, you're sinking.</p>
+<p><strong>Fix.</strong> Draw fewer boxes. Group services until the diagram has five to eight components. You can split them later if the interviewer asks.</p>
+
+<h3 id=dd-the-five-questions-fm-one-path level=3>5. Treating read and write paths as one</h3>
+<p><strong>Symptom.</strong> The same availability target, consistency level and scaling plan for everything.</p>
+<p><strong>Mechanism.</strong> Most systems have paths with very different needs. The shortener's redirect path needs high availability and tolerates staleness. Its create path needs correctness and tolerates a brief "try again." The ticket system's seat map tolerates seconds of staleness, and its hold must be exact. Merging them forces the strictest requirement onto everything.</p>
+<p><strong>How you detect it.</strong> Ask, for each question, "does the answer differ between reads and writes?" It usually does.</p>
+<p><strong>Fix.</strong> Answer the five questions separately for each main path, or at least for read and write. The lesson's shortener design does exactly this.</p>
+
+<h3 id=dd-the-five-questions-fm-script level=3>6. Running the questions as a script</h3>
+<p><strong>Symptom.</strong> The candidate answers each question once and never revisits an earlier one, even after Question 5 shows the storage plan won't last a year.</p>
+<p><strong>Mechanism.</strong> The procedure is meant to loop (see "Where the questions loop back" above). Treating it as a one-pass checklist misses the most valuable feedback: later questions revealing flaws in earlier answers.</p>
+<p><strong>How you detect it.</strong> At the end, ask whether any later answer contradicts an earlier one. Often one does, unnoticed.</p>
+<p><strong>Fix.</strong> After Question 5, take 30 seconds to say what you'd change in Questions 1 to 3 given what you now know.</p>
+
+<h3 id=dd-the-five-questions-fm-missing level=3>7. Forgetting what the five questions don't cover</h3>
+<p><strong>Symptom.</strong> A technically solid design with no word on security, privacy, cost or how the system is deployed and observed.</p>
+<p><strong>Mechanism.</strong> The five questions focus on data and load. They don't directly ask who may access what, what it costs per month, or how you'd know it was broken. Those are covered by later modules (the front door, operating in production), but they have to be added deliberately.</p>
+<p><strong>How you detect it.</strong> Ask "who can call this, what does it cost, and how would we know it was failing?"</p>
+<p><strong>Fix.</strong> Add a short sixth pass for the cross-cutting concerns: authentication and authorization, data protection, cost, and observability. In an interview, a single sentence on each is often enough to show you thought about them.</p>
+
+<h2 id=dd-the-five-questions-variations level=2>Deep Dive: Adapting the Questions</h2>
+<p>The five questions are general, but the weight shifts with the kind of system. A senior engineer knows in advance which question will dominate, and spends time accordingly.</p>
+
+<h3 id=dd-the-five-questions-by-system level=3>By kind of system</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Kind of system<th>Dominant question<th>What to add or sharpen<tbody>
+<tr><td>Read-heavy consumer product (catalog, profiles, shortener)<td>Q3<td>Staleness budget per field; hot-key and stampede plan
+<tr><td>Write-heavy ingestion (metrics, logs, clickstream)<td>Q2 and Q5<td>Partitioning, retention and tiering; batching; what may be dropped under load
+<tr><td>Money and inventory (payments, ticketing, orders)<td>Q4<td>Idempotency on every write; reconciliation; consistency per entity
+<tr><td>Real-time and connected (chat, games, live dashboards)<td>Q1<td>Connection model; reconnect storms; ordering and dedupe
+<tr><td>Data pipeline (batch or streaming)<td>Q1 and Q4<td>Exactly-once claims; replay; late data; <a href="#backpressure">backpressure</a>
+<tr><td>ML or LLM serving<td>Q3 and Q5<td>GPU capacity; per-request cost; <a href="#semantic-caching">semantic caching</a>; model version rollout
+<tr><td>Third-party integration<td>Q4<td>Provider rate limits; webhook verification and replay; circuit breaking
+<tr><td>Internal tool with few users<td>Q2<td>Source of truth and access control; most other questions have trivial answers
+</table></div></div>
+<p>The last row matters. For an internal tool with 50 users, Questions 3 and 5 often have the answer "nothing needed." Saying that quickly, with the number that justifies it, is better than inventing a caching layer to fill the slot.</p>
+
+<h3 id=dd-the-five-questions-by-setting level=3>By setting</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Setting<th>How the questions are used<th>Main risk<tbody>
+<tr><td>Interview<td>Spoken agenda, timeboxed, answered at whiteboard depth<td>Running out of time before Q4
+<tr><td>Design document<td>One section per question, each with numbers and a failure matrix<td>Answers that are long but never state a threshold
+<tr><td>Design review (as reviewer)<td>Coverage check: fill the five rows yourself and compare<td>Reviewing the diagram's look rather than its decisions
+<tr><td>Incident review<td>Run Q4 backwards: which arrow failed, and what did the matrix say should happen?<td>Fixing the one arrow and missing the same gap on its neighbours
+<tr><td>Capacity planning<td>Rerun Q5 with new growth numbers, then check whether Q2's answer still holds<td>Planning compute and forgetting storage or connection limits
+</table></div></div>
+
+<h3 id=dd-the-five-questions-depth level=3>How deep to go on each</h3>
+<p>A useful rule: go one level deeper on the dominant question than on the others. For the bookstore, that means naming the invalidation mechanism for price, not just "we cache products." For chat, it means describing the reconnect backoff, not just "clients reconnect." For tickets, it means the conditional update on the seat row, not just "we use a database." The other questions get a confident sentence and a number.</p>
+
+<h2 id=dd-the-five-questions-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<p>Run these against any design document. Each one maps to a gap the five questions should have caught.</p>
+<ol>
+<li>Are the numbers written down (traffic, peak ratio, data size, growth, read:write), and does every later decision refer to at least one of them?</li>
+<li>Is every arrow labelled with who waits, and is each asynchronous arrow justified by "nobody waits for this"?</li>
+<li>For each entity, is there exactly one source of truth, and is every other copy labelled as derived?</li>
+<li>For each cached item, are the staleness budget and the invalidation rule stated?</li>
+<li>Does the design say what happens when the cache itself is down, and has the database's load in that case been estimated?</li>
+<li>Is there a failure matrix with one row per arrow: timeout, retry, idempotency, 10-minute outage behaviour, user-visible result?</li>
+<li>Do read and write paths have separate availability and consistency targets where they differ?</li>
+<li>Is the first bottleneck at 10x named, along with the planned next step and the metric that will trigger it?</li>
+<li>Is the peak-to-average ratio realistic for this product (3-5x for steady products; far higher for launches, sales or on-sales)?</li>
+<li>Did any later answer change an earlier one, and was the earlier answer updated?</li>
+<li>Are security, cost and observability addressed, at least in a sentence each?</li>
+</ol>
+
+<h2 id=dd-the-five-questions-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Why this order? Why not start with failure, since that's what matters most?"</summary>
+<p>Because you can't reason about failure until you know what can fail. Question 4 walks the arrows from Question 1 and the stores from Question 2. Caching comes before failure because the cache is itself a dependency that changes failure behaviour: a cache outage moves load to the database. Growth comes last because it stresses the limits created by all the earlier choices. The order is a dependency order, not an importance order.</p>
+</details>
+
+<details>
+<summary>"Your cache has a 99% hit ratio. What happens to the database when the cache cluster restarts?"</summary>
+<p>Load on the database jumps by up to 100 times, because every request is now a miss. If the database was sized for the 1% miss traffic, it will fall over. Options are: keep the cache replicated so a full restart is rare; warm it before taking traffic; limit concurrent misses per key (<a href="#cache-stampede-prevention">stampede prevention</a>); and shed or degrade low-priority reads while it warms. The answer belongs in the failure matrix as its own row.</p>
+</details>
+
+<details>
+<summary>"In the chat design, how do you keep messages in order?"</summary>
+<p>Not with client timestamps, because device clocks drift and can be wrong by minutes. Each conversation has one owner at a time (for instance, the shard holding it), and that owner assigns a monotonically increasing sequence number when it stores a message. Clients display by sequence number. If a client sends two messages quickly and the first is retried, the client-generated message ID lets the server deduplicate, and the sequence number reflects storage order. Across conversations there is no global order, and none is needed.</p>
+</details>
+
+<details>
+<summary>"For the ticket sale, why not just autoscale?"</summary>
+<p>Autoscaling reacts to load after it arrives and takes minutes to add capacity. The on-sale spike arrives in seconds and is over in tens of minutes. More importantly, the bottleneck is contention on seat rows, which more application servers don't fix: they just send more conflicting writes. The waiting room caps the admitted rate at what the seat store can handle. Capacity outside the gate is pre-provisioned, mostly at the CDN, before the sale starts.</p>
+</details>
+
+<details>
+<summary>"The interviewer gives you no numbers at all. What do you do?"</summary>
+<p>State assumptions, label them, and derive from them. "I'll assume 10 million daily users and 10 actions each. That's 100 million a day, about 1,000 a second, so plan for 4,000 at peak." Then say which decisions depend on the assumption: "If it's ten times smaller, I'd drop the cache; if it's ten times larger, writes need sharding." This turns the missing number into a branch point rather than a guess.</p>
+</details>
+
+<details>
+<summary>"Which question did you answer least well, and what would you do with more time?"</summary>
+<p>This is a common closing question, and the strong answer is honest and specific. For example: "Question 5 for chat. I sized gateways from an assumed connections-per-server figure. I'd measure memory per connection on our stack, check the file-descriptor and kernel limits, and load-test a reconnect storm at 100,000 clients to confirm the jitter settings." Naming the weakest number and how you'd verify it shows judgment, not weakness.</p>
+</details>
+
+<details>
+<summary>"How do you use the five questions on a system that already exists?"</summary>
+<p>Answer them from what's actually deployed, then compare with what the system needs today. The gaps are the work. Common findings: an arrow with no timeout, a cache whose source of truth nobody can name, a failure matrix row where the honest answer is "we don't know," and a growth limit already at 70% of capacity. In an incident review, run Question 4 backwards from the arrow that failed, and then check its neighbours for the same gap.</p>
+</details>

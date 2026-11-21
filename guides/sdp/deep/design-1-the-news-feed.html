@@ -1,0 +1,176 @@
+<h2 id=dd-design-1-the-news-feed-capacity level=2>Deep Dive: The Capacity Plan, Box by Box</h2>
+<p>The lesson gives the headline numbers: 25,000 feed loads per second at peak, 500 posts per second, 1.3 TB of feed lists. A review panel takes those and asks a sharper question. How big is each box, and which one runs out first? This plan keeps the lesson's figures and adds a few stated assumptions. Change any of them and redo the line.</p>
+<h3 id=dd-design-1-the-news-feed-cap-assumptions level=3>The extra assumptions</h3>
+<ul>
+<li><strong>Registered users:</strong> 300M, of whom 100M are daily active. Follow edges exist for all 300M.</li>
+<li><strong>Page size:</strong> one feed load returns 50 posts. Followers scroll a second page on about 30% of loads.</li>
+<li><strong>Post body:</strong> about 1 KB of text and metadata. Media lives in object storage behind a CDN and is not counted here.</li>
+<li><strong>Edge size:</strong> one follow edge is two 8-byte IDs plus a timestamp, roughly 24 bytes before index overhead.</li>
+</ul>
+<h3 id=dd-design-1-the-news-feed-cap-read level=3>The read path: one feed load is not one read</h3>
+<p>A feed load does four things. It reads the user's list, reads about five celebrity recent-post lists, hydrates 50 post IDs into bodies, and checks follow membership for the unfollow filter. Count each one.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Operation<th>Per feed load<th>At 25K loads/s<th>Where it lands<tbody>
+<tr><td>Feed list read (<code>LRANGE 0 49</code>)<td>1<td>25K/s<td>Feed store, spread over ~40 nodes
+<tr><td>Celebrity recent-post reads<td>~5<td>125K/s<td>A few hundred very hot keys
+<tr><td>Post hydration<td>50 IDs, batched per shard<td>1.25M post lookups/s<td>Post cache, then post store on miss
+<tr><td>Follow-membership check<td>50 lookups, batched<td>1.25M/s<td>Per-user follow set, cached next to the feed
+<tr><td>Engagement counters (likes, replies)<td>50, batched<td>1.25M/s<td>Counter cache
+</table></div></div>
+<p>The surprise is the bottom three rows. Each is fifty times the request rate. The feed list itself is the cheapest part of a feed load. Hydration and its side lookups are where the capacity goes, and they are the reason a feed API server batches aggressively: one multi-get per cache shard, never fifty single gets.</p>
+<p>Post cache hit ratio decides the post store's size. Posts are read mostly in their first day. Ten million posts a day at 1 KB is 10 GB, so the last seven days fit in about 70 GB of cache with room to spare. At a 99% hit ratio, 1.25M lookups per second becomes 12,500 per second to the post store. At 95% it becomes 62,500. That four-point gap is a fivefold change in the database tier. Measure the hit ratio before you size the store, not after.</p>
+<h3 id=dd-design-1-the-news-feed-cap-celeb level=3>The hottest key in the system</h3>
+<p>Suppose the biggest celebrity is followed by 40% of daily users. Then about 10,000 feed loads per second read that one recent-post list. A single Redis key can serve that, but it lives on one node, and that node also serves its share of everyone else. Two cheap fixes make it a non-issue. Keep a few read replicas of the celebrity cache. Then put an in-process cache with a one-second TTL in each feed API server. With 200 API servers, the key now sees about 200 reads per second however popular the celebrity becomes. One second of extra staleness is far inside the 10-second freshness SLO.</p>
+<h3 id=dd-design-1-the-news-feed-cap-write level=3>The write path and the fan-out fleet</h3>
+<p>Peak fan-out is 500 posts per second times 200 median followers, or 100,000 appends per second. Spread over 40 feed-store nodes, that is 2,500 appends per second each, far below what one Redis process handles. Raw append throughput is not the constraint. Round trips are.</p>
+<p>A post with 200 followers touches about 40 shards, because the followers hash everywhere. The worker groups followers by shard and sends one pipelined batch per shard, in parallel. Assume a follower-list fetch of 2 ms and parallel shard batches of 3 ms. One median post costs about 10 ms of worker time including overhead. By Little's law, 500 posts per second times 0.01 s is only 5 posts in flight on average.</p>
+<p>The average hides the tail. An 80K-follower account needs 80 pages of 1,000 followers, and each page fans out to all 40 shards. Call it 80 × 10 ms = 0.8 s of work. Split it into page-sized tasks on the queue so twenty workers can share one big post. Then the big post finishes in under a second and does not sit in front of small posts on the same partition. Plan the fleet for the backlog-age SLO, not the average: provision for peak plus a 3× burst, and let autoscaling on backlog age cover the rest.</p>
+<h3 id=dd-design-1-the-news-feed-cap-storage level=3>Storage</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Store<th>Assumption<th>Size<tbody>
+<tr><td>Posts<td>10M/day × 1 KB, kept forever<td>~3.6 TB per year, before replication
+<tr><td>Follow graph, both directions<td>300M users × 200 edges × ~24 B, stored twice (followers and following)<td>~2.9 TB before indexes
+<tr><td>Feed lists<td>Lesson's 100M × 800 × 16 B, plus per-key overhead<td>1.3 TB raw; plan ~2 TB with overhead and a replica each
+<tr><td>Post cache<td>7 days of posts<td>~70 GB
+<tr><td>Outbox / fan-out queue<td>500 posts/s × 200 B, 3-day retention<td>~26 GB
+</table></div></div>
+<p>The feed-list line deserves a second look. The lesson's 16 bytes per entry is the payload. Redis also pays per-key overhead (the key string, the dictionary entry, the list header), which is tens of bytes per key. Across 100M keys that is several more gigabytes. Small lists are stored compactly as listpacks, and the threshold for that is a config knob (<code>list-max-listpack-size</code>). Load a sample of real feeds and read <code>MEMORY USAGE</code> before you commit to a node count. Then add a replica per primary, which doubles it. The LRU eviction the lesson describes is what makes this affordable: keeping only the 30% recently active users cuts the fleet to roughly a third.</p>
+
+<h2 id=dd-design-1-the-news-feed-fanout level=2>Deep Dive: Inside the Fan-Out Worker</h2>
+<p>The lesson draws fan-out as one arrow. In production it is a small protocol, and most feed bugs live inside it.</p>
+<h3 id=dd-design-1-the-news-feed-fanout-steps level=3>The steps for one post</h3>
+<ol>
+<li><strong>Consume the outbox event.</strong> It carries <code>post_id</code>, <code>author_id</code> and the author's follower count at post time. The queue is partitioned by author, so one author's posts are processed in order.</li>
+<li><strong>Check the strategy.</strong> If the author is flagged as pull (above the celebrity threshold), write the post ID to the author's recent-post list and stop. One append, done.</li>
+<li><strong>Page the follower list.</strong> Read followers in pages of about 1,000 from the follow graph, which is sharded by the followed account. For a large account, enqueue one child task per page instead of doing all pages inline.</li>
+<li><strong>Filter.</strong> Drop followers who muted or blocked the author, and optionally followers who have been inactive for 30 days (more on that below).</li>
+<li><strong>Group by feed-store shard and write.</strong> One pipelined batch per shard, each entry an append followed by a trim to the cap.</li>
+<li><strong>Commit the offset</strong> only after every batch for that page has succeeded. A failed batch means the page is retried, so the append must be safe to repeat.</li>
+</ol>
+<h3 id=dd-design-1-the-news-feed-fanout-idem level=3>List or sorted set: where idempotency comes from</h3>
+<p>Step 6 means some appends will run twice. With a Redis list, they are not idempotent. <code>LPUSH</code> on a retry puts the same post ID in the list twice, and the reader sees a duplicate. There are two clean answers.</p>
+<pre>
+# Option A: list, dedupe on read
+LPUSH feed:{user} 1734567890123456   # post ID (time-ordered)
+LTRIM feed:{user} 0 799
+
+# Option B: sorted set, idempotent by construction
+ZADD feed:{user} 1734567890123456 1734567890123456   # score = member = post ID
+ZREMRANGEBYRANK feed:{user} 0 -801                   # keep the newest 800
+</pre>
+<p>Option A is cheaper in memory and needs a dedupe step at read time, which is trivial on 50 IDs. Option B costs more memory per entry, but a repeated <code>ZADD</code> of the same member changes nothing, and the set stays sorted even when appends arrive out of order. Out-of-order arrival happens whenever two authors' partitions are processed at different speeds. With a list, a slow partition puts a five-second-old post above a newer one. Readers rarely notice at this scale, but a sorted set removes the question entirely. Many teams pick the list for memory and accept the read-time sort and dedupe. Either is defensible. What is not defensible is a list with no dedupe and an at-least-once queue.</p>
+<p>Put the append and trim in one <code>MULTI</code>/<code>EXEC</code> block or a short Lua script so a crash between them cannot leave a list growing past its cap.</p>
+<h3 id=dd-design-1-the-news-feed-fanout-ids level=3>Post IDs carry the order</h3>
+<p>Every ordering decision in this design rests on the post ID being roughly time-ordered. A Snowflake-style ID does that: 41 bits of milliseconds, 10 bits of generator ID, 12 bits of sequence. Sorting by ID then sorts by time with no second lookup, and the feed cursor is just "give me IDs below X."</p>
+<p>The catch is that the timestamp bits come from the generator's clock. A generator whose clock runs 30 seconds slow mints IDs that sort 30 seconds in the past. Its posts land below the fold and look like they never appeared. Generators should refuse to issue IDs if their clock moves backwards, and the fleet should alert on clock offset. This is a small piece of the lesson's vector clocks material showing up in an unexpected place.</p>
+<h3 id=dd-design-1-the-news-feed-fanout-active level=3>Push only to active followers</h3>
+<p>The lesson evicts idle users' feed lists from memory. The same idea applies one step earlier, at fan-out. If a follower has not opened the app in 30 days, do not append to their list at all. Their list was probably evicted already. When they return, the pull rebuild runs once and push takes over again.</p>
+<p>Suppose 40% of follow edges point at inactive accounts. Skipping them cuts fan-out work by 40%, from 100K to 60K appends per second at peak, with no change in what active users see. The cost is one more input to fan-out: an activity bit per user, read during step 4. Keep it in a compact bitmap rather than a database lookup per follower.</p>
+
+<h2 id=dd-design-1-the-news-feed-hybrid level=2>Deep Dive: The Hybrid Boundary and the Merge</h2>
+<p>The celebrity threshold looks like one number. In practice it is a small state machine with edges that need handling.</p>
+<h3 id=dd-design-1-the-news-feed-hybrid-cross level=3>Crossing the threshold</h3>
+<p>An account at 99,000 followers goes viral and passes 100,000 in an hour. Nothing has to be migrated. Its old posts are already in followers' lists, and those lists stay valid. From the moment the flag flips, new posts go to its recent-post list instead of being fanned out. The read path already merges celebrity lists, so the change is invisible to readers.</p>
+<p>The flag needs hysteresis. Switch to pull at 100K and back to push only below about 80K. Without the gap, an account hovering at the threshold flips every few minutes. Each flip sends some posts down one path and some down the other. Readers who follow it may briefly see a post twice (once from their list, once from the merge) or, worse, miss one that was in flight during the flip. Dedupe on post ID at merge time covers the first case. For the second, the fan-out worker reads the flag once per post and stamps it on the outbox event, so each post takes exactly one path.</p>
+<h3 id=dd-design-1-the-news-feed-hybrid-merge level=3>The merge and the cursor</h3>
+<p>A feed page is a k-way merge of the user's own list and about five celebrity lists, all sorted by post ID. Take the top 50 by ID. The cursor for the next page is the smallest ID returned. The next request asks every source for IDs below that cursor and merges again.</p>
+<p>This cursor survives new posts arriving at the top, because it is anchored to an ID, not an offset. That is the cursor-based pagination lesson's rule, and it matters more here than usual: with offset pagination, every new post at the top shifts page two by one and duplicates a row.</p>
+<p>The cursor has one edge. The user's list is capped at 800 entries. A user who scrolls past entry 800 has reached the end of the precomputed list, but not the end of history. At that point the read path switches to pull for older pages: query the post store by followed author with <code>id &lt; cursor</code>. It is slow, but almost nobody scrolls that far. Measure how many do. If it is more than a fraction of a percent, the cap is too low.</p>
+<h3 id=dd-design-1-the-news-feed-hybrid-follow level=3>A new follow</h3>
+<p>The lesson handles unfollow with a read-time filter. A new follow has the opposite problem: the list contains nothing from the new account. Push has no history to offer. Two choices exist. Backfill the author's last 20 posts into the follower's list with one small merge (bounded work, one shard). Or let the read path merge the new author like a celebrity for the next hour. Backfill is simpler and makes the follow feel instant, which is what product usually wants.</p>
+
+<h2 id=dd-design-1-the-news-feed-hydrate level=2>Deep Dive: Hydration and the Read Latency Budget</h2>
+<p>Give the feed read a p99 target of 200 ms at the server. Then split it, because each stage gets only what remains after the others.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Stage<th>p99 budget<th>What makes it slow<tbody>
+<tr><td>Gateway, auth, BFF routing<td>15 ms<td>Token validation on the hot path
+<tr><td>Feed list + celebrity lists (parallel)<td>15 ms<td>One slow feed-store node
+<tr><td>Merge, dedupe, unfollow filter<td>5 ms<td>Rarely the problem
+<tr><td>Hydrate posts, counters, author profiles (parallel)<td>60 ms<td>Fan-out to many cache shards
+<tr><td>Ads and injected content (BFF)<td>40 ms<td>An external ad decision service
+<tr><td>Serialisation and headroom<td>65 ms<td>Everything you forgot
+</table></div></div>
+<p>Hydration is a fan-out of its own. Fifty post IDs hash to many cache shards, and the request waits for the slowest. If each shard has a 1% chance of a 50 ms hiccup and the request touches 20 shards, about 18% of requests hit at least one hiccup (1 − 0.99<sup>20</sup>). That is the tail-at-scale effect, and it is why the hydration p99 is so much worse than any single shard's p99.</p>
+<p>Three fixes work together. Batch per shard so the request touches as few shards as possible. Send a hedged request to a replica if a shard has not answered by its p95. And set a hard deadline on hydration: posts that miss the deadline are dropped from this page and appear on the next load. A feed with 48 posts instead of 50 is invisible to users. A feed that takes 900 ms is not.</p>
+<p>Hydration is also where deletion, blocking and privacy are enforced. The lesson's "deletion is a recorded fact" lives here. So do "the author made their account private" and "the reader blocked the author yesterday." All are cheap checks on data already being fetched. Centralising them in hydration means one place to audit, instead of every writer remembering to clean feed lists.</p>
+
+<h2 id=dd-design-1-the-news-feed-drills level=2>Deep Dive: Failure Drills</h2>
+<p>The lesson walks the obvious arrows. These drills are the ones that show up in real postmortems. Each runs symptom, mechanism, detection, fix.</p>
+<h3 id=dd-design-1-the-news-feed-drill1 level=3>Drill 1: The whole feed store restarts cold</h3>
+<p><strong>Symptom.</strong> After a bad config push restarts every feed-store node, read latency climbs to seconds and the post store's CPU pins. <strong>Mechanism.</strong> One node failing sends 1/40th of users to the pull rebuild, about 625 rebuilds per second at peak, each 200 point reads. That is 125K reads per second, which the post store absorbs. All nodes at once sends every load to rebuild: 25K × 200 = 5M point reads per second, the exact load that ruled out pure pull. <strong>Detection.</strong> Feed-store hit ratio falls off a cliff; rebuild rate graph spikes. <strong>Fix.</strong> Rate-limit rebuilds with a token bucket in front of the post store. Users beyond the budget get a cheap degraded feed: recent posts from their 20 most-interacted accounts plus the celebrity lists, clearly good enough for a few minutes. Roll config changes across nodes in waves, never all at once. Persistence (RDB snapshots on replicas) turns a restart into a warm start, at the cost of disk and fork memory.</p>
+<h3 id=dd-design-1-the-news-feed-drill2 level=3>Drill 2: New posts vanish for a few seconds</h3>
+<p><strong>Symptom.</strong> Users occasionally report that a friend's post appeared, disappeared on refresh, then came back. <strong>Mechanism.</strong> The fan-out worker is fast. It appends the post ID within 200 ms. Hydration reads the post from a replica that is 500 ms behind the primary. The post is "not found," and the hydration code treats not found as deleted and drops it. <strong>Detection.</strong> Count hydration misses on IDs younger than a few seconds; that count should be near zero. <strong>Fix.</strong> Distinguish "not found" from "deleted." Deletion writes a tombstone. A missing young ID is retried against the primary or simply skipped for this page without being treated as deleted. This is replication lag biting a read-your-writes expectation.</p>
+<h3 id=dd-design-1-the-news-feed-drill3 level=3>Drill 3: Duplicates after a worker deploy</h3>
+<p><strong>Symptom.</strong> After every fan-out deploy, some users see the same post twice. <strong>Mechanism.</strong> Workers are killed mid-page. The page's appends partly succeeded, the offset was not committed, and the restarted worker replays the page. <code>LPUSH</code> is not idempotent. <strong>Detection.</strong> A read-side counter of duplicate IDs removed per page. <strong>Fix.</strong> Dedupe at merge time (cheap), or move to sorted sets. Also drain workers gracefully on deploy: stop consuming, finish in-flight pages, commit, then exit.</p>
+<h3 id=dd-design-1-the-news-feed-drill4 level=3>Drill 4: The follow graph shard melts during a viral post</h3>
+<p><strong>Symptom.</strong> Fan-out backlog age grows for one partition range only. <strong>Mechanism.</strong> A 90K-follower account posts ten times in a minute. Each post pages 90 follower pages from the same follow-graph shard, which holds that account's follower list. The follow graph is sharded by followed account, so one account's followers live together. Ten posts mean 900 page reads hitting one shard in a burst. <strong>Detection.</strong> Per-shard read latency on the follow graph; backlog age per queue partition. <strong>Fix.</strong> Cache follower pages for hot authors for a minute. Their follower list barely changes between posts. Collapse bursts: if an author posts several times within seconds, one fan-out pass can carry all their new post IDs.</p>
+<h3 id=dd-design-1-the-news-feed-drill5 level=3>Drill 5: A celebrity post melts the post cache</h3>
+<p><strong>Symptom.</strong> One post-cache node's CPU hits 100% minutes after a celebrity posts. <strong>Mechanism.</strong> The celebrity list is protected by local caching, but the post body is a separate key. Ten thousand feed loads per second hydrate that same post ID, and all land on one shard. <strong>Detection.</strong> Hot-key sampling on the cache (Redis has <code>--hotkeys</code> with an LFU policy, or sample at the client). <strong>Fix.</strong> Feed API servers cache post bodies of celebrity posts in process, exactly like the celebrity list. Post bodies are immutable, so the local cache never needs invalidation except for deletion, which hydration checks separately.</p>
+<h3 id=dd-design-1-the-news-feed-drill6 level=3>Drill 6: Posts sink below the fold</h3>
+<p><strong>Symptom.</strong> A subset of posts gets far fewer views than normal for their authors. <strong>Mechanism.</strong> One ID generator's clock drifted 40 seconds slow after an NTP problem. Its IDs sort into the past, so its posts land on page two. <strong>Detection.</strong> Compare each post's ID timestamp with its insert time in the post store; alert when the gap exceeds a few seconds. <strong>Fix.</strong> Generators refuse to issue IDs when their clock offset exceeds a bound or moves backwards. A generator that stops issuing IDs is a visible failure; one that issues wrong IDs is invisible.</p>
+
+<h2 id=dd-design-1-the-news-feed-alternatives level=2>Deep Dive: Alternatives the Panel Will Debate</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>How to choose<tbody>
+<tr><td>Fan-out target<td>Push to all followers<td>Push to followers active in the last N days<td>B once inactive followers are a large share of edges; it needs the rebuild path you already have
+<tr><td>Feed list structure<td>Redis list, dedupe and sort at read<td>Sorted set keyed by post ID<td>A for memory; B when out-of-order or duplicate appends are visible to users
+<tr><td>Feed store<td>In-memory cache (Redis)<td>Wide-row store (Cassandra-style, one partition per user)<td>A while feeds are disposable and fit in RAM; B when lists must survive restarts or grow to thousands of ranked candidates
+<tr><td>Post to queue<td>Transactional outbox table<td>CDC reading the post store's log<td>Outbox is explicit and portable; CDC adds no write to the hot path but ties you to the database's log format
+<tr><td>Celebrity cutoff<td>Fixed follower threshold<td>Measured fan-out time per post<td>Start with A; B adapts to bursts, since what you really care about is whether fan-out beats the SLO
+<tr><td>Ranking<td>Score at read over precomputed candidates<td>Precompute ranked feeds offline<td>A for freshness and personalisation; B only for low-traffic surfaces like weekly digests
+</table></div></div>
+<p>The debate that takes longest is usually Redis versus a wide-row store. The case for a durable store is drill 1: a cold restart is the one failure where "the feed is a disposable cache" stops being comforting. The case against is cost and latency. Keep the cache, make restarts warm with replica persistence, and rate-limit rebuilds. That handles drill 1 without paying for durability on data you can recompute. Move to a durable feed store when ranking grows the candidate list to thousands of entries per user and RAM stops being the cheap option.</p>
+<p>A second debate: should the fan-out queue be partitioned by author or by follower shard? By author keeps one author's posts in order and makes burst collapsing easy. By follower shard lets a worker write to one feed-store shard at a time, which batches better. Author partitioning wins because per-author ordering and per-author work splitting are what the hard cases need. Batching per shard happens inside the worker anyway.</p>
+
+<h2 id=dd-design-1-the-news-feed-evolution level=2>Deep Dive: The Evolution Path</h2>
+<p>Nobody should build the final design first. Each stage below is triggered by a measured pain.</p>
+<ol>
+<li><strong>Stage 1: pull from one database.</strong> One posts table indexed on <code>(author_id, id)</code> and a follows table. A feed is a query over followed authors. At 1M daily users and about 250 loads per second at peak, that is about 50K index reads per second, which a primary and two replicas can serve. Ship this.</li>
+<li><strong>Stage 2: cache the assembled feed.</strong> Cache each user's last result for 30 seconds. Triggered by database CPU, not by a design document.</li>
+<li><strong>Stage 3: push fan-out with an outbox.</strong> Triggered when pull read volume or p99 crosses its budget, around tens of millions of users. The pull path stays as the rebuild path.</li>
+<li><strong>Stage 4: hybrid.</strong> Triggered by the first account whose fan-out takes longer than the freshness SLO.</li>
+<li><strong>Stage 5: ranked feed.</strong> The list grows to about 2,000 candidates, a feature store appears, and the read path gains a scoring stage with its own latency budget. Now the durable feed store debate reopens.</li>
+<li><strong>Stage 6: multi-region.</strong> Each region keeps its own feed store, built by regional fan-out workers reading a replicated post stream. Posts have one home region per author. The tricky part is cross-region follows: a post from a Europe-homed author must fan out in every region where followers live. That usually means replicating the outbox stream everywhere and fanning out locally.</li>
+</ol>
+
+<h2 id=dd-design-1-the-news-feed-review level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the per-feed-load operation count, and which row of it dominates the cache fleet's size?</li>
+<li>What is the measured post-cache hit ratio, and how big does the post store get if it drops five points?</li>
+<li>Are fan-out appends idempotent, or deduped at read? Show where.</li>
+<li>How is a large author's fan-out split so it cannot block small authors on the same partition?</li>
+<li>What happens if every feed-store node restarts at once? Where is the rebuild rate limit?</li>
+<li>Does the celebrity flag have hysteresis, and is the chosen path stamped on each post?</li>
+<li>How does hydration tell "deleted" from "not replicated yet"?</li>
+<li>What is the hydration deadline, and what does the user see when it fires?</li>
+<li>Which keys are hot (celebrity lists, celebrity post bodies, celebrity follower pages), and what protects each?</li>
+<li>Where are block, mute, privacy and deletion enforced, and is it one place?</li>
+<li>How do you detect clock drift in ID generators?</li>
+<li>Which metric pages the on-call engineer: backlog age, feed read p99, or rebuild rate?</li>
+</ol>
+
+<h2 id=dd-design-1-the-news-feed-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Fan-out is 100K appends per second. Redis does more than that on one node. Why 40 nodes?"</summary>
+<p>Because the nodes are sized for memory, not throughput. The feed lists are 1.3 TB of payload plus overhead plus replicas. Throughput per node is low, about 2,500 appends per second at peak. The real throughput constraint is round trips from workers, which is why the worker batches per shard. If someone sizes this fleet on ops per second, they will build five nodes and run out of RAM.</p>
+</details>
+<details>
+<summary>"A user follows 5,000 accounts, 40 of them celebrities. Does your read path still work?"</summary>
+<p>The push list is unaffected: it is still one read of 50 IDs. The merge now has 40 celebrity sources instead of five. Each is a cached read with a local in-process copy, so 40 reads costs a few milliseconds more, not 40 network round trips. Cap it anyway. Above some count, say 20, merge only the celebrities this user interacts with most, and fan out the rest into the user's list by a special path. Heavy followers are rare, and the cap keeps one user from costing the read path forty times the median.</p>
+</details>
+<details>
+<summary>"Can a follower ever miss a post permanently?"</summary>
+<p>Yes, in two places, and both are acceptable if you say so. First, a post that was fanned out while the follower's list was evicted is never in the list. The rebuild on their return pulls it back, so it is not lost. Second, a post that falls past the 800 cap before the user opens the app is out of the precomputed list but still reachable by pulling older pages. Permanent loss would need the post itself to be lost, and the outbox prevents that. The feed is a view, so missing from the view is recoverable.</p>
+</details>
+<details>
+<summary>"Why not use Kafka with one partition per user and have the client read their partition?"</summary>
+<p>Because partitions are a scarce, heavyweight resource and users are not. A broker cluster handles thousands to low hundreds of thousands of partitions, not 100M. And it would turn every feed read into a log read with offsets to manage per user. The queue's job is to carry fan-out work, partitioned by author. The feed store's job is to serve one cheap read per user. Mixing them gives you the worst of both.</p>
+</details>
+<details>
+<summary>"Your threshold is 100K followers. Defend the number."</summary>
+<p>Don't defend it. Derive it. The constraint is that fan-out must finish within the freshness SLO under burst. If a worker pool can sustain 100K appends per second and you want one post to finish in 1 second while sharing the pool with others, a post can afford maybe 50K to 100K appends. That gives the threshold's order of magnitude. Then measure: plot fan-out completion time against follower count and set the threshold where p99 completion crosses a fraction of the SLO. The number moves when the fleet changes, so it should be config, not code.</p>
+</details>
+<details>
+<summary>"Legal says a post must disappear from every feed within 60 seconds of a takedown. Does your design meet it?"</summary>
+<p>Yes, without touching feed lists. Takedown writes a tombstone at the source. Hydration checks tombstones on every read. The only lag is the post-body cache: if a celebrity post is cached in process for one second and in the shared cache with a long TTL, the takedown must also invalidate those. So add a tombstone check that bypasses the body cache (a small, hot set of recent tombstones), or publish takedowns on a fan-out channel to the API servers. Deletion as a recorded fact makes the SLO cheap to meet.</p>
+</details>
+<details>
+<summary>"The feed loads, but it's from four minutes ago. How do you even notice?"</summary>
+<p>You measure end to end, not per box. Emit a synthetic canary: a bot account posts every 30 seconds, and a set of follower bots read their feeds and record when the post appears. The gap is your true freshness, including queue lag, fan-out, replication and caches. Backlog age catches most causes. The canary catches the rest, like a bug that silently drops a partition.</p>
+</details>

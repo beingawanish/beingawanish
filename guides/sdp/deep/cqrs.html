@@ -1,0 +1,216 @@
+<h2 id=dd-cqrs-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's diagram has three boxes and some arrows: write model, change stream, read models. In a design review, nearly every hard question is about the arrows. How does a change get from Postgres to Elasticsearch? What happens when two changes arrive in the wrong order? How does the orders page know whether it has caught up with the user's own write? This section follows one order, 7f3a, from checkout to the three read models, using the most common setup: Postgres as the write model, CDC into Kafka, and a projector per read model.</p>
+
+<h3 id=dd-cqrs-command-side level=3>The command side: validate, commit, return a position</h3>
+<p>A command handler does four things inside one database transaction. It loads what it needs, checks the business rules, writes the change, and commits. With only 3 indexes left on the write tables, the commit is fast.</p>
+<p>It then returns something the lesson does not mention, and that the read side will need: <strong>a position token</strong>. In Postgres this can be the WAL position of the commit, read with <code>pg_current_wal_lsn()</code> right after it. A simpler option is a per-order version number that the write increments. The client keeps the token and sends it with its next read. That one value is what turns read-your-writes from a guess ("wait a second and hope") into a check ("has the projection applied my change yet?").</p>
+<p>Commands should also carry an <strong>idempotency key</strong>. When the orders page lags and the user does not see their order, the next thing they do is press "Place order" again. With a key, the second command finds the first result and returns it. Without one, lag becomes duplicate orders.</p>
+
+<h3 id=dd-cqrs-cdc level=3>The change stream: logical decoding, slots and topics</h3>
+<p>Debezium is the usual CDC tool for Postgres, and its moving parts are worth naming, because each one is a knob and a failure mode.</p>
+<ul>
+<li><strong>Logical decoding</strong> turns WAL records into row-level changes (insert, update, delete, with column values). It needs <code>wal_level = logical</code> on the primary, which writes somewhat more WAL.</li>
+<li>A <strong>publication</strong> lists which tables are captured. Capture the tables the read models need, not the whole database.</li>
+<li>A <strong>replication slot</strong> remembers how far the consumer has read. Postgres keeps all WAL the slot has not confirmed. This is what makes CDC lossless across connector restarts. It is also what fills the primary's disk when the connector stops.</li>
+<li><strong>Kafka topics</strong>, usually one per table, keyed by primary key. Kafka preserves order only within a partition, so keying by primary key means all changes to order 7f3a land in one partition, in commit order. Changes to <em>different</em> rows have no shared order at all.</li>
+<li>An <strong>initial snapshot</strong>. When the connector starts for the first time, it reads the existing tables and emits them as change events, then switches to streaming. Every new read model needs either this or a separate backfill.</li>
+</ul>
+<p>Raw table CDC has one structural weakness: your read models now depend on your write schema. Rename a column and every projector sees a different event. The common answer is the <strong>outbox</strong> variant. The command handler writes an <code>outbox</code> row with a deliberate, versioned event (<code>OrderPlaced</code> v2) in the same transaction, and CDC captures only the outbox table. Debezium ships an "outbox event router" for exactly this. You get the safety of log-based capture and a contract you control.</p>
+
+<h3 id=dd-cqrs-projector level=3>The projector: idempotent, ordered per key, checkpointed</h3>
+<p>A projector consumes changes and writes one read model. Kafka delivers at least once, so every change may arrive twice. Partitions can also be reassigned mid-batch. The apply step must survive both. The standard tool is a <strong>version guard</strong>: each read row stores the version (or LSN) of the last change it applied, and an update only lands if it is newer.</p>
+<pre><code>-- orders_list: one flat row per order, no joins at read time
+INSERT INTO orders_list (order_id, customer_id, status, total, item_count,
+                         customer_name, placed_at, src_version)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (order_id) DO UPDATE
+SET status        = EXCLUDED.status,
+    total         = EXCLUDED.total,
+    item_count    = EXCLUDED.item_count,
+    customer_name = EXCLUDED.customer_name,
+    src_version   = EXCLUDED.src_version
+WHERE orders_list.src_version &lt; EXCLUDED.src_version;   -- duplicates and stale changes do nothing</code></pre>
+<p>A duplicate has the same version, so the <code>WHERE</code> rejects it. A stale change has a lower version, so it is rejected too. The read model converges on the latest state no matter how many times or in what order a change for that row arrives.</p>
+<p>Elasticsearch has the same idea built in. Index with <code>version_type=external</code> and pass the source version: Elasticsearch rejects any write whose version is not higher than the stored one. One Elasticsearch detail surprises people. A document is not searchable until the next <em>refresh</em>, which happens every second by default (<code>refresh_interval</code>). So search lag has a floor of about a second, however fast the projector is. Raising the interval to 30 s during a bulk rebuild makes indexing much cheaper. Forgetting to set it back makes search 30 s stale.</p>
+<p>Offsets come last. Commit the Kafka offset only after the batch is applied. If the read model is a relational table, you can go one better: store the offset in the same transaction as the rows, and on startup resume from the stored offset instead of Kafka's.</p>
+
+<h3 id=dd-cqrs-joins level=3>Where the join went: denormalization fan-out</h3>
+<p>The lesson says the join "still happens, but only once, at write time." True, and it has a cost the lesson leaves out. The <code>orders_list</code> row contains <code>customer_name</code>. When customer 8412 changes their name, the projector must rewrite every order row that copied it. A customer with 2,000 orders turns one write into 2,000.</p>
+<p>A projector that joins also has to cope with events from two topics that have no shared order. The <code>customers</code> change can arrive before or after the <code>orders</code> change that refers to it. There are three ways to handle this:</p>
+<ul>
+<li><strong>Fan out the update.</strong> The projector keeps a local <code>customers</code> table and, on a name change, rewrites that customer's order rows in batches. Correct, simple, and expensive for customers with huge histories.</li>
+<li><strong>Join inside the read store.</strong> Keep <code>orders_list</code> and a small <code>customer_names</code> table side by side in the read database, and join at query time on an indexed key. That join is cheap: two tables, one key, both shaped for it. It is nothing like the six-table join from the incident.</li>
+<li><strong>Do not copy volatile fields.</strong> If the orders page can show the name from the session, leave it out of the projection entirely.</li>
+</ul>
+<p>The general rule: copy fields that rarely change (a product's title at purchase time, which should never change on an old order anyway), and reference fields that change often.</p>
+
+<h3 id=dd-cqrs-ryw level=3>Read-your-writes, done precisely</h3>
+<p>With a position token from the command side, the read side can do better than "route to the primary for a few seconds":</p>
+<ol>
+<li>The client places order 7f3a and gets back <code>version = 1</code> (or an LSN).</li>
+<li>It requests the orders page with <code>min_version</code> for that order, or <code>min_lsn</code> for the whole projection.</li>
+<li>The read service checks the projection's applied position. If it is far enough, it serves the read model.</li>
+<li>If not, it waits briefly (say up to 300 ms), polling the position. Past that budget, it falls back to the write model for this one read, or serves the read model plus the client's optimistic copy of the new order.</li>
+</ol>
+<p>This sends almost no traffic to the write side, because the projection is usually already there. "Primary for five seconds after any write" is cruder. It sends every read in that window to the write side, which is fine at small scale and a real load at large scale.</p>
+
+<figure>
+<svg role="img" aria-labelledby="dd-cqrs-svg-title dd-cqrs-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-cqrs-svg-title">The CQRS sync path with CDC, and where lag is added</title>
+<desc id="dd-cqrs-svg-desc">A command commits to Postgres and an outbox row in one transaction and returns a position token. Logical decoding through a replication slot feeds Debezium, which publishes to Kafka topics keyed by order ID. Three projectors consume: one upserts orders_list with a version guard, one indexes Elasticsearch with external versions and a one second refresh, one loads the warehouse in micro-batches. Typical added lag is shown under each stage. The read service compares the client's token with the projection's applied position before serving.</desc>
+<rect x="10" y="30" width="130" height="80" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="75" y="54" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Postgres</text>
+<text x="75" y="72" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">orders + outbox</text>
+<text x="75" y="90" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">returns token</text>
+<rect x="170" y="30" width="120" height="80" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="230" y="54" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Debezium</text>
+<text x="230" y="72" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">slot + logical</text>
+<text x="230" y="90" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">decoding</text>
+<rect x="320" y="30" width="110" height="80" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="375" y="54" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Kafka</text>
+<text x="375" y="72" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">key = order_id</text>
+<text x="375" y="90" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">order per key</text>
+<line x1="140" y1="70" x2="168" y2="70" style="stroke:var(--accent,#1f5f99)"/>
+<polygon points="168,70 160,66 160,74" style="fill:var(--accent,#1f5f99)"/>
+<line x1="290" y1="70" x2="318" y2="70" style="stroke:var(--accent,#1f5f99)"/>
+<polygon points="318,70 310,66 310,74" style="fill:var(--accent,#1f5f99)"/>
+<rect x="470" y="10" width="240" height="50" rx="6" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="590" y="31" text-anchor="middle" style="fill:var(--ink,#1c2430)">orders_list upsert, version guard</text>
+<text x="590" y="49" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">+50–150 ms</text>
+<rect x="470" y="70" width="240" height="50" rx="6" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="590" y="91" text-anchor="middle" style="fill:var(--ink,#1c2430)">Elasticsearch, external version</text>
+<text x="590" y="109" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">+1 s refresh floor</text>
+<rect x="470" y="130" width="240" height="50" rx="6" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="590" y="151" text-anchor="middle" style="fill:var(--ink,#1c2430)">Warehouse micro-batches</text>
+<text x="590" y="169" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">+1–5 min</text>
+<line x1="430" y1="60" x2="468" y2="35" style="stroke:var(--accent,#1f5f99)"/>
+<line x1="430" y1="70" x2="468" y2="95" style="stroke:var(--accent,#1f5f99)"/>
+<line x1="430" y1="85" x2="468" y2="155" style="stroke:var(--accent,#1f5f99)"/>
+<text x="75" y="135" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">commit</text>
+<text x="230" y="135" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">+10–50 ms</text>
+<text x="375" y="135" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">+5–20 ms</text>
+<rect x="10" y="200" width="420" height="60" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="220" y="224" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Read service</text>
+<text x="220" y="243" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">applied position ≥ client token? serve : wait ≤300 ms, then fall back</text>
+<text x="470" y="224" style="fill:var(--muted,#5c6b7c)">Lag figures are typical, not guarantees.</text>
+<text x="470" y="243" style="fill:var(--muted,#5c6b7c)">Measure each stage separately.</text>
+</svg>
+</figure>
+
+<h2 id=dd-cqrs-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions: the bookstore's peak is 300 orders per second. Each order commits the order row, three item rows, one payment row and one outbox row: 6 row changes. Change events average 1 KB on the wire.</p>
+
+<h3 id=dd-cqrs-sizing-index level=3>The write-side saving, counted</h3>
+<p>Before the split, each insert into the orders table touched the heap plus 14 indexes: 15 writes. After, it touches the heap plus 3: 4 writes. That is about 73% fewer page writes for that table. Each index change also generates WAL, so the WAL volume for orders falls by a similar share. Part of that saving goes straight back into CDC, because <code>wal_level = logical</code> writes extra information and the outbox adds a row per command. Net, the write side still comes out well ahead, and, more important, it stops getting slower every time a reader wants something.</p>
+
+<h3 id=dd-cqrs-sizing-stream level=3>Change stream throughput</h3>
+<ul>
+<li>Raw table CDC: 300 orders/s × 6 changes = 1,800 events/s, about 1.8 MB/s. With the outbox variant only: 300 events/s. Either is small for Kafka.</li>
+<li>Partitions are set by the slowest consumer, not by Kafka. Say the <code>orders_list</code> projector applies batches at about 1,500 changes per second per partition. Peak 1,800/s needs at least 2 partitions. Plan for 12, so a backlog drains in parallel and you can add projector instances later. Partitions are cheap to have and painful to change, because changing the count moves keys between partitions and breaks per-key order during the switch.</li>
+<li>Retention: at 1.8 MB/s, a day of changes is about 155 GB. Seven days is about 1.1 TB, times the replication factor of 3: about 3.3 TB of Kafka disk. That retention is what lets a projector that broke on Friday replay from Kafka on Monday instead of re-snapshotting Postgres.</li>
+</ul>
+
+<h3 id=dd-cqrs-sizing-lag level=3>The lag budget, stage by stage</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Stage<th>Typical added lag<th>What moves it<tbody>
+<tr><td>Commit to logical decoding<td>10–50 ms<td>Large transactions (decoded only after commit), connector polling settings
+<tr><td>Debezium to Kafka<td>5–20 ms<td>Producer <code>linger.ms</code> and batching, broker acks setting
+<tr><td>Kafka to projector<td>5–100 ms<td>Consumer poll and batch size; bigger batches mean higher throughput and higher lag
+<tr><td>Apply to <code>orders_list</code><td>20–50 ms<td>Upsert batch size, target database load
+<tr><td>Elasticsearch searchable<td>up to 1 s<td><code>refresh_interval</code>
+</tbody></table></div></div>
+<p>The sum for <code>orders_list</code> lands near the lesson's 200 ms. Search sits nearer 1–1.5 s. Every stage has a "bigger batch" knob that trades lag for throughput, so the budget is a design decision. Write it down per read model: the orders page may need p99 under 1 s, search under 5 s, the warehouse under 15 minutes.</p>
+
+<h3 id=dd-cqrs-sizing-storage level=3>Read model storage and rebuild time</h3>
+<ul>
+<li><code>orders_list</code>: 100 million orders × about 600 bytes with indexes ≈ 60 GB. One modest database, or a replicated pair for read volume.</li>
+<li>Elasticsearch: source documents of about 1.5 KB, plus the inverted index, often land at 1–2× the source size, then × (1 primary + 1 replica). Call it 300–600 GB for 100 million orders. Measure on a real sample. Text-heavy fields swing it a lot.</li>
+<li>Rebuild of <code>orders_list</code> from a Kafka topic or a snapshot at 20,000 rows/s with batched upserts: 100M / 20,000 = 5,000 s, under 1.5 hours. Elasticsearch bulk indexing speed varies too much with mapping and hardware to quote. Measure it, then plan the rebuild window with 2× margin.</li>
+</ul>
+
+<h3 id=dd-cqrs-sizing-fanout level=3>Fan-out cost of a copied field</h3>
+<p>Suppose 0.05% of 20 million customers change their name each day: 10,000 changes. If the average customer has 40 orders, that is 400,000 extra row updates a day, about 5 per second. Harmless. Now copy the <em>category name</em> into every order item, and rename one category with 30 million items. One click becomes 30 million updates. At 20,000 per second that is 25 minutes, and if those updates share partitions with normal traffic, every orders-page read in that time is 25 minutes stale. Do this arithmetic for each copied field before you copy it.</p>
+
+<h2 id=dd-cqrs-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-cqrs-fm-slot level=3>1. The primary's disk fills up because a read model stopped</h3>
+<p><strong>Symptom:</strong> disk usage on the write primary climbs steadily all weekend. On Monday writes fail. <strong>Mechanism:</strong> the Debezium connector crashed on Friday, or a test connector was created and abandoned. Its replication slot still exists, so Postgres keeps every WAL segment since the slot's last confirmed position. The read side's outage has become a write-side outage. <strong>Detect:</strong> alert on retained WAL per slot, in bytes (the gap between <code>pg_current_wal_lsn()</code> and the slot's <code>confirmed_flush_lsn</code> in <code>pg_replication_slots</code>), and on inactive slots. <strong>Fix:</strong> restart the connector or drop the abandoned slot. Since Postgres 13, <code>max_slot_wal_keep_size</code> caps retained WAL. When the cap is hit, the slot is invalidated and the connector needs a fresh snapshot. That is the right trade: a slow rebuild of the read side beats a down write side.</p>
+
+<h3 id=dd-cqrs-fm-reorder level=3>2. An old status overwrites a new one</h3>
+<p><strong>Symptom:</strong> some cancelled orders show "shipped" on the orders page. The write model says cancelled. <strong>Mechanism:</strong> the projector applies changes with plain <code>UPDATE ... SET status = ?</code>. During a consumer rebalance, a batch was processed twice: once by the old owner, then again by the new owner after a newer change had already landed. Or the read model is fed from two topics, and their changes interleave arbitrarily. The last write wins, and it was the older one. <strong>Detect:</strong> a reconciliation job that samples rows and compares read-model version and status with the write model. <strong>Fix:</strong> the version guard from the mechanism section, on every projector. Then rebuild or repair the drifted rows.</p>
+
+<h3 id=dd-cqrs-fm-double-submit level=3>3. Lag turns into duplicate orders</h3>
+<p><strong>Symptom:</strong> a spike in customers charged twice, all within a few seconds of each other, during a busy evening. <strong>Mechanism:</strong> projection lag rose from 200 ms to 4 s under load. Users placed an order, saw an empty orders page, assumed it failed, and placed it again. Each command was valid on its own. <strong>Detect:</strong> duplicate-order rate (same customer, same items, within 60 s) graphed next to projection lag. They move together. <strong>Fix:</strong> idempotency keys on commands, generated by the client per checkout attempt. Then position tokens, so the page waits for or patches in the user's own order. A lag spike should cause a slower page, never a second charge.</p>
+
+<h3 id=dd-cqrs-fm-schema level=3>4. A harmless migration breaks every projector</h3>
+<p><strong>Symptom:</strong> after a deploy that renamed <code>orders.total</code> to <code>orders.total_amount</code>, the search projector stops. Its lag grows, and so does the dead-letter queue. <strong>Mechanism:</strong> with raw table CDC, the table schema <em>is</em> the read side's contract. The projector cannot find <code>total</code>, fails, and retries the same event. If it uses a dead-letter queue, it skips ahead, and every order since the deploy is missing from search. <strong>Detect:</strong> projector error rate, DLQ depth, and stuck-offset alerts, split by projector. <strong>Fix:</strong> short term, update the projector to read both names. Long term, move read models to outbox events with a versioned contract, and add a schema compatibility check (a schema registry, or a CI test) that fails the write-side deploy before it breaks the read side.</p>
+
+<h3 id=dd-cqrs-fm-drift level=3>5. A read model drifts and nobody notices for weeks</h3>
+<p><strong>Symptom:</strong> finance notices that the dashboard's monthly revenue is 0.4% below the ledger. It has been for six weeks. <strong>Mechanism:</strong> a projector bug dropped partial refunds of a particular type. There was no error, because the code did exactly what it was written to do. This is the costliest failure in CQRS: a read model that is wrong and trusted. <strong>Detect:</strong> scheduled reconciliation. For each day, compare count and sum of key fields between the write model and each read model, by bucket (per day, per shard, per status). Alert on any difference above a small tolerance. <strong>Fix:</strong> fix the projector, rebuild the read model, and keep the reconciliation running. A read model with no reconciliation job is a read model you only <em>hope</em> is right.</p>
+
+<h3 id=dd-cqrs-fm-rebuild level=3>6. A rebuild takes down production</h3>
+<p><strong>Symptom:</strong> the team rebuilds the search index on a Tuesday afternoon. Checkout latency doubles, and search returns half-empty results for an hour. <strong>Mechanism:</strong> two mistakes at once. The rebuild used a fresh Debezium snapshot, which ran large scans against the write primary at peak. And it wrote into the live index after deleting it, so readers saw a half-built index. <strong>Detect:</strong> primary CPU and I/O during snapshots; search result counts against a baseline. <strong>Fix:</strong> rebuild from Kafka retention or a replica, never from the primary at peak. Build into a new index (<code>orders_v7</code>) behind an alias, let it catch up to the live stream, verify counts, then swap the alias in one atomic step. The old index stays as an instant rollback.</p>
+
+<h3 id=dd-cqrs-fm-fanout level=3>7. One rename makes the orders page stale for everyone</h3>
+<p><strong>Symptom:</strong> lag on <code>orders_list</code> jumps from 200 ms to 25 minutes at 15:00. Writes look normal. <strong>Mechanism:</strong> a merchandiser renamed a category copied into 30 million rows (the sizing example). The fan-out updates queued in the same partitions as live order changes. <strong>Detect:</strong> lag per partition plus apply rate by change type. A sudden flood of one type is the giveaway. <strong>Fix:</strong> stop copying that field, or join it in the read store instead. If it must be copied, run bulk fan-out in a separate, lower-priority lane so live changes are never queued behind it.</p>
+
+<h2 id=dd-cqrs-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Options<th>Trade<th>Choose…<tbody>
+<tr><td>How read models are fed<td>Raw table CDC · outbox + CDC · event-sourced events · dual write<td>Raw CDC needs no app change but couples readers to the write schema. Outbox costs one extra row per command and gives a real contract. Events come free if you already event-source. Dual write loses data silently.<td>Raw CDC for internal read models owned by the same team. Outbox for anything another team consumes. Never dual write.
+<tr><td>Projection timing<td>Synchronous (same transaction) · asynchronous<td>Synchronous gives instant consistency and puts read-side cost on every write. Asynchronous keeps writes fast and adds lag.<td>Synchronous only for a small read table in the same database that must never lag (for example a per-customer order count used in validation). Asynchronous for the rest.
+<tr><td>Level 1 options<td>Separate query code · SQL views · materialized views<td>Plain views still run the join on read. Materialized views precompute it, but refresh is a full recompute. <code>REFRESH MATERIALIZED VIEW CONCURRENTLY</code> avoids blocking readers and needs a unique index.<td>Materialized views when minutes of staleness are fine and the data fits a periodic recompute. A projector when it must be fresh or is too large to recompute.
+<tr><td>Read-your-writes<td>Route to write side for N seconds · position token · optimistic UI<td>Routing is simple and sends load to the write side. Tokens are precise but need plumbing through clients. Optimistic UI is free and only covers the user's own screen.<td>Optimistic UI always, plus tokens on pages users check right after acting. Time-based routing at small scale.
+<tr><td>Copied fields<td>Denormalize into each row · reference and join in the read store<td>Copying gives the fastest reads and fan-out on change. Referencing gives cheap changes and a small indexed join.<td>Copy fields that never or rarely change. Reference anything an admin can edit in bulk.
+<tr><td>Command response<td>Synchronous (200 with the new state) · asynchronous (202 Accepted, poll)<td>Synchronous is simple for clients and needs the write to finish inside the request. Asynchronous suits long-running commands and adds a status endpoint.<td>Synchronous for checkout-style commands. CQRS does not require async commands, despite what many diagrams imply.
+</tbody></table></div></div>
+<p>Two strong opinions. First, <strong>the outbox is worth it as soon as a second team reads your changes.</strong> Raw CDC feels free. Then your table refactor needs four teams' sign-off, and you learn what "free" cost. Second, <strong>do not make commands asynchronous because you split the read side.</strong> CQRS splits models, not request styles. A checkout that returns 202 and asks the client to poll has added a second problem to fix the first.</p>
+<p>And remember the lesson's spectrum. Many review discussions end, correctly, at Level 1 or a materialized view. The question to ask is "what is the freshness budget and the size?", not "which product should we add?"</p>
+
+<h2 id=dd-cqrs-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What measured shape conflict justifies this split? Show the slow query, the index count and the write latency trend.</li>
+<li>Which level of the spectrum is proposed, and why would the level below it not work?</li>
+<li>How does every read model get its changes? Is there any code path that writes to two stores directly?</li>
+<li>Is the read side fed from raw tables or from a versioned outbox contract? Who must approve a write-side schema change?</li>
+<li>Is each projector's apply idempotent and order-safe (a version guard or external versioning)? What happens if a batch is processed twice after a rebalance?</li>
+<li>What is the freshness budget for each read model, and is lag measured end to end against it?</li>
+<li>Which pages need read-your-writes? Is it solved with tokens, routing or optimistic UI, and do commands carry idempotency keys?</li>
+<li>Which fields are copied into read rows, and what is the fan-out cost when each one changes?</li>
+<li>Is retained WAL per replication slot alerted on, and is <code>max_slot_wal_keep_size</code> set?</li>
+<li>How is each read model rebuilt, from where (not the primary at peak), how long does it take, and how do readers switch over?</li>
+<li>Is there a reconciliation job comparing each read model with the write model? What tolerance triggers an alert?</li>
+<li>Who owns each read model and its alerts when it is wrong at 3 AM?</li>
+</ol>
+
+<h2 id=dd-cqrs-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Kafka delivers at least once. How does your projection avoid double-applying a change?"</summary>
+<p>Make the apply idempotent rather than chasing exactly-once delivery. Each read row stores the source version of the last change applied, and the upsert only takes effect if the incoming version is higher. A duplicate has the same version and does nothing. A stale change has a lower one and does nothing. If the read store is relational, I also store the consumer offset in the same transaction, so a restart resumes exactly where the data is.</p>
+</details>
+<details>
+<summary>"How do you give a user read-your-writes without sending all their reads to the primary?"</summary>
+<p>The command returns a position: a version for the entity or the commit's WAL position. The client sends it with the next read. The read service compares it with the projection's applied position. If the projection is there, which is almost always, serve it. If not, wait up to a small budget, then fall back to the write side for that single read. The UI also shows the new item optimistically. Write-side load stays tiny because only the rare lagging read falls back.</p>
+</details>
+<details>
+<summary>"Your CDC connector was down for six hours. What happened to the read models and the database?"</summary>
+<p>Read models are six hours stale but not wrong, and they will catch up once the connector returns, because the replication slot held its place. The database kept six hours of WAL for that slot. That is the danger: if WAL growth outran free disk, the primary would have stopped accepting writes. So I alert on slot lag in bytes, cap it with <code>max_slot_wal_keep_size</code>, and accept that hitting the cap means re-snapshotting the read side. A stale read side is a much smaller incident than a stopped write side.</p>
+</details>
+<details>
+<summary>"Isn't a read replica a read model? Why not just add replicas?"</summary>
+<p>A replica is a read model with the same shape. It fixes volume: too many reads for one machine. It cannot fix shape: the six-table join is 300 ms on every copy, and full-text search is still bad. CQRS changes the shape. In practice you often use both. The <code>orders_list</code> projection is itself replicated when its read volume grows.</p>
+</details>
+<details>
+<summary>"A customer renames themselves. How many writes does that cause on your read side?"</summary>
+<p>It depends on where the name lives. If every order row copies it, one write per order they have ever placed: thousands for a heavy buyer. If the read store keeps names in a small table joined by an indexed key, one write. I copy only fields that rarely change and reference the rest. For fields that must be copied, I run the fan-out on a low-priority lane so it never delays live updates.</p>
+</details>
+<details>
+<summary>"How do you know a read model is correct, not just up to date?"</summary>
+<p>Low lag only proves the projector is running. Correctness needs reconciliation: a scheduled job that compares counts and sums of key fields between the write model and the read model, bucketed by day or shard, plus random row-level sampling. Any difference beyond tolerance opens an alert, and the fix is a rebuild from the stream. Without that job, a projector bug can stay silent for weeks.</p>
+</details>
+<details>
+<summary>"When is a materialized view enough?"</summary>
+<p>When the data is small enough to recompute on a schedule and the readers accept that much staleness. A nightly sales summary or a ten-minute dashboard fits. <code>REFRESH MATERIALIZED VIEW CONCURRENTLY</code> keeps readers unblocked, at the cost of a unique index and a full recompute each time. Once the data is large or needs to be fresh within seconds, an incremental projector fed by the change stream wins.</p>
+</details>
+<details>
+<summary>"Does CQRS require event sourcing, or async commands, or two databases?"</summary>
+<p>None of them. CQRS only requires that reads and writes use different models. Level 1 is separate query code in one database. CDC from a plain relational table is the most common way to feed separate read stores. Commands can stay synchronous. Event sourcing pairs well with CQRS because its events are a ready-made change stream, but each pattern works alone.</p>
+</details>

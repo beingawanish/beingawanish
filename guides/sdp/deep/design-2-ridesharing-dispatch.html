@@ -1,0 +1,162 @@
+<h2 id=dd-design-2-ridesharing-dispatch-capacity level=2>Deep Dive: The Capacity Plan, Box by Box</h2>
+<p>The lesson's two numbers set the shape: 500,000 location updates per second and about 500 ride requests per second at peak. A review panel wants every box sized from those, with the assumptions written down. Here they are.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-cap-assume level=3>The extra assumptions</h3>
+<ul>
+<li><strong>Location message:</strong> driver ID, latitude, longitude, heading, speed, accuracy, device timestamp, sequence number and status. About 60 bytes in a compact binary encoding, about 150 bytes as JSON. Assume binary.</li>
+<li><strong>On-trip share:</strong> at peak, 40% of online drivers are carrying a rider, so 800,000 trips are in progress.</li>
+<li><strong>Riders watching:</strong> each in-progress trip and each waiting rider has an app open that receives the driver's position every 4 seconds. Call it 1M rider connections.</li>
+<li><strong>Cell size:</strong> H3 resolution 8, a hexagon about 0.7 km² in area and a little under 1 km across.</li>
+</ul>
+<h3 id=dd-design-2-ridesharing-dispatch-cap-gateway level=3>The connection tier</h3>
+<p>Ingress is 500,000 × 60 B = 30 MB/s of payload, under 300 Mbps. Add WebSocket framing, TLS records and TCP overhead and it roughly doubles. That is modest bandwidth. The cost of this tier is connections, not bytes.</p>
+<p>Each WebSocket holds TLS state, kernel socket buffers and some application state. A realistic budget is 20 to 50 KB per idle connection, depending on buffer tuning. At 30 KB, 3M connections (2M drivers and 1M riders) need about 90 GB of memory across the fleet. If one gateway node holds 50,000 connections comfortably, the fleet is 60 nodes. Plan 90, for two reasons. A node failure moves its connections onto the others, and a rolling deploy drains nodes one at a time.</p>
+<p>Egress to riders is 1M connections × one update every 4 seconds, or 250,000 pushes per second. It is half the ingress rate again. People forget it because it is "just tracking."</p>
+<h3 id=dd-design-2-ridesharing-dispatch-cap-index level=3>The location index fits in one machine</h3>
+<p>This line surprises people. Each driver's latest state is about 100 bytes in memory with index overhead. Two million drivers is 200 MB. The whole planet's live driver index fits in a laptop's RAM.</p>
+<p>So sharding by cell is not about memory. It is about three other things. The update rate: 500,000 updates per second is too much for one process to decode, validate and index with headroom. Isolation: a bad deploy in one city should not stall another. And locality: a city's matcher wants its index in the same process or the same rack. A process that sustains 50,000 updates per second means ten processes for the planet. Run them per city or per region group, with a replica each, and you have 20 to 40 location processes. That is the whole location service.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-cap-match level=3>The match path</h3>
+<p>One ride request does this:</p>
+<ol>
+<li>Look up drivers in the rider's cell and its ring of neighbours. One ring of H3 neighbours is 7 cells, two rings is 19. In a dense downtown, 7 cells may hold 100 drivers. In a suburb, 19 cells may hold 3.</li>
+<li>Filter: idle, right vehicle type, heard from in the last 12 seconds, not already offered.</li>
+<li>Estimate road time for the best 10 by straight-line distance. Straight-line distance lies across rivers and one-way grids, so ETA must come from a routing engine.</li>
+<li>Offer to the best one.</li>
+</ol>
+<p>At 500 requests per second, that is 5,000 ETA queries per second, plus repeats when an offer is declined. A routing engine with precomputed shortcuts (contraction hierarchies and their relatives) answers a city-scale query in milliseconds. So a few dozen ETA servers handle it. The ETA service is the most CPU-hungry part of matching, and it is also the one that most needs a fallback: if it is slow, rank by straight-line distance and say so in the metrics.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-cap-offer level=3>How long a match takes</h3>
+<p>The 10-second matching target is a statement about the offer loop. Assume 70% of offers are accepted within about 4 seconds. The other 30% are declined or time out, at an average cost of about 8 seconds. The expected time to match is E = 0.7 × 4 + 0.3 × (8 + E). Solve it and E is about 7.4 seconds.</p>
+<p>The average meets the target. The tail does not. Three non-accepts in a row happen 0.3³ = 2.7% of the time and cost over 24 seconds. That is 13 requests per second at peak waiting far too long. The levers are shorter offer TTLs, better candidate choice (drivers with high acceptance rates for this kind of trip), or offering to the next driver before the first one times out. Each lever has a cost, discussed under alternatives.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-cap-storage level=3>Storage</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Store<th>Assumption<th>Size<tbody>
+<tr><td>Live index<td>2M drivers × ~100 B<td>~200 MB, in memory
+<tr><td>Sampled location log<td>1 in 10 updates, 50K/s × 60 B, 7 days, 3 replicas<td>~5.4 TB
+<tr><td>Trip traces<td>10M trips/day, ~600 points each, ~30 B per point compressed<td>~180 GB/day, kept for years
+<tr><td>Rides and saga state<td>10M/day × ~2 KB<td>~20 GB/day
+<tr><td>Surge multipliers<td>~200K active cells, one number per minute<td>Trivial
+</table></div></div>
+<p>The trip-trace row is the one the lesson's "locations are ephemeral" story does not cover. It gets its own section next.</p>
+
+<h2 id=dd-design-2-ridesharing-dispatch-traces level=2>Deep Dive: Which Locations Are Not Ephemeral</h2>
+<p>The hot path is right to drop old positions for matching. But some positions are evidence. The fare is computed from distance travelled. A rider disputing a charge wants to see the route. A safety team investigating an incident needs the trace at full resolution. None of that can come from a one-in-ten sample.</p>
+<p>So a location update has three possible destinations, and the driver's status decides which apply.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Destination<th>Guarantee<th>Which updates<th>Latency need<tbody>
+<tr><td>Live index<td>Latest only, may drop<td>All<td>Under a second
+<tr><td>Sampled log<td>At-least-once, sampled<td>1 in 10<td>Seconds to minutes
+<tr><td>Trip trace<td>Durable, complete, ordered by device sequence<td>On-trip only<td>Before the fare is computed
+</table></div></div>
+<p>Writing 200,000 durable points per second through the hot path would ruin it. The trick is to move durability to the phone. During a trip, the driver app records every GPS fix into a local buffer with a per-trip sequence number. It uploads the buffer in batches every 30 seconds, over plain HTTPS with an idempotency key of <code>(trip_id, first_seq)</code>. At trip end it uploads whatever remains, and the server will not finalise the fare until it has every sequence number or a timeout passes.</p>
+<p>This splits one stream into two transports with different guarantees. The WebSocket carries "where is the driver now," and losing a message costs nothing. The batch upload carries "where did the driver go," and losing a message costs money. It is the lesson's "two consumers, two guarantees" taken one step further: two producers' paths from the same sensor.</p>
+<p>If the phone dies mid-trip, the server still has the sampled points and the live positions it saw. The fare falls back to a route estimate between those points, and the trip is flagged for review. That is a designed degradation, not a guess at runtime.</p>
+
+<h2 id=dd-design-2-ridesharing-dispatch-ownership level=2>Deep Dive: Ownership at the Edges</h2>
+<p>The lesson's core claim is that each driver's assignment state has exactly one owner, so two matchers can never win the same driver. That holds. The hard part is the edges: cell boundaries, drivers who move, and owners that fail.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-own-boundary level=3>Riders near a boundary</h3>
+<p>A rider stands on the edge of cell A. The best driver is 200 m away, in cell B. Cell A's matcher does not own that driver. It cannot claim the driver directly. It must ask B's owner.</p>
+<p>That turns a local claim into a remote one: A sends "claim driver 42 for offer 9f1c, TTL 10 s" to B's owner, which runs the same atomic claim it would run for its own riders. Exactly one winner is still guaranteed, because only B's owner writes driver 42's state. The cost is a network hop, and a design choice about who decides. A should rank candidates across both cells and then ask for claims in order, accepting that B may answer "already taken."</p>
+<h3 id=dd-design-2-ridesharing-dispatch-own-granularity level=3>Two ways to draw the ownership line</h3>
+<p>There are two real designs here, and the panel will push on which one you mean.</p>
+<p><strong>Ownership by place.</strong> Matchers own groups of cells, say a whole city district. A driver's assignment state lives with the owner of their current cell. Most matches are local, so most claims are in-process. The cost is handoff. When a driver crosses into another owner's area, their state must move. If an offer was in flight at that moment, the old owner and the new owner both have a view of it. Handoff needs a protocol: the old owner keeps the driver until any in-flight offer resolves, then transfers with a version number.</p>
+<p><strong>Ownership by driver.</strong> Assignment state is sharded by <code>driver_id</code>, in a store that supports a conditional write. The geo index is just a lookup structure with no authority. A claim is a compare-and-set: <code>status = idle → offered(offer_id, expires_at)</code> only if the current version matches. No handoff exists, because a driver's owner never changes. The cost is that every claim is a network call to the driver-state store, about 1 to 2 ms, and that store's availability now gates matching.</p>
+<p>At 500 requests per second with a few claims each, the network call is cheap. Ownership by driver removes a whole class of handoff bugs. Many teams choose it and keep place-based sharding for the index and the matcher's queue. The lesson's per-cell owner is still the right mental model. Just be ready to say which state is owned by place and which by driver.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-own-fencing level=3>Owners that fail and come back</h3>
+<p>A matcher process owns its cells through a lease from a coordination service (etcd, ZooKeeper, or a database row with an expiry). Suppose the matcher pauses for 15 seconds in garbage collection. Its lease expires and a new owner takes over. Then the old one wakes up, still believing it owns the cells, and issues a claim.</p>
+<p>The fix is a fencing token. Each lease grant carries a number that only increases. Every write to driver state includes the owner's token, and the store rejects writes with a token older than the last one it saw. The paused owner's claim fails. Without fencing, a lease is a hint, not a guarantee. This is the same mechanism quorum-based systems use, applied to one small piece of state.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-own-states level=3>The driver state machine, with timers</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>From<th>Event<th>To<th>Guard or timer<tbody>
+<tr><td>offline<td>Driver goes online, sends first position<td>idle<td>Position younger than 12 s
+<tr><td>idle<td>Matcher claims<td>offered<td>Conditional on version; expires in 10 s
+<tr><td>offered<td>Accept with matching <code>offer_id</code><td>assigned<td>Accept must arrive before expiry; a duplicate accept returns the same result
+<tr><td>offered<td>Decline or expiry<td>idle<td>Driver excluded from this request's retries
+<tr><td>assigned<td>Driver arrives and starts trip<td>on_trip<td>This is the saga's pivot
+<tr><td>on_trip<td>Trip ends<td>idle<td>Fare waits for the complete trace
+<tr><td>any online state<td>No heartbeat for 30 s<td>offline (logically)<td>Assigned and on_trip rides keep their durable record
+</table></div></div>
+<p>Two subtleties are in that table. First, the accept and the expiry race. An accept that arrives at 10.1 seconds is rejected, and the app must show "this offer expired" rather than navigating. The app treats the server's reply as truth. It shows "confirming" until the reply arrives. Second, going offline does not end a trip. The lesson's dead-phone case is the bottom row: connection state and trip state are separate machines.</p>
+
+<h2 id=dd-design-2-ridesharing-dispatch-matching level=2>Deep Dive: Greedy Matching Versus Batched Matching</h2>
+<p>The lesson matches each request as it arrives: nearest available driver, offer, next. That is greedy matching. It is simple and fast, and it makes bad global choices at busy moments.</p>
+<p>Picture two riders 30 seconds apart and two drivers. Rider 1 arrives first and takes driver X, who is 2 minutes away. Rider 2 arrives and gets driver Y, who is 9 minutes away. Had the system waited, it would have seen that X is also 2 minutes from rider 2 and Y is 3 minutes from rider 1. The total wait drops from 11 minutes to 5.</p>
+<p>Batched matching collects requests for a short window, often a couple of seconds, then solves an assignment problem over the whole batch: minimise total ETA across all pairs. With a few hundred requests and drivers per cell group, a min-cost matching runs in milliseconds. The cost is the window itself. Every rider waits up to the window length before their first offer.</p>
+<p>The choice depends on density. In a quiet suburb, batching gains little and adds delay. At the airport or downtown at 6 PM, it gains a lot. A common answer is greedy by default and batched in hot cells, switched by the same backlog-age signal that triggers cell splitting. The matcher's single-owner structure makes this easy, because one process already sees all requests for its cells.</p>
+
+<h2 id=dd-design-2-ridesharing-dispatch-drills level=2>Deep Dive: Failure Drills</h2>
+<p>The lesson walks five failures. These six go further, and several have caused real outages in systems like this.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-drill1 level=3>Drill 1: The reconnect storm</h3>
+<p><strong>Symptom.</strong> A load balancer fault drops every driver socket in a region. Two minutes later the gateways are at 100% CPU and almost nobody is connected. <strong>Mechanism.</strong> 500,000 drivers reconnect at once. Each reconnect is a full TLS handshake, which costs far more CPU than steady traffic. The gateways spend everything on handshakes, many time out, and the apps retry, so the storm feeds itself. <strong>Detection.</strong> New connections per second, TLS handshake latency, and connected-driver count all on one dashboard. <strong>Fix.</strong> Jittered exponential backoff in the app, with the first retry spread over 30 seconds or more. TLS session resumption so returning clients skip the expensive handshake. An admission limit on new connections per gateway node, which rejects quickly and tells the app when to retry. Plan capacity for reconnecting a whole region in a few minutes, not for steady state.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-drill2 level=3>Drill 2: A phone with the wrong clock</h3>
+<p><strong>Symptom.</strong> A few drivers appear frozen on the map even though their apps are sending updates. <strong>Mechanism.</strong> The hot path keeps "the latest by device timestamp." A phone whose clock was set back five minutes sends updates stamped in the past. Every new update looks older than the one already stored, so all are dropped. <strong>Detection.</strong> Track the gap between device time and server receive time per connection. Alert when updates are received but the stored position does not change. <strong>Fix.</strong> Order by a per-connection sequence number, which the app increments, not by wall clock. Use the device timestamp for the trace and for smoothing, after correcting it with the offset measured at connect time. A local clock is an input to validate, not a source of truth.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-drill3 level=3>Drill 3: The index goes stale while looking healthy</h3>
+<p><strong>Symptom.</strong> Offer timeouts double in one city. Riders wait longer. Every service reports healthy. <strong>Mechanism.</strong> One location process is falling behind its input, perhaps in long GC pauses. Its index still answers queries, but positions are 20 seconds old. Matchers offer drivers who have driven away or gone offline, and the offers time out. <strong>Detection.</strong> The age of the newest update in each index shard, and offer timeout rate per city. A health check that only asks "are you up?" misses this completely. <strong>Fix.</strong> The candidate filter already drops drivers not heard from in 12 seconds. Make the location process report its own lag and shed read traffic when lag passes a threshold, so matchers fail over to a replica. This is honest staleness inside the backend, not only in the rider's UI.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-drill4 level=3>Drill 4: Split brain on a cell group</h3>
+<p><strong>Symptom.</strong> Support reports two drivers arriving for one rider, in one district, during a network incident. <strong>Mechanism.</strong> A network partition separated a matcher from the coordination service. Its lease expired and a new matcher took the district. The old matcher could still reach drivers and kept issuing offers, because nothing stopped its writes. <strong>Detection.</strong> Count writes rejected for stale fencing tokens. Without fencing, the count is zero and the bug is invisible until support calls. <strong>Fix.</strong> Fencing tokens on every driver-state write, as described above. A matcher should also stop issuing offers on its own once its lease is close to expiry, before the store has to reject it.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-drill5 level=3>Drill 5: Trips that never end</h3>
+<p><strong>Symptom.</strong> A growing number of drivers are stuck "on trip" and receive no offers. <strong>Mechanism.</strong> The end-trip event was lost: the driver's phone died at the destination and they started a new shift on another phone. The saga is waiting for an event that will never come. <strong>Detection.</strong> Trips in progress longer than the 99.9th percentile trip duration for their city. <strong>Fix.</strong> A saga timeout that triggers a reconciliation step: compare the trip's last known position with its destination, end the trip with the trace collected so far, and flag the fare for review. Every saga step that waits on a human or a device needs a timer and a defined way out.</p>
+<h3 id=dd-design-2-ridesharing-dispatch-drill6 level=3>Drill 6: Surge oscillates</h3>
+<p><strong>Symptom.</strong> A cell's multiplier swings between 1.0× and 2.5× every few minutes. Riders complain. Drivers chase the swings. <strong>Mechanism.</strong> Surge is a feedback loop. A high price cuts demand and pulls drivers in. The next window sees low demand and high supply and drops the price. The window length and the reaction time of people are close enough to resonate. <strong>Detection.</strong> Variance of the multiplier per cell over an hour. <strong>Fix.</strong> Damp it. Limit how far the multiplier can move per window, and smooth over several windows and neighbouring cells. A control loop that reacts faster than the system it controls will oscillate.</p>
+
+<h2 id=dd-design-2-ridesharing-dispatch-alternatives level=2>Deep Dive: Alternatives the Panel Will Debate</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>How to choose<tbody>
+<tr><td>Spatial index<td>H3 hexagons<td>Geohash or S2 cells<td>Hexagons have uniform neighbour distances, which makes rings and smoothing clean. Geohash is simpler and supported by many databases. S2 has good hierarchy. Any works; pick one and use it everywhere
+<tr><td>Live index store<td>In-process memory in the location service<td>Redis GEO (<code>GEOADD</code>, <code>GEOSEARCH</code>)<td>Redis is a fine start for one city. In-process wins at scale because the matcher can query its own memory with no hop
+<tr><td>Assignment ownership<td>By place (cell groups)<td>By driver ID<td>By driver avoids handoff bugs and costs one network call per claim; by place keeps claims in-process
+<tr><td>Matching<td>Greedy per request<td>Batched over a short window<td>Greedy in sparse cells, batched in dense ones; switch on backlog
+<tr><td>Offers<td>One driver at a time<td>Overlapping offers to two or three drivers<td>Sequential is fair to drivers. Overlapping cuts the tail but makes some drivers accept rides that are then "taken," which they hate
+<tr><td>Driver transport<td>WebSocket<td>MQTT or gRPC bidirectional streams<td>MQTT was built for flaky mobile networks and has small headers. WebSocket works everywhere. gRPC suits server-to-server more than phones
+</table></div></div>
+<p>The longest debate is often overlapping offers. The tail math says sequential offers leave 2.7% of riders waiting over 24 seconds. Overlapping offers fix that. But a driver who taps accept and hears "sorry, taken" a few times a day stops trusting the app, and drivers are the scarce side of the market. A middle path works well: start the next offer early, at say 6 seconds into a 10-second TTL, only if the first driver has not opened the offer screen. That captures most of the gain without breaking promises to drivers who are actively looking.</p>
+<p>A second debate: in-process index or a shared store? A shared store is easier to operate and survives a process restart. In-process is faster and has no network hop, and the lesson's failure walk already shows it rebuilds in seconds from heartbeats. Since the data is rebuilt every 4 seconds anyway, durability buys almost nothing. Keep it in process.</p>
+
+<h2 id=dd-design-2-ridesharing-dispatch-evolution level=2>Deep Dive: The Evolution Path</h2>
+<ol>
+<li><strong>Stage 1: one city, one database.</strong> Drivers post their position over HTTPS every 4 seconds into a table with a spatial index (PostGIS, for example). Matching is a nearest-neighbour query. At 5,000 drivers that is about 1,250 updates per second, which one database handles. Offers go out as push notifications. Ship it.</li>
+<li><strong>Stage 2: live index in memory.</strong> Triggered when the location table's write rate and index churn hurt the database. Positions move to an in-memory index. The database keeps rides and payments only.</li>
+<li><strong>Stage 3: persistent connections.</strong> Triggered by offer latency from push notifications and by battery cost of polling. WebSocket gateways arrive, then the backplane when there is more than one gateway.</li>
+<li><strong>Stage 4: cells and per-area owners.</strong> Triggered by the first double-booking incident, or by matching load that one process cannot carry. Leases and fencing arrive here.</li>
+<li><strong>Stage 5: many cities.</strong> Cities become bulkheads with their own location, matching and surge processes. The sampled log and stream processing appear for surge and ETA training.</li>
+<li><strong>Stage 6: optimisation.</strong> Batched matching in dense cells, learned ETAs, demand forecasting that moves idle drivers before surge appears, and pooled rides. Pooling is a big change. A match becomes "fit a rider into an in-progress trip," and the matcher reasons about routes, not points.</li>
+</ol>
+
+<h2 id=dd-design-2-ridesharing-dispatch-review level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>How many connections does each gateway node hold, how much memory does that take, and can the fleet absorb losing two nodes?</li>
+<li>What happens when an entire region's drivers reconnect at once? Show the backoff and the admission limit.</li>
+<li>Which state is owned by place and which by driver? Where is the conditional write?</li>
+<li>Are ownership leases fenced? What rejects a write from a paused owner?</li>
+<li>How does a match work for a rider on a cell boundary?</li>
+<li>What is the p99 time to match, not the average? Which lever do you pull first?</li>
+<li>Which location updates are durable, and how does the fare get a complete trace if the socket drops?</li>
+<li>How are updates ordered when a phone's clock is wrong?</li>
+<li>How do you detect a live index that answers queries but is falling behind?</li>
+<li>What timer ends a saga step that waits on a device that never reports?</li>
+<li>How is surge damped, and who can override it in an emergency?</li>
+</ol>
+
+<h2 id=dd-design-2-ridesharing-dispatch-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"The whole live index is 200 MB. Why shard it at all?"</summary>
+<p>Because the problem is the write rate and the blast radius, not the size. 500,000 updates per second need several processes to decode and index with headroom. And one global process means one GC pause or bad deploy stalls matching on every continent. Shard for throughput and isolation. The small size is still useful: any shard can rebuild from heartbeats in seconds, and a replica is cheap.</p>
+</details>
+<details>
+<summary>"A driver accepts, but the accept is lost on the network. What does each side see?"</summary>
+<p>The driver's app shows "confirming" and retries the accept with the same offer ID. If the retry arrives before expiry, the server returns "assigned," the same answer it would have given the first time, because the accept is idempotent on offer ID. If the offer expired, the server returns "expired" and the app tells the driver, who never started driving. The rider was already moved to the next driver at expiry. Nobody drives to a rider based on a message the server did not confirm.</p>
+</details>
+<details>
+<summary>"Why not run the claim through a distributed lock service like ZooKeeper?"</summary>
+<p>Because a lock held across a 10-second offer is a lock held across a human decision on a phone on a cell network. Locks and leases still exist in the design, but at a coarser level: one lease per cell group, renewed every few seconds. Individual claims are conditional writes with an expiry, which never block anyone. The lease decides who may write. The conditional write decides what wins. Mixing those roles gives you lock contention on the hottest path.</p>
+</details>
+<details>
+<summary>"The airport cell splits into seven. A driver's offer is in flight during the split. What happens?"</summary>
+<p>With ownership by driver, nothing happens: the split changes which matcher queues the request, not who owns the driver's state, and the in-flight claim resolves as usual. With ownership by place, the split is a handoff. The old owner stops taking new requests for the cell, finishes or expires in-flight offers (at most 10 seconds), then hands state to the seven new owners with a new fencing epoch. Riders in the queue are re-routed to their new cell's matcher. That ten-second drain is the price of place-based ownership.</p>
+</details>
+<details>
+<summary>"How would you test matching changes without risking real riders?"</summary>
+<p>Replay. The sampled location log and the request log are enough to rebuild a city's day. Run the new matcher against the replay in a simulator and compare total rider wait, driver idle time, and acceptance-adjusted match time. Simulators lie about human behaviour, so then canary in one city behind a flag, compared against a control city. Switchback tests, which alternate the old and new algorithm by time slot within one city, are common in marketplaces because riders and drivers in one city affect each other.</p>
+</details>
+<details>
+<summary>"A whole city's matcher fleet is down. What do riders get?"</summary>
+<p>An honest error and a queue, not silent spinning. Ride requests are accepted and stored with their request IDs, and the app shows "high demand, finding a driver." The ride workflow can wait. When matchers return, they rebuild state from heartbeats and the rides table in seconds and drain the queue in order of request time, discarding requests older than a cutoff. Other cities keep working, because each city is a bulkhead.</p>
+</details>
+<details>
+<summary>"Riders want to see the car move smoothly, not jump every 4 seconds. Do you send updates faster?"</summary>
+<p>No. Sending every second would quadruple egress from 250,000 to 1M pushes per second for a cosmetic gain. The rider's app interpolates between points along the road, using heading and speed from the last update. The server sends each update with its timestamp, and the app animates. If the next update disagrees, the app corrects gently. Fidelity is a client problem here, not a bandwidth problem.</p>
+</details>

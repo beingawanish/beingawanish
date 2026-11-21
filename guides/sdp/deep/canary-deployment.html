@@ -1,0 +1,264 @@
+<h2 id=dd-canary-deployment-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson describes a canary as a split, a sticky cohort, a compared verdict and an automated gate. Each of those is a real component with its own state and its own knobs. This section takes them one at a time, in the order a request meets them, then walks the control loop that ties them together.</p>
+
+<h3 id=dd-canary-deployment-split level=3>The split: three ways to send 1% somewhere else</h3>
+<p>There are three common places to put the split, and they differ in how fine the percentage can be and whether the same user lands on the same version twice.</p>
+<ul>
+<li><strong>Replica ratio.</strong> Run 39 pods of v1.42 and 1 pod of v1.43 behind the same Kubernetes Service. The load balancer spreads requests evenly, so the canary gets about 1/40, or 2.5%. No extra tooling is needed. The catch is granularity: the smallest step is one pod, so a 10-pod service can never canary below 10%. And the split is per connection or per request, not per user.</li>
+<li><strong>Weighted routing in a proxy or mesh.</strong> Envoy's <code>weighted_clusters</code>, an Istio <code>VirtualService</code> with route weights, or the ingress-nginx annotations <code>nginx.ingress.kubernetes.io/canary: "true"</code> and <code>canary-weight</code>. Now the percentage is independent of pod count, so 1% on a 10-pod service is fine. But a weighted route picks a destination per request. Two requests from the same browser can land on different versions.</li>
+<li><strong>Header or cookie routing.</strong> Something upstream decides the cohort and stamps it on the request, for example <code>x-cohort: canary</code>. The mesh then routes on an exact header match. ingress-nginx has <code>canary-by-header</code> and <code>canary-by-cookie</code> for this, and Istio matches on headers in the same <code>VirtualService</code>. This is the only one of the three that is sticky by construction.</li>
+</ul>
+<p>The point worth stating in a review is that "1% via the mesh" usually means 1% of requests, not 1% of users. The lesson's sticky cohort needs the third shape, or a load balancer that hashes a user key consistently across both version pools.</p>
+
+<h3 id=dd-canary-deployment-cohort level=3>Cohort assignment: the hash and its two rules</h3>
+<p>The edge (the gateway or the first service a request hits) computes a bucket for each user: <code>bucket = hash(salt + user_id) mod 10000</code>. A user is in the canary when <code>bucket &lt; 100</code> for 1%, <code>&lt; 500</code> for 5%, and so on. Two rules follow from that one line.</p>
+<p><strong>Rule one: thresholds only grow.</strong> Because a user's bucket never changes, raising the threshold from 100 to 500 keeps every existing canary user in and adds new ones. That is exactly the lesson's "new users join, earlier members do not move." A scheme that re-randomises at each stage breaks it.</p>
+<p><strong>Rule two: change the salt per rollout.</strong> With a fixed salt, the same 1% of users would be the canary for every release, every week. They would absorb all the risk, and any quirk in that group (one heavy enterprise tenant, one region) would bias every verdict. A per-release salt, such as the release ID, spreads exposure across the user base.</p>
+<p>Anonymous traffic needs a stable key too. A device cookie works. The client IP does not, because NAT puts thousands of users behind one address and mobile clients change addresses mid-session. For B2B products, bucket by tenant ID instead of user ID, so one company's employees all see the same version.</p>
+
+<h3 id=dd-canary-deployment-propagation level=3>Across services: whose canary is it?</h3>
+<p>Checkout v1.43 calls pricing, inventory and payments. If only checkout is under canary, the downstream services run their stable versions for everyone and nothing special is needed. The trouble starts when two services are canarying at the same time. A user might get checkout-canary plus pricing-stable, or both canaries, and the verdict for each can no longer be blamed on one change.</p>
+<p>Teams handle this in one of two ways. Most serialise: one canary per call path at a time, enforced by the deployment system. Some propagate the cohort as a header (or W3C <code>baggage</code>) so downstream meshes can route canary traffic to canary versions. That "canary lane" gives a clean end-to-end test of a coordinated change, but every hop has to forward the header. One proxy that strips it silently sends canary users to stable versions.</p>
+
+<h3 id=dd-canary-deployment-baseline level=3>The baseline: compare against a fresh twin, not against production</h3>
+<p>The lesson says to compare the canary with the concurrent 99%. That is right in spirit, but it hides a bias. The production pods have been running for days. Their JIT compilers are warm, their local caches are full, their connection pools are open, and any slow memory leak has had time to show. The canary pods started ten minutes ago.</p>
+<p>So the canary is "worse" on latency for reasons that have nothing to do with the code. Kayenta's guidance, and the setup Spinnaker uses for automated canary analysis, is to deploy a <strong>fresh baseline</strong>: a small set of new pods running the <em>old</em> version, started at the same moment and given the same traffic weight as the canary. The judge compares canary against baseline. Production is a third group that neither is compared against.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-canary-deployment-svg-title dd-canary-deployment-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-canary-deployment-svg-title">A canary judged against a fresh baseline</title>
+<desc id="dd-canary-deployment-svg-desc">The edge hashes each user ID into a bucket. Buckets 0 to 99 go to the canary pods running v1.43. Buckets 100 to 199 go to fresh baseline pods running v1.42, started at the same time. The other 98% go to long-running production pods. Metrics labelled by version flow from the canary and the baseline into the judge, which compares them and either advances the weight or drains the canary. Production metrics are not part of the comparison.</desc>
+<defs><marker id="dd-canary-deployment-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="300" fill="#ffffff"/>
+<rect x="20" y="110" width="150" height="70" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="95" y="138" font-size="14" fill="#1c2430" text-anchor="middle">Edge</text>
+<text x="95" y="158" font-size="12" fill="#5c6b7c" text-anchor="middle">hash(salt+user) mod 10000</text>
+<rect x="260" y="20" width="170" height="60" rx="8" fill="#f8ebee" stroke="#c898a4" stroke-width="2"/>
+<text x="345" y="45" font-size="14" fill="#1c2430" text-anchor="middle">Canary v1.43</text>
+<text x="345" y="64" font-size="12" fill="#5c6b7c" text-anchor="middle">buckets 0-99 (1%)</text>
+<rect x="260" y="115" width="170" height="60" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="345" y="140" font-size="14" fill="#1c2430" text-anchor="middle">Baseline v1.42</text>
+<text x="345" y="159" font-size="12" fill="#5c6b7c" text-anchor="middle">fresh pods, buckets 100-199</text>
+<rect x="260" y="215" width="170" height="60" rx="8" fill="#f1f3f5" stroke="#9aa5b1"/>
+<text x="345" y="240" font-size="14" fill="#1c2430" text-anchor="middle">Production v1.42</text>
+<text x="345" y="259" font-size="12" fill="#5c6b7c" text-anchor="middle">long-running, 98%</text>
+<rect x="520" y="60" width="180" height="80" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="610" y="88" font-size="14" fill="#1c2430" text-anchor="middle">Judge</text>
+<text x="610" y="107" font-size="12" fill="#5c6b7c" text-anchor="middle">canary vs baseline,</text>
+<text x="610" y="124" font-size="12" fill="#5c6b7c" text-anchor="middle">per metric, per interval</text>
+<line x1="170" y1="130" x2="256" y2="55" stroke="#1c2430" marker-end="url(#dd-canary-deployment-arrow)"/>
+<line x1="170" y1="145" x2="256" y2="145" stroke="#1c2430" marker-end="url(#dd-canary-deployment-arrow)"/>
+<line x1="170" y1="160" x2="256" y2="240" stroke="#1c2430" marker-end="url(#dd-canary-deployment-arrow)"/>
+<line x1="430" y1="50" x2="516" y2="85" stroke="#c898a4" stroke-width="2" marker-end="url(#dd-canary-deployment-arrow)"/>
+<line x1="430" y1="145" x2="516" y2="115" stroke="#1f5f99" stroke-width="2" marker-end="url(#dd-canary-deployment-arrow)"/>
+<text x="610" y="175" font-size="12" fill="#1c2430" text-anchor="middle">pass: raise threshold</text>
+<text x="610" y="193" font-size="12" fill="#1c2430" text-anchor="middle">fail: drain canary</text>
+<text x="610" y="245" font-size="12" fill="#5c6b7c" text-anchor="middle">production is not compared</text>
+</svg>
+<figcaption>Canary and baseline start together and receive the same share of traffic, so warm-up and uptime effects cancel. The judge only sees metrics labelled with a version.</figcaption>
+</figure>
+
+<h3 id=dd-canary-deployment-judge level=3>The judge: how "worse than baseline" becomes a number</h3>
+<p>A judge works per metric, per interval. For each metric it has two samples, canary and baseline, and asks whether they differ in a direction that matters. Kayenta's default judge classifies each metric as pass, high or low using a nonparametric test (Mann-Whitney U) with an allowed effect size. It then scores the run as the weighted share of metrics that passed, and compares that score with two configured thresholds, marginal and pass. Below marginal, the canary fails. Above pass, it advances. In between, a person is asked.</p>
+<p>Three knobs matter in any judge, homemade or not:</p>
+<ul>
+<li><strong>Direction.</strong> Higher latency is bad; lower is fine. Higher conversion is fine; lower is bad. A metric that fails in both directions will reject harmless releases that happen to be faster.</li>
+<li><strong>Allowed effect size.</strong> "Statistically different" is not the same as "worse enough to care." At high traffic, a 1 ms latency increase is detectable and irrelevant. Set a minimum effect per metric, for example "p99 more than 10% higher."</li>
+<li><strong>Criticality.</strong> Some metrics should fail the run alone, whatever the score. Checkout error rate is one. Most others should only lower the score.</li>
+</ul>
+
+<h3 id=dd-canary-deployment-loop level=3>The control loop, in real configuration</h3>
+<p>Argo Rollouts expresses the whole thing as a sequence of steps plus an analysis that runs in the background. The shape below is close to what teams run; the names and numbers are the bookstore's.</p>
+<pre><code>apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: checkout
+spec:
+  replicas: 40
+  strategy:
+    canary:
+      canaryService: checkout-canary
+      stableService: checkout-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: checkout
+            routes: [primary]
+      analysis:                      # background analysis, runs during every step
+        startingStep: 1
+        templates:
+        - templateName: checkout-vs-stable
+      steps:
+      - setWeight: 1
+      - pause: {duration: 15m}
+      - setWeight: 5
+      - pause: {duration: 30m}
+      - setWeight: 25
+      - pause: {duration: 1h}
+      - setWeight: 50
+      - pause: {duration: 1h}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: checkout-vs-stable
+spec:
+  metrics:
+  - name: error-ratio
+    interval: 5m
+    failureLimit: 2                  # two bad intervals in a row, not one, aborts
+    successCondition: result[0] &lt; 1.5
+    provider:
+      prometheus:
+        address: http://prometheus.monitoring:9090
+        query: |
+          ( sum(rate(http_requests_total{app="checkout",track="canary",code=~"5.."}[5m]))
+            / sum(rate(http_requests_total{app="checkout",track="canary"}[5m])) )
+          /
+          clamp_min(
+            sum(rate(http_requests_total{app="checkout",track="stable",code=~"5.."}[5m]))
+            / sum(rate(http_requests_total{app="checkout",track="stable"}[5m])),
+            0.001)</code></pre>
+<p>A few details in that file carry real weight. <code>failureLimit</code> trades detection speed for fewer false aborts. The <code>clamp_min</code> on the denominator stops a healthy baseline with zero errors from turning the ratio into infinity. And the query is a ratio of rates, not a fixed threshold, which is the lesson's "compared, not thresholded" in one line of PromQL. Note what it does not handle: this weighted Istio route is per request, so it is not sticky. Header-based routes would be needed for the cohort behaviour the lesson describes. Flagger expresses the same loop with <code>stepWeight</code>, <code>maxWeight</code>, <code>interval</code> and a failure <code>threshold</code>.</p>
+<p>The loop's states are simple: progressing, paused, aborted, healthy. The one people forget is what "aborted" leaves behind. Argo and Flagger shift weight back to stable immediately. But canary pods, the database rows they wrote and the cache entries they filled are still there. Draining traffic is instant. Cleaning up state is not, which is why the expand-contract rule from the lesson never goes away.</p>
+
+<h2 id=dd-canary-deployment-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The lesson's rule of thumb is "cohort size times effect frequency." This section turns that into numbers you can redo, using the lesson's 40,000 req/s and a two-proportion test. The formula for the number of requests needed per group is:</p>
+<p><code>n ≈ (z<sub>α</sub> + z<sub>β</sub>)² × (p₀(1−p₀) + p₁(1−p₁)) / (p₁ − p₀)²</code></p>
+<p>With a one-sided 5% false-alarm rate (z<sub>α</sub> = 1.645) and 80% power (z<sub>β</sub> = 0.84), the first factor is about 6.2. The assumptions are an equal-sized fresh baseline and independent requests. Real requests are correlated by user, so treat the results as lower bounds.</p>
+
+<h3 id=dd-canary-deployment-sizing-errors level=3>Error rate: fast for big regressions, slow for small ones</h3>
+<p>The 1% cohort gets 400 req/s, which is 24,000 requests a minute.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Regression (baseline 0.30%)</th><th>Requests needed per group</th><th>Time at 1% (400 req/s)</th><th>Time at 5% (2,000 req/s)</th></tr></thead><tbody>
+<tr><td>0.30% → 2.1% (v1.43)</td><td>about 450</td><td>about 1 s</td><td>under a second</td></tr>
+<tr><td>0.30% → 0.60% (doubled)</td><td>about 6,100</td><td>15 s</td><td>3 s</td></tr>
+<tr><td>0.30% → 0.36% (+20%)</td><td>about 113,000</td><td>4.7 min</td><td>57 s</td></tr>
+<tr><td>0.30% → 0.33% (+10%)</td><td>about 430,000</td><td>18 min</td><td>3.6 min</td></tr>
+</tbody></table></div></div>
+<p>The v1.43 bug is statistically obvious within a couple of seconds. The six minutes in the lesson's walkthrough are not statistics; they are pipeline delay. A Prometheus scrape interval of 15 to 30 seconds, a 5-minute <code>rate()</code> window, and a <code>failureLimit</code> of two intervals add up to several minutes. If you want faster aborts on gross failures, shorten the window for one critical metric, not for all of them.</p>
+
+<h3 id=dd-canary-deployment-sizing-business level=3>Business metrics: this is where the hours go</h3>
+<p>Conversion is measured per session, not per request, and sessions are scarce. Say the bookstore sees 2,000 checkout starts a minute in total, with 60% converting. The 1% cohort sees 20 a minute.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Conversion drop (60% baseline)</th><th>Sessions needed per group</th><th>At 1% (20/min)</th><th>At 5% (100/min)</th><th>At 25% (500/min)</th></tr></thead><tbody>
+<tr><td>−8% relative (60% → 55.2%), v1.44</td><td>about 1,300</td><td>65 min</td><td>13 min</td><td>2.6 min</td></tr>
+<tr><td>−2% relative (60% → 58.8%)</td><td>about 20,700</td><td>17 h</td><td>3.5 h</td><td>41 min</td></tr>
+</tbody></table></div></div>
+<p>The table explains the shape of a good stage plan. The 1% stage is for errors and latency, which are request-level and plentiful. Business metrics only become meaningful at 5% to 25%. So the long pauses belong in the middle stages, not at 1%. A plan that waits an hour at 1% and ten minutes at 25% has its pauses backwards.</p>
+<p>It also explains why small regressions in business metrics are rarely caught by canaries at all. A 2% conversion drop at 1% needs most of a day. That is a job for an A/B experiment, or for a flag-gated release with a planned measurement window.</p>
+
+<h3 id=dd-canary-deployment-sizing-peeking level=3>Two statistical traps: peeking and many metrics</h3>
+<p><strong>Peeking.</strong> A judge that checks every 5 minutes is running a new test each time. Each look has a 5% chance of a false alarm, and the looks add up. With a fixed 5% threshold per look, the chance of at least one false alarm is roughly 14% over 5 looks, 19% over 10 and 25% over 20. A 2-hour rollout judged every 5 minutes is 24 looks. So either require consecutive failures (<code>failureLimit</code>), tighten the per-look threshold, or use a sequential test designed for repeated looks.</p>
+<p><strong>Many metrics.</strong> Twenty metrics, each tested at 5%, give a 1 − 0.95²⁰ = 64% chance that at least one fails by luck. A gate that aborts when <em>any</em> metric fails will reject most healthy releases. This is why Kayenta scores the share of passing metrics and keeps "fail on its own" for a few critical ones.</p>
+
+<h3 id=dd-canary-deployment-sizing-capacity level=3>Capacity and duration</h3>
+<p>Assume 40 production pods, each comfortable at 1,000 req/s. At 1%, the canary needs 400 req/s, so one pod at 40% load. Run two, so one restart does not empty the canary, and add two fresh-baseline pods. That is four extra pods, 10% of the fleet in pod count but only 2% of traffic. At 25% the canary needs 10 pods and the baseline is usually dropped or kept small. Argo can scale canary replicas to match the weight, so the extra capacity tracks the stage.</p>
+<p>The schedule above (15 min, 30 min, 1 h, 1 h, then full) is about 2 h 45 min before 100%. A team that deploys checkout 6 times a day cannot run those rollouts back to back without overlap. Either releases queue and get batched into bigger, riskier changes, or the schedule shortens for low-risk changes. Many teams run a "fast lane" (1% for 5 minutes, then 25%, then 100%) for config-only or low-risk changes, and the full schedule for anything that touches checkout's write path.</p>
+<p>Blast radius in user-minutes is the number to put in the review. v1.43 as a blue-green switch: 100% of users for 8 minutes to detection plus about 4 minutes to roll back, so 12 full-traffic minutes. As a canary: 1% for 6 minutes, so 0.06 full-traffic minutes. That is about 200 times less exposure, paid for with hours of rollout time on every release.</p>
+
+<h2 id=dd-canary-deployment-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-canary-deployment-fm-cold level=3>1. Every canary fails on latency, so the team turns the gate off</h3>
+<p><strong>Symptom.</strong> Roughly one rollout in three aborts on p99 latency in the first interval. Re-runs pass. Engineers start adding "skip analysis" to deploys.</p>
+<p><strong>Mechanism.</strong> The canary is compared against long-running production pods. New pods pay for JIT warm-up, empty caches and new connection pools in their first minutes.</p>
+<p><strong>Detect.</strong> Plot canary-minus-baseline latency against minutes since pod start. A curve that decays to zero over 3 to 10 minutes is warm-up, not a regression. Track the abort rate and the override rate per service.</p>
+<p><strong>Fix.</strong> Compare against a fresh baseline. Warm pods with synthetic traffic before giving them weight, or ignore the first interval for latency only. A gate that cries wolf is worse than none, because people learn to ignore it.</p>
+
+<h3 id=dd-canary-deployment-fm-sticky level=3>2. The baseline looks sick while the canary looks fine</h3>
+<p><strong>Symptom.</strong> During a rollout, baseline errors rise slightly. The canary looks clean and advances.</p>
+<p><strong>Mechanism.</strong> The split is per request. A user's cart is written by v1.43 in a new shape, and the next request lands on v1.42, which cannot read it. The error is counted against the baseline. Contamination flows backwards, and the judge rewards the version causing it.</p>
+<p><strong>Detect.</strong> Trace attributes. Find error traces on the baseline where an earlier request in the same session was served by the canary. A metric of "sessions that saw both versions" should be near zero.</p>
+<p><strong>Fix.</strong> Assign the cohort at the edge and route on it. Make the gate also fail when baseline degrades during the rollout, because "the canary must not hurt anyone else" is part of the verdict.</p>
+
+<h3 id=dd-canary-deployment-fm-nodata level=3>3. The gate passes because it measured nothing</h3>
+<p><strong>Symptom.</strong> A broken release reaches 100% with every analysis green.</p>
+<p><strong>Mechanism.</strong> A relabelling change dropped the <code>track</code> label, or the canary pods were in a namespace Prometheus did not scrape. The query returned an empty result, and the tool treated "no data" as not failing. A related version: the error ratio's denominator was zero, the result was NaN, and the comparison evaluated to pass.</p>
+<p><strong>Detect.</strong> Add a sample-count metric to every analysis: "canary request count in the window is at least N." Alert when an analysis completes with fewer samples than its plan assumed.</p>
+<p><strong>Fix.</strong> Treat missing or insufficient data as failed or inconclusive, never as passed. Argo and Flagger both let you configure this; check what yours does before you trust it. Test the gate itself by deploying a deliberately broken build to a staging rollout.</p>
+
+<h3 id=dd-canary-deployment-fm-shared level=3>4. Draining the canary does not stop the damage</h3>
+<p><strong>Symptom.</strong> The canary is aborted at 5%. Errors keep coming from the baseline for another hour.</p>
+<p><strong>Mechanism.</strong> The canary wrote to shared state. It filled Redis with product entries in a new serialisation format under the same keys, or published events in a new schema to a topic. Baseline pods read them and fail. Draining traffic removed the writer but not the writes.</p>
+<p><strong>Detect.</strong> Baseline deserialisation errors that start with the rollout and do not stop at abort. Cache entries tagged with a writer version, if you tag them.</p>
+<p><strong>Fix.</strong> Version cache keys (<code>product:v2:123</code>) or include a format version inside the value that old readers can skip. Treat any shared format change as expand-contract: ship readers that understand both formats first, then writers. The canary tests code. It does not make shared state reversible.</p>
+
+<h3 id=dd-canary-deployment-fm-load level=3>5. Load-dependent regressions pass every stage</h3>
+<p><strong>Symptom.</strong> v1.46 passes 1%, 5%, 25% and 50% with flat metrics. At 100%, the database's CPU reaches 95% and every service slows down.</p>
+<p><strong>Mechanism.</strong> The new code issues three times as many queries per request. At 25%, that adds about 50% more database load, which the database absorbs. Per-pod latency and errors look identical between canary and baseline, because the cost lands on a shared downstream, not on the canary pods. This is the same N+1 bug that opens the feature-flags lesson.</p>
+<p><strong>Detect.</strong> Compare <em>cost per request</em>, not just outcome per request: database queries per request, bytes read, downstream calls, CPU per request. A ratio of 3.0 against baseline is a regression even when latency is fine.</p>
+<p><strong>Fix.</strong> Add per-request resource metrics to the gate as critical metrics. For a known risky change, run a stage at 50% during peak hours rather than finishing the rollout at 3 AM.</p>
+
+<h3 id=dd-canary-deployment-fm-async level=3>6. A "1%" canary consumer takes 8% of the work</h3>
+<p><strong>Symptom.</strong> A Kafka consumer is canaried by adding one v1.43 pod to a group of eleven. A bug in it sends thousands of messages to the dead letter queue.</p>
+<p><strong>Mechanism.</strong> Traffic weights do not apply to consumers. The group's assignor gives the new pod a share of partitions: one of twelve, about 8%, and every message in them, keyed by order ID. If the bug corrupts state, those orders are damaged. A rebalance can also move partitions on and off the canary mid-stream.</p>
+<p><strong>Detect.</strong> Consumer lag and DLQ counts labelled by consumer version. Partition assignment logs per pod.</p>
+<p><strong>Fix.</strong> Canary consumers by key inside the handler: the new pods run both code paths and a flag decides by key hash. Or give the canary its own consumer group on a mirrored topic in shadow mode, if its writes can be suppressed. Size the "percentage" by partitions, and say so in the rollout plan.</p>
+
+<h3 id=dd-canary-deployment-fm-rare level=3>7. The canary passes, and a rare cohort pays</h3>
+<p><strong>Symptom.</strong> The lesson's Q3: screen-reader users cannot check out, and nobody notices for two days.</p>
+<p><strong>Mechanism.</strong> 0.4% of a 1% cohort is 0.004% of traffic. At 20 checkout starts a minute in the cohort, that is under one screen-reader checkout every ten minutes. No aggregate metric can see it.</p>
+<p><strong>Detect.</strong> Segmented metrics on dimensions you know matter: platform, locale, assistive technology, payment method, account age. Compare each segment's canary versus baseline only where the segment has enough volume, and accept that the rest needs other layers.</p>
+<p><strong>Fix.</strong> Layers, as the lesson says. Deterministic tests for known rare paths. A flag-targeted beta that includes rare cohorts by name. Post-release segmented monitoring for a week after 100%.</p>
+
+<h2 id=dd-canary-deployment-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<p>Every canary design answers five questions. The table lists the real options; the guidance after it says how to pick.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision</th><th>Options</th><th>What you trade</th></tr></thead><tbody>
+<tr><td>Where the split happens</td><td>Replica ratio; weighted proxy or mesh route; header or cookie cohort at the edge; flag inside the code</td><td>Simplicity versus granularity and stickiness. Replica ratio needs nothing but is coarse and per request. Edge cohorts are sticky but need the edge to own the hash.</td></tr>
+<tr><td>What the canary is compared against</td><td>Fixed thresholds; production; a fresh baseline; the same hour last week</td><td>A fresh baseline removes warm-up and uptime bias at the cost of a few extra pods. Historical comparisons are canary theater.</td></tr>
+<tr><td>How the verdict is computed</td><td>Ratio with a tolerance; statistical test per metric; weighted score across metrics</td><td>Ratios are easy to read and fine for big effects. Tests and scores handle many metrics without false alarms, but need someone who understands them.</td></tr>
+<tr><td>How long each stage lasts</td><td>Fixed duration; until N samples are collected; until a sequential test decides</td><td>Fixed durations are predictable but too short at night and too long at peak. Sample-based stages adapt to traffic.</td></tr>
+<tr><td>What the unit of exposure is</td><td>Users or tenants within one cluster; one cell; one availability zone; one region</td><td>Cohorts within a cluster give statistics. Cells and regions give hard isolation of infrastructure faults, but each wave exposes everyone in that cell.</td></tr>
+</tbody></table></div></div>
+<p><strong>Start from the traffic.</strong> Below a few hundred requests per second, statistical canaries mostly produce noise. Use blue-green plus flag-targeted betas. Above that, a weighted mesh route with Argo or Flagger and a ratio-based gate is a reasonable first version. Add a fresh baseline and per-request cost metrics before you add statistics.</p>
+<p><strong>Use waves for infrastructure and config.</strong> Large providers deploy in waves: one box, then one availability zone, then one region, then the rest, with bake time between waves. A cohort canary cannot catch a change that breaks one zone's network config, because the cohort spans all zones. A wave can, because the zone itself is the unit. Mature systems do both: a cohort canary inside the first region, then regional waves.</p>
+<p><strong>Mobile and desktop clients are a different animal.</strong> App stores offer staged rollouts by percentage, but you cannot drain an installed app. Once a user has v5.2, they keep it until they update. Client canaries therefore lean on flags for the actual behaviour and treat the binary rollout as a slow, mostly one-way release.</p>
+<p><strong>Canary versus shadow.</strong> Shadowing (mirroring requests to the new version and discarding responses) is safer for read paths and gives full traffic volume with zero user exposure. It cannot test writes, and it cannot measure user behaviour. Use shadow for read-heavy services before the canary, not instead of it.</p>
+
+<h2 id=dd-canary-deployment-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Is the split per user or per request? If per request, what happens to a session that crosses versions?</li>
+<li>What key does the cohort hash, what is the salt, and does it change per rollout? What do anonymous users and B2B tenants hash on?</li>
+<li>Is the canary compared with a fresh baseline, with production, or with history? If production, how is warm-up handled?</li>
+<li>Which metrics are in the gate, which are critical on their own, and which direction counts as worse for each?</li>
+<li>For each stage, how many requests and sessions will the cohort see, and what effect size can that detect? Show the arithmetic.</li>
+<li>What does the gate do with missing data, zero denominators, or fewer samples than planned?</li>
+<li>Is there a per-request cost metric (queries, downstream calls, CPU) so shared-resource regressions are visible?</li>
+<li>Can the canary write anything shared (cache entries, events, rows) in a format the baseline cannot read? What cleans it up after an abort?</li>
+<li>How many concurrent canaries can touch one call path, and who prevents two from overlapping?</li>
+<li>How are queue consumers and scheduled jobs canaried, given that traffic weights do not apply to them?</li>
+<li>Who can skip or override the gate, how often does that happen, and is it audited?</li>
+<li>Which rare cohorts can this canary not see, and which other layer (tests, flag beta, segmented monitoring) covers each?</li>
+</ol>
+
+<h2 id=dd-canary-deployment-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Your mesh sends 1% of requests to the canary. Is that the same as a 1% cohort?"</summary>
+<p>No. A weighted route decides per request, so a user making 30 requests in a session has about a 26% chance (1 − 0.99³⁰) of hitting the canary at least once, and will usually flip between versions. That breaks multi-step flows and contaminates the baseline with canary side effects. A real cohort needs a stable assignment: hash a user or tenant key at the edge, stamp a header, and route on the header.</p>
+</details>
+<details>
+<summary>"Why deploy a separate baseline when production is already running the old version?"</summary>
+<p>Because production pods are not a fair comparison. They have hours or days of uptime, warm JIT, full caches and open pools. New canary pods have none of that, so they look slower for reasons unrelated to the code. A fresh baseline runs the old version on new pods started at the same time with the same traffic share. Uptime effects cancel, and what remains is the code difference.</p>
+</details>
+<details>
+<summary>"The v1.43 bug was detectable in about a second. Why did the drain take six minutes?"</summary>
+<p>Pipeline latency, not statistics. Metrics are scraped every 15 to 30 seconds, rates are computed over windows of minutes, and the gate requires two failed intervals to avoid false aborts. You can shorten that for one or two critical metrics with tight windows and a lower failure limit. Doing it for every metric would bring back the false-alarm problem, because many metrics and many looks multiply the chance of a spurious fail.</p>
+</details>
+<details>
+<summary>"You have 20 metrics in the gate. What goes wrong if any single failure aborts?"</summary>
+<p>At a 5% false-positive rate per metric, the chance that at least one of 20 fails by luck is about 64%. Most healthy releases would be rejected, and the team would start skipping analysis. The fix is to score the share of passing metrics, mark only a few as critical on their own, and require a minimum effect size so a trivial but statistically real difference does not count.</p>
+</details>
+<details>
+<summary>"Every metric was flat between canary and baseline at 50%, but 100% took the database down. How?"</summary>
+<p>The regression was in shared cost, not in per-pod outcomes. If the new code makes three times as many queries per request, canary and baseline pods see the same latency until the shared database saturates. Then both suffer equally, so the comparison still looks even. The gate needs per-request cost metrics, such as queries or downstream calls per request, compared as a ratio against baseline.</p>
+</details>
+<details>
+<summary>"How do you canary a Kafka consumer?"</summary>
+<p>Not with traffic weights, since consumers pull. Adding one new pod to a group gives it a partition share, which is a key-based slice of whatever size the partition count dictates, often well above 1%. Options: put both code paths in the new build and choose per message by key hash under a flag; or run the new version as a separate consumer group in shadow mode with its writes suppressed. Either way, label lag and DLQ metrics by consumer version.</p>
+</details>
+<details>
+<summary>"When would you deploy in regional waves instead of, or as well as, a cohort canary?"</summary>
+<p>When the risk is in infrastructure or configuration that is scoped to a location, such as a network policy, a load balancer setting or a dependency endpoint. A cohort spans every zone, so a fault in one zone shows up as a small blip in everyone's metrics. A wave makes the zone or region the unit, so the fault is contained and obvious. Large fleets usually do both: cohort analysis inside the first region, then waves with bake time between them.</p>
+</details>
+<details>
+<summary>"Your team ships checkout eight times a day and the canary takes three hours. What do you change?"</summary>
+<p>Not the gate's honesty. First, move the long pauses to the stages where business metrics have enough sessions, usually 5% to 25%, and make stages end on sample counts rather than fixed times. Second, add a risk-based fast lane for low-risk changes. Third, decouple feature risk from binary risk with flags, so most binaries carry dark code and pass quickly on technical metrics. Batching eight changes into one rollout to save time is the wrong answer: it makes every failure harder to attribute.</p>
+</details>

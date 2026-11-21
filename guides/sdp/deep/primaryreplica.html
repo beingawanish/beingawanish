@@ -1,0 +1,263 @@
+<h2 id=dd-primaryreplica-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson describes replication as log shipping: the primary sends its log, and replicas replay it. That sentence is true for every database in this section. What differs is how the log is shipped, how far each replica has got with it, and what the primary waits for before it says "saved." Those details decide your lag, your data-loss window and your failover story. We will look at PostgreSQL first, because its view of replication is the easiest to see, then MySQL and MongoDB.</p>
+
+<h3 id=dd-primaryreplica-four-positions level=3>Four positions on one log</h3>
+<p>Every change in PostgreSQL gets a place in the write-ahead log, identified by a <strong>log sequence number</strong> (LSN). An LSN is a byte position in the log, shown as two hex numbers like <code>3/A1B2C3D0</code>. Because it is a position, you can subtract two LSNs and get a distance in bytes. That simple fact makes most replication monitoring possible.</p>
+<p>On the primary, a process called the <strong>walsender</strong> streams log records to each replica. On the replica, a <strong>walreceiver</strong> writes them to the replica's own log, and a separate <strong>startup process</strong> replays them into the data files. So one change passes through four positions on its way to a reader:</p>
+<ol>
+<li><code>sent_lsn</code>: the primary has sent the record over the network.</li>
+<li><code>write_lsn</code>: the replica has written it to its operating system, not yet forced to disk.</li>
+<li><code>flush_lsn</code>: the replica has fsynced it. It now survives a crash of the replica.</li>
+<li><code>replay_lsn</code>: the replica has applied it. Only now can a query on the replica see it.</li>
+</ol>
+<p>The primary reports all four in <code>pg_stat_replication</code>, one row per replica, along with <code>write_lag</code>, <code>flush_lag</code> and <code>replay_lag</code> as time intervals. When someone says "the replica is 2 seconds behind," ask which of these they mean. A replica can have every byte safely flushed and still be minutes behind on replay.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-primaryreplica-svg-title dd-primaryreplica-svg-desc" viewBox="0 0 720 290" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-primaryreplica-svg-title">Where one replica stands on the primary's log</title>
+<desc id="dd-primaryreplica-svg-desc">A horizontal bar represents the primary's write-ahead log, older on the left and newer on the right. From left to right it is divided at four marks: replay_lsn, flush_lsn, write_lsn and sent_lsn, ending at the primary's current log position. Everything left of replay_lsn is visible to readers on the replica. Everything right of flush_lsn would be lost if the primary died now and this replica were promoted. Below, the synchronous_commit settings are mapped to the mark each one waits for: remote_write waits for write_lsn, on waits for flush_lsn, and remote_apply waits for replay_lsn.</desc>
+<rect x="0" y="0" width="720" height="290" fill="#ffffff"/>
+<text x="40" y="28" font-size="13" fill="#5c6b7c">older log</text>
+<text x="680" y="28" font-size="13" fill="#5c6b7c" text-anchor="end">newer log</text>
+<rect x="40" y="100" width="320" height="40" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="200" y="125" font-size="13" fill="#1c2430" text-anchor="middle">replayed: visible to replica reads</text>
+<rect x="360" y="100" width="90" height="40" fill="#e4eef8" stroke="#7ea4c8"/>
+<rect x="450" y="100" width="70" height="40" fill="#e4eef8" stroke="#7ea4c8"/>
+<rect x="520" y="100" width="60" height="40" fill="#e4eef8" stroke="#7ea4c8"/>
+<rect x="580" y="100" width="100" height="40" fill="#f8ebee" stroke="#c898a4"/>
+<text x="630" y="125" font-size="12" fill="#1c2430" text-anchor="middle">not sent yet</text>
+<line x1="360" y1="92" x2="360" y2="148" stroke="#1f5f99" stroke-width="2"/>
+<line x1="450" y1="70" x2="450" y2="148" stroke="#1f5f99" stroke-width="2"/>
+<line x1="520" y1="92" x2="520" y2="148" stroke="#1f5f99" stroke-width="2"/>
+<line x1="580" y1="70" x2="580" y2="148" stroke="#1f5f99" stroke-width="2"/>
+<line x1="680" y1="92" x2="680" y2="148" stroke="#1c2430" stroke-width="2"/>
+<text x="360" y="86" font-size="12" fill="#1c2430" text-anchor="middle">replay_lsn</text>
+<text x="450" y="64" font-size="12" fill="#1c2430" text-anchor="middle">flush_lsn</text>
+<text x="520" y="86" font-size="12" fill="#1c2430" text-anchor="middle">write_lsn</text>
+<text x="580" y="64" font-size="12" fill="#1c2430" text-anchor="middle">sent_lsn</text>
+<text x="680" y="86" font-size="12" fill="#1c2430" text-anchor="end">primary now</text>
+<path d="M450,160 L450,170 L680,170 L680,160" fill="none" stroke="#c898a4" stroke-width="2"/>
+<text x="565" y="188" font-size="12" fill="#1c2430" text-anchor="middle">lost if primary dies now (async)</text>
+<path d="M360,200 L360,210 L680,210 L680,200" fill="none" stroke="#7ea4c8" stroke-width="2"/>
+<text x="520" y="228" font-size="12" fill="#1c2430" text-anchor="middle">replay lag: what replica readers cannot see yet</text>
+<text x="360" y="266" font-size="12" fill="#5c6b7c" text-anchor="middle">waits here: remote_apply</text>
+<text x="40" y="266" font-size="12" fill="#5c6b7c">synchronous_commit</text>
+<text x="470" y="282" font-size="12" fill="#5c6b7c" text-anchor="middle">on</text>
+<text x="540" y="266" font-size="12" fill="#5c6b7c" text-anchor="middle">remote_write</text>
+</svg>
+<figcaption>One replica's four positions on the primary's log. Durability is decided by flush_lsn; staleness of reads is decided by replay_lsn.</figcaption>
+</figure>
+
+<h3 id=dd-primaryreplica-postgres-knobs level=3>PostgreSQL: the knobs that matter</h3>
+<p>The diagram maps directly onto the setting that controls the data-loss window, <code>synchronous_commit</code>. It decides what a commit waits for before the client hears "saved":</p>
+<ul>
+<li><code>off</code>: not even the primary's own fsync. A crash can lose recent commits on a single machine, though the data stays consistent.</li>
+<li><code>local</code>: the primary's fsync only. Replication is fully asynchronous.</li>
+<li><code>remote_write</code>: the synchronous replica has written the record to its OS. That survives a Postgres crash on the replica, but not a power loss there.</li>
+<li><code>on</code>: the synchronous replica has flushed the record. Nothing acknowledged is lost if the primary dies. This is the usual meaning of "synchronous replication."</li>
+<li><code>remote_apply</code>: the synchronous replica has replayed it. A read on that replica right after the commit will see the write. This is the only level that gives read-your-writes on a replica for free, and it is the slowest.</li>
+</ul>
+<p>Which replicas count as synchronous is set by <code>synchronous_standby_names</code>. If it is empty, <code>on</code> behaves like <code>local</code>. Two forms are worth knowing. <code>FIRST 1 (r1, r2)</code> waits for <code>r1</code> by priority, with <code>r2</code> as the fallback. <code>ANY 1 (r1, r2)</code> waits for whichever answers first, which is the quorum version of semi-sync from the lesson. A nice property: <code>synchronous_commit</code> can be set per session or per transaction. The checkout transaction can run with <code>on</code> while the page-view counter runs with <code>local</code>, on the same database.</p>
+<p>Three more knobs shape day-to-day behaviour:</p>
+<ul>
+<li><strong>Replication slots.</strong> A slot makes the primary keep every WAL segment a replica has not yet confirmed. Without one, a replica that falls far behind finds its log already deleted and must be rebuilt from scratch. With one, an abandoned replica makes the primary keep WAL forever. <code>max_slot_wal_keep_size</code> (PostgreSQL 13 and later; unlimited by default) caps that, at the cost of breaking the slow replica instead of the primary.</li>
+<li><strong><code>hot_standby_feedback</code></strong> (off by default). Replay sometimes wants to remove row versions that a long query on the replica is still reading. By default, the replica waits up to <code>max_standby_streaming_delay</code> (30 seconds by default) and then cancels the query with "canceling statement due to conflict with recovery." Turning feedback on tells the primary to keep those row versions instead. Queries stop being cancelled, but a 2-hour analytics query on the replica now stops vacuum on the primary for 2 hours, and the primary's tables bloat.</li>
+<li><strong>Single-threaded replay.</strong> One startup process replays all WAL. A primary with 64 cores running writes in parallel can generate WAL faster than one process can apply it. That is the most common root cause of lag that "nobody can explain."</li>
+</ul>
+<p>Promotion is <code>pg_promote()</code> or <code>pg_ctl promote</code>. The promoted replica starts a new <strong>timeline</strong>, a numbered branch of history. If the old primary comes back, its history has forked from the new one. <code>pg_rewind</code> can wind it back to the fork point so it can rejoin as a replica, which is far faster than a full copy.</p>
+
+<h3 id=dd-primaryreplica-mysql level=3>MySQL: binlog, relay log and a semi-sync trap</h3>
+<p>MySQL replicates its <strong>binary log</strong> (binlog), not InnoDB's internal redo log. The binlog is a logical log: with <code>binlog_format=ROW</code> (the default since 5.7) it records the before and after images of each changed row. On the replica, a receiver thread copies the binlog into a local <strong>relay log</strong>, and one or more applier threads replay it. Since 8.0.27, <code>replica_parallel_workers</code> defaults to 4, so replay can run in parallel for transactions that did not conflict on the primary. That is a real advantage over Postgres's single replay process for write-heavy primaries.</p>
+<p>With <strong>GTIDs</strong> enabled (global transaction IDs, one per committed transaction), each replica knows exactly which transactions it has. Failover tools can then pick the most complete replica and repoint the others without counting byte offsets by hand.</p>
+<p>Semi-synchronous replication is a plugin, and its defaults hide the trap in this section. Two settings matter (renamed from <code>master</code> to <code>source</code> in 8.0.26):</p>
+<ul>
+<li><code>rpl_semi_sync_source_wait_point</code>: <code>AFTER_SYNC</code> (the default, called "lossless") waits for a replica's acknowledgement before committing in the storage engine. <code>AFTER_COMMIT</code> commits first, so other sessions can see a transaction that could still vanish on failover.</li>
+<li><code>rpl_semi_sync_source_timeout</code>: 10,000 ms by default. If no replica acknowledges within that time, the primary <strong>silently falls back to asynchronous</strong> and keeps going. Writes do not stall, which is the point. But your "zero data loss" guarantee is now off, and only the <code>Rpl_semi_sync_source_status</code> variable tells you.</li>
+</ul>
+<p>Also be wary of <code>Seconds_Behind_Source</code>. It compares the timestamp of the event being applied with the replica's clock. If the receiver thread is stuck, the applier finishes its relay log, and the value happily reports 0 while the replica falls hours behind. Production teams write a heartbeat row on the primary every second (Percona's <code>pt-heartbeat</code> is the classic tool) and measure lag as "now minus the newest heartbeat the replica can see."</p>
+
+<h3 id=dd-primaryreplica-mongodb level=3>MongoDB: the oplog, write concern and rollback</h3>
+<p>A MongoDB replica set replicates through the <strong>oplog</strong>, a capped collection of idempotent operations. Secondaries pull from it, and they can pull from each other, not only from the primary. The durability question appears as <strong>write concern</strong>:</p>
+<ul>
+<li><code>w: 1</code> acknowledges once the primary has the write. It is the asynchronous mode.</li>
+<li><code>w: "majority"</code> acknowledges once a majority of voting members have it. It has been the default since MongoDB 5.0 for most deployments.</li>
+</ul>
+<p>The failure case shows why the default changed. Suppose the primary accepted writes with <code>w: 1</code>, then got cut off before they replicated. The rest elect a new primary, and the old one later rejoins. Its unreplicated writes conflict with the new history, so MongoDB <strong>rolls them back</strong>. It writes them to rollback files for a person to inspect, and they disappear from the database. With <code>w: "majority"</code>, an acknowledged write is on a majority, and any electable new primary must have it.</p>
+<p>Elections use a Raft-like protocol with terms, which are numbered epochs. <code>electionTimeoutMillis</code> defaults to 10 seconds, and MongoDB's documentation says a typical election completes within about 12 seconds. Reads have their own knobs. <code>readPreference</code> chooses primary or secondaries, <code>readConcern: "majority"</code> returns only data that cannot be rolled back, and <strong>causally consistent sessions</strong> make a secondary wait until it has caught up to the session's last write. That last feature is read-your-writes built into the driver.</p>
+
+<h3 id=dd-primaryreplica-failover-managers level=3>Failover managers and fencing</h3>
+<p>Postgres and MySQL do not elect a new primary by themselves. Something outside the database decides. The common choices are Patroni for Postgres, Orchestrator or MySQL InnoDB Cluster for MySQL, and the cloud's own controller on RDS or Cloud SQL.</p>
+<p>Patroni is a good model of how this is done safely. Each node runs a Patroni agent. The agents share a small strongly consistent store, usually etcd, Consul or ZooKeeper. The primary holds a <strong>leader key</strong> in that store with a time to live (<code>ttl</code>, 30 seconds by default) and renews it every <code>loop_wait</code> (10 seconds by default). Two rules then give you fencing:</p>
+<ol>
+<li>If the primary's agent cannot renew the key, for example because it is cut off from the store, it <strong>demotes its own database</strong> before the key expires. An isolated primary stops accepting writes on its own.</li>
+<li>A replica may promote itself only after it wins the expired key. Patroni also refuses to promote a replica more than <code>maximum_lag_on_failover</code> behind (1 MB of WAL by default), so it will not quietly promote a replica that would lose minutes of data.</li>
+</ol>
+<p>The first rule depends on the old primary's agent being alive enough to demote. If the whole machine hangs and then wakes up, it could miss the deadline. That is why Patroni can use a hardware or kernel <strong>watchdog</strong>, which reboots the machine if the agent stops checking in. The general name for this is STONITH, "shoot the other node in the head": you prove the old primary is dead, rather than hoping it is.</p>
+<p>The final piece is routing. Applications must find the new primary. Options include a DNS name the manager updates, a virtual IP, a proxy such as HAProxy that health-checks each node's role, or a driver that tries several hosts. In Postgres, libpq's <code>target_session_attrs=read-write</code> makes the client skip any host that is not the primary, and <code>prefer-standby</code> (PostgreSQL 14 and later) sends read sessions to replicas when one is up. Whichever you use, it is part of the fence. A client still connected to the old primary can keep writing to it, so the old primary must refuse writes, not just stop being advertised.</p>
+
+<h2 id=dd-primaryreplica-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>All the math below uses the bookstore's Tuesday numbers from the lesson: 8,000 reads per second, 300 writes per second, and machines that top out at 5,000 queries per second. Change the inputs to yours; the shape of each calculation is the point.</p>
+
+<h3 id=dd-primaryreplica-replica-count level=3>How many replicas, really</h3>
+<p>The lesson's two replicas each run at 4,000 of their 5,000 queries per second. That is 80% utilisation, and it has no room for failure. If one replica dies, the other gets 8,000 reads per second and falls over too. Worse, during a primary failover one replica becomes the primary, so you are a replica short at the exact moment things are already going wrong.</p>
+<p>A sounder sizing rule has two parts. Plan each replica to run at most around 60% at peak, because queueing delay climbs steeply above that. Then add one replica so the plan still holds with one machine lost.</p>
+<ul>
+<li>Usable capacity per replica: 5,000 × 0.6 = 3,000 reads per second.</li>
+<li>Replicas for today's peak: 8,000 / 3,000 = 2.7, so 3.</li>
+<li>Plus one for failure or promotion: 4 replicas.</li>
+<li>If reads grow 40% a year, next year's peak is 11,200, which needs 4 + 1 = 5.</li>
+</ul>
+<p>Four replicas at 2,000 reads per second each sit at 40%. Lose one and the other three run at 2,667 each, about 53%. That is the cluster you can sleep through.</p>
+
+<h3 id=dd-primaryreplica-wal-volume level=3>Log volume, network and retention</h3>
+<p>Replication cost scales with WAL bytes, not with queries. Assume an average of 1.5 KB of WAL per write transaction (a row, two index entries and a commit record; full-page writes after each checkpoint can push this much higher).</p>
+<ul>
+<li>Normal WAL rate: 300 × 1.5 KB = 450 KB per second, or about 39 GB per day.</li>
+<li>Four replicas each pull a full copy: 1.8 MB per second of egress from the primary. That is trivial on a 10 Gbps link.</li>
+<li>Cross-zone transfer is usually billed per GB. 39 GB × 4 replicas × 30 days is about 4.7 TB a month. Check your provider's price; it is small but not zero, and cross-region is more.</li>
+</ul>
+<p>Now the bulk import. Say it generates 50 MB per second of WAL for 10 minutes. Four replicas pull 200 MB per second, about 1.6 Gbps. Still fine on the network.</p>
+<p>The real risk is slot retention. Suppose one replica is down and its slot holds WAL. At the normal 450 KB per second, a 50 GB WAL volume lasts about 31 hours. During the import, the same 50 GB lasts under 17 minutes. Size WAL disk and <code>max_slot_wal_keep_size</code> against your worst write burst, not your average.</p>
+
+<h3 id=dd-primaryreplica-lag-math level=3>Lag is a queue: when it grows and how long it drains</h3>
+<p>Replay lag behaves like any queue. It grows when WAL arrives faster than the replica applies it, and it drains at the difference.</p>
+<p>Assume one replay process applies about 30 MB per second of this workload's WAL. The real number varies a lot with record types and disk speed, so measure yours. During the 10-minute import, WAL arrives at 50 MB per second:</p>
+<ul>
+<li>Backlog grows at 50 − 30 = 20 MB per second, reaching 12 GB at the end of the import.</li>
+<li>By then the replica has applied 30 × 600 = 18 GB of the 30 GB generated. It is replaying WAL that the primary wrote around minute 6, so it is about 4 minutes behind in time.</li>
+<li>After the import, WAL arrives at 0.45 MB per second. The backlog drains at about 29.5 MB per second: 12 GB / 29.5 MB/s is roughly 7 minutes.</li>
+</ul>
+<p>So a 10-minute import produces up to 4 minutes of read staleness and 17 minutes of elevated lag in total. Chunking the import into batches with pauses, or throttling it to 25 MB per second, keeps lag near zero. That is a cheap fix, and it belongs in the import job's design, not in an incident review.</p>
+
+<h3 id=dd-primaryreplica-loss-window level=3>The data-loss window in writes, not milliseconds</h3>
+<p>The exposure from asynchronous replication is lag times write rate:</p>
+<ul>
+<li>Normal lag of 50 ms × 300 writes per second = 15 acknowledged writes at risk.</li>
+<li>During an 8-second lag spike: 8 × 300 = 2,400 writes at risk.</li>
+<li>During the 4-minute import lag above: the import's own writes plus every order taken in those minutes.</li>
+</ul>
+<p>That is why "async loses about 200 ms" is a typical number, not a bound. It is also why Patroni's <code>maximum_lag_on_failover</code> exists. Refusing to fail over automatically to a replica that is minutes behind is often the right call; a human should choose between "down for a while" and "lose four minutes of orders."</p>
+
+<h3 id=dd-primaryreplica-sync-cost level=3>What synchronous replication costs per commit</h3>
+<p>Synchronous commit adds one network round trip, plus the replica's fsync for <code>on</code>, plus replay for <code>remote_apply</code>. Rough round-trip times (they vary by provider and region):</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Replica placement<th>Typical round trip<th>Commit latency, local fsync 1 ms<th>Serial commits per connection<tbody><tr><td>Async (no wait)<td>none<td>about 1 ms<td>about 1,000 per second<tr><td>Same zone<td>0.1 to 0.5 ms<td>about 1.5 ms<td>about 650 per second<tr><td>Another zone, same region<td>0.5 to 2 ms<td>about 2.5 to 4 ms<td>250 to 400 per second<tr><td>Another region<td>tens of ms<td>30 to 100 ms<td>10 to 30 per second</table></div></div>
+<p>Two things follow. First, total throughput mostly survives, because many connections commit at once and group commit sends their log together. Latency per transaction is what users feel. Second, cross-region synchronous replication is a business decision, not a config tweak. A checkout that makes four sequential commits gains 200 to 400 ms at cross-region distances.</p>
+
+<h3 id=dd-primaryreplica-failover-budget level=3>The failover time budget</h3>
+<p>Break the lesson's 45 seconds into its parts. With Patroni defaults:</p>
+<ul>
+<li>Detection: the leader key must expire. Up to 30 seconds after the primary's last renewal.</li>
+<li>Election and promotion: a replica's agent notices on its next loop (up to 10 seconds) and promotes. Promotion itself takes a few seconds, longer if replay was behind.</li>
+<li>Rerouting: proxies see the new role on their next health check. If routing uses DNS, add the record's TTL, and add the time for application pools to drop dead connections. Pools with long timeouts on dead TCP connections can add a minute by themselves.</li>
+</ul>
+<p>So 30 to 60 seconds is realistic, and lowering the TTL trades faster failover for more false failovers on a brief network blip. At four unplanned failovers a year at 45 seconds each, write downtime is 3 minutes a year. Planned switchovers for upgrades usually add more than that, so practise them too.</p>
+
+<h2 id=dd-primaryreplica-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-primaryreplica-fm-zero-lag level=3>1. The replica that reports zero lag and serves yesterday</h3>
+<p><strong>Symptom.</strong> Customers on some page loads see orders from hours ago. Others see current data. The lag dashboard says every replica is at 0 seconds.</p>
+<p><strong>Mechanism.</strong> One replica's receiver thread disconnected after a network change, or its slot was dropped. Its applier finished the local relay log and went idle. MySQL's <code>Seconds_Behind_Source</code> compares the event being applied with the clock; with nothing to apply, it shows 0 (or NULL, which many dashboards render as 0). The load balancer keeps sending it a quarter of all reads, because the replica is up and answering queries.</p>
+<p><strong>Detect.</strong> A heartbeat table: write <code>now()</code> on the primary every second and alert when any replica's newest heartbeat is more than a few seconds old. In Postgres, also alert when a replica disappears from <code>pg_stat_replication</code>, or its <code>replay_lsn</code> stops moving while the primary's position advances.</p>
+<p><strong>Fix.</strong> Make the read router health-check on heartbeat lag, not on "accepts connections." Remove a replica from the read pool above a lag threshold, say 5 seconds, and put it back only after it catches up.</p>
+
+<h3 id=dd-primaryreplica-fm-slot-disk level=3>2. The primary's disk fills from a replica nobody uses</h3>
+<p><strong>Symptom.</strong> At 3 AM the primary stops accepting writes with "could not write to file pg_wal/…: No space left on device". Checkout is down. Every replica that is still running looks healthy.</p>
+<p><strong>Mechanism.</strong> Weeks ago someone created a replica for a one-off data migration, with a replication slot. The replica was deleted; the slot was not. The slot pins every WAL segment since its last confirmed position, so the primary kept all of it. Last night's import produced 50 MB per second of WAL and used the last of the disk.</p>
+<p><strong>Detect.</strong> Watch <code>pg_replication_slots</code>: alert on any slot with <code>active = false</code> for more than a few minutes, and on retained WAL per slot (<code>pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)</code>). Alert on WAL volume usage at 60%, not 95%.</p>
+<p><strong>Fix.</strong> Set <code>max_slot_wal_keep_size</code> so a dead replica breaks itself, not the primary. Give WAL its own volume. Make slot creation and deletion part of the replica's provisioning code, so they live and die together.</p>
+
+<h3 id=dd-primaryreplica-fm-split-brain level=3>3. Split brain after a partition</h3>
+<p><strong>Symptom.</strong> After a network incident, two machines report being primary. A day later, finance finds orders that exist in neither database's final state, and some customer records have two different versions.</p>
+<p><strong>Mechanism.</strong> A network partition separated the primary from the failover manager but not from half of the application servers. The manager promoted a replica. The old primary had no self-fencing, so it kept accepting writes from the application servers that could still reach it. Both histories advanced. When the partition healed, the old primary's writes were on a timeline the new primary never saw.</p>
+<p><strong>Detect.</strong> Alert whenever more than one node reports <code>pg_is_in_recovery() = false</code> (or MySQL <code>read_only = OFF</code>) in the same cluster. Track the timeline ID or term; a node accepting writes on an old timeline is a red alarm.</p>
+<p><strong>Fix.</strong> Fencing before promotion, always: leader leases where the primary demotes itself when it cannot renew, a watchdog for the frozen-machine case, and clients that verify the role on connect (<code>target_session_attrs=read-write</code>). Recovering the lost writes is manual. Extract them from the old primary's WAL or binlog, then reconcile by business key. Practise this once, so you know it is painful enough to prevent.</p>
+
+<h3 id=dd-primaryreplica-fm-semisync level=3>4. Semi-sync that quietly became async</h3>
+<p><strong>Symptom.</strong> The design document says the payments database has zero data loss on failover. After a primary hardware failure, 90 seconds of acknowledged payments are missing on the promoted replica.</p>
+<p><strong>Mechanism.</strong> Earlier that day, both semi-sync replicas were slow for a few seconds during a backup. MySQL waited the default 10-second <code>rpl_semi_sync_source_timeout</code>, then switched to asynchronous replication so writes would not stall. Replication caught up, but the switch back only happens once a replica acknowledges again, and the failure hit during a second slow period. For those 90 seconds the cluster was async.</p>
+<p><strong>Detect.</strong> Alert on <code>Rpl_semi_sync_source_status = OFF</code> and on increases in <code>Rpl_semi_sync_source_no_tx</code> (commits that were not acknowledged by a replica). In Postgres, the equivalent check is <code>sync_state</code> in <code>pg_stat_replication</code>: a cluster with no row in state <code>sync</code> or <code>quorum</code> is not synchronous.</p>
+<p><strong>Fix.</strong> Decide explicitly which failure you prefer. For true zero loss, set a very high timeout and accept that writes stall when no replica can acknowledge. Then run at least two candidate replicas so one slow machine does not stall you. Otherwise, document the guarantee honestly as "zero loss except during degraded periods, which page us."</p>
+
+<h3 id=dd-primaryreplica-fm-sync-stall level=3>5. One sick replica stops every write</h3>
+<p><strong>Symptom.</strong> Checkout hangs. The primary's CPU is idle. Connections pile up in state "waiting for SyncRep" until the pool is exhausted.</p>
+<p><strong>Mechanism.</strong> The team turned on synchronous replication with <code>synchronous_standby_names = 'r1'</code>: one named replica. Its disk failed and the replica stopped acknowledging. With <code>synchronous_commit = on</code>, every commit now waits forever for an acknowledgement that cannot come. The safety feature became the outage.</p>
+<p><strong>Detect.</strong> Wait events in <code>pg_stat_activity</code> (<code>SyncRep</code>), commit latency p99, and the sync replica's absence from <code>pg_stat_replication</code>.</p>
+<p><strong>Fix.</strong> Never depend on exactly one synchronous replica. Use <code>ANY 1 (r1, r2)</code> or <code>FIRST 1 (r1, r2)</code> so a second replica can take over the role. Patroni's <code>synchronous_mode</code> manages this list for you. Keep <code>synchronous_commit</code> at <code>local</code> for tables that do not need the guarantee, so a stall only blocks what must block.</p>
+
+<h3 id=dd-primaryreplica-fm-recovery-conflict level=3>6. Analytics on the replica: cancelled queries or a bloated primary</h3>
+<p><strong>Symptom.</strong> Either the data team complains that reports fail with "canceling statement due to conflict with recovery," or, after someone "fixed" that, the primary's tables grow 30% in a week and its queries slow down.</p>
+<p><strong>Mechanism.</strong> A 2-hour report on a replica reads old row versions. Vacuum on the primary removes those versions, and the removal arrives in the WAL. Replay must either wait for the query, which grows replay lag past <code>max_standby_streaming_delay</code>, or cancel the query. Turning on <code>hot_standby_feedback</code> asks the primary not to remove those versions, which blocks vacuum for the length of the longest replica query.</p>
+<p><strong>Detect.</strong> <code>pg_stat_database_conflicts</code> on the replica for cancellations. On the primary, <code>n_dead_tup</code> growth and the age of <code>backend_xmin</code> reported for replicas in <code>pg_stat_replication</code>.</p>
+<p><strong>Fix.</strong> Separate the jobs. Serve user reads from replicas with feedback off and a short delay limit. Give analytics its own replica with a long <code>max_standby_streaming_delay</code>, accept that it lags during long reports, and keep it out of the user read pool. Better still, feed analytics from change data capture into a warehouse.</p>
+
+<h3 id=dd-primaryreplica-fm-cold-primary level=3>7. The failover that works, then the new primary falls over</h3>
+<p><strong>Symptom.</strong> Failover completes in 40 seconds. Then write latency stays 10 times normal for 15 minutes, and connection errors spike.</p>
+<p><strong>Mechanism.</strong> Two effects stack. The promoted replica's memory held the pages its read traffic used, not the pages the write path uses, so the write path runs from disk until the cache warms. Meanwhile, every application instance reconnects at once. Hundreds of pools open their full connection count in the same second, and each new Postgres connection is a process to fork. The replica also lost its old read traffic to the survivors, which are now one machine short.</p>
+<p><strong>Detect.</strong> Buffer cache hit ratio and disk reads on the new primary, connection rate, and per-replica CPU right after failover. Failover drills should record these, not just "promotion succeeded."</p>
+<p><strong>Fix.</strong> Put a pooler such as PgBouncer between the application and the database, so reconnects hit the pooler, not Postgres. Add jitter to client reconnects. Use <code>pg_prewarm</code> where it helps, and size replicas with the N+1 headroom from the sizing section so losing one to promotion does not overload the rest.</p>
+
+<h2 id=dd-primaryreplica-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-primaryreplica-choose-replication level=3>How replicas get the data</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach<th>Examples<th>Loses acknowledged writes on failover?<th>Write latency cost<th>Failover<th>Watch out for<tbody><tr><td>Asynchronous streaming<td>Postgres default, MySQL default<td>Yes, up to the lag at that moment<td>None<td>External manager, 30 to 60 s typical<td>Lag spikes widen the loss window<tr><td>Semi-sync or quorum sync (one of N)<td>MySQL semi-sync, Postgres <code>ANY 1</code><td>No, while at least one replica keeps up<td>One round trip plus replica fsync<td>External manager; must pick the replica that acknowledged<td>MySQL's silent fallback to async<tr><td>Consensus (majority)<td>MongoDB <code>w: "majority"</code>, etcd, CockroachDB, MySQL Group Replication<td>No, while a majority survives<td>Round trip to the nearest majority<td>Built in, seconds<td>Needs 3 or 5 voting members; minority side stops writing<tr><td>Shared storage<td>Aurora, AlloyDB-style designs<td>No; storage is replicated below the database<td>Storage quorum write (Aurora writes 6 copies, needs 4)<td>Built in, usually tens of seconds<td>Vendor lock-in; replicas still replay to update their caches<tr><td>Synchronous standby, not readable<td>RDS Multi-AZ (classic)<td>No<td>One cross-zone round trip<td>Managed, often one to two minutes<td>Standby adds no read capacity</table></div></div>
+<p>The default for most product databases is asynchronous replicas for reads, plus either quorum sync with two candidates or a managed synchronous standby for durability. If the business cannot lose a payment, move the guarantee into a consensus or quorum system, and make sure the minority side cannot write.</p>
+
+<h3 id=dd-primaryreplica-choose-ryw level=3>Read-your-writes: five ways, and what each costs</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Technique<th>How it works<th>Cost<th>Good for<tbody><tr><td>Read from primary after a write<td>Session flag for N seconds after any write<td>Primary load grows with active writers<td>Simple apps with few writers<tr><td>Position token<td>Store the commit's LSN or GTID in the session; read only from replicas past it (<code>pg_last_wal_replay_lsn()</code>, <code>WAIT_FOR_EXECUTED_GTID_SET</code>)<td>Data-layer code; a read may wait or fall back to primary<td>High-traffic apps; precise<tr><td>Causal sessions<td>Driver carries the cluster time and the server waits (MongoDB)<td>Built in; same wait-or-fallback trade<td>MongoDB users: just turn it on<tr><td><code>remote_apply</code> on the write<td>Commit returns only after a sync replica replayed it<td>Every such write pays replay latency<td>A few critical flows, paired with sticky reads to that replica<tr><td>Optimistic UI<td>Client shows its own change immediately<td>Server data still stale for other views<td>Low-risk edits, profile fields</table></div></div>
+<p>The position token is the one to reach for at scale. It is precise, it keeps reads on replicas, and the logic lives in one place in the data layer. Time-window routing is fine to start with, but it guesses: a lag spike longer than the window brings the bug back.</p>
+
+<h3 id=dd-primaryreplica-choose-routing level=3>Where the read/write split lives</h3>
+<p>There are three common places. The <strong>application</strong> holds two connection pools and picks one per query; this is explicit and easy to reason about, but every service must do it right. A <strong>proxy</strong> such as ProxySQL (MySQL) or Pgpool-II (Postgres) inspects queries and routes them; applications stay simple, but the proxy guesses intent from SQL and is one more hop to run. A <strong>driver</strong> (libpq's <code>target_session_attrs</code>, MongoDB's <code>readPreference</code>) handles role discovery but leaves query choice to you. Most teams end up with explicit routing in the application's data layer, because only the application knows which reads must be fresh.</p>
+
+<h2 id=dd-primaryreplica-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Is the bottleneck reads, writes or data size? Show the read/write ratio and growth rate, not an impression.</li>
+<li>How many replicas, at what utilisation, and does the plan still hold with one replica lost or promoted?</li>
+<li>Which data needs zero loss on failover, and which replication mode and setting (<code>synchronous_commit</code>, write concern, semi-sync timeout) delivers it? What happens to writes when the synchronous replica is unavailable?</li>
+<li>How is lag measured: heartbeat or LSN difference, not a single built-in "seconds behind" value? What threshold removes a replica from the read pool?</li>
+<li>Which reads must see the user's own writes, and which technique handles them? What happens during a 60-second lag spike?</li>
+<li>What fences the old primary: lease, watchdog, STONITH? Can a client still connected to it keep writing?</li>
+<li>What is the failover time budget, broken into detection, promotion and rerouting? When was it last measured in a drill?</li>
+<li>Will automatic failover refuse a replica that is too far behind? Who decides in that case, and how are they paged?</li>
+<li>Are replication slots tied to replica lifecycle, capped, and alerted on? Is WAL disk sized for the worst write burst?</li>
+<li>Where do analytics and backups run, and how are recovery conflicts handled without bloating the primary?</li>
+<li>How do bulk jobs (imports, backfills, migrations) avoid creating minutes of lag?</li>
+<li>After failover, how does the old primary rejoin (<code>pg_rewind</code>, rebuild), and how would you recover writes it accepted after the split?</li>
+</ol>
+
+<h2 id=dd-primaryreplica-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Your replica lag graph says 0 ms, yet users see stale data. How can both be true?"</summary>
+<p>Because the metric measures the wrong thing. MySQL's <code>Seconds_Behind_Source</code> compares the event being applied with the clock, so a replica whose receiver has stopped shows 0 once its relay log is empty. In Postgres, a dashboard might show <code>flush_lag</code> while reads depend on <code>replay_lag</code>. The robust measure is end-to-end: write a heartbeat timestamp on the primary every second and read it on each replica. Lag is the age of the newest heartbeat the replica can see. That catches a stopped stream, a stuck replay and clock-based artefacts with one check.</p>
+</details>
+
+<details>
+<summary>"Why not just make all replication synchronous and be done with data loss?"</summary>
+<p>Because every write then waits for the slowest required replica, and a replica problem becomes a write outage. Fully synchronous to every replica also means one sick replica stalls everything. The practical answer is quorum: wait for one of two or more candidates (<code>ANY 1</code>), keep others async for read scaling, and set the guarantee per transaction, so a page-view counter does not pay the checkout's price. And remember the latency cost: cross-zone adds a few milliseconds per commit, cross-region adds tens.</p>
+</details>
+
+<details>
+<summary>"The primary dies. Replica A is 2 MB behind, replica B is 40 MB behind. Walk me through failover."</summary>
+<p>First fence the old primary so it cannot come back writing. Then promote the replica with the most WAL: A. Its flush position, not its replay position, decides what survives, though it must finish replaying before it serves as primary. Then repoint B to follow A; with GTIDs or Postgres timelines B can stream the difference rather than rebuild. Anything the old primary acknowledged beyond A's position is lost under async replication, so log the old primary's last known LSN to size the loss. If even the best replica is minutes behind, an automatic manager should stop and page a human rather than promote silently.</p>
+</details>
+
+<details>
+<summary>"How do you give read-your-writes without sending all of a user's reads to the primary?"</summary>
+<p>Capture the commit position after the write: <code>pg_current_wal_lsn()</code> in Postgres, the GTID in MySQL. Store it in the user's session or a cookie. On each read, pick a replica whose <code>pg_last_wal_replay_lsn()</code> is past that position, or ask the replica to wait briefly (<code>WAIT_FOR_EXECUTED_GTID_SET</code> with a timeout), and fall back to the primary if none is ready. Reads stay on replicas almost always, and correctness no longer depends on guessing how long lag lasts. MongoDB gives you this through causally consistent sessions.</p>
+</details>
+
+<details>
+<summary>"What exactly prevents split brain in a Patroni cluster? What could still go wrong?"</summary>
+<p>A leader key with a TTL in a consensus store. Only the holder may be primary. A primary that cannot renew the key demotes itself before it expires, and a replica can promote only after winning the expired key. What can still go wrong: a machine that freezes (a long GC-like pause, a hung hypervisor) and wakes up after the TTL, still believing it is primary. That is why Patroni supports a watchdog that reboots the node if the agent misses its deadline. Clients should also check the role on connect, so a stale primary that does wake up finds no one willing to write to it.</p>
+</details>
+
+<details>
+<summary>"A team adds replicas, and the primary's write throughput drops. Why?"</summary>
+<p>Each replica is another walsender streaming the full WAL, another consumer of network and CPU on the primary. With synchronous or quorum settings, more replicas in the synchronous set can mean waiting on slower ones. With slots, a slow new replica makes the primary keep more WAL. And with <code>hot_standby_feedback</code>, long queries on any replica block vacuum on the primary, so tables bloat and every write does more work. Replicas are never free for the primary; they are cheap when async and well-behaved.</p>
+</details>
+
+<details>
+<summary>"When would you deliberately delay a replica?"</summary>
+<p>As protection from humans, not hardware. A replica with <code>recovery_min_apply_delay = '1h'</code> in Postgres (or <code>SOURCE_DELAY</code> in MySQL) applies changes an hour late. If someone runs <code>DROP TABLE orders</code> at 14:00, every normal replica drops it within milliseconds, but the delayed one still has it until 15:00. You pause its replay, copy the table out, and restore. It is cheaper and faster than a point-in-time restore from backups, and it must never serve user reads.</p>
+</details>

@@ -1,0 +1,233 @@
+<h2 id=dd-timeout-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson talks about "the timeout" as if a call had one. A real HTTP call has at least six phases, and each client library puts its timers on different ones. Most timeout bugs in production come from a gap between two timers: a phase that nobody's clock covers. So start by taking one call apart.</p>
+
+<h3 id=dd-timeout-anatomy level=3>The anatomy of one call</h3>
+<p>Follow the bookstore's checkout service as it calls the payment provider:</p>
+<ol>
+<li><strong>Pool acquire.</strong> The client asks its connection pool for an idle connection. If all are busy, it waits in line. This wait happens before any network activity, so a "request timeout" often does not cover it.</li>
+<li><strong>DNS resolution.</strong> If no pooled connection exists, the host name must be resolved. On Linux, glibc's resolver defaults to a 5-second timeout per attempt with 2 attempts, set in <code>/etc/resolv.conf</code>. In some runtimes the call is blocking and ignores the socket timeout you configured. Python's <code>getaddrinfo</code> is one example.</li>
+<li><strong>TCP connect.</strong> The three-way handshake. If the remote host is gone, the kernel retransmits the SYN. With Linux's default <code>net.ipv4.tcp_syn_retries = 6</code> and the doubling retransmit timer, the kernel gives up after roughly 127 seconds. That is the hidden default behind "the call hung for two minutes".</li>
+<li><strong>TLS handshake.</strong> One or two more round trips, plus certificate checks. A server that accepts TCP but stalls in TLS (an overloaded TLS terminator is the usual culprit) is not covered by a connect timeout in many clients.</li>
+<li><strong>Send and wait for the first byte.</strong> The request goes out, then the server does its real work. This gap is the one you sized from the dependency's p99.</li>
+<li><strong>Read the body.</strong> Bytes arrive in chunks. A large or slowly streamed response can take far longer than the time to first byte.</li>
+</ol>
+
+<svg role="img" aria-labelledby="dd-timeout-svg-title dd-timeout-svg-desc" viewBox="0 0 720 230" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-timeout-svg-title">Which timer covers which phase of one HTTP call</title>
+<desc id="dd-timeout-svg-desc">A horizontal bar splits one call into seven phases: pool acquire, DNS, TCP connect, TLS, send, wait for first byte, and read body. Below it, brackets show the timers. The pool acquire timeout covers only the pool wait. The connect timeout covers TCP connect. The TLS handshake timeout covers TLS. The read timeout covers the wait and the body, but it resets on every byte received. Only the total deadline covers the whole call from start to finish.</desc>
+<rect x="0" y="0" width="720" height="230" fill="#ffffff"/>
+<rect x="20" y="30" width="60" height="44" fill="#f6f0e4" stroke="#c4ae86"/>
+<text x="50" y="57" font-size="12" fill="#1c2430" text-anchor="middle">pool</text>
+<rect x="80" y="30" width="60" height="44" fill="#e7f2f6" stroke="#86aec0"/>
+<text x="110" y="57" font-size="12" fill="#1c2430" text-anchor="middle">DNS</text>
+<rect x="140" y="30" width="80" height="44" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="180" y="57" font-size="12" fill="#1c2430" text-anchor="middle">TCP connect</text>
+<rect x="220" y="30" width="90" height="44" fill="#e8ecf8" stroke="#8e9cc8"/>
+<text x="265" y="57" font-size="12" fill="#1c2430" text-anchor="middle">TLS</text>
+<rect x="310" y="30" width="70" height="44" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="345" y="57" font-size="12" fill="#1c2430" text-anchor="middle">send</text>
+<rect x="380" y="30" width="180" height="44" fill="#eaf3e6" stroke="#96b48a"/>
+<text x="470" y="57" font-size="12" fill="#1c2430" text-anchor="middle">server works (first byte)</text>
+<rect x="560" y="30" width="140" height="44" fill="#f8ebee" stroke="#c898a4"/>
+<text x="630" y="57" font-size="12" fill="#1c2430" text-anchor="middle">read body</text>
+<text x="20" y="20" font-size="12" fill="#5c6b7c">one call, left to right in time</text>
+<path d="M20,98 v-8 h60 v8" fill="none" stroke="#1c2430"/>
+<text x="50" y="114" font-size="11" fill="#1c2430" text-anchor="middle">acquire</text>
+<path d="M140,98 v-8 h80 v8" fill="none" stroke="#1c2430"/>
+<text x="180" y="114" font-size="11" fill="#1c2430" text-anchor="middle">connect</text>
+<path d="M220,98 v-8 h90 v8" fill="none" stroke="#1c2430"/>
+<text x="265" y="114" font-size="11" fill="#1c2430" text-anchor="middle">TLS handshake</text>
+<path d="M380,146 v-8 h320 v8" fill="none" stroke="#1c2430" stroke-dasharray="5 4"/>
+<text x="540" y="162" font-size="11" fill="#1c2430" text-anchor="middle">read timeout: resets on every byte received</text>
+<path d="M20,200 v-10 h680 v10" fill="none" stroke="#1f5f99" stroke-width="2.5"/>
+<text x="360" y="218" font-size="12" fill="#1f5f99" text-anchor="middle">total deadline: the only timer that covers the whole call</text>
+</svg>
+
+<p>The dashed bracket is the trap. In Python's <code>requests</code>, <code>timeout=(3.05, 10)</code> means a 3.05-second connect timeout and a 10-second <em>read</em> timeout. The read timeout is the longest gap allowed between two bytes. A server that sends one byte every 9 seconds never trips it, and the call can run for an hour. nginx works the same way: <code>proxy_read_timeout</code> (default 60 s) is "between two successive read operations", not a total.</p>
+<p>So the rule a reviewer enforces is simple. Per-phase timers are useful for fast failure on a dead host. But every call also needs one <strong>total deadline</strong> that covers all phases, including the pool wait.</p>
+
+<h3 id=dd-timeout-knobs level=3>The real knobs, by system</h3>
+<p>Each stack names these timers differently. Here are the ones that come up most in reviews. Defaults change between versions, so check yours before you rely on a number.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>System<th>Knob<th>What it covers<th>Default to watch for<tbody>
+<tr><td>Python <code>requests</code><td><code>timeout=(connect, read)</code><td>Connect, then max gap between bytes<td>None at all if you omit it
+<tr><td>Go <code>net/http</code><td><code>Client.Timeout</code>; <code>Transport.DialContext</code>, <code>TLSHandshakeTimeout</code>, <code>ResponseHeaderTimeout</code><td><code>Client.Timeout</code> is total, including body read; the others are per phase<td><code>Client.Timeout</code> is zero, meaning no limit
+<tr><td>Java <code>HttpURLConnection</code><td><code>setConnectTimeout</code>, <code>setReadTimeout</code><td>Connect; gap between reads<td>Zero, meaning wait forever
+<tr><td>gRPC<td>Deadline on the call context<td>The whole RPC, sent to the server as <code>grpc-timeout</code><td>No deadline unless you set one
+<tr><td>HikariCP (JDBC pool)<td><code>connectionTimeout</code><td>Waiting for a pooled connection<td>30 s
+<tr><td>Postgres<td><code>statement_timeout</code>, <code>lock_timeout</code>, <code>idle_in_transaction_session_timeout</code><td>Server-side query time, lock waits, idle open transactions<td>All 0 (disabled)
+<tr><td>nginx<td><code>proxy_connect_timeout</code>, <code>proxy_read_timeout</code>, <code>proxy_send_timeout</code><td>Upstream connect; gaps between reads and writes<td>60 s each
+<tr><td>Envoy<td>Route <code>timeout</code>, <code>retry_policy.per_try_timeout</code><td>Whole upstream exchange; each attempt<td>Route timeout 15 s
+<tr><td>Linux TCP<td><code>tcp_syn_retries</code>, <code>tcp_retries2</code>, <code>TCP_USER_TIMEOUT</code><td>SYN retransmits; retransmits on an open connection<td>About 127 s to give up on connect; about 15 minutes on an established connection
+</tbody></table></div></div>
+<p>Two rows deserve a comment. The Postgres timeouts are server-side, so they are the cancellation the lesson says plain HTTP lacks. If the checkout service gives up after 300 ms, a <code>statement_timeout</code> of, say, 2 s makes sure the database also gives up eventually. And <code>idle_in_transaction_session_timeout</code> catches the client that opened a transaction, took a lock, then hung. That one hang can block every writer to the row.</p>
+<p>The Linux row explains a classic. A client writes to a peer whose machine has vanished. No RST ever comes back. The kernel keeps retransmitting for about 15 minutes before it reports an error. Without an application-level deadline, that is how long the thread waits.</p>
+
+<h3 id=dd-timeout-deadlines level=3>Timeouts versus deadlines on the wire</h3>
+<p>A <strong>timeout</strong> is relative: "300 ms from now". A <strong>deadline</strong> is absolute: "by 14:15:02.300". Inside one process, a deadline is easier to work with. Every layer computes <code>remaining = deadline - now()</code> from the same clock and cannot accidentally reset it.</p>
+<p>Across machines, absolute times are dangerous because clocks disagree. If the API gateway's clock runs 400 ms behind the search service's, an absolute deadline arrives already 400 ms shorter than intended. If the skew goes the other way, the server gets 400 ms more than the caller will wait. That is why gRPC sends a <em>relative</em> value. The client converts its deadline to <code>grpc-timeout: 1500m</code> (1,500 milliseconds) just before sending. The server converts it back to a local deadline on arrival. Network transit time is silently absorbed into the budget, which errs on the safe side.</p>
+<p>When the deadline passes, gRPC does three things. The client returns <code>DEADLINE_EXCEEDED</code>. It sends an HTTP/2 <code>RST_STREAM</code> to cancel the stream. And the server's context is cancelled, so well-written handlers stop and pass the cancellation to their own outgoing calls. That last step is what plain HTTP/1.1 lacks. Closing the connection is its only cancellation signal, and most servers do not check for it mid-request.</p>
+<p>If you build propagation yourself over HTTP, the pattern is a header such as <code>X-Request-Timeout-Ms</code>, sent relative and recomputed at every hop. Keep a small reserve at each hop for your own work after the call returns. Here it is in standard-library Python:</p>
+<pre><code>import time, urllib.request
+
+class Budget:
+    """Remaining time for one inbound request, measured on this host's monotonic clock."""
+    def __init__(self, ms):
+        self.deadline = time.monotonic() + ms / 1000
+
+    def remaining_ms(self):
+        return max(0, int((self.deadline - time.monotonic()) * 1000))
+
+    def for_call(self, own_limit_ms, reserve_ms=20):
+        # The call gets its own limit or what's left, minus time we need afterwards.
+        ms = min(own_limit_ms, self.remaining_ms() - reserve_ms)
+        if ms &lt;= 0:
+            raise TimeoutError("budget spent before the call started")
+        return ms
+
+def call_search(budget, query):
+    ms = budget.for_call(own_limit_ms=360)
+    req = urllib.request.Request(
+        "http://search.internal/q?" + query,
+        headers={"X-Request-Timeout-Ms": str(ms)},   # relative, never a wall-clock time
+    )
+    # urllib's timeout is per socket operation, like requests' read timeout.
+    # Treat it as a backstop; the budget check above is the real deadline.
+    with urllib.request.urlopen(req, timeout=ms / 1000) as resp:
+        return resp.read()
+</code></pre>
+<p>Notice <code>time.monotonic()</code>. A wall clock can jump when NTP corrects it, and a jump backwards would make a deadline last longer than intended. Every timer in your code should use a monotonic clock.</p>
+
+<h3 id=dd-timeout-timers level=3>How timers are kept cheaply</h3>
+<p>A busy proxy may hold 100,000 pending requests, each with its own timer. Keeping them in a sorted heap costs O(log n) for each insert and cancel. That is fine at small scale, but most timers are cancelled before they fire, because most calls succeed. So high-throughput systems use a <strong>timing wheel</strong>: an array of buckets, one per tick, where inserting or cancelling a timer is O(1). Netty's <code>HashedWheelTimer</code> and Kafka's request purgatory (hierarchical timing wheels) are well-known examples. You rarely build one. You do need to know that timer resolution is a tick, often 1 to 100 ms. A 5 ms timeout on a wheel with a 10 ms tick is a fiction.</p>
+<p>One more mechanism matters in practice: what "timed out" actually stops. In Go, a cancelled <code>context</code> closes the connection and unblocks the reader. In Python, <code>asyncio.timeout()</code> cancels the awaiting task. But a <em>thread</em> blocked in a C call cannot be killed. <code>concurrent.futures</code>' <code>result(timeout=…)</code> returns to you on time, while the worker thread keeps running and keeps its connection. Your caller is protected. Your thread pool is not.</p>
+
+<h2 id=dd-timeout-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Every number in this section comes from one law and two percentiles. Redo the math with your own figures. The assumptions are stated each time.</p>
+
+<h3 id=dd-timeout-littles-law level=3>Little's law sets the ceiling</h3>
+<p>Little's law says the number of requests in flight equals arrival rate times time in the system: <code>L = λ × W</code>. For a call to a hung dependency, time in the system is the timeout. So the worst-case concurrency against one dependency is:</p>
+<pre><code>in_flight_worst = request_rate × timeout</code></pre>
+<p>Turn that around and you get the most useful sizing rule in this module. Given a pool of size <code>P</code> dedicated to a dependency, the longest timeout that cannot exhaust it is:</p>
+<pre><code>timeout_max = P / request_rate</code></pre>
+<p>Worked example. The bookstore's checkout handles 300 requests per second. Each request calls the recommendation service once. Checkout has 200 worker threads in total.</p>
+<ul>
+<li>At a 2-second timeout, a hang puts 300 × 2 = 600 requests in flight. That is three times the whole pool. Checkout dies, as the lesson showed.</li>
+<li>To survive with every thread on recommendations, the timeout must be under 200 / 300 = 0.67 s.</li>
+<li>Realistically you want recommendations to use at most a quarter of the threads, so 50 threads. Then the timeout must be under 50 / 300 = 0.167 s. The dependency's healthy p99 is 120 ms, so 2-3x p99 (240-360 ms) does not fit.</li>
+</ul>
+<p>That last line is the interesting result. The p99 rule and the pool rule disagree. You have three honest options: give recommendations more threads, cap its concurrency with a <a href="#bulkhead">bulkhead</a> so excess calls fail fast instead of queueing, or make the call asynchronous so it holds no thread while waiting. Picking a timeout that ignores the pool is not one of the options.</p>
+
+<h3 id=dd-timeout-false-timeouts level=3>The false-timeout rate, and why fan-out makes it worse</h3>
+<p>Any finite timeout fails some calls that would have succeeded. Set it at the healthy p99.9 and, by definition, about 0.1% of healthy calls time out. That sounds tiny until the request fans out.</p>
+<p>Suppose a product page calls 50 backend shards in parallel and needs all of them. Assume the calls are independent. The chance that at least one call is slower than the timeout is:</p>
+<pre><code>P(at least one slow) = 1 - (1 - 0.001)^50 ≈ 4.9%</code></pre>
+<p>Nearly 1 page in 20 fails on a perfectly healthy day. At p99 the number is 1 - 0.99^50 ≈ 39.5%. This is the "tail at scale" effect. With fan-out, the per-call timeout has to sit much further out in the tail, or the page has to tolerate missing shards. Better still, send a backup request (a <em>hedge</em>) to another replica once a call passes its p95, and take whichever answers first. Hedging at p95 adds about 5% load and cuts the tail sharply. It is only safe for idempotent reads.</p>
+
+<h3 id=dd-timeout-budget-split level=3>Splitting a budget across hops and attempts</h3>
+<p>The checkout API promises 2,000 ms. A sensible split, assuming these healthy p99s:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Step<th>Healthy p99<th>Per-attempt timeout<th>Attempts<th>Worst case<tbody>
+<tr><td>Auth (cached token check)<td>15 ms<td>50 ms<td>2<td>about 150 ms with backoff
+<tr><td>Inventory read<td>40 ms<td>120 ms<td>2<td>about 300 ms
+<tr><td>Payment authorization<td>350 ms<td>900 ms<td>1 (retry only with an idempotency key)<td>900 ms
+<tr><td>Own work and response<td>-<td>-<td>-<td>150 ms reserve
+<tr><td><strong>Total</strong><td><td><td><td><strong>about 1,500 ms</strong>
+</tbody></table></div></div>
+<p>The remaining 500 ms is slack, and that is deliberate. Under load, everything gets slower together. The per-attempt timeouts here are still capped by the remaining budget at the moment each call starts, so a slow auth call shrinks the time payment gets, rather than pushing the response past 2 s.</p>
+<p>The rule for retries inside a budget: <code>attempts × per_try_timeout + sum(backoff waits) ≤ remaining budget</code>. If it doesn't fit, cut attempts before you cut the per-try timeout. Two quick attempts that both time out at p99 just double the load for nothing.</p>
+
+<h3 id=dd-timeout-goodput level=3>The cost of abandoned work</h3>
+<p>The lesson says a timeout stops your waiting, not the server's working. Here is what that costs during an overload.</p>
+<p>Assume a search service can complete 1,000 queries per second, and clients time out at 500 ms. Load rises to 1,200 per second. The queue grows by 200 per second. After about 2.5 seconds the queue holds 500 queries, so queueing delay alone is about 500 ms. From then on, almost every query the server finishes belongs to a client that has already left.</p>
+<p>The server is still running at 100% CPU. Its <strong>goodput</strong>, the rate of answers someone actually reads, falls towards zero. Clients that retry make the queue grow faster. This is congestion collapse, and it continues after the load drops back to 900 per second, because the backlog of dead requests takes time to drain. That self-sustaining state is called a <em>metastable failure</em>.</p>
+<p>The fixes are all server-side:</p>
+<ul>
+<li><strong>Drop expired work.</strong> Carry the client's remaining budget with the request. Before starting work, check it. If the request has already spent its budget in the queue, reject it in microseconds.</li>
+<li><strong>Bound the queue.</strong> A queue longer than <code>throughput × client_timeout</code> holds only requests that will die. For the numbers above, that is 1,000 × 0.5 = 500 entries at most, and less in practice.</li>
+<li><strong>Serve newest first under overload.</strong> Some systems switch the queue to LIFO, or use a CoDel-style rule that sheds requests when queueing delay stays above a target. The newest requests are the ones whose clients are still waiting.</li>
+</ul>
+
+<h2 id=dd-timeout-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-timeout-fm-trickle level=3>1. The read timeout that never fires</h3>
+<p><strong>Symptom:</strong> some calls to a dependency take minutes, even though the client is configured with a 10-second timeout. Thread dumps show workers blocked in socket reads. <strong>Mechanism:</strong> the configured timer is per read. A dependency under memory pressure, or a misbehaving proxy, streams the response a few bytes at a time. Each read finishes inside 10 seconds, so the timer keeps resetting. <strong>Detect:</strong> a histogram of client-side call duration whose max is far above the configured timeout. Any duration above the timeout means a timer is not doing what you think. <strong>Fix:</strong> add a total deadline around the whole call (Go's <code>Client.Timeout</code>, a context deadline, or <code>asyncio.timeout()</code>), and test it against a deliberately slow test server.</p>
+
+<h3 id=dd-timeout-fm-pool level=3>2. Requests time out before they leave the building</h3>
+<p><strong>Symptom:</strong> latency to the database spikes in the application's metrics. The database's own query latency is flat, and its CPU is idle. <strong>Mechanism:</strong> the time is spent waiting for a pooled connection. The pool is exhausted, perhaps by a few slow queries holding connections, and HikariCP's 30-second default <code>connectionTimeout</code> lets every other request wait in line. The query timeout never starts, because no query was sent. <strong>Detect:</strong> pool metrics, specifically "threads waiting for a connection" and acquire-time percentiles. HikariCP exposes these as <code>hikaricp_connections_pending</code> and <code>hikaricp_connections_acquire</code>. <strong>Fix:</strong> set the acquire timeout from the request budget, usually tens to a few hundred milliseconds. Then find what is holding connections. A pool wait longer than the query itself is almost always wrong.</p>
+
+<h3 id=dd-timeout-fm-mismatch level=3>3. Sporadic 502s from a keep-alive mismatch</h3>
+<p><strong>Symptom:</strong> a low, steady rate of 502 errors from the load balancer. They are random across endpoints and clustered after quiet periods. <strong>Mechanism:</strong> the load balancer keeps idle connections to the backend open for 60 seconds (the AWS ALB default). The backend closes idle connections after 5 seconds (Node.js's default <code>keepAliveTimeout</code>). Now and then the load balancer reuses a connection at the very moment the backend closes it, and the request hits a dead socket. <strong>Detect:</strong> 502s whose backend logs show no matching request, with load-balancer logs reporting the target closed the connection. <strong>Fix:</strong> make the backend's idle timeout <em>longer</em> than the load balancer's, for example 65 s against 60 s. The rule generalises: idle timeouts should grow as you move away from the client, so the side that opens connections is always the side that closes them.</p>
+
+<h3 id=dd-timeout-fm-inverted level=3>4. Inverted timeouts: the inner layer outlives the outer one</h3>
+<p><strong>Symptom:</strong> users get 504s for the "export orders" endpoint. Then they retry, and duplicate exports appear in storage. <strong>Mechanism:</strong> the load balancer times out at 60 s, nginx at 60 s, and the application allows 120 s. The user gives up at 60 s and retries. The original request keeps running to completion and writes its file. <strong>Detect:</strong> requests in application logs that finished successfully but appear as 504 at the edge. A trace with an application span longer than its parent's span is the giveaway. <strong>Fix:</strong> timeouts must shrink as you go deeper: edge > proxy > service > database. Long work like this export moves to the async pattern the lesson describes: accept, return a job ID, finish in the background.</p>
+
+<h3 id=dd-timeout-fm-retry-amp level=3>5. A latency regression turns into an error storm</h3>
+<p><strong>Symptom:</strong> after a deploy of the inventory service, its p99 rises from 40 ms to 140 ms. Callers have a 120 ms timeout and 2 attempts. Within minutes the inventory service is at 180% of normal load and its p99 is 2 s. <strong>Mechanism:</strong> the regression pushed a large share of calls past the timeout. Each timeout triggered a retry, which added load, which slowed every call, which caused more timeouts. A timeout set close to the healthy tail has no margin for a slow deploy. <strong>Detect:</strong> the ratio of attempts to logical calls. It sits at about 1.01 on a healthy day. A jump to 1.5 or 2.0 is a retry amplification signal, and it appears before the error rate climbs. <strong>Fix:</strong> keep a retry budget (the next lesson), add a circuit breaker, and revisit timeouts as part of the deploy checklist when a dependency's latency changes. Alerting on dependency p99 drift catches it before the storm.</p>
+
+<h3 id=dd-timeout-fm-pause level=3>6. GC pauses and clock jumps fire timers that shouldn't fire</h3>
+<p><strong>Symptom:</strong> a burst of timeouts on calls that the server's logs show completing in 20 ms. Bursts are short and appear on one client host at a time. <strong>Mechanism:</strong> the client process paused, from a long garbage-collection pause or a VM being descheduled. The response arrived during the pause. When the process resumed, the timer checked first and declared the call failed. A related bug: code measuring timeouts with the wall clock sees time jump when NTP steps the clock. <strong>Detect:</strong> correlate timeout bursts with GC pause logs or the JVM's safepoint logs, and with steal time on the VM. Compare client-side and server-side durations in the same trace. <strong>Fix:</strong> use monotonic clocks everywhere. Fix the pause itself: heap sizing, a low-pause collector, fewer noisy neighbours. Do not "fix" it by doubling every timeout.</p>
+
+<h3 id=dd-timeout-fm-dns level=3>7. DNS lookups that ignore your timeout</h3>
+<p><strong>Symptom:</strong> when the internal DNS server degrades, calls with a 300 ms timeout take 5 or 10 seconds. <strong>Mechanism:</strong> name resolution happens before the socket exists. The resolver uses its own timeout and retry count (5 s and 2 attempts by default on glibc). Several runtimes do not let the socket timeout cover it. <strong>Detect:</strong> traces that separate DNS time from connect time. Durations that cluster near exact multiples of 5 s are a strong hint. <strong>Fix:</strong> cache resolutions in-process or with a local caching resolver, run resolution under the same total deadline (an async resolver, or a deadline-aware wrapper), and tune <code>options timeout:1 attempts:2</code> in <code>resolv.conf</code> for internal names.</p>
+
+<h2 id=dd-timeout-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Value source<td>Static, per dependency, from measured p99<td>Adaptive: computed from a live latency percentile<td>Almost always. Adaptive timeouts follow a degrading dependency upwards and hide the problem. If you go adaptive, clamp it between a floor and a hard ceiling.
+<tr><td>Scope<td>Per-attempt timeout plus an overall deadline<td>Per-attempt timeout only<td>Retries exist, or the call is on a user-facing path. The overall deadline stops attempts adding up past the promise. B is acceptable only for a single attempt with no retries.
+<tr><td>Propagation<td>Relative remaining time (gRPC style)<td>Absolute deadline timestamp<td>Requests cross machines. Absolute deadlines are fine only inside one process, or where clock sync is tightly monitored.
+<tr><td>Expiry handling on the server<td>Check the budget and drop expired work<td>Process everything that arrives<td>The service can be overloaded at all. B is acceptable only for cheap, low-traffic endpoints.
+<tr><td>Cancellation<td>Propagate (gRPC, context cancellation, <code>statement_timeout</code>)<td>Fire and forget<td>The abandoned work is expensive: queries, model inference, fan-out calls. B is fine when the work is cheap and small.
+<tr><td>Slow tail<td>Longer timeout<td>Hedged request at p95 to another replica<td>The call is a write, or replicas share the slowness. Choose hedging for idempotent reads with independent replicas.
+<tr><td>Long work<td>Synchronous call with a long timeout<td>Async job: accept, return ID, notify or poll<td>The work reliably finishes within the user's patience, about 1 to 2 seconds for interactive paths. Anything longer is B.
+</tbody></table></div></div>
+<p>Two of these deserve an opinion. <strong>Prefer static timeouts with alerts over adaptive ones.</strong> An adaptive timeout is clever on paper. In an incident it quietly stretches to accept the dependency's new, slower normal, and your thread pool pays for it. A static number plus an alert on p99 drift keeps a human in the loop on a slow change and still fails fast on a sudden one.</p>
+<p>Second, <strong>server-side deadline checks are the most underused item on this list</strong>. Client timeouts protect clients. They do nothing for the overloaded server, which keeps working on requests that nobody wants. One "is this request already dead?" check at the head of the handler costs a microsecond and turns congestion collapse into graceful shedding.</p>
+
+<h2 id=dd-timeout-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Show me every outbound call from this service. Does each one have a total deadline, not only per-read or per-connect timers?</li>
+<li>Where did each timeout value come from? Name the measured p99 it is based on, and when it was last checked.</li>
+<li>For each dependency, is <code>request_rate × timeout</code> smaller than the threads or connections that dependency is allowed to hold?</li>
+<li>Is the connection-pool acquire wait covered by the same budget as the call?</li>
+<li>Do timeouts shrink as you go deeper (edge > proxy > service > database), and do idle keep-alive timeouts grow in the same direction?</li>
+<li>Is the remaining budget propagated to downstream calls, as a relative value? What does each hop reserve for its own work?</li>
+<li>Do retries fit inside the budget: attempts × per-try timeout + backoff ≤ remaining time?</li>
+<li>When the client gives up, does the server stop? Is there a <code>statement_timeout</code>, context cancellation, or a budget check before expensive work?</li>
+<li>Which timed-out operations are writes? Is each one idempotent, or is a retry forbidden for it?</li>
+<li>Are timeouts emitted as their own metric, separate from other errors, per dependency?</li>
+<li>Is there a test that runs the client against a server that accepts and never responds, and one that trickles bytes slowly?</li>
+<li>Which library defaults are in use, and has someone read what they are for this version?</li>
+</ol>
+
+<h2 id=dd-timeout-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"You set a 10-second read timeout, but a call took four minutes. How?"</summary>
+<p>The read timeout is the maximum gap between bytes, not the total. A server that trickles data keeps resetting it. Most clients have the same split: Python's <code>requests</code>, Java's <code>setReadTimeout</code>, nginx's <code>proxy_read_timeout</code>. The fix is a total deadline around the whole call, enforced by a context, an async timeout, or the client's total-time setting.</p>
+</details>
+<details>
+<summary>"How do you choose a timeout when p99 says 360 ms but your thread pool says 167 ms?"</summary>
+<p>The pool limit wins, because breaking it takes down the whole service. Little's law gives the ceiling: pool size divided by request rate. Then you change the inputs. Give the dependency more threads, cap its concurrency with a bulkhead so excess calls fail fast, move the call off the thread (async I/O), or cache the result so fewer calls happen. Choosing the p99-based number anyway means accepting that a hang will exhaust the pool.</p>
+</details>
+<details>
+<summary>"Why does gRPC send a relative timeout instead of a deadline timestamp?"</summary>
+<p>Clocks on different machines disagree. An absolute deadline arriving at a server whose clock is behind gets extra time; one whose clock is ahead gets less, possibly none. Sending "1,500 ms remaining" and converting it to a local deadline on arrival avoids skew entirely. The cost is that network transit time is not subtracted, which only ever makes the server's budget slightly too generous.</p>
+</details>
+<details>
+<summary>"Clients time out at 500 ms. The server is at 100% CPU but users see nothing but errors. What's happening and what do you change?"</summary>
+<p>Congestion collapse. The queue is long enough that queueing delay exceeds the client timeout. The server is busy finishing requests whose clients already left, so goodput is near zero. Retries make the queue grow faster. Change three things on the server: check each request's remaining budget before working on it and drop expired ones, bound the queue to about throughput × client timeout, and shed load early (CoDel-style or LIFO under overload). On the client, add a retry budget so retries cannot feed the collapse.</p>
+</details>
+<details>
+<summary>"Should timeouts adapt automatically to observed latency?"</summary>
+<p>Rarely, and never without bounds. An adaptive timeout tracks the dependency's latency, so when the dependency degrades, the timeout grows with it. Your threads are held longer at exactly the moment you need them back. If you use one, clamp it with a hard ceiling derived from the pool math and alert when it moves. A static, measured value plus a drift alert is usually the better design.</p>
+</details>
+<details>
+<summary>"What happens to a Python thread when <code>future.result(timeout=0.3)</code> raises?"</summary>
+<p>Only the waiting stops. The worker thread keeps running its blocking call and keeps its socket. Python cannot kill a thread. So the caller meets its deadline, but the pool slot is still occupied until the underlying call ends on its own. That is why the underlying call needs its own socket timeout, and why async I/O, where cancellation actually closes the operation, is easier to make safe.</p>
+</details>
+<details>
+<summary>"Where in a chain should the longest timeout be?"</summary>
+<p>At the edge, closest to the user. Each layer inward must have a smaller budget than the layer that called it, or it keeps working after its caller gave up. That wasted work produces 504s with successful backend logs, and duplicate effects when the user retries. Idle keep-alive timeouts go the other way: the backend should keep idle connections open slightly longer than the proxy in front of it, so the proxy never reuses a connection the backend just closed.</p>
+</details>
+<details>
+<summary>"When is a hedged request better than a longer timeout?"</summary>
+<p>When the slowness is per replica rather than shared, and the call is an idempotent read. Sending a second request after the first passes its p95 costs about 5% extra load and lets the faster replica win. A longer timeout just waits longer on the slow replica. Hedging is wrong for writes, and it is useless when every replica is slow for the same reason, such as a shared overloaded database. Then it only doubles the load.</p>
+</details>

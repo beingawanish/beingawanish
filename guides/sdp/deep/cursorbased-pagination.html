@@ -1,0 +1,221 @@
+<h2 id=dd-cursorbased-pagination-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson gives you the core query: <code>WHERE (created_at, id) &lt; (:ts, :id) ORDER BY created_at DESC, id DESC LIMIT 20</code>. That query is the easy part. A cursor API that survives years of partners has four more pieces: an index the planner actually uses, a token with a real format, a rule for knowing when you are done, and a story for going backwards. This section walks each one, then the cases where the simple query stops working.</p>
+
+<h3 id=dd-cursorbased-pagination-index level=3>The index has to match the sort, column for column</h3>
+<p>The technical name for this is <strong>keyset pagination</strong>, or the seek method. It only works when a B-tree index stores rows in exactly the order you return them. For the bookstore's order feed, which is always scoped to one customer, that index is:</p>
+<pre><code>CREATE INDEX orders_feed_idx ON orders (customer_id, created_at DESC, id DESC);</code></pre>
+<p>Equality filters go first, sort columns after, tiebreaker last. With that index, Postgres descends the tree once (three or four page reads for a table of tens of millions of rows) and then reads the next 20 entries from a leaf page. The cost is the same whether the user is on page 1 or page 5,000.</p>
+<p>Three details trip people up:</p>
+<ul>
+<li><strong>Row-value comparison is not portable.</strong> Postgres turns <code>(created_at, id) &lt; (:ts, :id)</code> into a single index range condition. Some other engines and older versions handle row constructors poorly and fall back to a scan. The portable form is <code>created_at &lt; :ts OR (created_at = :ts AND id &lt; :id)</code>. It means the same thing, but check with <code>EXPLAIN</code> that the planner still seeks rather than scans.</li>
+<li><strong>Mixed directions break the tuple form.</strong> "Highest price first, then oldest first" is <code>ORDER BY price DESC, id ASC</code>. A single tuple comparison cannot express that, because the two columns move in opposite directions. You need the expanded form, <code>price &lt; :p OR (price = :p AND id &gt; :id)</code>, plus an index declared with the same mixed directions.</li>
+<li><strong>NULLs need a decision.</strong> If the sort column is nullable, NULL rows fall outside every <code>&lt;</code> comparison and silently vanish from the feed. Either make the column <code>NOT NULL</code>, or sort by <code>COALESCE(col, sentinel)</code> with a matching expression index, or page through the NULL rows as a separate segment.</li>
+</ul>
+
+<h3 id=dd-cursorbased-pagination-token level=3>What goes inside the token</h3>
+<p>"Base64 of the last row" is where most teams start. A token that lasts in production carries a little more:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Field<th>Example<th>Why it is there<tbody>
+<tr><td>Format version<td><code>v: 2</code><td>Lets you change the layout later and still decode old tokens for a while
+<tr><td>Sort key name<td><code>s: "created_desc"</code><td>Rejects a token minted for one sort order but sent with another
+<tr><td>Last row's sort values<td><code>k: ["2026-11-20T14:03:11.482913Z", 8412]</code><td>The anchor itself, at full precision
+<tr><td>Direction<td><code>d: "next"</code><td>Tells the server which way to seek
+<tr><td>Filter fingerprint<td><code>f: "a91c…"</code><td>A hash of the query's filters, so a token cannot be replayed against a different filter
+<tr><td>Signature<td>HMAC-SHA256, truncated<td>Detects tampering and hand-built tokens
+</tbody></table></div></div>
+<p>Signing matters more than it looks. An unsigned token is a free-form input into your WHERE clause. A client can edit it to skip ahead, probe for rows, or send a malformed value that throws a 500. With a signature, the server rejects anything it did not mint, and the token stays genuinely opaque. If the sort values are themselves sensitive, encrypt instead of sign. Most APIs only need signing.</p>
+<p>Keep tenant scoping out of the token. The customer ID comes from the authenticated caller on every request, never from the cursor. A token is a position, not a permission.</p>
+<p>A minimal encoder in the Python standard library:</p>
+<pre><code>import base64, hashlib, hmac, json
+
+SECRET = b"rotate-me"          # from your secret store, with a key id for rotation
+
+def encode_cursor(payload: dict) -&gt; str:
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    sig = hmac.new(SECRET, body, hashlib.sha256).digest()[:16]
+    return base64.urlsafe_b64encode(sig + body).rstrip(b"=").decode()
+
+def decode_cursor(token: str, expected_sort: str, filter_hash: str) -&gt; dict:
+    raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+    sig, body = raw[:16], raw[16:]
+    good = hmac.new(SECRET, body, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(sig, good):
+        raise ValueError("invalid cursor")              # return 400, not 500
+    p = json.loads(body)
+    if p["s"] != expected_sort or p["f"] != filter_hash:
+        raise ValueError("cursor does not match this query")
+    return p</code></pre>
+<p>Two choices in that snippet are deliberate. URL-safe base64 avoids <code>+</code> and <code>/</code>, which otherwise need escaping in query strings. And the timestamp is stored as a string with microseconds, not as a float. The failure modes section shows why.</p>
+
+<h3 id=dd-cursorbased-pagination-done level=3>Knowing when you are done: fetch one extra row</h3>
+<p>The server needs to tell the client whether another page exists. The cheap trick is to ask the database for <code>LIMIT 21</code> when the page size is 20. If 21 rows come back, return 20 plus a <code>next_cursor</code> built from row 20, and set <code>has_more: true</code>. If 20 or fewer come back, omit the cursor.</p>
+<p>The common mistake is to build the cursor from row 21. Row 21 then appears on neither page. The other common mistake is to return a cursor on every page and let the client discover the end by getting an empty page. That works, but it costs one wasted request per scan. It also invites the infinite-loop bug described below.</p>
+
+<h3 id=dd-cursorbased-pagination-backwards level=3>Going backwards</h3>
+<p>A "previous" link is the same seek with everything flipped. To get the page before a row, query with the opposite comparison and the opposite order, then reverse the rows in memory before returning them:</p>
+<pre><code>-- page before the row (ts0, id0), feed is newest-first
+SELECT * FROM orders
+WHERE customer_id = :c AND (created_at, id) &gt; (:ts0, :id0)
+ORDER BY created_at ASC, id ASC
+LIMIT 21;                       -- then reverse, drop the extra row</code></pre>
+<p>A B-tree can be walked in either direction, so the same index serves both queries. Stripe's API shows the shape well: <code>starting_after</code> and <code>ending_before</code>, each taking an object ID. Each response page therefore carries two anchors, its first row and its last.</p>
+
+<h3 id=dd-cursorbased-pagination-elsewhere level=3>The same idea in other stores</h3>
+<ul>
+<li><strong>DynamoDB.</strong> A Query returns <code>LastEvaluatedKey</code>, and you pass it back as <code>ExclusiveStartKey</code>. Pages are also capped at 1 MB of data read before filtering, so a page can come back short, or even empty, with a key still present. Clients must keep going until the key is absent, not until a page is short.</li>
+<li><strong>Elasticsearch and OpenSearch.</strong> <code>from</code> + <code>size</code> is offset pagination, and the default <code>index.max_result_window</code> stops it at 10,000 hits. Deep pages use <code>search_after</code> with the last hit's sort values, plus a unique tiebreaker field. A point-in-time (PIT) handle can pin the view so that refreshes do not shift results mid-scan.</li>
+<li><strong>Sharded SQL.</strong> If orders are sharded by customer, each customer's feed lives on one shard and nothing changes. A global feed across shards needs a merge. Ask each of N shards for <code>LIMIT 21</code> after the same anchor, merge the N small sorted lists, and keep the top 20. The cursor still holds one global anchor, because the sort key is total across shards. The cost is N times the per-shard work, so this suits admin views, not hot user paths.</li>
+</ul>
+
+<h3 id=dd-cursorbased-pagination-not-a-snapshot level=3>What a cursor does not promise</h3>
+<p>A cursor fixes drift caused by inserts ahead of the anchor. It does not give the client a snapshot. Three things can still change what a long scan sees:</p>
+<ul>
+<li><strong>Rows inserted behind the anchor</strong> appear when the scan reaches them. In an oldest-first export, new orders at the end are picked up. That is usually what you want.</li>
+<li><strong>Rows whose sort value changes</strong> move. Sort by <code>updated_at</code> and an order edited mid-scan jumps from behind the anchor to ahead of it, so the client sees it twice. Or it jumps the other way and is never seen.</li>
+<li><strong>Rows that commit late</strong> can land behind an anchor the reader already passed. This one is subtle enough to get its own failure mode.</li>
+</ul>
+<p>If a client truly needs "exactly the set of rows that existed at 09:00", a cursor alone cannot give it. You need a snapshot: an Elasticsearch PIT, a read at a fixed timestamp on a database that supports it, or an export job that writes a file from one transaction.</p>
+
+<h2 id=dd-cursorbased-pagination-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-cursorbased-pagination-sizing-export level=3>The full-export bill, offset vs. cursor</h3>
+<p>Take the partner export from the lesson and make it bigger: 100 million order rows, read oldest first, 1,000 rows per page. That is 100,000 requests either way. The difference is how many rows the database touches.</p>
+<p><strong>Cursor.</strong> Each page is one index descent plus 1,000 leaf entries and 1,000 heap fetches. Total rows touched: about 100 million, once each. At 10 ms per page, a single serial client finishes in 100,000 × 10 ms = 1,000 s, about 17 minutes.</p>
+<p><strong>Offset.</strong> Page <em>k</em> scans and discards <em>k</em> × 1,000 rows. Summed over all pages, that is roughly N² / (2p), where N is total rows and p is page size:</p>
+<pre><code>(10^8)^2 / (2 × 1,000) = 5 × 10^12 rows touched</code></pre>
+<p>Assume a generous 10 million rows per second of index scan throughput. The export would take 5 × 10<sup>5</sup> s, close to six days, and it would hammer the database the whole time. In practice it never finishes: the partner's request timeout kills the deep pages first. That quadratic total is the real argument for cursors. "Page 5,000 is slow" undersells it.</p>
+
+<h3 id=dd-cursorbased-pagination-sizing-page level=3>Choosing the page size</h3>
+<p>Page size trades round trips against response time and memory. Some rough numbers for a 1 KB JSON order:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Page size<th>Response size<th>Requests for 100M rows<th>Fits<tbody>
+<tr><td>20<td>~20 KB<td>5,000,000<td>Interactive feeds and infinite scroll
+<tr><td>100<td>~100 KB<td>1,000,000<td>Default for most public list endpoints
+<tr><td>1,000<td>~1 MB<td>100,000<td>Partner sync and export endpoints
+<tr><td>10,000<td>~10 MB<td>10,000<td>Too big for one HTTP response; use a file export
+</tbody></table></div></div>
+<p>Publish a default and a hard maximum (for example default 100, maximum 1,000), and clamp silently or reject with 400. Without a maximum, one partner asks for <code>limit=1000000</code> and your API server buffers a gigabyte. For anything past a few million rows, the honest answer is often an asynchronous export: the client asks for a job, you write a compressed file to object storage from one snapshot, and return a signed URL.</p>
+
+<h3 id=dd-cursorbased-pagination-sizing-parallel level=3>Parallel exports: split the key space</h3>
+<p>One cursor is one serial stream. A partner who wants the 100-million-row export in 2 minutes instead of 17 needs about 8 streams in parallel. Cursors do not split themselves, so you offer partitions. For example, split the <code>id</code> range into 8 contiguous slices and give each its own cursor bounded by <code>id &lt; :slice_end</code>.</p>
+<p>Check the database side before offering this. Eight streams at 100 pages per second each is 800 pages per second, or 800,000 rows per second through the heap. That belongs on a read replica with headroom, under a partner-tier rate limit. It should never run on the primary that takes checkout writes.</p>
+
+<h3 id=dd-cursorbased-pagination-sizing-count level=3>The cost of "Page 3 of 812"</h3>
+<p>Postgres cannot answer <code>COUNT(*)</code> from metadata, because each transaction may see a different set of rows. A count over 50 million matching rows means visiting 50 million index entries (an index-only scan helps if the visibility map is current). Expect seconds, not milliseconds, and expect it on every page load if you put it in the response.</p>
+<p>Three cheaper options, in order of honesty:</p>
+<ul>
+<li><strong>Capped count.</strong> <code>SELECT count(*) FROM (SELECT 1 FROM orders WHERE … LIMIT 10001) t</code>, then show "10,000+". The cost is bounded at 10,001 rows.</li>
+<li><strong>Estimate.</strong> The planner's row estimate from <code>EXPLAIN</code>, or <code>reltuples</code> from <code>pg_class</code> for whole tables. Cheap, and often wrong by tens of percent on filtered queries.</li>
+<li><strong>Maintained counter.</strong> A per-customer counter updated by trigger or by an event consumer. Exact, but it adds a hot write row and its own drift.</li>
+</ul>
+
+<h3 id=dd-cursorbased-pagination-sizing-index level=3>The index you are paying for</h3>
+<p>The feed index on <code>(customer_id, created_at, id)</code> holds an 8-byte bigint, an 8-byte timestamp and an 8-byte id per row, plus tuple overhead. Call it 40 bytes per row in practice. At 100 million rows, that is about 4 GB of index. It needs to sit mostly in memory for the seek to stay at sub-millisecond speed. Every additional supported sort order is another index of similar size and another write amplification on every insert. That is the real reason to support two or three sort orders, not ten.</p>
+
+<h2 id=dd-cursorbased-pagination-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-cursorbased-pagination-fm-precision level=3>1. Duplicates at every page boundary after a serializer change</h3>
+<p><strong>Symptom.</strong> After a framework upgrade, mobile users see the last order of each page repeated as the first order of the next. Nothing in the pagination code changed.</p>
+<p><strong>Mechanism.</strong> Postgres stores <code>timestamptz</code> to the microsecond. The new JSON serializer writes timestamps in milliseconds, so the cursor holds <code>14:03:11.482Z</code> instead of <code>14:03:11.482913Z</code>. The row that ended page 1 compares as <em>later</em> than the truncated anchor. In a newest-first feed, <code>created_at &lt; anchor</code> then includes it again. Truncate in the other direction (a float losing precision, for example) and you skip rows instead.</p>
+<p><strong>Detect.</strong> A contract test that pages through a fixture with microsecond-distinct timestamps and asserts no overlap. In production, client-side dedupe counters or a "duplicate id across pages" log line in the client SDK.</p>
+<p><strong>Fix.</strong> Serialize sort values in the token as strings at full storage precision, or as integer microseconds since the epoch. Never round-trip them through a float. Treat the token encoder as code with its own tests, not as glue.</p>
+
+<h3 id=dd-cursorbased-pagination-fm-late-commit level=3>2. Incremental sync misses rows that committed late</h3>
+<p><strong>Symptom.</strong> A partner syncs new orders every minute with <code>?created_after=&lt;cursor&gt;</code>. About one order in 50,000 never reaches them. Reconciliation finds the gaps days later, always during busy periods.</p>
+<p><strong>Mechanism.</strong> <code>created_at</code> (or a sequence-generated <code>id</code>) is assigned when the row is inserted, not when the transaction commits. Transaction A inserts at 10:00:00.100 and commits at 10:00:00.900. Transaction B inserts at 10:00:00.300 and commits at 10:00:00.400. A sync read at 10:00:00.500 sees B and advances its cursor past 10:00:00.300. When A commits, its row sits behind the cursor. No later read will ever return it.</p>
+<p><strong>Detect.</strong> Periodic reconciliation by count per hour between your table and what the partner holds, or between the table and your own change log. A histogram of commit time minus <code>created_at</code> tells you how wide the window is. Long transactions widen it.</p>
+<p><strong>Fix.</strong> The cheap fix is a safety lag. Only return rows with <code>created_at &lt; now() - interval '30 seconds'</code>, sized above your longest normal transaction. Rows then appear a little later, but they are not lost. The robust fix is to page over something assigned in commit order: a change log fed by <a href="#change-data-capture">change data capture</a>, or an outbox table written in its own short transaction. A plain cursor over insert time is fine for a feed a human scrolls. It is not a sync protocol.</p>
+
+<h3 id=dd-cursorbased-pagination-fm-mutable level=3>3. Sorting by a column that changes</h3>
+<p><strong>Symptom.</strong> "Recently updated products" in the admin tool shows some products twice and skips others while a bulk price edit is running.</p>
+<p><strong>Mechanism.</strong> The cursor anchors to <code>(updated_at, id)</code>. A product the admin already scrolled past gets a new <code>updated_at</code>, which moves it ahead of the anchor in a newest-first list. It is never seen again on this pass. In an oldest-first sync, the same edit moves a row from behind the anchor to in front of it, so it is returned twice.</p>
+<p><strong>Detect.</strong> Duplicate IDs across pages in client telemetry. A pagination key that appears in any <code>UPDATE … SET</code> statement is a code-review red flag.</p>
+<p><strong>Fix.</strong> Paginate on immutable columns when the client needs each row once. When the point is to sync changes, duplicates are fine and skips are not. Sort oldest-first by <code>(updated_at, id)</code>, apply the safety lag from failure 2, and make the client upsert by ID. A row that changes again simply arrives again, which is correct for sync.</p>
+
+<h3 id=dd-cursorbased-pagination-fm-sparse level=3>4. The seek is fast, but finding 20 matches is not</h3>
+<p><strong>Symptom.</strong> <code>GET /orders?status=refunded</code> takes 4 seconds per page, while the unfiltered feed takes 3 ms. The query uses cursor syntax, and <code>EXPLAIN</code> shows an index scan, not a sequential scan.</p>
+<p><strong>Mechanism.</strong> The only index is <code>(customer_id, created_at, id)</code>. The seek lands in the right place instantly. But refunds are 0.1% of orders, so the scan walks 20,000 index entries and heap rows to find 20 that match. This is offset's linear cost wearing a disguise. It scales with filter selectivity instead of page depth. A business customer with 2 million orders and three refunds pays for a walk through all 2 million to learn there is no next page.</p>
+<p><strong>Detect.</strong> Rows examined versus rows returned per query: <code>pg_stat_statements</code> plus <code>EXPLAIN (ANALYZE, BUFFERS)</code>, or the slow-query log's rows-examined field in MySQL. Alert on a ratio above, say, 100:1 for list endpoints.</p>
+<p><strong>Fix.</strong> Put supported filters into the index prefix: <code>(customer_id, status, created_at, id)</code>. A partial index such as <code>WHERE status = 'refunded'</code> also works for a filter that is rare and hot. Then be explicit in the API about which filter combinations are supported. Each one is an index you carry forever.</p>
+
+<h3 id=dd-cursorbased-pagination-fm-sort-change level=3>5. A sort-key change breaks every export in flight</h3>
+<p><strong>Symptom.</strong> A deploy adds <code>merchant_id</code> to the sort key. Within minutes, 40 partner exports fail with 400 "invalid cursor", and several partners restart multi-hour jobs from the beginning.</p>
+<p><strong>Mechanism.</strong> Old tokens carry two sort values. The new decoder expects three and rejects them. Opacity protected the <em>format</em> from partners, but it did not protect partners from the format change. The tokens they held were still live state.</p>
+<p><strong>Detect.</strong> A dashboard of cursor decode failures by reason and token version. A spike right after a deploy is unambiguous.</p>
+<p><strong>Fix.</strong> Version the token from day one. When the layout changes, keep decoding the previous version for at least the longest plausible scan, a few days, and translate it to an equivalent position. When translation is impossible, return a clear, documented error code such as <code>cursor_expired</code>, so SDKs can restart cleanly. A generic 400 looks like a bug on the client side.</p>
+
+<h3 id=dd-cursorbased-pagination-fm-loop level=3>6. A client loops forever on empty pages</h3>
+<p><strong>Symptom.</strong> One partner sends 300 requests per second to the list endpoint, around the clock. Every response is an empty page.</p>
+<p><strong>Mechanism.</strong> The server returns <code>next_cursor</code> even on the last page, and builds it from the request's own anchor when there are no rows. The partner's loop is "while next_cursor: fetch". The same anchor goes in, the same anchor comes out, forever. DynamoDB's short-page behaviour causes the mirror bug: clients that stop on a short page miss data.</p>
+<p><strong>Detect.</strong> Rate of requests returning zero rows, per API key. A token that appears in more than a handful of consecutive requests from the same client is a loop.</p>
+<p><strong>Fix.</strong> One clear rule, documented and tested: <code>next_cursor</code> is present if and only if more rows may exist. Use the <code>LIMIT n+1</code> probe so the last page carries no cursor. If short or empty pages are possible (filters applied after a read cap), say so explicitly and tell clients to stop only on a missing cursor.</p>
+
+<h3 id=dd-cursorbased-pagination-fm-tamper level=3>7. Edited tokens crash the endpoint, or leak rows</h3>
+<p><strong>Symptom.</strong> A security scan reports a spike of 500s from the list endpoint. Some inputs look like SQL fragments.</p>
+<p><strong>Mechanism.</strong> The token is plain base64 JSON. A curious client decodes it, edits the values, and re-encodes. Strings where integers belong throw type errors. Worse, if an older version of the code took <code>customer_id</code> from the token "for convenience", an edited token reads another customer's orders.</p>
+<p><strong>Detect.</strong> 500s on cursor decode, and any decode failure rate above a trickle. Code review: search for any authorization input sourced from the cursor.</p>
+<p><strong>Fix.</strong> Sign tokens, validate types after decoding, and map every failure to a 400. Scope always comes from authentication. The cursor only narrows a query the caller was already allowed to run.</p>
+
+<h2 id=dd-cursorbased-pagination-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<p>"Cursor pagination" names a family. The real decisions are what the anchor is, how much consistency the client gets, and who holds the state.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Variant<th>State held by<th>Consistency across pages<th>Cost<th>Best for<tbody>
+<tr><td>Offset with a depth cap<td>Nobody (page number)<td>Drifts on every write<td>Linear in depth, capped<td>Small admin tables, search UIs that stop at page 50
+<tr><td>Keyset cursor, opaque token<td>Client (token)<td>No duplicates from inserts ahead; mutable keys still move<td>Constant per page<td>Feeds, public list APIs: the default
+<tr><td>Keyset cursor over a change log<td>Client (log position)<td>Every change seen at least once, in commit order<td>Constant per page, plus the log<td>Partner sync, "give me everything since"
+<tr><td>Snapshot cursor (PIT, read timestamp)<td>Server keeps a snapshot alive<td>Exact frozen view<td>Snapshot retention: memory, old versions, vacuum delay<td>Search exports, consistent reports
+<tr><td>Server-side database cursor<td>Server holds an open transaction<td>Exact frozen view<td>One connection and transaction per reader; blocks vacuum<td>Internal batch jobs only, never public HTTP
+<tr><td>Asynchronous file export<td>Server, as a job<td>One snapshot, one file<td>A job queue and storage; minutes of latency<td>Millions of rows, compliance dumps
+</tbody></table></div></div>
+
+<h3 id=dd-cursorbased-pagination-var-guidance level=3>How to choose</h3>
+<ul>
+<li><strong>Start from what the client is doing.</strong> A human scrolling needs speed and no visible duplicates. A keyset cursor is enough. A machine syncing needs completeness. That calls for a change-log cursor, or a keyset cursor with a safety lag and upsert semantics. A report needs one consistent view: a snapshot or a file.</li>
+<li><strong>Never expose server-side database cursors over HTTP.</strong> Each open scan pins a connection and a transaction. One hundred abandoned partner scans hold 100 connections and stop vacuum from cleaning dead rows. That is a <a href="#database-connection-pooling">connection pool</a> outage waiting for a busy day.</li>
+<li><strong>Snapshots need a lease.</strong> If you offer point-in-time scans, give the handle a short keep-alive (Elasticsearch PITs take an explicit <code>keep_alive</code>) and renew it on each page. Abandoned snapshots then expire on their own.</li>
+<li><strong>Body or headers.</strong> Putting <code>next_cursor</code> in the JSON body is the common choice and easiest for SDKs. RFC 8288 <code>Link: &lt;…&gt;; rel="next"</code> headers, as GitHub uses, keep the body a plain array. Either is fine. Mixing them across endpoints is not.</li>
+<li><strong>Cursor or full URL.</strong> Returning a complete <code>next</code> URL saves clients from rebuilding filters. It also tempts them to edit it. Returning a bare token with a filter fingerprint inside is stricter, and the fingerprint catches the edits.</li>
+</ul>
+
+<h2 id=dd-cursorbased-pagination-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the full sort key, and is its last column unique? Show me the index that matches it column for column, including direction.</li>
+<li>Does <code>EXPLAIN</code> show an index range seek for the cursor query on production-sized data, for every supported filter combination?</li>
+<li>Are any sort columns mutable or nullable? If so, what does a row that changes mid-scan do?</li>
+<li>What exactly is in the token? Is it versioned, signed, and stored at full precision? Does it reject reuse with a different filter or sort?</li>
+<li>Does any authorization input come from the token? (The answer must be no.)</li>
+<li>How does the client know it reached the end? Is <code>next_cursor</code> absent on the last page, and is that tested?</li>
+<li>What are the default and maximum page sizes, and what happens above the maximum?</li>
+<li>Is this a feed or a sync? If it is a sync, how are late-committing rows handled: safety lag, change log, or outbox?</li>
+<li>How long do tokens stay valid, and what happens to in-flight scans when the sort key or token format changes?</li>
+<li>What is the rows-examined to rows-returned ratio for the worst supported filter, and is it alerted on?</li>
+<li>Where do bulk exports run (replica, rate tier), and is there an asynchronous file export for the multi-million-row case?</li>
+<li>If the product asks for totals, which count do you show: capped, estimated or maintained? What does it cost per request?</li>
+</ol>
+
+<h2 id=dd-cursorbased-pagination-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Your cursor is (created_at, id). An order's created_at is corrected by a support tool. What happens to users mid-scroll?"</summary>
+<p>The row moves to a new position in the sort. If it moves ahead of a user's anchor, that user never sees it on this pass. If it moves behind, it may be seen twice. Keyset pagination guarantees positions relative to an anchor, not a frozen list. The fix is to keep pagination keys immutable. Put the corrected value in a separate column, or accept duplicates and dedupe by ID on the client, which most feed UIs already do.</p>
+</details>
+<details>
+<summary>"A partner uses your cursor endpoint for incremental sync and is missing rows. Nothing is wrong with the tiebreaker. What else?"</summary>
+<p>Late commits. Insert-time timestamps and sequence IDs are assigned before commit, so a slow transaction can commit a row behind a cursor that a faster transaction already moved past. The reader never goes back. Add a safety lag (only return rows older than now minus the longest normal transaction), or page over a log written in commit order, such as CDC or an outbox. Then give the partner a reconciliation endpoint for the rows already lost.</p>
+</details>
+<details>
+<summary>"Why sign the cursor? It's only a position."</summary>
+<p>Because the server treats it as input to a query. Unsigned tokens let clients hand-build positions, which makes the format a de facto public contract again. They can also inject malformed values that turn into 500s. Signing makes opacity enforceable instead of a polite request in the docs. It costs one HMAC per request, which is microseconds.</p>
+</details>
+<details>
+<summary>"Product insists on 'Page 3 of 812' over a 50-million-row table. What do you say?"</summary>
+<p>That the exact count costs a scan of every matching row on every request, seconds at that size, for a number nobody acts on. Offer a capped count ("10,000+"), the planner's estimate, or a maintained counter if the number truly drives a decision. If they also want jumps to page 812, ask what the user is looking for. It is usually "the oldest ones" or "around last March", and both are value seeks that a cursor handles directly.</p>
+</details>
+<details>
+<summary>"How do you paginate a feed merged from 16 shards?"</summary>
+<p>If the sort key is a total order shared by all shards, keep one global anchor. Query every shard for limit+1 rows after it, merge the small sorted lists, and return the top <em>n</em>. The cursor is just the last returned row's key. Cost is 16 × limit rows per page, which is fine for limits around 20 to 100 and bad for 1,000. If shards cannot share a sort key, the cursor has to hold one position per shard. It grows with the shard count, which is a sign the query belongs in a separate read model, such as a <a href="#cqrs">CQRS</a> projection.</p>
+</details>
+<details>
+<summary>"Can keyset pagination go backwards and still use the index?"</summary>
+<p>Yes. Flip the comparison and the ORDER BY, fetch limit+1, then reverse the rows in memory. A B-tree scans in both directions, so the same index serves both. The detail people miss is that each page needs two anchors, the first row for "previous" and the last for "next". And the boundary row must be excluded with a strict comparison in both directions.</p>
+</details>
+<details>
+<summary>"When would you deliberately choose offset pagination for a public API?"</summary>
+<p>When the data set is small and bounded, users really do jump to numbered pages, and drift is harmless: a list of 300 store locations, for instance. Even then, cap the depth so a crawler cannot turn it into a full scan, and keep the response format cursor-shaped (an opaque <code>next</code> token that happens to encode an offset). You can then switch implementations later without a version change. That is the <a href="#api-versioning">versioning</a> lesson's argument for opacity, applied in advance.</p>
+</details>

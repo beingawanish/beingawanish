@@ -1,0 +1,222 @@
+<h2 id=dd-database-connection-pooling-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's picture has four arrows: borrow, use, query, return. Under those arrows sit two very different machines. One is the pool library inside your app process. The other is the database's own model of a connection, which decides what each one costs. Then there is the proxy in the middle, which changes the rules about what a "connection" even means.</p>
+
+<h3 id=dd-database-connection-pooling-server-side level=3>What one connection costs the database</h3>
+<p>Postgres uses a process per connection. When a client connects, the postmaster forks a new backend process. That process holds its own memory: a private catalog cache, prepared statement plans, and any <code>work_mem</code> allocations for sorts and hashes while a query runs. A truly idle backend may use a few megabytes. A busy one that has touched many tables and run large sorts can use tens of megabytes. Measure your own; the honest answer is "it varies".</p>
+<p>Memory is not the only cost. Every backend appears in shared structures that other backends scan. Taking a snapshot for a query has historically cost more as the number of connections grows. Postgres 14 made that path much cheaper, but lock tables, the process scheduler and CPU caches still feel thousands of processes. This is why <code>max_connections</code> defaults to 100 and why "just raise it to 5,000" is the wrong reflex.</p>
+<p>MySQL uses a thread per connection by default, which is cheaper than a process but has the same shape of problem: past the point where cores are busy, more threads add context switches and contention, not throughput. Its enterprise thread-pool plugin and proxies such as ProxySQL exist for the same reason PgBouncer does.</p>
+
+<h3 id=dd-database-connection-pooling-client-side level=3>Inside an application pool</h3>
+<p>Every pool library holds roughly the same state:</p>
+<ul>
+<li>A set of <strong>idle</strong> connections, ready to lend.</li>
+<li>A set of <strong>borrowed</strong> connections, each tagged with who has it and since when (that tag is what makes leak detection possible).</li>
+<li>A <strong>wait queue</strong> of threads or coroutines blocked on <code>getConnection()</code>, each with a deadline.</li>
+<li>A <strong>housekeeper</strong> that closes connections that have been idle too long or lived too long, and tops the pool back up to its minimum.</li>
+</ul>
+<p>The borrow path is simple. Take an idle connection if there is one. Otherwise, open a new one if the pool is below its max. Otherwise, wait until another thread returns one, or until the deadline passes and the borrow fails. Return puts the connection back in idle, after resetting any session state the library knows how to reset (rolling back an open transaction, for example).</p>
+<p>The knobs have different names in each library, but they map onto the same ideas. These are the common defaults; check them against the version you run, because they change.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Idea</th><th>HikariCP (Java)</th><th>SQLAlchemy QueuePool (Python)</th><th>Go <code>database/sql</code></th></tr></thead><tbody>
+<tr><td>Max size</td><td><code>maximumPoolSize</code>, default 10</td><td><code>pool_size</code> 5 plus <code>max_overflow</code> 10</td><td><code>SetMaxOpenConns</code>, default <strong>unlimited</strong></td></tr>
+<tr><td>Idle kept open</td><td><code>minimumIdle</code>, defaults to max</td><td>Up to <code>pool_size</code></td><td><code>SetMaxIdleConns</code>, default 2</td></tr>
+<tr><td>Borrow timeout</td><td><code>connectionTimeout</code>, 30 s</td><td><code>pool_timeout</code>, 30 s</td><td>None; use the request's <code>context</code> deadline</td></tr>
+<tr><td>Max lifetime</td><td><code>maxLifetime</code>, 30 min</td><td><code>pool_recycle</code>, off by default</td><td><code>SetConnMaxLifetime</code>, off by default</td></tr>
+<tr><td>Validation</td><td>JDBC4 <code>isValid()</code> on borrow when idle a while</td><td><code>pool_pre_ping</code>, off by default</td><td>Driver-dependent; bad connections are retried</td></tr>
+<tr><td>Leak detection</td><td><code>leakDetectionThreshold</code>, off by default</td><td>None built in</td><td>None built in; watch <code>DB.Stats()</code></td></tr>
+</tbody></table></div></div>
+<p>Two defaults in that table cause real incidents. Go's unlimited max means a Go service under load will open as many connections as it has concurrent queries, which is a connection storm waiting for a spike. And a 30-second borrow timeout is far too long for a web request with a 2-second budget. Set the borrow timeout from the request's deadline: if you cannot get a connection in 100-500 ms, failing fast is kinder than holding a thread for 30 seconds.</p>
+<p>Note the Go row's idle default of 2. With bursts above 2 concurrent queries, Go closes the extra connections on return and reopens them on the next burst. That is connect-per-query by accident, and it shows up as high connection churn on the database.</p>
+
+<h3 id=dd-database-connection-pooling-pgbouncer level=3>PgBouncer: the three pool modes</h3>
+<p>PgBouncer speaks the Postgres wire protocol on both sides. Clients connect to it as if it were the database. It keeps a pool of server connections per (database, user) pair and assigns them to clients according to <code>pool_mode</code>:</p>
+<ul>
+<li><strong><code>session</code></strong>: a client gets a server connection when it connects and keeps it until it disconnects. Everything works, but there is no multiplexing. It only caps the total.</li>
+<li><strong><code>transaction</code></strong>: a client gets a server connection at <code>BEGIN</code> (or for one autocommit statement) and gives it back at <code>COMMIT</code> or <code>ROLLBACK</code>. This is the mode that turns 1,000 clients into 50 server connections.</li>
+<li><strong><code>statement</code></strong>: the connection goes back after every statement, so multi-statement transactions are forbidden. Rarely used.</li>
+</ul>
+<p>Transaction mode breaks anything that relies on session state outliving a transaction, because the next transaction may run on a different server connection. The usual list: <code>SET</code> of session variables (use <code>SET LOCAL</code> inside the transaction instead), session-level advisory locks, <code>LISTEN</code>/<code>NOTIFY</code>, temporary tables that outlive a transaction, and <code>WITH HOLD</code> cursors. Protocol-level prepared statements used to be on the list too. PgBouncer 1.21 added support for them in transaction mode through <code>max_prepared_statements</code>; on older versions, drivers had to turn server-side prepares off.</p>
+<p>The knobs that matter:</p>
+<ul>
+<li><code>max_client_conn</code>: how many client connections PgBouncer accepts. Client connections are cheap for PgBouncer (a small amount of memory each), so this can be in the thousands.</li>
+<li><code>default_pool_size</code> (20 by default) and <code>max_db_connections</code>: how many server connections per pool and per database. This is the number that should be sized to the database's cores.</li>
+<li><code>reserve_pool_size</code> and <code>reserve_pool_timeout</code>: a few extra server connections allowed when clients have waited longer than the timeout. A small shock absorber.</li>
+<li><code>query_wait_timeout</code>: how long a client may wait for a server connection before PgBouncer gives up. The proxy-level borrow timeout.</li>
+<li><code>server_lifetime</code> and <code>server_idle_timeout</code>: rotate and trim server connections.</li>
+</ul>
+<p>PgBouncer is single-threaded. One process uses one core, which comfortably handles many thousands of transactions per second for small queries, but it is a ceiling. Large deployments run several PgBouncer processes, either on one host sharing a port with <code>so_reuseport</code> or as several pods behind a TCP balancer. Newer poolers such as PgCat, Odyssey and Supavisor are multi-threaded and add features like read/write routing; the trade-offs are maturity and operational familiarity.</p>
+<p>The command <code>SHOW POOLS</code> on PgBouncer's admin console is the single most useful view. It lists, per pool, <code>cl_active</code> (clients with a server connection), <code>cl_waiting</code> (clients waiting for one), <code>sv_active</code>, <code>sv_idle</code>, and <code>maxwait</code> (how long the oldest waiting client has waited). <code>cl_waiting</code> above zero for more than a moment is the earliest warning of pool exhaustion.</p>
+
+<h3 id=dd-database-connection-pooling-rds-proxy level=3>RDS Proxy and pinning</h3>
+<p>AWS RDS Proxy is a managed pooler for RDS and Aurora. It multiplexes at transaction boundaries, like PgBouncer's transaction mode, and limits its share of the database with <code>MaxConnectionsPercent</code>.</p>
+<p>It handles session state differently. Instead of breaking, it detects statements that create session state and <strong>pins</strong> that client to one database connection for the rest of its session. Correctness is preserved, but multiplexing is lost for that client. If most of your clients run a <code>SET</code> at connect time, most of them get pinned, and the proxy quietly becomes a session-mode pooler with extra latency. CloudWatch reports the pinned count as <code>DatabaseConnectionsCurrentlySessionPinned</code>; watch it after every driver or ORM upgrade.</p>
+
+<h3 id=dd-database-connection-pooling-hold-time level=3>Hold time is not query time</h3>
+<p>The lesson's arithmetic uses query duration: 400 queries per second at 5 ms is 2 connections busy. That is right for single-statement autocommit queries. In real apps, the pool holds a connection for the whole <em>transaction</em>, and often for the whole time the code has it borrowed. That includes everything the code does between statements.</p>
+<p>A checkout handler that opens a transaction, reads the cart (3 ms), calls the payment API (300 ms), and writes the order (4 ms) holds its connection for about 307 ms, not 7. At 100 checkouts per second, that is 100 × 0.307 ≈ 31 connections busy, all of them idle inside an open transaction. Worse, any row locks taken by the first statement are held for the whole 300 ms. In Postgres these sessions show <code>state = 'idle in transaction'</code> in <code>pg_stat_activity</code>.</p>
+<p>The rule: no network calls inside a database transaction. Do the remote call first, or use a pattern like the <a href="#saga">saga</a> or an outbox, and keep transactions to the statements that need to be atomic. This one change often shrinks the needed pool by an order of magnitude.</p>
+
+<h2 id=dd-database-connection-pooling-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-database-connection-pooling-db-side-size level=3>Size the database side first</h3>
+<p>Start from the database, not the app. HikariCP's often-quoted starting formula is:</p>
+<pre><code>connections = (core_count × 2) + effective_spindle_count</code></pre>
+<p>On a 16-core database with SSDs (count the spindle term as roughly 1), that is about 33 connections doing work at once. The "× 2" covers the time each query spends waiting on IO or locks, when another can use the core. Treat the formula as a starting point for a load test, not a law. A workload of long analytical queries wants fewer; one with lots of IO wait might take a few more.</p>
+<p>That number is the total for <em>all</em> clients that share the database. If a PgBouncer sits in front, it is roughly the sum of <code>default_pool_size</code> across pools, or <code>max_db_connections</code>. Leave a reserve on top for admin sessions, replication and migrations: <code>max_connections</code> of 100 with 40 for the pooler leaves plenty.</p>
+
+<h3 id=dd-database-connection-pooling-app-side-size level=3>Then size each app pool from Little's law</h3>
+<p>Use the bookstore fleet from <a href="#autoscaling">Auto-Scaling</a>. Each server handles 520 requests per second at its planned load. Assume each request runs 1.5 queries on average, and each holds a connection for 4 ms including driver round-trips.</p>
+<pre><code>busy connections per server = 520 × 1.5 × 0.004 ≈ 3.1</code></pre>
+<p>A pool of 3 would run at 100% and queue constantly. How much bigger? Queueing theory gives a direct answer. Treating borrows as random arrivals (an Erlang C model; real traffic is burstier, so treat this as a floor), with 3.1 busy on average:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Busy on average</th><th>Pool size</th><th>Chance a borrow must wait</th><th>Mean wait (5 ms hold)</th></tr></thead><tbody>
+<tr><td>2</td><td>3</td><td>44%</td><td>2.2 ms</td></tr>
+<tr><td>2</td><td>4</td><td>17%</td><td>0.4 ms</td></tr>
+<tr><td>2</td><td>5</td><td>6%</td><td>0.1 ms</td></tr>
+<tr><td>8</td><td>10</td><td>41%</td><td>1.0 ms</td></tr>
+<tr><td>8</td><td>12</td><td>14%</td><td>0.2 ms</td></tr>
+<tr><td>8</td><td>16</td><td>1%</td><td>&lt;0.1 ms</td></tr>
+</tbody></table></div></div>
+<p>The pattern is the useful part. Wait time collapses once the pool is about 1.5 to 2 times the average busy count. Past 2 times, extra connections buy almost nothing. So for 3.1 busy per server, a pool of 6 to 8 is plenty, and the "10 to 20" in the lesson is a comfortable default with burst room. A pool of 200 "for safety" buys no lower wait at all. It only raises the number of queries that can pile onto the database at once.</p>
+<p>The first two rows match the lesson's own example: 400 queries per second at 5 ms is 2 busy, and a pool of 4 or 5 already makes waiting rare.</p>
+
+<h3 id=dd-database-connection-pooling-fleet-math level=3>Fleet totals and the pooler</h3>
+<p>Multiply out. 20 servers (the auto-scaling max) × a pool of 10 = 200 client connections. Total busy across the fleet is 20 × 3.1 ≈ 62. That is above the 33 the database should run at once, which tells you two things:</p>
+<ul>
+<li>At full fleet, the database is the bottleneck, not the pool. A pooler with 33-40 server connections makes the excess wait in PgBouncer, where waiting is cheap, instead of inside Postgres, where it costs contention. The <a href="#autoscaling">auto-scaling</a> max of 20 was derived from database capacity for the same reason.</li>
+<li>To serve more, reduce work per request (cache, fewer queries, shorter transactions) or add database capacity (<a href="#primaryreplica">replicas</a> for reads). A bigger pool is not on the list.</li>
+</ul>
+<p>Memory, for completeness. Without a pooler, 200 direct connections at a rough 5-10 MB each is 1-2 GB of database RAM spent on idle processes. That RAM would otherwise be page cache.</p>
+
+<h3 id=dd-database-connection-pooling-connect-cost level=3>What connection setup really costs</h3>
+<p>The lesson's 20-50 ms setup cost breaks down roughly like this, within one region:</p>
+<ul>
+<li>TCP handshake: one round trip, under 1 ms in the same zone.</li>
+<li>TLS 1.3 handshake: one more round trip, plus the server's key exchange and certificate signature CPU.</li>
+<li>Postgres startup and SCRAM-SHA-256 authentication: several round trips, and SCRAM deliberately runs thousands of hash iterations to make password guessing expensive. That CPU is spent on every new connection.</li>
+<li>Forking the backend and warming its catalog cache on the first queries.</li>
+</ul>
+<p>The CPU part is the one that bites at scale. A thousand clients reconnecting at once cost the database a thousand SCRAM computations and a thousand forks, all before any real query runs (failure 3 below).</p>
+
+<h2 id=dd-database-connection-pooling-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+<p>The lesson covers the leak that exhausts a pool. These are its relatives, several of which look the same on a dashboard and have a different cause.</p>
+
+<h3 id=dd-database-connection-pooling-fm-slow-dependency level=3>1. A slow API exhausts the database pool</h3>
+<p><strong>Symptom.</strong> The payment provider slows from 300 ms to 3 seconds. Within a minute, every page on the site fails with "pool borrow timeout", including pages that never touch payments. The database is nearly idle.</p>
+<p><strong>Mechanism.</strong> The checkout code holds a connection, often inside an open transaction, while it calls the payment API. Hold time goes up tenfold, so busy connections go up tenfold (Little's law). Checkout uses every connection in the pool, and browse requests that share the pool wait and time out.</p>
+<p><strong>Detect.</strong> Pool active equals max, wait time climbs, but database CPU and active queries are low. <code>pg_stat_activity</code> shows many sessions in <code>idle in transaction</code>. Traces show the time is in an HTTP span nested inside a database transaction span.</p>
+<p><strong>Fix.</strong> Never make network calls while holding a connection. Split pools for different request classes so one cannot starve another, which is a <a href="#bulkhead">bulkhead</a>. Set Postgres's <code>idle_in_transaction_session_timeout</code> so a stuck session is killed rather than holding locks forever. And put a <a href="#timeout">timeout</a> and a <a href="#breaker">circuit breaker</a> on the payment call itself.</p>
+
+<h3 id=dd-database-connection-pooling-fm-half-open level=3>2. The first query after a quiet period hangs</h3>
+<p><strong>Symptom.</strong> After a quiet night, the first few requests of the morning hang for 15 minutes or more, or fail with a socket timeout. Later requests are fine. It happens only in production, not on laptops.</p>
+<p><strong>Mechanism.</strong> Something in the network path drops idle TCP connections without telling either end: a NAT gateway, a firewall, or a load balancer with an idle timeout. (AWS's NAT gateway and Network Load Balancer each drop idle flows after a few minutes, for example; check your own path.) The pool still thinks the connection is fine. The first query is sent into a dead connection, and the client waits for TCP retransmissions to give up, which with Linux defaults can take a very long time.</p>
+<p><strong>Detect.</strong> Errors cluster at low traffic or right after a quiet period. Client logs show "connection reset" or socket timeouts, not database errors. The database never sees the query.</p>
+<p><strong>Fix.</strong> Set the pool's max lifetime and idle timeout shorter than the shortest idle timeout in the path. Turn on validation (a pre-ping or <code>isValid</code> check) for connections idle longer than a threshold. Enable TCP keepalives with intervals shorter than the path's timeout. And always set a socket or statement timeout on the client, so a dead connection fails in seconds.</p>
+
+<h3 id=dd-database-connection-pooling-fm-reconnect-storm level=3>3. The reconnect storm after a failover</h3>
+<p><strong>Symptom.</strong> The primary fails over to a replica. The new primary comes up healthy, then sits at 100% CPU for two minutes doing almost no queries. Some clients get "too many connections".</p>
+<p><strong>Mechanism.</strong> Every pool on every server noticed the broken connections at the same moment and reconnected at once. Fifty servers × 20 connections is 1,000 TLS handshakes, 1,000 SCRAM authentications and 1,000 forks, all in the same second. Pools that retry without backoff make it worse.</p>
+<p><strong>Detect.</strong> New connection rate on the database spikes to the size of the whole fleet's pools. CPU is high while transactions per second are low. Authentication time dominates.</p>
+<p><strong>Fix.</strong> A pooler absorbs this: PgBouncer keeps the clients and reconnects only its own few dozen server connections. Without one, add jittered exponential backoff to reconnects (<a href="#retry-with-exponential-backoff">Retry with Exponential Backoff</a>) and keep <code>minimumIdle</code> low so pools refill gradually on demand. Also check how the client finds the new primary: DNS-based failover needs the pool to stop reusing the old IP, which a modest max lifetime handles.</p>
+
+<h3 id=dd-database-connection-pooling-fm-nested level=3>4. The pool deadlock</h3>
+<p><strong>Symptom.</strong> Under heavy load only, request threads all freeze, then all fail at once with borrow timeouts. The database shows a few idle connections. At low load, everything is fine.</p>
+<p><strong>Mechanism.</strong> Some code path borrows a second connection while still holding the first: a helper that opens its own connection to write an audit row, or a framework that starts a new transaction for a nested call. With a pool of 10 and 10 such requests in flight, each holds one connection and waits for a second that will never come free. Nothing is deadlocked inside the database; the deadlock is in the pool.</p>
+<p><strong>Detect.</strong> Thread dumps show every request thread waiting in the pool's borrow while also holding a borrowed connection. Leak detection reports connections held exactly as long as the borrow timeout.</p>
+<p><strong>Fix.</strong> Pass the existing connection or transaction down instead of borrowing a new one. If a path truly needs two, the HikariCP documentation gives the minimum size that avoids the deadlock: <code>threads × (connections_per_thread − 1) + 1</code>. Better to remove the nesting.</p>
+
+<h3 id=dd-database-connection-pooling-fm-prepared level=3>5. "Prepared statement does not exist" after adding the pooler</h3>
+<p><strong>Symptom.</strong> The team puts PgBouncer in transaction mode in front of the database. Soon after, a fraction of requests fail with <code>prepared statement "S_1" does not exist</code> or <code>already exists</code>. The errors are intermittent and hard to reproduce locally.</p>
+<p><strong>Mechanism.</strong> The driver prepared a statement on one server connection and later tried to execute it by name. In transaction mode, the later transaction ran on a different server connection that had never seen it, or one where another client had already used that name. The same family of bugs hits <code>SET</code>, advisory locks and temp tables.</p>
+<p><strong>Detect.</strong> Errors start with the pooler rollout, and they vanish if you switch the pool to session mode.</p>
+<p><strong>Fix.</strong> On PgBouncer 1.21 or later, set <code>max_prepared_statements</code> so PgBouncer tracks and re-prepares them per server connection. On older versions, turn off server-side prepares in the driver (for the Postgres JDBC driver, <code>prepareThreshold=0</code>). Audit the code for other session state, and replace <code>SET</code> with <code>SET LOCAL</code> inside transactions.</p>
+
+<h3 id=dd-database-connection-pooling-fm-pooler-cpu level=3>6. The pooler becomes the bottleneck</h3>
+<p><strong>Symptom.</strong> p99 latency climbs at peak. The database has spare CPU, and the app pools show no waiting. Adding app servers makes latency worse.</p>
+<p><strong>Mechanism.</strong> A single PgBouncer process has hit 100% of its one core. Every query now waits in its event loop. TLS on both sides of the pooler, or very many tiny queries, makes this happen sooner.</p>
+<p><strong>Detect.</strong> The PgBouncer process at a flat 100% CPU on one core. <code>SHOW STATS</code> shows average wait time rising while server connections sit idle.</p>
+<p><strong>Fix.</strong> Run several PgBouncer processes behind one address (with <code>so_reuseport</code>, or several pods behind a balancer), or move to a multi-threaded pooler. Then treat the pooler fleet like any other critical tier: at least two instances, health checks, and alerts on their CPU.</p>
+
+<h3 id=dd-database-connection-pooling-fm-pinning level=3>7. The proxy that quietly stopped multiplexing</h3>
+<p><strong>Symptom.</strong> After an ORM upgrade, database connections climb from 40 to 800 during the evening, even though RDS Proxy sits in front. Then the database starts refusing connections, which the proxy was supposed to prevent.</p>
+<p><strong>Mechanism.</strong> The new ORM version runs a <code>SET</code> statement on every new connection. RDS Proxy pins each such client to its own database connection for the life of the session. Multiplexing has silently turned off.</p>
+<p><strong>Detect.</strong> <code>DatabaseConnectionsCurrentlySessionPinned</code> rises to match client connections. The proxy's logs name the statement that caused pinning.</p>
+<p><strong>Fix.</strong> Remove the session-level statement, move it into the connection's startup parameters where the proxy supports that, or use the proxy's settings to exclude specific statement types from pinning when you know they are safe. Then add an alert on the pinned count, because the next upgrade can do it again.</p>
+
+<h2 id=dd-database-connection-pooling-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-database-connection-pooling-choose-placement level=3>Where the pool lives</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Placement</th><th>Caps the fleet total?</th><th>Extra hop</th><th>Session features</th><th>Best for</th></tr></thead><tbody>
+<tr><td>In-app pool only</td><td>No: total = servers × pool size</td><td>None</td><td>All work</td><td>Small, fixed fleets well under <code>max_connections</code></td></tr>
+<tr><td>In-app pool + sidecar pooler per host or pod</td><td>Partly: one pool per host, still multiplied by hosts</td><td>Local, near-free</td><td>Depends on the sidecar's mode</td><td>Many processes per host (forking servers, PHP, Python workers)</td></tr>
+<tr><td>In-app pool + central pooler (PgBouncer fleet)</td><td>Yes</td><td>One network hop, under a millisecond in-zone</td><td>Transaction mode limits them</td><td>Autoscaled fleets; many services sharing one database</td></tr>
+<tr><td>Managed proxy (RDS Proxy and similar)</td><td>Yes</td><td>One hop, usually a little more latency than self-run</td><td>Kept via pinning, at the cost of multiplexing</td><td>Serverless; teams that would rather not run PgBouncer</td></tr>
+<tr><td>Serverless HTTP or Data API driver</td><td>Yes, inside the provider</td><td>An HTTP request per query or transaction</td><td>Limited</td><td>Edge and function runtimes that cannot hold TCP connections</td></tr>
+</tbody></table></div></div>
+<p>The guidance is short. Always have an in-app pool. Add a central pooler as soon as the fleet total could pass about half of <code>max_connections</code>, or as soon as the fleet autoscales, whichever is first. Keep the in-app pool even behind a pooler: it saves the per-request connect to PgBouncer, which still costs a handshake.</p>
+
+<h3 id=dd-database-connection-pooling-choose-mode level=3>Session mode or transaction mode</h3>
+<p>Choose transaction mode for the main web workload, because it is the only mode that multiplexes. Then send the workloads that need session features through a separate pool in session mode: migrations, jobs that use advisory locks, anything using <code>LISTEN</code>/<code>NOTIFY</code>. PgBouncer allows per-database or per-user pool modes, so one pooler can serve both.</p>
+
+<h3 id=dd-database-connection-pooling-choose-split level=3>One pool or several</h3>
+<p>Separate pools are bulkheads. A common split for the bookstore:</p>
+<ul>
+<li>A <strong>write pool</strong> to the primary, sized small, for checkout and account changes.</li>
+<li>A <strong>read pool</strong> to the replicas for browsing and search.</li>
+<li>A <strong>batch pool</strong>, tiny and separate, for reports and exports, so a slow report cannot use checkout's connections.</li>
+</ul>
+<p>The cost is more numbers to size and more chances to send a write to a read pool by mistake. The benefit is that one class of traffic cannot starve another, which is exactly failure 1.</p>
+
+<h3 id=dd-database-connection-pooling-choose-serverless level=3>Serverless and edge functions</h3>
+<p>A function instance may live for minutes and handle one request at a time. A thousand concurrent invocations means a thousand instances, each with its own pool. The options are a shared proxy (RDS Proxy is built for this), an HTTP-based driver, or capping function concurrency so the total stays bounded. Inside the function, open one connection lazily, keep it for the life of the instance, and do not create a pool larger than 1 or 2.</p>
+
+<h2 id=dd-database-connection-pooling-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the maximum total number of database connections, across every server, worker, cron job and admin tool, at the autoscaler's max? Show the multiplication.</li>
+<li>How was the database-side connection count chosen (cores, load test), and what reserve is left under <code>max_connections</code>?</li>
+<li>What is the measured connection hold time, and does it include any network calls inside transactions?</li>
+<li>Is each app pool sized from rate × hold time, with burst room, rather than "big for safety"?</li>
+<li>What is the borrow timeout, and is it shorter than the request's own deadline?</li>
+<li>Are max lifetime and idle timeout shorter than every idle timeout in the network path (NAT, firewall, load balancer, the pooler itself)?</li>
+<li>If a pooler is used, which mode, and what session features does the code depend on (prepared statements, <code>SET</code>, advisory locks, temp tables, <code>LISTEN</code>)?</li>
+<li>Is the pooler redundant and monitored for CPU, waiting clients and wait time? What happens to clients if one pooler instance dies?</li>
+<li>Are pools split so that batch, read and write traffic cannot starve each other?</li>
+<li>What do reconnects look like after a failover: is there backoff with jitter, and has a failover been tested at peak?</li>
+<li>Which metrics alert before exhaustion: pool wait time, waiting clients, utilisation, connections held longer than a threshold?</li>
+<li>Are <code>statement_timeout</code> and <code>idle_in_transaction_session_timeout</code> set on the database, so a stuck client cannot hold a connection forever?</li>
+</ol>
+
+<h2 id=dd-database-connection-pooling-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Pool wait time is high but the database CPU is at 20%. What are the possible causes?"</summary>
+<p>The connections are borrowed but not doing database work. Likely causes: code holding connections across network calls or slow app logic (look for <code>idle in transaction</code> in <code>pg_stat_activity</code>); a leak; nested borrows deadlocking the pool; lock waits inside the database (high wait, low CPU); or the pooler itself out of CPU. Rate × hold time says hold time has grown, so the question is where that time goes. A trace that shows spans inside the borrowed window usually answers it.</p>
+</details>
+
+<details>
+<summary>"Why does transaction-mode pooling break prepared statements, and how do you fix it?"</summary>
+<p>A named prepared statement lives on one server connection. In transaction mode, the client's next transaction may run on a different server connection that does not have it, or one where another client already used the same name. PgBouncer 1.21 and later can track protocol-level prepared statements and re-prepare them per server connection when <code>max_prepared_statements</code> is set. On older poolers, disable server-side prepares in the driver, or use session mode for that workload.</p>
+</details>
+
+<details>
+<summary>"You have 50 servers, each with a pool of 20, and a database with max_connections 500. Is that fine?"</summary>
+<p>It fits on paper and is still a bad design. 1,000 possible connections cannot fit in 500, so at full use some servers get refused. Even at 500, the database would run far more concurrent queries than it has cores, adding contention. Compute the real need with Little's law. It is probably tens of busy connections fleet-wide. Then put a pooler in front, size server connections to roughly 2× cores, and bring each app pool down to what rate × hold time needs.</p>
+</details>
+
+<details>
+<summary>"Doesn't adding PgBouncer add latency? Why is it worth it?"</summary>
+<p>It adds a network hop, usually well under a millisecond within a zone, and a little CPU. In exchange, the database runs a core-sized number of backends, so queries do not compete for cores and locks, and autoscaling or failover no longer causes connection storms. For most OLTP queries the contention you remove is worth far more than the hop you add. Keep the in-app pool so each request does not also pay a connection setup to PgBouncer.</p>
+</details>
+
+<details>
+<summary>"How do you choose maxLifetime?"</summary>
+<p>Shorter than the shortest idle or connection timeout anywhere in the path, so the pool retires connections before the network silently kills them. Short enough that after a DNS-based failover, every connection moves to the new primary within an acceptable window. Long enough that churn is negligible: a 30-minute lifetime on 20 connections is one reconnect every 90 seconds per server. Add jitter so connections opened together do not all expire together.</p>
+</details>
+
+<details>
+<summary>"Why not make the borrow timeout 30 seconds, so requests never fail?"</summary>
+<p>Because they fail anyway, just later and more expensively. The caller's own timeout is usually a few seconds, so after that the request is dead but its thread still waits for a connection. Meanwhile it holds a worker thread, memory, and the upstream's connection, and the wait queue grows. A borrow timeout of a few hundred milliseconds sheds load early, returns an error the caller can retry or degrade on, and keeps the server responsive. The borrow timeout is your backpressure signal.</p>
+</details>
+
+<details>
+<summary>"Your Lambda functions connect directly to Postgres and you see 'too many connections' during spikes. Options?"</summary>
+<p>Each concurrent invocation is a separate instance with its own connection, so connections equal concurrency. Options, in rough order: put RDS Proxy or a PgBouncer fleet in front; cap the function's reserved concurrency so the total is bounded; reuse one connection per instance across invocations instead of connecting per request; or switch to an HTTP-based data API where the provider pools for you. Raising <code>max_connections</code> alone treats the symptom and adds contention.</p>
+</details>

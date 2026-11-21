@@ -1,0 +1,315 @@
+<h2 id=dd-semantic-caching-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson gives the shape: embed, search, threshold, serve. A production semantic cache has more moving parts than that. It has an entry format that carries everything a hit must be checked against, a lookup ladder with several exits, a write path that decides what deserves to be cached at all, and an index whose own behaviour (deletes, rebuilds, versions) leaks into correctness. This section walks through each one.</p>
+
+<h3 id=dd-semantic-caching-entry level=3>What one cache entry holds</h3>
+<p>An exact cache stores a key and a value. A semantic cache entry has to carry its own evidence, because every hit is a judgement call that later checks will want to audit. A workable entry looks like this:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Field</th><th>Why it is there</th></tr></thead><tbody>
+<tr><td><code>embedding</code></td><td>The vector the index searches. Normalised to unit length, so cosine similarity becomes a plain dot product.</td></tr>
+<tr><td><code>embed_model</code></td><td>Model name and version. Lookups filter on it, so a query embedded by v2 never compares against a v1 vector.</td></tr>
+<tr><td><code>query_text</code></td><td>The canonical question that produced the answer. Needed for audits, for the entity guard, and for re-embedding during a migration.</td></tr>
+<tr><td><code>answer</code></td><td>The response to serve, plus any citations it carried.</td></tr>
+<tr><td><code>scope</code></td><td>Tenant, locale, and permission scope. A lookup searches only inside its own scope.</td></tr>
+<tr><td><code>prompt_version</code>, <code>gen_model</code></td><td>The system prompt and model that wrote the answer. Changing the prompt changes what a correct answer is.</td></tr>
+<tr><td><code>entities</code></td><td>Order numbers, SKUs, dates, amounts and negations pulled from the query. The entity guard compares these.</td></tr>
+<tr><td><code>tags</code>, <code>source_docs</code></td><td>Topic tags, and the document IDs and versions the answer was built from. Both drive invalidation.</td></tr>
+<tr><td><code>created_at</code>, <code>ttl</code>, <code>hits</code></td><td>Expiry, plus a hit counter that tells eviction and auditing which entries matter most.</td></tr>
+</tbody></table></div></div>
+<p>Two of these fields are easy to forget, and both cause real incidents. <code>prompt_version</code> matters because a new system prompt ("always mention the 30-day window") makes every old answer subtly wrong. <code>source_docs</code> matters because it turns fuzzy invalidation back into precise invalidation, which the variations section returns to.</p>
+
+<h3 id=dd-semantic-caching-ladder level=3>The lookup ladder</h3>
+<p>A lookup is not one comparison. It is a ladder of cheap checks, and a request can drop to generation at any rung. The order matters: cheap and certain checks first, expensive and fuzzy ones last.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-semantic-caching-svg-title dd-semantic-caching-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-semantic-caching-svg-title">The semantic cache lookup ladder</title>
+<desc id="dd-semantic-caching-svg-desc">A query passes five rungs in order: a cacheability check, an exact-match tier, an embedding and nearest-neighbour search filtered by scope and model version, a similarity threshold with a margin check, and an entity and freshness guard. Passing every rung serves the cached answer. Failing any rung sends the query down to generation, which may then write a new entry.</desc>
+<defs><marker id="dd-semantic-caching-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="300" fill="#ffffff"/>
+<rect x="10" y="30" width="120" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="70" y="56" font-size="13" fill="#1c2430" text-anchor="middle">1. Cacheable?</text>
+<text x="70" y="75" font-size="11" fill="#5c6b7c" text-anchor="middle">intent, no PII</text>
+<rect x="150" y="30" width="120" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="210" y="56" font-size="13" fill="#1c2430" text-anchor="middle">2. Exact tier</text>
+<text x="210" y="75" font-size="11" fill="#5c6b7c" text-anchor="middle">hash of normal form</text>
+<rect x="290" y="30" width="130" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="355" y="56" font-size="13" fill="#1c2430" text-anchor="middle">3. Embed + ANN</text>
+<text x="355" y="75" font-size="11" fill="#5c6b7c" text-anchor="middle">filter: scope, model</text>
+<rect x="440" y="30" width="125" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="502" y="56" font-size="13" fill="#1c2430" text-anchor="middle">4. Threshold</text>
+<text x="502" y="75" font-size="11" fill="#5c6b7c" text-anchor="middle">score and margin</text>
+<rect x="585" y="30" width="125" height="60" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="647" y="56" font-size="13" fill="#1c2430" text-anchor="middle">5. Guards</text>
+<text x="647" y="75" font-size="11" fill="#5c6b7c" text-anchor="middle">entities, freshness</text>
+<line x1="130" y1="60" x2="146" y2="60" stroke="#1c2430" marker-end="url(#dd-semantic-caching-arrow)"/>
+<line x1="270" y1="60" x2="286" y2="60" stroke="#1c2430" marker-end="url(#dd-semantic-caching-arrow)"/>
+<line x1="420" y1="60" x2="436" y2="60" stroke="#1c2430" marker-end="url(#dd-semantic-caching-arrow)"/>
+<line x1="565" y1="60" x2="581" y2="60" stroke="#1c2430" marker-end="url(#dd-semantic-caching-arrow)"/>
+<rect x="585" y="130" width="125" height="50" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="647" y="160" font-size="13" fill="#1c2430" text-anchor="middle">Serve hit (~40 ms)</text>
+<line x1="647" y1="90" x2="647" y2="126" stroke="#7eae96" stroke-width="2" marker-end="url(#dd-semantic-caching-arrow)"/>
+<rect x="150" y="225" width="300" height="56" rx="8" fill="#f8ebee" stroke="#c898a4"/>
+<text x="300" y="249" font-size="13" fill="#1c2430" text-anchor="middle">Generate (~2.5 s), single-flight by meaning</text>
+<text x="300" y="268" font-size="11" fill="#5c6b7c" text-anchor="middle">then admission check before writing an entry</text>
+<path d="M70,90 L70,250 L146,250" fill="none" stroke="#c898a4" marker-end="url(#dd-semantic-caching-arrow)"/>
+<line x1="210" y1="90" x2="210" y2="110" stroke="#7eae96" stroke-width="2"/>
+<text x="218" y="108" font-size="11" fill="#1c2430">hit</text>
+<line x1="355" y1="90" x2="330" y2="221" stroke="#c898a4" marker-end="url(#dd-semantic-caching-arrow)"/>
+<line x1="502" y1="90" x2="410" y2="221" stroke="#c898a4" marker-end="url(#dd-semantic-caching-arrow)"/>
+<line x1="620" y1="90" x2="440" y2="230" stroke="#c898a4" marker-end="url(#dd-semantic-caching-arrow)"/>
+<text x="470" y="200" font-size="11" fill="#1c2430">any rung fails</text>
+<text x="20" y="20" font-size="11" fill="#5c6b7c">Fail open: if rungs 3 to 5 time out (budget ~50 ms), skip to generation.</text>
+</svg>
+<figcaption>Every rung can only send a request down to generation, never to a riskier answer. That is what makes failing open safe.</figcaption>
+</figure>
+
+<ol>
+<li><strong>Cacheability.</strong> A small intent classifier, or a set of rules, decides whether this question may use the shared cache at all. "Where's my order?" and anything carrying personal data stops here and goes to the tool-call path. Doing this first matters. A personal question that never reaches the index can never false-hit.</li>
+<li><strong>Exact tier.</strong> Normalise the text (case, whitespace, punctuation) and look up a hash. This catches copy-pastes and repeated suggested questions for the price of one key-value read, with zero false-hit risk.</li>
+<li><strong>Embed and search.</strong> Embed the query and ask the index for the top few neighbours, say k = 5, filtered by <code>scope</code> and <code>embed_model</code>. The filter is part of the search, not a check afterwards. A neighbour from another tenant must never even be a candidate.</li>
+<li><strong>Threshold and margin.</strong> Take the best neighbour. Its score must clear the threshold. A useful extra test is the <strong>margin</strong>: the gap between the best and second-best entries when they hold different answers. If "cancel my order" scores 0.95 and "cancel my subscription" scores 0.94, the query sits between two meanings, and the cache should decline.</li>
+<li><strong>Guards.</strong> Compare extracted entities (order numbers, SKUs, amounts, dates, and negation words like "not" or "without"). Check that the entry's <code>prompt_version</code> is current and its source documents have not changed. Only then serve.</li>
+</ol>
+<p>Each rung has a latency cost, and the whole ladder needs a budget. Something like 50 ms for rungs 3 to 5 is reasonable. If the embedder or index is slow, the ladder times out and the request generates normally. That is failing open, and the miss path is always correct.</p>
+
+<h3 id=dd-semantic-caching-guard-code level=3>The decision in code</h3>
+<p>The decision logic is short enough to read in full. This sketch uses only the standard library and leaves the embedder and index as plain inputs. The point is the order of checks and what each one refuses.</p>
+<pre><code>import re
+from dataclasses import dataclass
+
+ENTITY = re.compile(r"#?\d{3,}|\b(?:not|no|without|never|cancel\w*)\b", re.I)
+
+def entities(text):
+    return {m.group(0).lower().lstrip("#") for m in ENTITY.finditer(text)}
+
+@dataclass
+class Entry:
+    query: str
+    answer: str
+    score: float          # similarity to the incoming query
+    prompt_version: str
+    docs_current: bool    # source documents unchanged since write
+
+def decide(query, neighbours, threshold=0.94, margin=0.02, prompt_version="p7"):
+    """Return an answer to serve, or None to generate."""
+    if not neighbours:
+        return None
+    best = neighbours[0]
+    if best.score &lt; threshold:
+        return None
+    rival = next((n for n in neighbours[1:] if n.answer != best.answer), None)
+    if rival and best.score - rival.score &lt; margin:
+        return None                       # ambiguous: two meanings nearby
+    if entities(query) != entities(best.query):
+        return None                       # different order number or negation
+    if best.prompt_version != prompt_version or not best.docs_current:
+        return None                       # answer was written under old rules
+    return best.answer
+</code></pre>
+<p>A real entity extractor is better than a regular expression. It should understand product names, dates and currency. But the structure stays the same: every check can only refuse.</p>
+
+<h3 id=dd-semantic-caching-scores level=3>What a similarity score actually means</h3>
+<p>The lesson's 0.94 threshold is a number for one model on one workload. It does not transfer. Embedding models differ a lot in how their scores spread. With many models, two unrelated sentences already score fairly high, because the vectors crowd into a narrow cone of the space. With others, paraphrases score lower than you would expect. So 0.94 can be conservative for one model and loose for another.</p>
+<p>The practical rule: a threshold is valid only for the model it was tuned on, and only on a labelled set from your own traffic. When the model changes, the threshold is retuned as part of the migration. It is never copied.</p>
+<p>Scores also vary by intent. Short queries ("returns?") produce noisier embeddings than long ones. Policy questions with fixed answers tolerate a looser threshold than questions whose answers branch on a detail. Mature caches end up with per-intent thresholds, tuned separately, rather than one global number.</p>
+
+<h3 id=dd-semantic-caching-index level=3>The index underneath</h3>
+<p>A semantic cache is usually small by vector-database standards. Even a busy one holds hundreds of thousands to a few million entries. That changes the index choice.</p>
+<ul>
+<li><strong>Flat (brute force).</strong> Compare the query with every entry. At 200,000 entries of 768 dimensions, that is about 150 million multiply-adds, a few milliseconds on a modern CPU core with vector instructions. Recall is exact, deletes are instant, and there is no index to rebuild. For many caches this is the right answer.</li>
+<li><strong>HNSW.</strong> A layered graph that finds near neighbours by walking from a coarse layer to a fine one. Lookups stay around a millisecond into the millions. The knobs are <code>M</code> (links per node: more links, better recall, more memory), <code>ef_construction</code> (build effort), and <code>ef_search</code> (how many candidates a lookup keeps; the main recall versus latency dial). Deletes in most HNSW implementations mark nodes as removed rather than repairing the graph, so a cache with high churn slowly degrades and needs periodic rebuilds.</li>
+<li><strong>Where it lives.</strong> Redis, Postgres with pgvector, a library like FAISS inside the gateway process, or a dedicated vector database. All of these work. The deciding factors are whether you already run it, whether it supports filtered search on <code>scope</code>, and how it handles deletes and TTLs.</li>
+</ul>
+<p>One subtlety: ANN search is approximate. If the index misses the true nearest entry, you get a false miss, which is cheap. It will not produce a false hit by itself, because the threshold still applies to whatever it returns. Approximation costs hit ratio, not correctness.</p>
+
+<h3 id=dd-semantic-caching-write level=3>The write path and admission</h3>
+<p>Writing every miss into the cache sounds natural, and it is usually wrong. Most questions in a long tail are asked once. Caching them fills the index with entries that will never hit, slows lookups, and gives the false-hit lottery more tickets.</p>
+<p>Better policies, roughly in order of sophistication:</p>
+<ul>
+<li><strong>Admit on second sighting.</strong> Keep a small, short-lived record of recent miss embeddings. Write a full entry only when a second question lands near one. This is the semantic cousin of the "doorkeeper" in admission-controlled caches. It filters one-off questions and costs little.</li>
+<li><strong>Admit only validated answers.</strong> Run a cheap grounding or policy check before writing. A bad generation that is served once is one bad answer. A bad generation that is cached may be served ten thousand times.</li>
+<li><strong>Curated answers.</strong> For the top few hundred meanings, the ones that make up the bulk of the 40%, have a person or a review process approve the cached answer. The cache becomes partly a managed FAQ with a fuzzy front door.</li>
+</ul>
+<p>Never write an answer whose generation included personal context, tool results, or user-supplied text. Those answers belong to one person.</p>
+
+<h3 id=dd-semantic-caching-single-flight level=3>Single-flight by meaning</h3>
+<p>The lesson mentions that the cache collapses a viral question into one generation. The mechanism needs its own small index. When a miss starts generating, register its embedding in an <strong>in-flight table</strong> with a future (a placeholder the result will fill). The next miss checks the in-flight table with the same threshold and guards. If it matches, it waits on the future instead of starting a second generation.</p>
+<p>Two details make this work. First, the wait needs a timeout shorter than the user's patience, after which the waiter generates on its own. Second, waiters should receive the stream as it is produced, not just the final text. Otherwise the second asker sees nothing for 2.5 seconds while the first sees tokens arrive.</p>
+
+<h2 id=dd-semantic-caching-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The running numbers from the lesson: about 1,000,000 queries a day, $0.002 and 2.5 seconds per generation, a 27% hit ratio at a 0.94 threshold, and a 0.05% false-hit rate in sampled audits. The assumptions below are stated so you can swap in your own.</p>
+
+<h3 id=dd-semantic-caching-breakeven level=3>Break-even hit ratio</h3>
+<p>Every query pays for the lookup. Only hits save money. So the cache pays for itself when</p>
+<p><code>hit_ratio × cost_generation &gt; cost_embed + cost_index_per_query</code></p>
+<p>Assume embedding a short query costs about 1% of a generation, roughly $0.00002, and the index and its servers cost $50 a day, or $0.00005 per query at a million queries. The total lookup cost is about $0.00007 per query. Divide by $0.002 and the break-even hit ratio is 3.5%.</p>
+<p>Two consequences follow. First, the exact cache's 4% barely beat break-even, which is why it felt useless. Second, the business case is almost always decided by the repetition rate, not by the embedding price. Measure that first.</p>
+
+<h3 id=dd-semantic-caching-false-hit-cost level=3>The cost of false hits, in money</h3>
+<p>The lesson treats the threshold as a product decision. Here is the arithmetic that makes the decision concrete.</p>
+<ul>
+<li>At 27% hits on a million queries, the cache serves 270,000 hits a day.</li>
+<li>At 0.05% false hits, that is 135 wrong answers a day. At the looser 0.92 threshold, 0.3% of 310,000 hits is 930 a day.</li>
+<li>Assume 10% of wrong answers lead to a support contact that costs $5, and ignore lost trust for now. That is $68 a day at 0.94 and $465 a day at 0.92.</li>
+<li>The looser threshold earned 40,000 extra hits, worth $80 a day in generation savings.</li>
+</ul>
+<p>So the four extra hit-ratio points cost about $400 a day in support contacts to save $80 in inference. The threshold choice is not close. And this count ignores the customer who acts on wrong instructions without calling. A domain where one wrong answer costs hundreds of dollars (a refund dispute, a compliance breach) pushes the threshold higher still, or out of the cache entirely.</p>
+
+<h3 id=dd-semantic-caching-audit-math level=3>How many audits you need</h3>
+<p>A false-hit rate of 0.05% is small, and small rates are hard to measure. Two rules from basic statistics help.</p>
+<ul>
+<li><strong>The rule of three.</strong> If you grade n hits and find zero false hits, the 95% upper bound on the rate is about 3 / n. To claim "below 0.1%" you need 3,000 clean grades. To claim "below 0.05%" you need 6,000.</li>
+<li><strong>Seeing enough events.</strong> To estimate a 0.05% rate to within roughly ±30%, you want about 10 or more observed false hits. That means about 20,000 graded hits.</li>
+</ul>
+<p>Humans cannot grade 20,000 pairs a week. The usual design is an LLM grader that compares each sampled (query, cached query, answer) triple and flags doubtful ones, with people reviewing the flags and a small random slice of the passes. Calibrate the grader against human labels first, and recheck it every time you change the grader prompt or model.</p>
+<p>Sample by hit count, not uniformly. One entry hit 9,000 times a day deserves far more scrutiny than one hit twice.</p>
+
+<h3 id=dd-semantic-caching-memory level=3>Memory and throughput</h3>
+<p>Assume 2,000,000 entries, a 768-dimension embedding model, and answers averaging 1.5 KB.</p>
+<ul>
+<li>Vectors: 2,000,000 × 768 × 4 bytes ≈ 6.1 GB at float32, 3.1 GB at float16.</li>
+<li>HNSW graph with <code>M</code> = 16: the base layer holds about 32 links per node at 4 bytes each, roughly 128 bytes, plus a little for upper layers. That is about 0.3 GB.</li>
+<li>Answers and metadata: 2,000,000 × 2 KB ≈ 4 GB, which can live in a key-value store next to the index.</li>
+</ul>
+<p>The total fits comfortably on one machine with a replica. A semantic cache does not need the sharding of the next lesson unless it is shared by a very large number of tenants.</p>
+<p>Throughput is modest too. A million queries a day averages about 12 per second. A peak of 10× is 120 per second. A small embedding model on a single GPU, or a few CPU cores for short texts, handles that with room to spare. Batch the embedding calls in windows of a few milliseconds to keep the per-query cost low.</p>
+
+<h3 id=dd-semantic-caching-latency level=3>Latency, averaged honestly</h3>
+<p>Every miss pays the lookup too. Assume the ladder costs 25 ms on a miss and a hit is served in 40 ms.</p>
+<p><code>mean = 0.27 × 40 ms + 0.73 × (2,500 + 25) ms ≈ 1,854 ms</code></p>
+<p>Without the cache, the mean is 2,500 ms. So the cache cuts mean latency by about a quarter, and it adds 25 ms (1%) to every miss. That is a good trade. But notice where the risk sits. If the index slows to 300 ms under load and nobody enforces the timeout, the cache adds 12% to every miss while saving nothing extra. The fail-open budget is not optional.</p>
+
+<h2 id=dd-semantic-caching-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-semantic-caching-fm-poison level=3>1. One bad answer, served ten thousand times</h3>
+<p><strong>Symptom.</strong> A burst of complaints about the same wrong statement, for example "orders over $50 ship free" a week after the threshold moved to $75. They arrive from many users within hours.</p>
+<p><strong>Mechanism.</strong> One generation was wrong, perhaps a hallucination or a retrieval of an outdated page. The cache admitted it. The question was popular, so the entry collected thousands of hits. A semantic cache amplifies errors in exactly the way it amplifies savings.</p>
+<p><strong>Detect.</strong> Per-entry hit counts joined with feedback signals: thumbs-down, "that's wrong" follow-ups, escalations. An entry with high hits and a rising negative rate is the one to look at. Weighted audit sampling (by hit count) finds these entries early.</p>
+<p><strong>Fix.</strong> Purge by entry ID within seconds, through an admin tool someone has already practised using. Gate admission on validation. Give new entries a short probation TTL and a higher audit rate before they earn a full TTL.</p>
+
+<h3 id=dd-semantic-caching-fm-negation level=3>2. The near-miss that means the opposite</h3>
+<p><strong>Symptom.</strong> Sampled audits show a cluster of false hits with one shape: "can I return opened items?" served the answer to "can I return unopened items?", and "cancel my order" served the subscription answer.</p>
+<p><strong>Mechanism.</strong> Embedding models capture topic well and small logical words poorly. Negations, quantities and qualifiers move a sentence only a little in the space, so pairs with opposite answers sit very close together.</p>
+<p><strong>Detect.</strong> Audit results grouped by intent, and a test set of hard negative pairs (same topic, different answer) that runs on every threshold or model change.</p>
+<p><strong>Fix.</strong> Add negation words and qualifiers to the entity guard. Use the margin test so ambiguous queries decline. For high-risk intents, add a verifier: a small cross-encoder that reads both questions together and judges whether they ask the same thing. It costs perhaps 10 to 30 ms on a hit, and it catches what geometry cannot.</p>
+
+<h3 id=dd-semantic-caching-fm-multiturn level=3>3. Follow-ups answered from someone else's conversation</h3>
+<p><strong>Symptom.</strong> A user who was asking about shoes types "what about the blue ones?" and gets an answer about blue jackets.</p>
+<p><strong>Mechanism.</strong> The cache embedded the last message alone. "What about the blue ones?" means nothing without its conversation, and the cache matched it to a fragment from a different conversation with a cached answer.</p>
+<p><strong>Detect.</strong> False hits concentrated on short queries with pronouns or no nouns. A metric for the share of hits whose query is under, say, five words is a cheap early warning.</p>
+<p><strong>Fix.</strong> Cache only standalone questions. Rewrite follow-ups into a standalone form first ("what is the return window for blue running shoes?") and use the rewrite as the cache key. If no rewrite is available, skip the cache for any turn that depends on earlier turns.</p>
+
+<h3 id=dd-semantic-caching-fm-stale level=3>4. The policy changed, and the tag purge missed</h3>
+<p><strong>Symptom.</strong> After the shipping threshold changed, most shipping answers are correct, but a few phrasings still return the old number for days.</p>
+<p><strong>Mechanism.</strong> The purge removed everything tagged <code>shipping-policy</code>. Some entries about shipping were tagged <code>orders</code> or <code>promotions</code> at write time, because the tagger saw the question, not the answer. Those survived until their TTL.</p>
+<p><strong>Detect.</strong> After every policy change, replay a set of probe questions against the cache and diff the answers against fresh generations. A canary per policy (a probe that must reflect the new value within minutes) turns this into an alert.</p>
+<p><strong>Fix.</strong> Record the <code>source_docs</code> an answer was built from, and invalidate by document ID when CDC reports a change to that document. This is precise, because it tracks what the answer actually used. Keep tags for broader purges, and keep the TTL backstop.</p>
+
+<h3 id=dd-semantic-caching-fm-scope level=3>5. A cross-tenant hit</h3>
+<p><strong>Symptom.</strong> A B2B partner's customer receives an answer naming the store's own return policy, or worse, another partner's.</p>
+<p><strong>Mechanism.</strong> The index was shared, and scope was checked after the search instead of inside it. Under load, someone raised k or removed the post-check for speed, and a neighbour from another tenant was served. Or the scope key omitted locale or brand, so two partners with similar questions collided.</p>
+<p><strong>Detect.</strong> Log the scope of the served entry next to the scope of the request, and alert on any mismatch. That count must be zero. It is a security metric, not a quality one.</p>
+<p><strong>Fix.</strong> Make scope a hard partition: a separate index or namespace per tenant, or a mandatory filter inside the search that the code cannot omit. Build the scope key from every dimension that changes the correct answer: tenant, brand, locale, permission tier.</p>
+
+<h3 id=dd-semantic-caching-fm-coldstart level=3>6. The cold cache after a restart</h3>
+<p><strong>Symptom.</strong> Inference spend jumps 35% for a few hours after a deploy. The provider's rate limits start returning errors during the busy hour.</p>
+<p><strong>Mechanism.</strong> The cache lived in process memory, or the index was rebuilt from empty after a migration. The 27% that used to hit now generates. Capacity planned with the cache in place is not enough without it.</p>
+<p><strong>Detect.</strong> Hit ratio by minute next to generation rate and spend rate. A drop in the first coincides with a jump in the other two.</p>
+<p><strong>Fix.</strong> Persist the cache outside the gateway process and warm a new index before cutting over. Plan provider quota for the no-cache case, or at least for a partially warm one. Treat the cache's hit ratio as a capacity dependency, just as you would treat a database replica.</p>
+
+<h3 id=dd-semantic-caching-fm-drift level=3>7. The hit ratio that rises for no reason</h3>
+<p><strong>Symptom.</strong> The hit ratio climbs from 27% to 33% over two weeks. The cost dashboard looks great. Then a sampled audit shows the false-hit rate has tripled.</p>
+<p><strong>Mechanism.</strong> Two common causes. The query mix changed (a holiday season brings many questions near, but not equal to, cached ones). Or the provider updated the embedding model behind an unchanged name, and scores shifted upward across the board.</p>
+<p><strong>Detect.</strong> Track the distribution of best-neighbour scores, not just the hit ratio. A shift in the median score with no change in traffic points at the model. Pin embedding model versions explicitly where the provider allows it.</p>
+<p><strong>Fix.</strong> Treat an unexplained rise in hit ratio as an incident to investigate, not a win. Re-run the labelled threshold set weekly. If the model changed, follow the migration playbook and retune the threshold.</p>
+
+<h2 id=dd-semantic-caching-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-semantic-caching-what-to-cache level=3>What to cache: the answer, or the retrieval</h3>
+<p>The lesson caches whole answers. In a RAG system there is a less risky option one layer down: cache the <em>retrieval result</em>, meaning the list of chunk IDs for a question, and still generate the answer fresh.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th></th><th>Cache the answer</th><th>Cache the retrieval</th><th>Cache curated answers only</th></tr></thead><tbody>
+<tr><td>Saves</td><td>Generation, the expensive part</td><td>Embedding, search, rerank (~75 ms, a little money)</td><td>Generation, for the top meanings</td></tr>
+<tr><td>Cost of a false hit</td><td>A wrong answer</td><td>Weaker context; the model may still answer well or say it does not know</td><td>A wrong but reviewed answer, so rare</td></tr>
+<tr><td>Freshness</td><td>Invalidate on source change</td><td>Chunk IDs re-read current text, so edits apply at once</td><td>Reviewed on policy change</td></tr>
+<tr><td>Threshold</td><td>High</td><td>Can be looser</td><td>Moderate, the answer is vetted</td></tr>
+<tr><td>Fits</td><td>Stable, impersonal, high repetition</td><td>Latency-sensitive RAG, moderate repetition</td><td>Regulated or brand-sensitive domains</td></tr>
+</tbody></table></div></div>
+<p>Retrieval caching saves little money, because generation dominates the cost. Its value is safety and latency. Curated answers trade coverage for near-zero risk. Many teams run both: curated answers for the top 200 meanings, and guarded answer caching for the rest.</p>
+
+<h3 id=dd-semantic-caching-match-decision level=3>How the match is decided</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach</th><th>Added latency on a hit</th><th>False-hit control</th><th>Operational cost</th></tr></thead><tbody>
+<tr><td>One global cosine threshold</td><td>None</td><td>Weak, the number is not portable</td><td>Lowest</td></tr>
+<tr><td>Per-intent thresholds</td><td>Classifier, a few ms</td><td>Better, tuned to how answers branch</td><td>One labelled set per intent</td></tr>
+<tr><td>Threshold plus entity and negation guard</td><td>A few ms</td><td>Catches the most common false hits</td><td>Maintain the extractor</td></tr>
+<tr><td>Cross-encoder verifier on candidates</td><td>~10 to 30 ms</td><td>Strong, reads both questions together</td><td>A second model on the hot path</td></tr>
+<tr><td>LLM judge on every hit</td><td>Hundreds of ms</td><td>Strong</td><td>Eats much of the saving</td></tr>
+</tbody></table></div></div>
+<p>The usual production stack is the third row everywhere, plus the fourth for intents where a false hit is expensive. Using an LLM to judge every hit is a trap. It spends a fair share of the generation cost to avoid paying for a generation.</p>
+
+<h3 id=dd-semantic-caching-placement level=3>Where the cache sits, and what goes in the key</h3>
+<ul>
+<li><strong>At the gateway</strong>, as the lesson recommends, so every team shares one cache and one audit process. The cost is that the gateway must know scopes and intents, which pulls product knowledge into a platform component.</li>
+<li><strong>In each application</strong>, when the products are very different (support answers and marketing copy share nothing). Simpler ownership, no cross-product sharing.</li>
+<li><strong>The key namespace</strong> should include everything that changes the correct answer: tenant, locale, permission scope, prompt version, generation model family, and embedding model version. Leave one out and the cache will eventually serve an answer that was right under different rules.</li>
+</ul>
+
+<h3 id=dd-semantic-caching-vs-prompt-caching level=3>Next to provider prompt caching</h3>
+<p>The two caches stack, and they work on different things. Prompt caching keeps the model's attention state (the KV cache) for a byte-identical prefix, such as a long system prompt and a fixed policy document. A request that shares the prefix skips recomputing it, which saves input cost and time to first token. It never changes the answer, because the model still reads the rest of the prompt and generates.</p>
+<p>The design consequence: keep the stable parts of the prompt at the front and identical across requests, so semantic-cache misses still get prefix-cache hits. Put per-request material (retrieved chunks, the question) at the end. Exact pricing, minimum prefix lengths and cache lifetimes vary by provider, so check the current documentation rather than designing around a remembered number.</p>
+
+<h2 id=dd-semantic-caching-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the measured repetition rate by meaning on real traffic, and what hit ratio does the business case assume?</li>
+<li>Which intents are allowed into the shared cache, and what stops personal or account questions before they reach the index?</li>
+<li>Which embedding model and version are used, is the version pinned, and is it stored on every entry and used as a search filter?</li>
+<li>How was the threshold chosen: on which labelled set, of what size, with which hard negatives, and who signed off on the false-hit rate?</li>
+<li>What does the entity guard compare (order numbers, SKUs, amounts, dates, negations), and is there a margin test for ambiguous queries?</li>
+<li>Is tenant and permission scope a hard partition or mandatory search filter, and is a scope mismatch logged as a security event?</li>
+<li>How are follow-up turns handled: rewritten to standalone questions, or excluded from the cache?</li>
+<li>What is the admission policy? Can an unvalidated or one-off answer enter the cache?</li>
+<li>How are entries invalidated when a source document, the system prompt, or the generation model changes? Is there a TTL backstop?</li>
+<li>What is the audit design: sample size, weighting by hit count, grader calibration, and who reads the results each week?</li>
+<li>What is the lookup's latency budget, and does a slow or failed index fail open to generation?</li>
+<li>Is provider quota sized for a cold or partly warm cache after a restart or migration?</li>
+</ol>
+
+<h2 id=dd-semantic-caching-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Why not ask an LLM whether the cached question matches before serving?"</summary>
+<p>Because it spends a large share of what the cache saves. A judge call adds hundreds of milliseconds and a real fraction of a generation's cost to every hit. The cache exists to avoid that. The better tool is a small cross-encoder verifier, which reads both questions together, runs in tens of milliseconds, and is used only for intents where a false hit is costly. Keep the LLM judge for offline audits, where its cost buys measurement rather than sitting on the hot path.</p>
+</details>
+
+<details>
+<summary>"Your audits found zero false hits in 1,000 samples. Is the false-hit rate zero?"</summary>
+<p>No. By the rule of three, zero in 1,000 only says the rate is probably below 0.3%, which is six times the lesson's target. To support "below 0.05%" you need about 6,000 clean samples. And sample by hit count, because the entries served most often carry most of the risk. A popular entry that is wrong does more damage than a hundred rare ones.</p>
+</details>
+
+<details>
+<summary>"How do you invalidate when one paragraph of the returns policy changes?"</summary>
+<p>Store the source documents and their versions on each entry when you write it. When CDC reports a change to the returns policy document, delete every entry whose <code>source_docs</code> include it. That is a precise, indexed delete, not a fuzzy one. Topic tags remain for broader purges, such as "everything about shipping", and the TTL catches anything both missed. Without source tracking you are relying on the tagger having guessed correctly at write time.</p>
+</details>
+
+<details>
+<summary>"Hit ratio went from 27% to 33% overnight with no change on our side. Good news?"</summary>
+<p>Probably not. Real repetition does not jump overnight. Check the distribution of best-neighbour scores. If the whole distribution moved up, the embedding model probably changed behind its name, and the threshold now admits pairs it used to reject. Pull a weighted audit sample immediately, pin the model version, and treat it as a migration. If the scores did not move, look at the traffic: a single viral question can produce a real but temporary jump.</p>
+</details>
+
+<details>
+<summary>"How does single-flight work when the key is fuzzy?"</summary>
+<p>Keep a small in-flight index of the embeddings of questions currently being generated, each with a future. A new miss searches that index with the same threshold and guards it would use on the main cache. If it matches, it subscribes to the in-flight stream and waits, with a timeout, instead of generating. When the generation finishes, the entry moves to the main cache, subject to admission, and the in-flight record is removed. The timeout matters: if the first generation hangs, waiters must not hang with it.</p>
+</details>
+
+<details>
+<summary>"Could an attacker poison a shared semantic cache?"</summary>
+<p>Yes, if user-controlled text can shape a cached answer. Suppose answers are generated with user-supplied context, such as a pasted document or a product review that contains injected instructions. A crafted request could then produce a harmful answer to a common question and get it cached for everyone. The defences are structural. Never cache answers whose prompt contained user-supplied or personal content. Validate before admission. Put new entries on a probation period with heavier auditing. Keep a fast purge by entry ID.</p>
+</details>
+
+<details>
+<summary>"Where does this cache sit relative to retrieval in a RAG pipeline, and why?"</summary>
+<p>Before retrieval, so a hit skips embedding the question against the corpus, the search, the rerank and the generation. That also means a hit must respect everything retrieval would have enforced. The cache key includes the tenant and permission scope, so a hit never returns an answer built from documents the asker could not retrieve. A cheaper variant caches the retrieval result after the ACL filter and still generates. It saves less, but a false hit there only weakens the context instead of serving a wrong answer.</p>
+</details>
+
+<details>
+<summary>"You are moving to a better embedding model. Walk through the cache side of the migration."</summary>
+<p>Build a v2 index beside v1 by re-embedding every entry's stored <code>query_text</code> with the new model. Retune the threshold on the labelled set using v2 scores. Do not reuse 0.94. Run v2 in shadow: for live queries, look up in both and log where the decisions differ, then audit the differences. Cut over by intent or tenant, keep v1 readable for rollback, and retire it when v2's audited false-hit rate matches. Every lookup filters on model version throughout, so a v2 query never scores against a v1 vector.</p>
+</details>

@@ -1,0 +1,280 @@
+<h2 id=dd-stream-processing-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson names five ideas: keyed state, checkpoint plus rewind, windows, event time, and watermarks. Each one is a concrete data structure or protocol inside the engine. This section uses Apache Flink's names, because Flink exposes the most of the machinery. Kafka Streams and Spark Structured Streaming come at the end, since they make different choices that change how they fail.</p>
+
+<h3 id=dd-stream-processing-keyed-state level=3>Where keyed state lives: key groups</h3>
+<p>The lesson says "all events for card X go to the instance that holds card X's state." Flink does not map keys to instances directly. It adds a layer in between called <strong>key groups</strong>.</p>
+<ul>
+<li>Each key is hashed into one of N key groups, where N is the job's <strong>max parallelism</strong>.</li>
+<li>Each parallel instance of the operator (a <strong>subtask</strong>) owns a contiguous range of key groups.</li>
+<li>State is stored and checkpointed per key group.</li>
+</ul>
+<p>The indirection exists for rescaling. Moving from 8 to 12 subtasks reassigns key-group ranges; it never rehashes individual keys. Each new subtask downloads only the key groups it now owns. The cost is that max parallelism is fixed for the life of the state. You can scale up to it, never past it, without starting state from scratch. Flink derives a default from the initial parallelism, with a floor of 128. Set it explicitly, with headroom, before the first production deploy.</p>
+
+<h3 id=dd-stream-processing-backends level=3>State backends: heap or RocksDB</h3>
+<p>The state itself sits in a <strong>state backend</strong>. Flink offers two kinds, and the choice decides your memory profile and your recovery time.</p>
+<ul>
+<li><strong>Heap</strong> (<code>HashMapStateBackend</code>) keeps state as Java objects. Reads and writes are fast. State must fit in memory, and large heaps bring long garbage-collection pauses.</li>
+<li><strong>RocksDB</strong> (<code>EmbeddedRocksDBStateBackend</code>) keeps state in an embedded key-value store on local disk, with a memory cache in front. State can be far larger than memory. Every access serializes and deserializes, so per-event cost is higher. It also supports <strong>incremental checkpoints</strong>, which upload only the files that changed since the last checkpoint.</li>
+</ul>
+<p>The lesson's fraud job has megabytes of state and should use the heap. A sessionization job with millions of open sessions should use RocksDB. Kafka Streams uses RocksDB by default for its state stores. Spark Structured Streaming has a default store kept in executor memory and an optional RocksDB store for large state.</p>
+<p><strong>State TTL</strong> belongs in the same decision. Keyed state lives until code clears it. A dedupe set of order IDs, or a "last seen" timestamp per device, grows forever unless you configure a time-to-live or register a timer that deletes it. Most unbounded-state incidents come from state nobody planned to expire.</p>
+
+<h3 id=dd-stream-processing-barriers level=3>Checkpoints: barriers through the dataflow</h3>
+<p>"Snapshot all state with the matching log position" sounds simple, until you notice that the job never stops. Different operators are processing different events at every instant. Flink's answer is <strong>asynchronous barrier snapshotting</strong>, a variant of the Chandy–Lamport distributed snapshot algorithm.</p>
+<ol>
+<li>The checkpoint coordinator tells every source to start checkpoint <em>n</em>. Each source records its current offsets and injects a <strong>barrier</strong> into its output stream. The barrier is a marker that flows with the data.</li>
+<li>When an operator receives barrier <em>n</em> on an input, every event before it belongs to checkpoint <em>n</em>, and every event after belongs to <em>n</em>+1.</li>
+<li>An operator with several inputs <strong>aligns</strong>: it waits until barrier <em>n</em> has arrived on all inputs, buffering post-barrier events from the faster ones. Then it snapshots its state and forwards the barrier.</li>
+<li>The snapshot is written asynchronously, usually to object storage, so processing resumes immediately.</li>
+<li>When every operator and sink has acknowledged, the coordinator marks checkpoint <em>n</em> complete.</li>
+</ol>
+<p>The result is a consistent cut. Every operator's state reflects exactly the events before the barrier, and the sources' offsets say where to resume. On failure, the job restores all state from the last completed checkpoint and rewinds each source to its recorded offset.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-stream-processing-svg-title dd-stream-processing-svg-desc" viewBox="0 0 720 280" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-stream-processing-svg-title">Checkpoint barriers flowing through a streaming job</title>
+<desc id="dd-stream-processing-svg-desc">Two source partitions each inject a barrier for checkpoint n into their streams and record their offsets. The barriers flow with the events to a keyed operator. The operator has received barrier n from partition 0 and is buffering partition 0's later events while it waits for barrier n from partition 1. Once both arrive, it snapshots its state to durable storage and forwards the barrier to the sink.</desc>
+<defs><marker id="dd-stream-processing-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="280" fill="#ffffff"/>
+<rect x="20" y="40" width="120" height="50" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="80" y="62" font-size="13" fill="#1c2430" text-anchor="middle">Partition 0</text>
+<text x="80" y="80" font-size="11" fill="#5c6b7c" text-anchor="middle">offset 9,120 saved</text>
+<rect x="20" y="150" width="120" height="50" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="80" y="172" font-size="13" fill="#1c2430" text-anchor="middle">Partition 1</text>
+<text x="80" y="190" font-size="11" fill="#5c6b7c" text-anchor="middle">offset 8,874 saved</text>
+<line x1="140" y1="65" x2="406" y2="105" stroke="#1c2430" marker-end="url(#dd-stream-processing-arrow)"/>
+<line x1="140" y1="175" x2="406" y2="140" stroke="#1c2430" marker-end="url(#dd-stream-processing-arrow)"/>
+<circle cx="200" cy="74" r="6" fill="#7ea4c8"/><circle cx="240" cy="80" r="6" fill="#7ea4c8"/>
+<rect x="356" y="88" width="6" height="22" fill="#c4502f"/>
+<text x="360" y="82" font-size="11" fill="#c4502f" text-anchor="middle">barrier n</text>
+<circle cx="200" cy="167" r="6" fill="#7ea4c8"/>
+<rect x="246" y="148" width="6" height="22" fill="#c4502f"/>
+<text x="250" y="186" font-size="11" fill="#c4502f" text-anchor="middle">barrier n (late)</text>
+<circle cx="300" cy="153" r="6" fill="#7ea4c8"/><circle cx="335" cy="148" r="6" fill="#7ea4c8"/>
+<rect x="410" y="80" width="150" height="80" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="485" y="104" font-size="13" fill="#1c2430" text-anchor="middle">Keyed operator</text>
+<text x="485" y="122" font-size="11" fill="#5c6b7c" text-anchor="middle">aligning: buffers p0</text>
+<text x="485" y="137" font-size="11" fill="#5c6b7c" text-anchor="middle">until p1's barrier arrives</text>
+<text x="485" y="152" font-size="11" fill="#5c6b7c" text-anchor="middle">then snapshots state</text>
+<rect x="600" y="95" width="100" height="50" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="650" y="117" font-size="13" fill="#1c2430" text-anchor="middle">Sink</text>
+<text x="650" y="134" font-size="11" fill="#5c6b7c" text-anchor="middle">commit on n</text>
+<line x1="560" y1="120" x2="596" y2="120" stroke="#1c2430" marker-end="url(#dd-stream-processing-arrow)"/>
+<rect x="410" y="210" width="150" height="50" rx="8" fill="#fbf3e4" stroke="#c4ae86"/>
+<text x="485" y="232" font-size="13" fill="#1c2430" text-anchor="middle">Durable storage</text>
+<text x="485" y="249" font-size="11" fill="#5c6b7c" text-anchor="middle">state + offsets for n</text>
+<line x1="485" y1="160" x2="485" y2="206" stroke="#1c2430" stroke-dasharray="4 3" marker-end="url(#dd-stream-processing-arrow)"/>
+<text x="20" y="250" font-size="12" fill="#5c6b7c">Events left of a barrier belong to checkpoint n;</text>
+<text x="20" y="267" font-size="12" fill="#5c6b7c">events right of it belong to n+1.</text>
+</svg>
+<figcaption>Alignment is why a backpressured input slows every checkpoint: the operator cannot snapshot until the slowest barrier arrives.</figcaption>
+</figure>
+
+<p>The knobs, and what each trades:</p>
+<ul>
+<li><strong>Checkpoint interval.</strong> Shorter means less replay after a crash and, with transactional sinks, lower output latency. It also means more upload traffic and more time spent aligning.</li>
+<li><strong>Minimum pause between checkpoints.</strong> Guarantees processing time between them, so a slow checkpoint does not start the next one immediately.</li>
+<li><strong>Checkpoint timeout</strong> and <strong>tolerable failed checkpoints.</strong> How long one may take, and how many may fail in a row before the job restarts.</li>
+<li><strong>Unaligned checkpoints.</strong> Instead of waiting, the operator forwards the barrier at once and stores the in-flight buffered events as part of the snapshot. Checkpoints stay fast under backpressure. Snapshots get larger, and recovery has more to restore.</li>
+</ul>
+<p>A <strong>savepoint</strong> uses the same mechanism, triggered by a person and kept until deleted. Upgrades, rescaling and migrations go through savepoints: stop with a savepoint, deploy the new code, start from it. For this to work, each stateful operator needs a stable ID (<code>uid()</code> in Flink). Without one, a code change can renumber operators, and the new job will not find its state.</p>
+
+<h3 id=dd-stream-processing-sinks level=3>How sinks turn replay into exactly-once output</h3>
+<p>A checkpoint makes <em>state</em> exactly-once. After a crash, state is as if each event was applied once. Output is different. Anything the sink emitted after the last checkpoint is emitted again on replay. The lesson's duplicate alerts are this. There are three ways to deal with it:</p>
+<ol>
+<li><strong>At-least-once with idempotent writes.</strong> The sink writes with a deterministic key, such as an upsert on <code>(card_id, window_id)</code>. A replayed write overwrites itself. Latency stays low.</li>
+<li><strong>Transactional, two-phase commit.</strong> The sink opens a transaction per checkpoint, writes into it, <em>pre-commits</em> when the barrier arrives, and commits only when the checkpoint completes. Flink's Kafka sink does this with Kafka transactions, and downstream consumers must read with <code>isolation.level=read_committed</code>.</li>
+<li><strong>At-least-once, and the consumer copes.</strong> Fine for metrics where a brief double count is harmless, and wrong for alerts and money.</li>
+</ol>
+<p>Option 2 has a cost people miss: <strong>output becomes visible only at checkpoint completion</strong>. With a 30-second interval, a read-committed consumer sees results up to 30 seconds late, even though processing took 200 ms. A fraud alert path should use option 1. Option 2 suits pipelines feeding other pipelines, where correctness matters more than seconds.</p>
+<p>Transactional sinks also have a timeout trap. Kafka aborts a transaction that stays open longer than its <code>transaction.timeout.ms</code>, and brokers cap that at <code>transaction.max.timeout.ms</code> (15 minutes by default). If a job fails and takes longer than the timeout to restart, the pre-committed data is gone when it tries to commit. Size the timeout above the checkpoint interval plus your worst realistic recovery time, within the broker's cap. The <a href="#exactlyonce-semantics">Exactly-Once Semantics</a> lesson goes further into these protocols.</p>
+
+<h3 id=dd-stream-processing-watermarks level=3>Watermarks as data, not a clock</h3>
+<p>A watermark is not computed centrally. It is a special record that flows through the job, like a barrier.</p>
+<ul>
+<li>Each source partition generates watermarks from the timestamps it sees. The common strategy is <strong>bounded out-of-orderness</strong>: watermark = largest event time seen − allowed delay.</li>
+<li>An operator with several inputs takes the <strong>minimum</strong> of their watermarks. It can only claim "seen everything through 9:05" if every input agrees.</li>
+<li>When an operator's watermark passes a window's end, it fires the window's event-time timer and emits the result.</li>
+</ul>
+<p>The minimum rule has a nasty corollary. One Kafka partition with no traffic stops advancing its watermark, and it holds back the watermark for the entire job. Windows stop closing everywhere. Flink's <code>withIdleness()</code> marks a quiet partition as idle so the others can advance without it. The failure modes section covers what goes wrong in both directions.</p>
+<p>Lateness is then handled in three tiers. Events before the watermark are on time. Events after it but within <strong>allowed lateness</strong> re-fire the window with an updated result; the window's state is kept that long. Events later than that go to a <strong>side output</strong> for reconciliation, or are dropped and counted.</p>
+
+<h3 id=dd-stream-processing-windows-impl level=3>What windows cost in state</h3>
+<p>Window types are a modelling choice in the lesson. In the engine they are a state-size choice.</p>
+<ul>
+<li>A <strong>tumbling</strong> window holds one accumulator per key per open window.</li>
+<li>A <strong>sliding</strong> window of size S and slide D assigns each event to S / D windows. "10 minutes every 30 seconds" puts every event into 20 windows, so it holds 20 accumulators per key.</li>
+<li>A <strong>session</strong> window starts as a window per event and <em>merges</em> windows when they overlap within the gap. Merging is more work, and one late event can glue two sessions into one.</li>
+</ul>
+<p>For "more than 5 orders in any 10 minutes", the built-in sliding window is not the only option. A keyed process function can keep a small ring of per-minute counts per card, ten buckets, and check the sum on every event. That is one structure per key instead of 20 windows, and it alerts on the triggering event instead of on the next slide boundary.</p>
+
+<h3 id=dd-stream-processing-other-engines level=3>Kafka Streams and Spark Structured Streaming</h3>
+<p><strong>Kafka Streams</strong> is a library, not a cluster. Your service instances form a consumer group, and each instance processes some partitions. State lives in local RocksDB stores. Every store is backed by a compacted <strong>changelog topic</strong> in Kafka, which is the durability mechanism; there are no separate checkpoints. Recovery means replaying the changelog into a fresh local store, which can take a long time for large state. <code>num.standby.replicas</code> keeps warm copies on other instances to make failover fast. Re-keying an operation writes through an internal <strong>repartition topic</strong>, so a <code>groupBy</code> on a new key costs an extra round trip through Kafka. Exactly-once is a setting (<code>processing.guarantee=exactly_once_v2</code>) built on Kafka transactions, and it applies only to Kafka-to-Kafka flows.</p>
+<p><strong>Spark Structured Streaming</strong> runs a micro-batch per trigger. Each batch first writes the offset range it will read to an <strong>offset log</strong> in the checkpoint location, then processes it, then writes a <strong>commit log</strong> entry. On restart, a batch logged but not committed is rerun with the same offsets. State lives in a per-partition state store, versioned per batch. Watermarks are set with <code>withWatermark()</code>, and the <strong>output mode</strong> (append, update, complete) decides whether a window's result is emitted once after the watermark passes, or on every change. The latency floor is the trigger interval plus batch planning, typically around a second at best. Spark also offers a continuous processing mode, but it supports a limited set of operations.</p>
+
+<h2 id=dd-stream-processing-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The running example is the fraud job plus a heavier neighbour: a clickstream sessionization job. Assumptions are stated each time.</p>
+
+<h3 id=dd-stream-processing-size-throughput level=3>Throughput and parallelism</h3>
+<p>Assume orders peak at 4,000 events/s on sale days, ten times the normal 400/s. Suppose one subtask of the fraud operator handles 20,000 events/s with heap state (a simple keyed count is cheap). The job needs one subtask for throughput. Run at least 4 for fault isolation and headroom, and make the orders topic's partition count a multiple of that, say 12.</p>
+<p>The clickstream is bigger: 100,000 events/s at peak, 1 KB each, so 100 MB/s into the job. With RocksDB state, assume one subtask handles 10,000 events/s. That gives 10 subtasks at full load; plan for 20, so peak runs at 50%. The source topic should have at least as many partitions as source subtasks, or some subtasks will sit idle. 40 partitions leaves room to double.</p>
+
+<h3 id=dd-stream-processing-size-state level=3>State size and checkpoint size</h3>
+<p><strong>Fraud job.</strong> 200,000 active cards. With a built-in sliding window (10 min, every 30 s), that is 20 windows per card. At an assumed 100 bytes per window entry with overhead: 200,000 × 20 × 100 B = <strong>400 MB</strong>. With a ring of ten one-minute counters per card, about 200 bytes per card: 200,000 × 200 B = <strong>40 MB</strong>. The modelling choice is a 10x state difference.</p>
+<p><strong>Clickstream sessions.</strong> 5 million open sessions × 2 KB each (page list, counters, timestamps) = <strong>10 GB</strong> of state. Spread across 20 subtasks, that is 500 MB each, which suits RocksDB. A full checkpoint uploads 10 GB. Incremental checkpoints upload only the changed RocksDB files. If 15% of state changes per minute, a 60-second checkpoint uploads about 1.5 GB, which is 25 MB/s of steady object-storage traffic. That is a real line in the network budget.</p>
+
+<h3 id=dd-stream-processing-size-recovery level=3>Recovery time</h3>
+<p>Recovery has three parts. Write them down separately, because each has its own fix.</p>
+<ol>
+<li><strong>Detect and restart:</strong> heartbeat timeout plus scheduling. Commonly tens of seconds.</li>
+<li><strong>Restore state:</strong> 500 MB per subtask from object storage. At 100 MB/s per subtask, about 5 s. With 10 GB on a single instance it would be 100 s. Local recovery (keeping a copy of state on local disk) can skip most of this.</li>
+<li><strong>Replay the gap:</strong> the events since the last checkpoint, plus the events that arrived during steps 1 and 2.</li>
+</ol>
+<p>Step 3 is where headroom matters. Suppose arrival rate λ = 100,000/s, the job's maximum rate μ = 200,000/s, and the outage lasted 60 s (a 30 s average checkpoint age plus 30 s of restart). The backlog is 60 × 100,000 = 6 million events. It drains at μ − λ = 100,000/s, so catching up takes <strong>60 s</strong>. At 80% utilization (μ = 125,000/s), the same backlog drains at 25,000/s and takes <strong>240 s</strong>. At 95% it takes 20 minutes. The general form:</p>
+<pre><code>catch_up_seconds = outage_seconds × λ / (μ − λ)</code></pre>
+<p>A streaming job that runs near full capacity in steady state cannot recover in any useful time. Plan for 50–70% utilization at peak.</p>
+
+<h3 id=dd-stream-processing-size-watermark level=3>Choosing the watermark delay from data</h3>
+<p>Do not guess the delay. Measure lateness: for each event, compute processing time − event time, and look at the distribution. Suppose for orders it is:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Percentile<th>Lateness<th>Watermark delay that covers it<th>Window results emitted after<tbody><tr><td>p50<td>0.3 s<td>1 s<td>Window end + 1 s<tr><td>p99<td>8 s<td>10 s<td>Window end + 10 s<tr><td>p99.9<td>45 s<td>60 s<td>Window end + 60 s<tr><td>p99.99<td>12 min<td>15 min<td>Window end + 15 min</table></div></div>
+<p>Each row is a different product. A 10-second delay means about 1 in 100 events arrives after its window closed. For a per-minute chart that is fine. For a billing aggregate it is not: use a long allowed lateness or a side output, and reconcile. The fraud rule can use the 10-second delay and still re-fire on late events, because the lesson's policy updates the count anyway.</p>
+<p>Allowed lateness also costs state. Every window stays in state until watermark + allowed lateness. A 15-minute allowed lateness on one-minute windows keeps about 16 windows per key alive instead of one.</p>
+
+<h3 id=dd-stream-processing-size-latency level=3>End-to-end latency budget</h3>
+<p>The lesson's 200 ms path, broken down with assumed values:</p>
+<ul>
+<li>Producer batching (<code>linger.ms</code>) and broker write with replication: 5–20 ms.</li>
+<li>Consumer fetch wait (<code>fetch.max.wait.ms</code> when traffic is light) and network: 5–100 ms.</li>
+<li>Network buffers between operators: Flink flushes buffers on a timeout (<code>execution.buffer-timeout</code>, 100 ms by default), so a quiet stream can wait that long at each exchange.</li>
+<li>Operator work: under 1 ms for a counter.</li>
+<li>Sink write: 5–50 ms.</li>
+</ul>
+<p>Two things can add far more. A transactional sink adds up to a full checkpoint interval. A window result waits for its watermark, so it adds the watermark delay plus whatever is left of the window. If the product needs a sub-second alert, check that neither sits on the alert's path.</p>
+
+<h2 id=dd-stream-processing-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-stream-processing-fm-idle level=3>1. The dashboard that froze at 3 AM</h3>
+<p><strong>Symptom.</strong> The orders-per-minute chart stops updating overnight. The job is healthy, consumer lag is zero, and events are flowing.</p>
+<p><strong>Mechanism.</strong> The orders topic has 12 partitions, keyed by region. At 3 AM one region has no orders, so its partition receives nothing and its watermark stops moving. The window operator's watermark is the minimum of its inputs, so it stops too. No window can close, so no results come out.</p>
+<p><strong>Detect.</strong> Watermark lag: wall clock minus the operator's current watermark (Flink reports <code>currentOutputWatermark</code> per operator). Alert when it grows past a few times the configured delay. Per-partition event rates show one at zero.</p>
+<p><strong>Fix.</strong> Configure idleness on the source (<code>withIdleness(Duration.ofMinutes(1))</code>), so a quiet partition stops holding the watermark back. Know the trade: when the idle partition wakes up, its first events may already be behind the advanced watermark and count as late. Pair idleness with allowed lateness or a side output for the paths that care.</p>
+
+<h3 id=dd-stream-processing-fm-skew-clock level=3>2. One phone from the future</h3>
+<p><strong>Symptom.</strong> From mid-morning, the late-events counter jumps and the dashboard drops nearly every event. Totals for the day come out at a fraction of the real numbers.</p>
+<p><strong>Mechanism.</strong> A client with its clock set a year ahead sent events timestamped next year. Bounded out-of-orderness takes the <em>maximum</em> event time seen, so that partition's watermark jumped forward a year. Every normal event behind it became "late" and was dropped by the late-data policy. Event time trusts timestamps, and a single bad one can poison the watermark.</p>
+<p><strong>Detect.</strong> Max event time minus wall clock, per partition. Any positive value beyond a small tolerance is suspicious. Flink's late-record counter (<code>numLateRecordsDropped</code>) jumping from near zero. Watermark lag going <em>negative</em>.</p>
+<p><strong>Fix.</strong> Never trust client timestamps raw. Clamp event time to the ingest timestamp plus a small tolerance, or reject and side-output events too far ahead. Use broker or server receive time as the bound. Keep both timestamps on the event, so you can reprocess with a corrected rule.</p>
+
+<h3 id=dd-stream-processing-fm-checkpoint-timeout level=3>3. The restart loop under load</h3>
+<p><strong>Symptom.</strong> During a sale, the job restarts every 20 minutes. Each restart replays more data, lag grows, and output goes quiet for minutes at a time.</p>
+<p><strong>Mechanism.</strong> A slow sink caused backpressure. Buffers filled, so barriers queued behind data and alignment took minutes. Checkpoints began to time out. After the tolerated number of failed checkpoints, the job restarted from the last good one, which was now old. The replay added more load, which caused more backpressure. The system was spending its capacity re-doing work.</p>
+<p><strong>Detect.</strong> Checkpoint duration and alignment time trending up. Backpressure metrics (<code>backPressuredTimeMsPerSecond</code> high on the operators upstream of the slow one, <code>busyTimeMsPerSecond</code> high on the slow one). Checkpoint failure count rising before each restart.</p>
+<p><strong>Fix.</strong> Treat the slow operator first: batch sink writes, add sink parallelism, or put the sink behind an async I/O operator with a bounded queue. Enable unaligned checkpoints so snapshots complete under backpressure. Raise tolerable checkpoint failures so a short spike does not cause a restart. And keep the utilization headroom from the sizing section. The <a href="#backpressure">Backpressure</a> lesson covers the signal itself.</p>
+
+<h3 id=dd-stream-processing-fm-hot-key level=3>4. The merchant that saturated one subtask</h3>
+<p><strong>Symptom.</strong> A per-merchant revenue job falls behind on a flash-sale day. Eleven subtasks are idle; one is at 100% busy. Adding parallelism changes nothing.</p>
+<p><strong>Mechanism.</strong> Keyed routing sends all events for one key to one subtask. One merchant running a flash sale produced 60% of the events. More subtasks do not help, because the key cannot be split. This is the stream form of the hot-key problem from <a href="#sharding">Sharding</a> and the skewed reducer in <a href="#mapreduce">MapReduce</a>.</p>
+<p><strong>Detect.</strong> Per-subtask records-in rate and busy time: one outlier. Consumer lag concentrated on the partitions that carry that key.</p>
+<p><strong>Fix.</strong> Two-phase aggregation. First key by <code>(merchant, hash(order_id) mod 16)</code> and pre-aggregate per short window; then key by merchant and sum the 16 partials. The second stage sees 16 events per merchant per window instead of thousands. Flink SQL has this built in for some aggregations (local-global aggregation and split-distinct). This works for associative aggregates; it does not work for per-key logic that must see every event in order, such as a state machine.</p>
+
+<h3 id=dd-stream-processing-fm-state-growth level=3>5. State that never stops growing</h3>
+<p><strong>Symptom.</strong> Over six weeks, checkpoint size climbs from 2 GB to 400 GB. Checkpoints take longer each week, local disks fill, and finally a restore takes 40 minutes.</p>
+<p><strong>Mechanism.</strong> A dedupe step keeps every order ID it has seen, so replayed events are dropped. Nobody gave the state a TTL. Each new key adds a few dozen bytes, forever. A similar leak comes from keying by something unbounded, like session ID, with no timer to clear state when the session ends.</p>
+<p><strong>Detect.</strong> Checkpoint size as a time series. Healthy state plateaus; a leak grows in a straight line with traffic. RocksDB's estimated number of keys, if exposed.</p>
+<p><strong>Fix.</strong> Give every piece of keyed state a lifetime: state TTL set to the longest replay or duplicate window you need (for dedupe, a bit longer than the producer's retry horizon), or an event-time timer that clears state when a session or window can no longer change. Fixing a leak in a running job may need a savepoint, a code change, and a one-time cleanup, so add the TTL on day one.</p>
+
+<h3 id=dd-stream-processing-fm-lost-state level=3>6. The deploy that reset every counter</h3>
+<p><strong>Symptom.</strong> After a routine deploy, fraud alerts stop for 10 minutes, then resume. Investigation shows the ring's first six orders after the deploy did not trigger an alert.</p>
+<p><strong>Mechanism.</strong> The deploy pipeline cancelled the job and started the new version from the latest Kafka offsets, not from a savepoint. Or it did use a savepoint, but a refactor changed the operator graph, the stateful operator had no explicit <code>uid()</code>, and the new job could not match it. The deploy pipeline was configured to allow unmatched state, so it started empty. Every card's count was zero again.</p>
+<p><strong>Detect.</strong> Job startup logs say whether the job was restored from a savepoint and how much state was matched. A state-size metric that drops to near zero right after a deploy. Fraud alert rate dropping right after each release.</p>
+<p><strong>Fix.</strong> Deploy only through stop-with-savepoint, then start from it. Give every stateful operator a stable <code>uid()</code>. Do not allow non-restored state unless a human approves it for that release. Test state compatibility in CI by restoring the previous release's savepoint into the new build. Schema changes to state types need the serializer to support evolution.</p>
+
+<h3 id=dd-stream-processing-fm-restore-storm level=3>7. The rolling restart that took all afternoon</h3>
+<p><strong>Symptom.</strong> A Kafka Streams service with large state is restarted one pod at a time. Each pod takes 30 minutes to become useful, the group rebalances again with every pod, and processing is degraded for hours.</p>
+<p><strong>Mechanism.</strong> When a pod leaves, its partitions move to other instances, which must rebuild those state stores from the changelog topics before they can process. When the pod comes back, partitions move again. Without standby replicas, every move replays changelogs. With eager rebalancing, every move also pauses the whole group.</p>
+<p><strong>Detect.</strong> Restoration metrics (records restored, restore time per store). Rebalance count during deploys. Lag rising on every partition each time a pod restarts.</p>
+<p><strong>Fix.</strong> Set <code>num.standby.replicas</code> to at least 1 so a warm copy is ready. Use static membership (<code>group.instance.id</code>) so a quick restart does not trigger a rebalance at all. Recent versions warm up state on the new owner before moving the active task (KIP-441), which helps if you let it finish. Keep state stores on persistent volumes, so a restarted pod reuses its local RocksDB instead of rebuilding it.</p>
+
+<h2 id=dd-stream-processing-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-stream-processing-choose-engine level=3>Choosing the engine</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th>Flink<th>Kafka Streams<th>Spark Structured Streaming<th>Managed (Dataflow, managed Flink)<tbody><tr><td>Deployment<td>Its own cluster or Kubernetes operator<td>A library inside your service<td>Spark cluster<td>Service<tr><td>Processing model<td>Per event<td>Per event<td>Micro-batch (per trigger)<td>Per event (runner-dependent)<tr><td>Latency floor<td>Milliseconds<td>Milliseconds<td>Around a second and up<td>Seconds<tr><td>State durability<td>Checkpoints to object storage<td>Changelog topics in Kafka<td>Checkpoint location, per-batch versions<td>Managed<tr><td>Sources and sinks<td>Many<td>Kafka in and out only<td>Many<td>Many<tr><td>Event time and watermarks<td>Full: idleness, allowed lateness, side outputs<td>Grace periods on windows; stream time per task<td>Watermark per query; output modes<td>Full (Beam model)<tr><td>Exactly-once<td>Checkpoints + two-phase-commit sinks<td>Kafka transactions, Kafka-to-Kafka<td>Replayable source + idempotent sink<td>Managed, runner-specific<tr><td>Best fit<td>Large stateful jobs, complex time logic<td>Services that transform Kafka topics<td>Teams already on Spark, minute budgets<td>Teams that want no cluster</table></div></div>
+<p>Choose by the budget and the team, as the lesson says. Kafka Streams is often the right first step: it runs inside a normal service, with normal deploys, and it needs no new cluster. Move to Flink when state is large, when you need sources other than Kafka, or when event-time logic outgrows grace periods. Use Spark when the team already runs Spark and the staleness budget is a minute.</p>
+
+<h3 id=dd-stream-processing-choose-sink level=3>Choosing the output guarantee</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Sink approach<th>Duplicates on replay<th>Added latency<th>Requires<th>Use for<tbody><tr><td>At-least-once, plain append<td>Yes<td>None<td>Nothing<td>Metrics where a brief double count is tolerable<tr><td>At-least-once, idempotent upsert<td>Overwritten, invisible<td>None<td>Deterministic key per result<td>Alerts, dashboards, key-value read models<tr><td>Transactional (two-phase commit)<td>No<td>Up to one checkpoint interval<td>Transactional sink; read-committed readers<td>Topic-to-topic pipelines, financial aggregates<tr><td>Dedupe at the consumer<td>Removed downstream<td>None<td>Consumer state keyed by event ID<td>Sinks you do not control</table></div></div>
+<p>Idempotent upserts are the default worth reaching for. They need only a deterministic key, which windowed results naturally have: <code>(key, window_start)</code>. Use transactions where the output is itself a log that others consume, and where an extra few seconds do not matter.</p>
+
+<h3 id=dd-stream-processing-choose-time level=3>Choosing the notion of time</h3>
+<ul>
+<li><strong>Event time</strong> for anything about what users did: fraud, billing, behaviour features, funnels. You must handle lateness and clock problems.</li>
+<li><strong>Ingestion time</strong> (the broker or gateway's receive timestamp) when client clocks are untrustworthy and the question can tolerate network delay inside its windows. It is monotonic per partition and immune to the phone from the future.</li>
+<li><strong>Processing time</strong> for operational questions about the pipeline itself: throughput, lag, rate limits. Never for business metrics.</li>
+</ul>
+<p>A common sound design records all three on every event, uses event time for windows, and clamps it with ingestion time.</p>
+
+<h3 id=dd-stream-processing-choose-join level=3>Stream joins and their state</h3>
+<p>Joins are where streaming state gets expensive, so it is worth naming the three kinds.</p>
+<ul>
+<li><strong>Stream–table (enrichment) join.</strong> Each order looks up the current customer record. The table side is kept as keyed state, often fed by <a href="#change-data-capture">CDC</a>. State size is the table size. The catch is timing: a customer updated a second before the order may not have arrived yet.</li>
+<li><strong>Interval join.</strong> Orders joined to payments within 30 minutes of each other. Each side buffers its events for the interval, so state is rate × interval × event size for both sides.</li>
+<li><strong>Unbounded join.</strong> Join any two events ever seen with the same key. State grows forever unless you set a TTL. In SQL engines this is the default for a plain <code>JOIN</code> between two streams, so check the plan.</li>
+</ul>
+
+<h2 id=dd-stream-processing-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the staleness budget for each output, and is per-event streaming actually required, or would a one-minute micro-batch do?</li>
+<li>What is the key for each stateful operator, what are its ten largest values at peak, and what happens on the subtask that owns the largest?</li>
+<li>How big is state per key and in total, including window multiplication and allowed lateness? Which state backend, and why?</li>
+<li>Does every piece of keyed state have a lifetime: a TTL or a timer that clears it?</li>
+<li>Which timestamp drives windows? How are client clocks clamped? What is the measured lateness distribution, and which percentile does the watermark delay cover?</li>
+<li>What happens to a late event on each output: dropped, re-fired, or side-output? Who decided, and is the dropped count monitored?</li>
+<li>How do idle partitions affect the watermark? Is idleness configured, and what does it do to late events?</li>
+<li>What are the checkpoint interval, timeout and tolerable failures? What does checkpoint duration look like under peak backpressure?</li>
+<li>For each sink: what happens on replay? Is it idempotent on a deterministic key, transactional, or does a consumer dedupe?</li>
+<li>What is the recovery time budget, broken into detect, restore and catch-up? What peak utilization makes catch-up fit?</li>
+<li>How is the job deployed: stop-with-savepoint, stable operator IDs, a CI test that restores the previous savepoint?</li>
+<li>How far back can the source be replayed (topic retention), and is that longer than the longest outage plus the longest backfill you would want?</li>
+</ol>
+
+<h2 id=dd-stream-processing-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"How does Flink take a consistent snapshot without stopping the job?"</summary>
+<p>Sources inject barriers into the stream and record their offsets. Each operator, on receiving the barrier from all of its inputs, snapshots its state asynchronously and forwards the barrier. Everything before the barrier is in the snapshot; everything after is not. When every operator and sink has acknowledged, the checkpoint is complete. Recovery restores every operator's state and rewinds every source to the recorded offsets, which gives a consistent cut across the whole job. Under backpressure, alignment is slow, so unaligned checkpoints forward the barrier at once and include in-flight buffers in the snapshot.</p>
+</details>
+
+<details>
+<summary>"You turned on the exactly-once Kafka sink and alert latency went from 200 ms to 30 seconds. Why?"</summary>
+<p>A transactional sink writes each checkpoint's output inside a Kafka transaction and commits only when the checkpoint completes. Consumers reading with <code>read_committed</code> cannot see uncommitted records, so they see results only at checkpoint boundaries. With a 30-second interval, that is up to 30 seconds of delay. For alerts, use an at-least-once sink that writes idempotently on <code>(card_id, window_id)</code>, or have the alert consumer dedupe. Keep transactions for pipelines that feed other pipelines.</p>
+</details>
+
+<details>
+<summary>"One Kafka partition stops receiving events. What happens to your windows, and what is the trade-off in fixing it?"</summary>
+<p>The operator's watermark is the minimum across its inputs. The silent partition's watermark stops, so the operator's watermark stops, and no event-time window closes anywhere in the job. Marking the source idle after a timeout lets the other partitions advance the watermark without it. The trade-off: when the idle partition resumes, its first events may be behind the watermark and treated as late. So idleness has to come with an allowed-lateness or side-output policy for the outputs that cannot lose those events.</p>
+</details>
+
+<details>
+<summary>"How do you rescale a stateful job from 8 to 32 subtasks, and what limits you?"</summary>
+<p>Take a savepoint, then restart the job at the new parallelism from it. Flink redistributes key-group ranges, so each new subtask loads the key groups it now owns. Keys are never rehashed individually. The hard limit is max parallelism, which fixes the number of key groups: you cannot go past it without discarding state. The practical limits are the source partition count, since extra source subtasks would be idle, and the restore time, since every subtask downloads its share of state at startup.</p>
+</details>
+
+<details>
+<summary>"Your watermark is 10 seconds. How did you choose that, and how do you know it is right?"</summary>
+<p>From a measured lateness distribution: processing time minus event time, per event, over normal and bad days. A 10-second delay might cover the 99th percentile. Then I check the product consequences: about 1% of events will arrive after their window closes, so each output needs a late policy. I monitor the late-event rate and the watermark lag continuously. If late events rise, either the network got worse or a client clock went bad, and both need attention. It is not a number you set once.</p>
+</details>
+
+<details>
+<summary>"Why does a streaming job need spare capacity in steady state?"</summary>
+<p>Because recovery is replay. After an outage of T seconds, the job has T × λ events of backlog, and it can drain them only at μ − λ, its spare capacity. Catch-up time is T × λ / (μ − λ). At 50% utilization, catching up takes as long as the outage. At 95%, it takes nineteen times as long, and any further hiccup compounds. The same headroom absorbs traffic spikes and the extra cost of checkpoints. A job sized to 100% of peak has no recovery story.</p>
+</details>
+
+<details>
+<summary>"Kafka Streams or Flink for the fraud job? Defend the choice."</summary>
+<p>For the fraud job as described, Kafka Streams. Input and output are Kafka topics, state is tens of megabytes, and the logic is a keyed counter with a simple window. Running it as a library in a normal service means normal deploys and no new cluster to operate. I would move to Flink if state grew into hundreds of gigabytes, where changelog restoration becomes slow, if I needed non-Kafka sources or sinks with exactly-once, or if the event-time logic needed idleness handling, side outputs and allowed lateness that Kafka Streams handles less directly.</p>
+</details>
+
+<details>
+<summary>"How do you join an order stream with a customer table that keeps changing?"</summary>
+<p>Feed the customer table into the job as a changelog stream, typically from CDC, and keep it as keyed state. Each order looks up the current record for its customer. The subtle part is time. If the customer's update and the order happen a second apart, they may arrive in the other order. If correctness needs the version that was current at the order's event time, use a temporal (versioned) join that keeps recent versions and waits for the watermark. Otherwise accept "latest known" and document it. Either way, the table state is as large as the table, so it sets the state backend choice.</p>
+</details>

@@ -1,0 +1,272 @@
+<h2 id=dd-twophase-commit-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson gives the protocol in two sentences: collect binding votes, then announce one decision. A real implementation is mostly about the moments between those sentences. Which record is forced to disk, and when? What does each side do after a crash? What does a participant answer when someone asks about a transaction it has never heard of? Get those details right and 2PC is boring. Get one wrong and you are back to the vanished $50.</p>
+
+<h3 id=dd-twophase-commit-state-machines level=3>Two state machines and five log records</h3>
+<p>Each side runs a small state machine, and every transition that matters is backed by a log record.</p>
+<p>The <strong>participant</strong> moves through WORKING, then PREPARED, then COMMITTED or ABORTED.</p>
+<ul>
+<li>In WORKING it runs the statements, takes row locks and writes ordinary undo/redo records. Nothing is promised yet. If it times out or loses contact with the coordinator here, it may abort on its own. That freedom matters, and it is lost at the next step.</li>
+<li>On PREPARE it writes a <strong>PREPARED record</strong> and forces it to disk with fsync. Only then does it reply YES. The record must hold enough to finish the work after a crash: the redo for every change, the list of locks to reacquire, and the global transaction ID (the gid). From this point the participant is in doubt.</li>
+<li>On COMMIT it writes and forces a COMMITTED record, releases its locks, and acknowledges. On ABORT it rolls back and acknowledges.</li>
+</ul>
+<p>The <strong>coordinator</strong> moves through COLLECTING, then COMMIT or ABORT, then END.</p>
+<ul>
+<li>It sends PREPARE and waits for votes, with a timeout. A missing vote counts as NO.</li>
+<li>It writes the <strong>decision record</strong> and forces it. This single fsync is the instant the transaction commits. Everything before it can still abort; everything after it must commit.</li>
+<li>It sends the decision, collects acknowledgments, and then writes an <strong>END record</strong>. END is not forced. If it is lost in a crash, recovery simply resends the decision, and participants treat a repeat as harmless.</li>
+</ul>
+<p>So the happy path costs <strong>2n + 1 forced writes</strong> for n participants (a PREPARED and a COMMITTED on each, one decision) and <strong>4n messages</strong> (prepare, vote, decision, ack). Hold on to that count. The sizing section turns it into milliseconds.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-twophase-commit-svg-title dd-twophase-commit-svg-desc" viewBox="0 0 720 330" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-twophase-commit-svg-title">Timeline of one two-phase commit, with forced log writes and the in-doubt window</title>
+<desc id="dd-twophase-commit-svg-desc">Three horizontal lanes: the coordinator, shard 2 and shard 5. Time runs left to right. The coordinator sends prepare to both shards. Each shard forces a PREPARED record and replies yes. From that moment each shard is in doubt and holds its locks. The coordinator forces its decision record, which is the commit point; a crash between the votes and the decision being sent leaves both shards blocked. The coordinator sends commit, each shard forces a COMMITTED record and releases its locks, then acknowledges. The coordinator finally writes an END record without forcing it.</desc>
+<defs><marker id="dd-twophase-commit-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="330" fill="#ffffff"/>
+<text x="10" y="64" font-size="13" fill="#1c2430">Coordinator</text>
+<text x="10" y="164" font-size="13" fill="#1c2430">Shard 2</text>
+<text x="10" y="264" font-size="13" fill="#1c2430">Shard 5</text>
+<rect x="250" y="44" width="110" height="32" fill="#f8ebee" stroke="#c898a4"/>
+<text x="305" y="40" font-size="11" fill="#5c6b7c" text-anchor="middle">crash here: all block</text>
+<rect x="215" y="144" width="270" height="32" fill="#e4eef8" stroke="#7ea4c8"/>
+<rect x="215" y="244" width="270" height="32" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="350" y="196" font-size="11" fill="#5c6b7c" text-anchor="middle">in doubt: locks held, cannot decide alone</text>
+<text x="350" y="296" font-size="11" fill="#5c6b7c" text-anchor="middle">in doubt: locks held, cannot decide alone</text>
+<line x1="100" y1="60" x2="700" y2="60" stroke="#5c6b7c"/>
+<line x1="100" y1="160" x2="700" y2="160" stroke="#5c6b7c"/>
+<line x1="100" y1="260" x2="700" y2="260" stroke="#5c6b7c"/>
+<line x1="120" y1="60" x2="180" y2="156" stroke="#1c2430" marker-end="url(#dd-twophase-commit-arrow)"/>
+<line x1="120" y1="60" x2="180" y2="256" stroke="#1c2430" marker-end="url(#dd-twophase-commit-arrow)"/>
+<text x="128" y="96" font-size="12" fill="#1c2430">PREPARE</text>
+<rect x="183" y="150" width="30" height="20" fill="#1f5f99"/>
+<rect x="183" y="250" width="30" height="20" fill="#1f5f99"/>
+<text x="198" y="138" font-size="11" fill="#1c2430" text-anchor="middle">force</text>
+<line x1="215" y1="156" x2="248" y2="64" stroke="#1c2430" marker-end="url(#dd-twophase-commit-arrow)"/>
+<line x1="215" y1="256" x2="252" y2="64" stroke="#1c2430" marker-end="url(#dd-twophase-commit-arrow)"/>
+<text x="232" y="118" font-size="12" fill="#1c2430">YES</text>
+<rect x="290" y="50" width="30" height="20" fill="#1f5f99"/>
+<text x="305" y="92" font-size="11" fill="#1c2430" text-anchor="middle">force decision</text>
+<text x="305" y="106" font-size="11" fill="#1c2430" text-anchor="middle">= commit point</text>
+<line x1="362" y1="60" x2="440" y2="156" stroke="#1c2430" marker-end="url(#dd-twophase-commit-arrow)"/>
+<line x1="362" y1="60" x2="440" y2="256" stroke="#1c2430" marker-end="url(#dd-twophase-commit-arrow)"/>
+<text x="400" y="84" font-size="12" fill="#1c2430">COMMIT</text>
+<rect x="447" y="150" width="30" height="20" fill="#1f5f99"/>
+<rect x="447" y="250" width="30" height="20" fill="#1f5f99"/>
+<text x="540" y="154" font-size="11" fill="#1c2430">locks released</text>
+<line x1="485" y1="156" x2="560" y2="64" stroke="#1c2430" marker-end="url(#dd-twophase-commit-arrow)"/>
+<line x1="485" y1="256" x2="566" y2="64" stroke="#1c2430" marker-end="url(#dd-twophase-commit-arrow)"/>
+<text x="528" y="100" font-size="12" fill="#1c2430">ACK</text>
+<rect x="600" y="50" width="30" height="20" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="615" y="92" font-size="11" fill="#1c2430" text-anchor="middle">END (lazy)</text>
+<rect x="120" y="310" width="14" height="12" fill="#1f5f99"/>
+<text x="140" y="320" font-size="11" fill="#5c6b7c">forced log write (fsync)</text>
+</svg>
+<figcaption>Five forced writes for two participants. The shaded stretch on each shard is the price of atomicity: rows stay locked until the decision arrives.</figcaption>
+</figure>
+
+<h3 id=dd-twophase-commit-recovery level=3>Recovery: what each side does after a crash</h3>
+<p>Recovery is the part that makes the protocol correct, so it is worth tracing case by case. Each side reads its own log and acts on the last record it finds.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Who restarts<th>Last record in its log<th>What it does<tbody><tr><td>Participant<td>Nothing for this gid<td>Aborts. It never voted, so the coordinator cannot have decided COMMIT.<tr><td>Participant<td>PREPARED<td>Reacquires the locks, stays in doubt, and asks the coordinator for the verdict. It does not rerun the business logic.<tr><td>Participant<td>COMMITTED or ABORTED<td>Nothing to decide. Re-sends the ack if asked.<tr><td>Coordinator<td>Nothing for this gid<td>The transaction aborts. Any participant that asks is told ABORT.<tr><td>Coordinator<td>Decision record, no END<td>Re-sends the decision to every participant until all acknowledge.<tr><td>Coordinator<td>END<td>Forgets the transaction.</table></div></div>
+<p>Look at the fourth row. The coordinator answers ABORT for a gid it has no record of. That is a convention called <strong>presumed abort</strong>, and it is the default in most real implementations, including the XA model. It has a pleasant consequence: the abort path needs no forced write at the coordinator, because "no record" already means abort. Participants can also skip forcing their ABORTED record. Aborts are common under contention, so this saves real disk time.</p>
+<p>The mirror image, <strong>presumed commit</strong>, makes commits cheaper instead. But the coordinator must then force a "collecting" record before sending PREPARE, so a crash during voting is not mistaken for a commit. It is rarely worth it.</p>
+<p>Two more optimizations show up in real systems:</p>
+<ul>
+<li><strong>Read-only votes.</strong> A participant that only read data answers READ-ONLY instead of YES. It releases its locks at once and drops out of phase 2. If shard 5 is only checked for fraud flags, it costs one round trip and no forced writes.</li>
+<li><strong>One-phase commit.</strong> With a single participant there is nothing to agree on. Transaction managers detect this and send a plain commit. That is why a "distributed" transaction that touches only one shard costs the same as a local one.</li>
+</ul>
+
+<h3 id=dd-twophase-commit-termination level=3>Can participants help each other?</h3>
+<p>An in-doubt participant can ask the other participants instead of waiting for the coordinator. This is the <strong>cooperative termination protocol</strong>. If any peer says "I never voted" or "I aborted", everyone can safely abort. If any peer says "I committed", everyone commits.</p>
+<p>The trouble is the remaining case. If every reachable peer answers "I'm PREPARED too", nobody knows the decision, because it lives only in the coordinator's log. Cooperative termination shortens some outages but cannot remove blocking. To remove blocking, the decision itself must be replicated. That idea leads to Paxos Commit and to Spanner, covered under design variations below.</p>
+<p>The textbook alternative, <strong>three-phase commit (3PC)</strong>, inserts a PRE-COMMIT phase so that no participant is ever uncertain while another has committed. It is non-blocking only if crashed nodes stay crashed and messages arrive within a known bound. A network partition breaks that assumption, and 3PC can then commit on one side and abort on the other. That is worse than blocking. Almost nobody runs 3PC in production.</p>
+
+<h3 id=dd-twophase-commit-xa-postgres level=3>XA and PostgreSQL: the participant you actually operate</h3>
+<p><strong>XA</strong> is the Open Group interface between a transaction manager (the coordinator) and a resource manager (a database or a broker). Its calls map directly onto the protocol: <code>xa_start</code> and <code>xa_end</code> bracket the work, <code>xa_prepare</code> is the vote, <code>xa_commit</code> and <code>xa_rollback</code> deliver the decision, and <code>xa_recover</code> lists in-doubt transactions after a restart. In Java the transaction manager is usually Narayana or Atomikos, driven through JTA. In MySQL the same steps are SQL: <code>XA START</code>, <code>XA END</code>, <code>XA PREPARE</code>, <code>XA COMMIT</code>, and <code>XA RECOVER</code> to list prepared transactions.</p>
+<p>PostgreSQL exposes only the participant side, and its knobs deserve attention:</p>
+<pre><code>-- postgresql.conf: 0 (the default) disables prepared transactions entirely.
+-- Set it to at least the number of sessions that can prepare at once.
+max_prepared_transactions = 100
+
+-- Phase 1 on shard 2
+BEGIN;
+UPDATE gift_cards SET balance = balance - 50 WHERE customer_id = 'A';
+PREPARE TRANSACTION 'xfer-9c41-shard2';   -- forced to WAL; the session is now free
+
+-- Phase 2, possibly from a different session, even after a restart
+COMMIT PREPARED 'xfer-9c41-shard2';
+-- or: ROLLBACK PREPARED 'xfer-9c41-shard2';
+
+-- What is in doubt right now, and for how long?
+SELECT gid, prepared, now() - prepared AS age, database
+FROM pg_prepared_xacts ORDER BY prepared;</code></pre>
+<p>Three properties matter operationally. A prepared transaction survives a server restart. It keeps its row locks while detached from any session. And it holds back the <strong>xmin horizon</strong>, the oldest transaction that vacuum must still respect. That last property is easy to miss, and the failure-modes section shows how much damage it does.</p>
+<p>Put the gid to work. Encode the coordinator's transaction ID in it, plus the participant name, as in <code>xfer-9c41-shard2</code>. A recovery tool can then find the verdict in the coordinator's log from the gid alone.</p>
+
+<h3 id=dd-twophase-commit-kafka level=3>Kafka transactions: 2PC with fencing</h3>
+<p>Kafka's transactions are the most widely deployed 2PC most engineers touch, even if they never call it that. The pieces line up neatly.</p>
+<ul>
+<li>The <strong>transaction coordinator</strong> is a broker. Its log is the internal <code>__transaction_state</code> topic, which is replicated like any other topic. So the coordinator's decision survives a broker crash. That is the replicated-coordinator fix from the lesson, built in.</li>
+<li>A producer registers with a <code>transactional.id</code>. Registering bumps an <strong>epoch</strong> number. Any older producer instance with the same id (a "zombie" left from before a restart) is fenced: its writes are rejected. This prevents two coordinators-in-spirit from both driving the same transaction.</li>
+<li>The producer adds partitions to the transaction as it writes. That list is the participant set.</li>
+<li>On commit, the coordinator writes PREPARE_COMMIT to its log (the decision), then writes a <strong>commit marker</strong> into every participating partition, then COMPLETE_COMMIT.</li>
+<li>Consumers with <code>isolation.level=read_committed</code> read only up to the <strong>last stable offset</strong> (LSO), the point before the oldest still-open transaction on that partition. Records from aborted transactions are filtered out.</li>
+</ul>
+<p>The knob that trades safety for liveness is <code>transaction.timeout.ms</code> on the producer (60 seconds by default), capped by the broker's <code>transaction.max.timeout.ms</code>. If a producer goes silent, the coordinator aborts the transaction after this timeout. That is presumed abort with a clock. It also means a stuck transaction can freeze the LSO, and every read_committed consumer behind it, for up to that long.</p>
+
+<h3 id=dd-twophase-commit-isolation level=3>Atomic is not the same as isolated</h3>
+<p>The lesson says no observer ever sees the half-done state. That holds under locking reads: a reader that hits a prepared row on shard 5 waits for its lock. But most databases use MVCC (multi-version concurrency control), where readers do not take locks and do not wait for writers.</p>
+<p>Now picture a nightly balance report reading both shards. COMMIT reaches shard 2 a millisecond before shard 5. The report reads shard 2 after its commit and shard 5 before its commit. Each read is a perfectly valid snapshot of its own shard. Together they show $50 that left A and never reached B.</p>
+<p>2PC made the <em>write</em> atomic. It did not give the <em>read</em> a single snapshot across shards. Systems that promise both need a global ordering of commits. Spanner gets it from TrueTime commit timestamps. Other systems use a timestamp oracle or a global transaction manager. Sharded Postgres without such a component does not offer it. If your reports must balance to the cent, run them against one consistent source, or read with locks.</p>
+
+<h2 id=dd-twophase-commit-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The assumptions for this section, all stated so you can swap in your own: same-datacenter round trip 0.5 ms, a forced log write 1 ms (a cloud block volume; local NVMe with power-loss protection can be ten times faster), and 0.5 ms of actual work per shard. The lesson's 10-20 ms lock times include driver round trips, connection checkouts and slower disks. The model below gives the floor, which tells you where the time goes.</p>
+
+<h3 id=dd-twophase-commit-latency-budget level=3>The latency and lock budget, step by step</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Step<th>Local transaction<th>2PC, same datacenter<th>2PC, cross-region (70 ms RTT)<tbody><tr><td>Do the work (statements on each shard, in parallel)<td>0.5 ms<td>1.0 ms (RTT + work)<td>70.5 ms<tr><td>PREPARE: send, force PREPARED, vote back<td>n/a<td>1.5 ms<td>71 ms<tr><td>Force the decision record<td>n/a<td>1.0 ms<td>1 ms<tr><td>Deliver COMMIT, force COMMITTED, release locks<td>1.0 ms (commit fsync)<td>1.25 ms<td>36 ms<tr><td><strong>Lock hold time</strong><td><strong>1.5 ms</strong><td><strong>4.75 ms</strong><td><strong>about 180 ms</strong><tr><td>Client can be told "done" after<td>1.5 ms<td>3.5 ms (decision forced)<td>about 143 ms</table></div></div>
+<p>Two things fall out of this table. First, the client can be answered as soon as the decision is durable. Waiting for the acks adds latency and buys nothing, since the decision cannot change. Second, and more important, lock time grows about three times in one datacenter and more than a hundred times across regions. Lock time, not latency, is what limits throughput.</p>
+
+<h3 id=dd-twophase-commit-hot-row level=3>The hot-row ceiling</h3>
+<p>A row that every transaction must lock can serve at most <strong>1 / lock hold time</strong> transactions per second. Say every promotional gift card is funded from one "promotions pool" row.</p>
+<ul>
+<li>Local transaction, 1.5 ms: about 660 transfers per second through that row.</li>
+<li>2PC same datacenter, 4.75 ms: about 210 per second.</li>
+<li>2PC at the lesson's 15 ms: about 66 per second.</li>
+<li>2PC cross-region, 180 ms: about 5.5 per second.</li>
+</ul>
+<p>Adding shards or app servers does not lift any of these numbers. The fixes are structural: split the pool into 16 sub-rows and pick one at random (16 times the ceiling), keep the pool on the same shard as most of its customers, or move promotions to a saga where the pool is debited in its own short local transaction.</p>
+
+<h3 id=dd-twophase-commit-concurrency level=3>How many transactions are holding locks right now</h3>
+<p>Use Little's law from the <a href="#backofenvelope-math">arithmetic lesson</a>: concurrency = rate x duration. At 2,000 transfers per second and 4.75 ms of lock time, about 9.5 transactions hold locks at any instant. At the lesson's 15 ms, about 30.</p>
+<p>Those are also roughly the transactions caught in doubt if the coordinator dies at a random moment. Thirty stuck transactions sounds small. What matters is what queues up behind them.</p>
+
+<h3 id=dd-twophase-commit-blast-radius level=3>The blast radius of a 40-second coordinator outage</h3>
+<p>Take the lesson's failure drill: 40 seconds until a replacement coordinator replays the log. Suppose one of the in-doubt transactions holds the promotions pool row, which receives 200 requests per second.</p>
+<ul>
+<li>Waiting requests pile up at 200 per second. After 40 seconds, 8,000 requests are blocked on one lock.</li>
+<li>Each blocked request holds a database connection and an app thread. With 20 app servers and a pool of 50 connections each, the whole fleet has 1,000 connections.</li>
+<li>The pool is exhausted after 1,000 / 200 = <strong>5 seconds</strong>. From then on, requests that never touch the pool row also fail, because they cannot get a connection.</li>
+</ul>
+<p>So a lock on one row takes down the whole service in 5 seconds. Two settings contain this. A <code>lock_timeout</code> (say 2 s in Postgres) makes waiters give up instead of hoarding connections. A <a href="#bulkhead">bulkhead</a> gives promotion transfers their own small pool. Neither unlocks the row. They just stop one stuck row from spreading.</p>
+
+<h3 id=dd-twophase-commit-availability-math level=3>Availability, with and without replicated participants</h3>
+<p>With single-machine parts at 99.9% each, a transfer needs the coordinator and both shards. That gives 0.999³ = 99.70%. Every extra participant multiplies again: five shards plus a coordinator give 0.999⁶ = 99.40%, about 52 hours of unavailability a year.</p>
+<p>Now make each part a three-replica group that works while any two replicas are up. A group fails only when at least two of its three machines are down, which has probability about 3 x 0.001² = 3 x 10⁻⁶. The group is up 99.9997% of the time. Three such groups give about 99.999%. That arithmetic is the whole reason Spanner can run 2PC and microservices should not: replication turns a multiplying chain of weak links into a chain of strong ones. It assumes failures are independent, and racks and zones break that assumption, so place replicas in different failure domains.</p>
+
+<h3 id=dd-twophase-commit-tail level=3>Tail latency: the slowest participant wins</h3>
+<p>A transaction finishes when its slowest participant answers. If each shard is under 20 ms 99% of the time, a two-shard transaction is under 20 ms only 0.99² = 98.0% of the time. With four shards, 0.99⁴ = 96.1%. The per-shard p99 has become roughly the transaction's p96. Every participant you add moves your p99 to the right, so trace each phase separately and keep the participant count small.</p>
+
+<h3 id=dd-twophase-commit-vacuum-math level=3>The vacuum clock on an orphaned prepared transaction</h3>
+<p>In PostgreSQL, an orphaned prepared transaction pins the xmin horizon. Vacuum cannot remove any row version that died after it, and it cannot freeze old transaction IDs. Transaction IDs are 32-bit and wrap around after about 2.1 billion. The database protects itself by refusing new writes before it gets there.</p>
+<p>At 5,000 write transactions per second, 2.1 billion IDs last about 420,000 seconds, or <strong>roughly five days</strong>. Long before that, every frequently updated table bloats, because none of its dead rows can be reclaimed. Those orphaned transactions in the lesson's Q3 were "hours old". They were already costing performance, and they were on a clock.</p>
+
+<h2 id=dd-twophase-commit-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-twophase-commit-fm-orphan level=3>1. The orphaned prepared transaction</h3>
+<p><strong>Symptom.</strong> A few queries on one table hang. Over days, the table and its indexes grow while row counts stay flat. Autovacuum runs constantly and achieves nothing.</p>
+<p><strong>Mechanism.</strong> A coordinator prepared a transaction and then vanished. Maybe an app server ran as its own coordinator and its container was replaced. The prepared transaction is detached from any session, so killing connections does nothing. It holds its locks and the xmin horizon indefinitely.</p>
+<p><strong>Detect.</strong> Alert on <code>max(now() - prepared)</code> from <code>pg_prepared_xacts</code> above, say, 60 seconds. Also watch <code>age(datfrozenxid)</code> per database and the age of the oldest xmin. Lock-wait graphs in <code>pg_locks</code> show which sessions wait on the prepared transaction.</p>
+<p><strong>Fix.</strong> Run a resolver job that, for every prepared transaction older than the threshold, looks up the gid in the coordinator's durable log and issues <code>COMMIT PREPARED</code> or <code>ROLLBACK PREPARED</code>. Never guess. If no verdict exists anywhere, the coordinator never forced a decision, and presumed abort says roll back. Long term, do not let stateless app servers act as coordinators. The coordinator's log must live somewhere that outlives the process.</p>
+
+<h3 id=dd-twophase-commit-fm-heuristic level=3>2. The heuristic decision that broke atomicity</h3>
+<p><strong>Symptom.</strong> Reconciliation finds a transfer debited on shard 2 and never credited on shard 5, in a system that "uses 2PC". The transaction manager's logs contain a heuristic-mixed warning.</p>
+<p><strong>Mechanism.</strong> During a long coordinator outage, an operator or a database timeout resolved an in-doubt transaction unilaterally. This is called a <strong>heuristic decision</strong>. XA even has return codes for the aftermath: heuristic commit, heuristic rollback, and heuristic mixed. One shard was committed by hand. The coordinator later recovered with an ABORT decision and rolled back the other shard. The protocol's one guarantee was overridden by a person under pressure.</p>
+<p><strong>Detect.</strong> Treat any heuristic outcome reported by the transaction manager as a paging alert. Your reconciliation job is the second line of defence.</p>
+<p><strong>Fix.</strong> Write a runbook that forbids manual resolution without the coordinator's verdict. Give operators a tool that shows the verdict and every participant's state side by side. Make the coordinator's log replicated, so that its unavailability is rare and short enough that nobody is tempted to guess.</p>
+
+<h3 id=dd-twophase-commit-fm-pool level=3>3. One in-doubt row exhausts every connection pool</h3>
+<p><strong>Symptom.</strong> The coordinator fails over. Within seconds the whole application returns 500s, including endpoints that never touch gift cards.</p>
+<p><strong>Mechanism.</strong> The blast-radius arithmetic above. An in-doubt transaction holds a hot row. Requests for that row block, each holding a connection, until the pools are empty. The coordinator recovers in 40 seconds, but the pile-up of retries keeps the app down for minutes more.</p>
+<p><strong>Detect.</strong> Connection pool wait time and active connections jump to the pool maximum. Database lock waits concentrate on one or two relations. Traces show many requests stalled on the same statement.</p>
+<p><strong>Fix.</strong> Set <code>lock_timeout</code> and a statement timeout so waiters fail fast. Isolate 2PC workloads in their own pool. Remove the hot row from the 2PC path, by splitting it or by debiting it in a separate step.</p>
+
+<h3 id=dd-twophase-commit-fm-hanging-kafka level=3>4. The hanging Kafka transaction</h3>
+<p><strong>Symptom.</strong> Consumer lag on one partition grows steadily. Producers report success and the partition keeps receiving data. Consumers that read with read_uncommitted see the new data fine. Consumers with read_committed are frozen.</p>
+<p><strong>Mechanism.</strong> A transaction on that partition never received its commit or abort marker. That can happen after a producer crash combined with a broker bug, or when a producer sets a very long transaction timeout. The LSO cannot move past the open transaction, so read_committed consumers cannot advance either. This is the in-doubt participant again, wearing a different hat.</p>
+<p><strong>Detect.</strong> Compare the log end offset with the last stable offset per partition. A gap that only grows means a stuck transaction. Recent Kafka versions include a <code>kafka-transactions.sh</code> tool that can find hanging transactions.</p>
+<p><strong>Fix.</strong> Keep <code>transaction.timeout.ms</code> short, matched to your commit interval. Upgrade past known hanging-transaction bugs. Use the tooling to abort a confirmed hanging transaction, after checking that no live producer owns it.</p>
+
+<h3 id=dd-twophase-commit-fm-zombie level=3>5. The zombie coordinator</h3>
+<p><strong>Symptom.</strong> Rarely, and only after coordinator failovers, one participant commits a transaction while another aborts it.</p>
+<p><strong>Mechanism.</strong> The old coordinator was not dead, only slow: a long GC pause or a network partition. The replacement found no decision record for the transaction, presumed abort, and told everyone ABORT. Then the old coordinator woke up, forced COMMIT to its own copy of the log, and sent COMMIT to a participant that had not yet heard the abort. Two coordinators made two decisions.</p>
+<p><strong>Detect.</strong> Reconciliation finds split outcomes. The coordinator logs show two instances active at overlapping times.</p>
+<p><strong>Fix.</strong> The decision must be written once, to one shared place, with a compare-and-set that fails if a decision already exists. Coordinators should carry an epoch or fencing token that participants check, as Kafka does with producer epochs. A coordinator lease alone is not enough, because a paused process does not know its lease expired.</p>
+
+<h3 id=dd-twophase-commit-fm-ambiguous level=3>6. The client retry that commits twice</h3>
+<p><strong>Symptom.</strong> Some customers receive $100 instead of $50. All the duplicates happened during a period of high coordinator latency.</p>
+<p><strong>Mechanism.</strong> The client's request timed out after 2 seconds, but the coordinator had already forced COMMIT. The client retried, and the retry became a <em>new</em> 2PC transaction with a new gid. Both committed atomically and correctly. 2PC makes one transaction atomic. It does not make two attempts into one. This is the lesson's "retry defect" in different clothes.</p>
+<p><strong>Detect.</strong> Duplicate business keys (same transfer request ID) in the ledger. Client timeout rates correlate with coordinator p99 latency.</p>
+<p><strong>Fix.</strong> Put an <a href="#idempotency">idempotency key</a> inside the transaction: insert the request ID into a uniqueness-constrained table on one of the participants as part of the same 2PC. Give clients an endpoint that answers "what happened to request X?" so they can ask instead of retrying blind.</p>
+
+<h3 id=dd-twophase-commit-fm-report level=3>7. The report that saw money in flight</h3>
+<p><strong>Symptom.</strong> The finance dashboard's total of all gift-card balances wobbles by small amounts during the day and is exact at night.</p>
+<p><strong>Mechanism.</strong> The isolation gap described above. The dashboard runs one query per shard, each on its own MVCC snapshot. Commits reach the shards a millisecond apart, so some transfers appear on one side only.</p>
+<p><strong>Detect.</strong> The wobble exists only while transfers are flowing. It never shows up in single-shard queries.</p>
+<p><strong>Fix.</strong> Read from a store with a global snapshot. Or compute the total from a ledger of completed transfer records rather than from balances. Or document that the intraday total is approximate. What you must not do is "fix" it by adding a nightly correction, which hides real bugs behind the expected wobble.</p>
+
+<h2 id=dd-twophase-commit-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<p>The real decision is rarely "2PC or not". It is where the atomic boundary sits, and who holds the decision. Here are the options a review panel should weigh for the gift-card transfer.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach<th>Atomic?<th>Blocks on a crash?<th>Lock time<th>Isolation of intermediate state<th>Where it fits<tbody><tr><td>Co-locate both rows on one shard<td>Yes, local transaction<td>No<td>Shortest<td>Full<td>Whenever the shard key allows it. Always try this first.<tr><td>Classic 2PC (XA, single coordinator)<td>Yes<td>Yes, on coordinator crash<td>Two round trips plus fsyncs<td>Under locking reads; not across MVCC snapshots<td>Legacy integration of a database and a broker; short, rare, internal operations<tr><td>2PC over replicated participants and coordinator (Spanner, CockroachDB, YugabyteDB)<td>Yes<td>Only if a majority of a group is lost<td>Higher: each log write is a consensus round<td>Full, with global timestamps<td>Distributed SQL where you want transactions and can pay consensus latency<tr><td>Client-coordinated, decision stored in a "primary" row (Percolator style, as in TiDB)<td>Yes<td>No long-term: anyone can resolve by checking the primary<td>Two phases over the storage layer<td>Snapshot isolation via a timestamp oracle<td>Transactions on top of a replicated key-value store<tr><td>Kafka transactions<td>Yes, within Kafka<td>Bounded by transaction timeout<td>Commit interval<td>read_committed consumers only<td>Read-process-write pipelines entirely inside Kafka<tr><td>Transactional outbox + idempotent consumer<td>Eventually, not atomically<td>No<td>Local only<td>None: the credit lags the debit<td>Most cross-service "do X and tell Y" flows<tr><td><a href="#saga">Saga</a><td>Simulated with compensations<td>No<td>Local only<td>None, managed by design<td>Long, multi-service, cross-company workflows</table></div></div>
+<p>A few decision points deserve a sentence each.</p>
+<p><strong>Can the data live together?</strong> Shard gift cards by a household or region key, and most transfers become local. If 95% of transfers are same-shard, you pay the 2PC cost on 5% and the hot-row cost almost nowhere. The <a href="#sharding">sharding lesson</a>'s key choice is the cheapest consistency tool you have.</p>
+<p><strong>Who holds the decision?</strong> A single coordinator process is the classic weak point. Replicating the coordinator's log (Kafka's <code>__transaction_state</code>, Spanner's coordinator Paxos group) or storing the decision in a replicated data row (Percolator's primary lock) removes the long blocking window. That one change decides whether 2PC is an emergency waiting to happen or a quiet internal detail.</p>
+<p><strong>Do readers need a cross-shard snapshot?</strong> If yes, you need a timestamp-ordered design, not just 2PC. Ask this early. It changes the product choice.</p>
+<p><strong>Is the coupling acceptable?</strong> 2PC forces every participant to be up, fast and in the same trust domain. If any of the three fails, prefer an outbox or a saga and design the intermediate state on purpose.</p>
+<p><strong>Paxos Commit</strong>, from Gray and Lamport, is the theory behind the replicated variants. It runs a consensus instance for each participant's vote, so the outcome survives F failures with 2F + 1 acceptors. With F = 0 it reduces to classic 2PC. That is a neat way to see the whole family: 2PC is the version with no fault tolerance in the decision.</p>
+
+<h2 id=dd-twophase-commit-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Why can't this operation be a single local transaction? What shard key change was considered and rejected, and why?</li>
+<li>Where does the coordinator's decision live, and does it survive the loss of the machine or container running the coordinator?</li>
+<li>Is the decision written exactly once, with fencing, so that a paused old coordinator cannot make a second decision?</li>
+<li>How many participants does a typical transaction touch, and how many does the worst one touch? What is the p99 latency of each?</li>
+<li>Which rows are hot, what is their lock hold time under 2PC, and what is the resulting per-row throughput ceiling compared with peak demand?</li>
+<li>What are <code>lock_timeout</code>, statement timeout and the 2PC transaction deadline, and is the 2PC workload isolated in its own connection pool?</li>
+<li>Is there an alert on the age of the oldest prepared transaction (<code>pg_prepared_xacts</code>, <code>XA RECOVER</code>, or the LSO gap in Kafka), with a threshold in seconds, not hours?</li>
+<li>Does an automated resolver exist that settles in-doubt transactions from the coordinator's log, and does the runbook forbid heuristic decisions without the verdict?</li>
+<li>Is there an idempotency key inside the transaction, so a client retry after an ambiguous timeout cannot commit twice?</li>
+<li>Do any readers need a consistent view across shards? If so, what provides the global snapshot?</li>
+<li>Is <code>max_prepared_transactions</code> (or the equivalent) sized for peak concurrency, and has a coordinator failover been drilled under load?</li>
+<li>Does every participant sit inside one trust and operations boundary? If any is external, why is this not a saga?</li>
+</ol>
+
+<h2 id=dd-twophase-commit-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"A prepared participant hasn't heard from the coordinator for ten minutes. Why can't it just time out and abort?"</summary>
+<p>Because the coordinator may already have forced COMMIT and told another participant, which then committed. If this participant aborts, the transfer is half applied, which is exactly what 2PC exists to prevent. Its YES vote gave up the right to decide alone. Before voting it may abort on a timeout; after voting it may only ask, either the coordinator or its peers. That asymmetry is the root of 2PC's blocking.</p>
+</details>
+
+<details>
+<summary>"Is two-phase commit a consensus protocol?"</summary>
+<p>No, it solves atomic commitment, which differs in two ways. First, any single participant can veto: the outcome must be abort if anyone votes no, while consensus just needs a majority to agree on some value. Second, 2PC is not fault tolerant: one coordinator failure blocks it, while consensus (Paxos, Raft) keeps going while a majority is up. Production systems combine them. They run 2PC between groups and consensus inside each group, so the votes and the decision are themselves replicated. Paxos Commit is the formal version of that idea.</p>
+</details>
+
+<details>
+<summary>"What does presumed abort buy you, concretely?"</summary>
+<p>It lets the coordinator forget aborted transactions without logging them. If anyone asks about a gid it has no record of, it answers ABORT. So the abort path needs no forced write at the coordinator, and participants need not force their ABORTED records either. Under contention, where many transactions abort on lock conflicts or vote NO, that removes a forced fsync from every abort. The commit path costs the same as before.</p>
+</details>
+
+<details>
+<summary>"You replicate the coordinator. Is 2PC now non-blocking?"</summary>
+<p>It no longer blocks on a coordinator crash, which is the common and painful case. A replacement reads the replicated decision and finishes. A crashed participant still matters, but differently. If it crashed before voting, the transaction aborts. If it crashed after voting, the others proceed with the decision, and the crashed one applies it on recovery; meanwhile its own rows are unavailable, as they would be anyway. Only when the participants are replicated groups too, as in Spanner, does blocking require losing a majority of some group.</p>
+</details>
+
+<details>
+<summary>"The client's transfer request timed out. Did the transfer happen?"</summary>
+<p>Unknown, and the answer must come from the system, not from a guess. The commit point is the coordinator's forced decision record, which may have been written just before the timeout. The client should retry with the same idempotency key, or ask an outcome endpoint for that request ID. The server side must store the key inside the transaction, so a retry finds "already committed" instead of starting a second, perfectly atomic, duplicate transfer.</p>
+</details>
+
+<details>
+<summary>"Your transfers use 2PC. Can a reporting query still see the $50 in neither account?"</summary>
+<p>Yes, if it reads each shard on an independent MVCC snapshot. COMMIT reaches the shards at slightly different moments, and MVCC readers do not wait on prepared rows. 2PC guarantees the writes are all-or-nothing in the end; it does not give a reader one consistent cut across shards. You need a global snapshot for that, from commit timestamps (Spanner's TrueTime, a timestamp oracle) or from locking reads.</p>
+</details>
+
+<details>
+<summary>"Why do Kafka transactions need producer epochs?"</summary>
+<p>To fence zombies. A producer that pauses for a long GC or a network partition may be replaced by a new instance with the same <code>transactional.id</code>. When the new one registers, the coordinator bumps the epoch. Brokers then reject writes and commits from the old epoch. Without that, two producers could drive the same transaction to different outcomes. It is the same lesson as the zombie-coordinator failure: a decision maker needs a fencing token, because it cannot tell on its own that it has been replaced.</p>
+</details>
+
+<details>
+<summary>"How would you get rid of 2PC for the gift-card transfer altogether?"</summary>
+<p>Three options, in order of preference. Co-locate: shard by a key that puts most transfer pairs together, and accept 2PC or a saga only for the rest. Re-model: record each transfer as one row in a ledger on one shard (the source of truth), and derive balances from it asynchronously, so the atomic write is a single insert. Or accept a visible intermediate state: debit plus an outbox event in one local transaction, then an idempotent credit on the other shard, with a reconciliation check. The last one is a two-step <a href="#saga">saga</a>, and the product must accept "transfer pending" for a few hundred milliseconds.</p>
+</details>

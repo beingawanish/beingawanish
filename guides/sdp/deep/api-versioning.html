@@ -1,0 +1,201 @@
+<h2 id=dd-api-versioning-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson gives the policy: add first, version coarsely when you must, retire on a schedule. This section is about the machinery that makes that policy real. That means a sharper definition of "breaking", the request path through version resolution and adapters, the headers that announce retirement, and the CI checks that catch a break before it ships.</p>
+
+<h3 id=dd-api-versioning-breaking level=3>What "breaking" really covers</h3>
+<p>Removing, renaming and re-typing fields are the obvious breaks. Most production breaks are quieter. A useful working definition: a change is breaking if any client that was correct yesterday can be wrong today without changing a line. By that test, these all count:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Change<th>Looks like<th>Why it breaks someone<tbody>
+<tr><td>New enum value (<code>state: "partially_shipped"</code>)<td>Additive<td>Generated Swift and Kotlin enums often fail to decode unknown values; switch statements hit their default branch
+<tr><td>Field that was never null now sometimes null<td>No shape change<td>Clients that dereference it crash; the schema said "string" and they believed it
+<tr><td>Tighter validation (max length 255 → 100)<td>A bug fix<td>Requests that succeeded yesterday now get 422
+<tr><td>New required request field, or new required header<td>Small<td>Every existing caller is now invalid
+<tr><td>Different default (page size 100 → 20)<td>Tuning<td>Clients that never sent the parameter silently get less data
+<tr><td>Different status code (200 → 201, or 404 → 403)<td>More correct<td>Clients branch on exact codes
+<tr><td>Different array order, or a field moved inside an object<td>Cosmetic<td>Clients that read <code>items[0]</code> or parse by position
+<tr><td>Same field, new meaning (cents → dollars)<td>Nothing visible<td>The hardest kind: every check passes and the numbers are wrong
+</tbody></table></div></div>
+<p>Behind all of these sits Hyrum's law: with enough users, every observable behaviour of your API is depended on by somebody. Error message text, response timing, the order of keys in a JSON object. You cannot promise all of that. What you can do is publish what <em>is</em> the contract (the schema, the documented codes, the documented ordering) and say clearly that anything else may change. Then put the published part under automated checks.</p>
+<p>The enum case deserves its own rule, because it catches careful teams. If an enum may grow, document it as open from day one ("clients must handle unknown values"), and ship SDKs that decode unknown values into an <code>unknown</code> case. Protobuf 3 does this by design: an unrecognised enum number is preserved, not rejected. JSON clients only do it if you tell them to.</p>
+
+<h3 id=dd-api-versioning-request-path level=3>The request path: resolve, upgrade, run, downgrade</h3>
+<p>With a gateway adapter in place, a <code>/v1</code> call to the bookstore goes through four steps:</p>
+<ol>
+<li><strong>Resolve the version.</strong> The gateway reads the path prefix (or header, or the account's pinned version) and normalises it to an internal version ID. Unknown versions get a 404 or 400 with a link to the docs. They must never fall through to "latest".</li>
+<li><strong>Upgrade the request.</strong> The adapter rewrites the v1 request into the current internal shape. For the rename, an incoming filter <code>?state=shipped</code> becomes <code>?status=shipped</code>.</li>
+<li><strong>Run the current code.</strong> One backend, one code path, one set of business rules.</li>
+<li><strong>Downgrade the response.</strong> The adapter maps the current response back to the v1 shape. It renames <code>status</code> to <code>state</code>, drops fields v1 never had, and maps new enum values onto old ones where a safe mapping exists.</li>
+</ol>
+<p>Steps 2 and 4 are where the engineering lives. Shape changes (renames, nesting, dropping fields) are mechanical and suit a gateway filter or a middleware layer. Semantic changes are not mechanical. Suppose v2 splits an order into shipments. Then a v1 <code>tracking_number</code> has to be derived from "the first shipment" or "the most recent one", which is a business decision. That kind of adapter belongs in the service, next to the code that understands shipments, and it needs an owner.</p>
+
+<h3 id=dd-api-versioning-chain level=3>Date-pinned versions and the transformer chain</h3>
+<p>Stripe's model is the best-known alternative to <code>/v1</code> and <code>/v2</code>, and it shows how far the adapter idea can go. Each breaking change ships as a dated version. Each account is pinned to the version that was current when it first integrated. A request can override the pin with a <code>Stripe-Version</code> header. Internally, the core always produces the newest response. A chain of small "version change" modules then walks it backwards, one dated step at a time, until it matches the caller's pinned version.</p>
+<pre><code>core response (2026-09-01 shape)
+  → undo 2026-09-01 change: split "shipments" back into "tracking_number"
+  → undo 2026-03-15 change: rename "status" back to "state"
+  → caller pinned at 2025-11-01: done</code></pre>
+<p>The appeal is that every change is small, isolated and individually tested. A client upgrades on its own schedule, one step at a time if it likes, and nobody faces a giant v1-to-v2 migration. The cost is that the chain only grows. Every request from an old pin pays for every transform since. Every transform has to keep working against a core that keeps moving. And retiring a step means migrating every account still pinned before it. This is the "two live versions, maximum" rule traded away for very fine-grained versions. It suits a company with a dedicated API platform team and very high switching costs for customers. It is a heavy choice for a bookstore.</p>
+
+<h3 id=dd-api-versioning-headers level=3>Announcing retirement in a form machines can read</h3>
+<p>Two standard response headers carry the lifecycle, plus links to the human explanation:</p>
+<pre><code>HTTP/1.1 200 OK
+Deprecation: @1767225600
+Sunset: Wed, 01 Jul 2026 00:00:00 GMT
+Link: &lt;https://api.example.com/docs/migrate-v2&gt;; rel="deprecation"; type="text/html"</code></pre>
+<ul>
+<li><strong><code>Sunset</code></strong> (RFC 8594) gives the date after which the resource is expected to stop working. It uses the ordinary HTTP-date format.</li>
+<li><strong><code>Deprecation</code></strong> (RFC 9745) says the resource is deprecated, and since when. Its value is a structured-field date, written as <code>@</code> followed by Unix seconds. Earlier drafts used other formats, and some APIs still send <code>Deprecation: true</code>, so client libraries should tolerate both.</li>
+</ul>
+<p>Headers only help if something reads them. Make your own SDKs log a warning once per process when they see <code>Deprecation</code>, and surface it in the partner dashboard. Most partners never look at response headers by hand. They will, however, notice a yellow banner with a date on it.</p>
+
+<h3 id=dd-api-versioning-ci level=3>Catching breaks in CI, before review</h3>
+<p>A policy that relies on reviewers spotting a renamed field will eventually miss one. Put a machine in front of the reviewer:</p>
+<ul>
+<li><strong>Schema diff.</strong> Keep the OpenAPI document in the repo and diff every pull request against the published version. Tools such as oasdiff classify each change as breaking or not and can fail the build. For protobuf, <code>buf breaking</code> does the same: it rejects a reused field number, a type change, or a removed field that was not marked <code>reserved</code>.</li>
+<li><strong>Consumer-driven contracts.</strong> For important clients (the mobile app, the top partners), record the requests they make and the fields they read, then replay them against every build. Pact is the common tool. This catches behavioural breaks that a schema diff cannot see.</li>
+<li><strong>Golden responses per live version.</strong> For each live version, keep a set of recorded request/response pairs. Run them through the adapter on every build. This is the test that catches adapter drift, which the failure modes section returns to.</li>
+</ul>
+
+<h3 id=dd-api-versioning-measure level=3>What you can and cannot measure</h3>
+<p>The retirement plan depends on usage data. The gateway can log, per request: resolved version, API key or account, SDK name and version from <code>User-Agent</code>, endpoint, and status. That answers "who still calls v1, and how often".</p>
+<p>It cannot tell you which response fields a client actually reads. A REST response goes out whole, and you never see what the client does with it. So "is anyone still using <code>state</code>?" has no direct answer. You have three partial answers: sparse fieldsets (<code>?fields=id,status</code>) that make clients declare what they read, per-field usage in GraphQL, where the query names every field, and outreach. This is one real argument for GraphQL in partner APIs. Field-level deprecation (<code>@deprecated</code>) plus field-level usage counts let you retire a single field with evidence instead of a whole version.</p>
+
+<h2 id=dd-api-versioning-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-api-versioning-sizing-matrix level=3>The cost of one more live version</h3>
+<p>Say the bookstore's public API has 60 endpoints and supports 3 client SDKs (JavaScript, Python, Java). Each live version needs:</p>
+<ul>
+<li>A golden test suite: 60 endpoints × roughly 5 scenarios = 300 recorded cases per version.</li>
+<li>Documentation and SDK releases: 3 SDKs per version.</li>
+<li>Security review for every fix that touches request parsing, once per version path.</li>
+<li>On-call knowledge: someone who can debug a v1 adapter at 2 AM.</li>
+</ul>
+<p>Two versions mean 600 golden cases and 6 SDK lines. Four versions mean 1,200 and 12. The work grows linearly, but the attention does not. The oldest version gets the least care and accumulates the most bugs. That is why the two-version rule is about attention as much as about arithmetic.</p>
+<p>Mixed per-endpoint versions are worse. Suppose 10 resources can each be on any of 3 versions. Clients may combine them in up to 3<sup>10</sup> = 59,049 ways. Nobody tests that, so nobody really supports it. That is the lesson's "testing matrix" warning, made concrete.</p>
+
+<h3 id=dd-api-versioning-sizing-adapter level=3>Adapter overhead</h3>
+<p>A shape-only adapter that parses and re-serialises a 20 KB JSON response costs on the order of 0.1 to 0.5 ms of CPU in most runtimes. At 2,000 v1 requests per second, that is 0.2 to 1 CPU core spent purely on translation. That is real, but small. A date-pinned chain with 15 steps, each re-walking the response, can cost several milliseconds per request for the oldest pins. That cost lands on exactly the clients you most want to move, which is a decent incentive to keep in mind.</p>
+
+<h3 id=dd-api-versioning-sizing-decay level=3>How fast old versions drain</h3>
+<p>Two populations drain on very different curves, and the retirement date must respect the slower one.</p>
+<p><strong>Mobile builds.</strong> Store auto-update moves most users within weeks. A long tail stays on old builds for a year or more: users who turned off auto-update, old devices that cannot run new OS versions, and devices that are rarely opened. The exact shape varies a lot by audience and platform, so measure your own. An illustrative curve: 60% on the new build after two weeks, 90% after three months, and 2 to 5% still on an eighteen-month-old build. The lesson's "one-third still on that build" is what you get when the old build is the last one that supports some older OS version.</p>
+<p><strong>Partners.</strong> Partners do not auto-update. They move when someone schedules the work. Plan from the partner's side: a straightforward migration might take one engineer 2 to 10 days, and it competes with their own roadmap. If you announce in January with a July sunset, most partners will start in June. The usage graph is flat for months and then drops in the last six weeks. Expect that and budget outreach for it.</p>
+
+<h3 id=dd-api-versioning-sizing-brownout level=3>Planning the brownout schedule</h3>
+<p>Say v1 still serves 30% of partner traffic, about 1,200 requests per second, from 45 API keys. A 15-minute brownout returns 410 to 1,200 × 900 = 1.08 million requests. Size the escalation so each step reaches more integrations without hitting every partner's peak hour at once:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Weeks before sunset<th>Brownout<th>Purpose<tbody>
+<tr><td>12<td>None; headers, emails, dashboard banner<td>Inform
+<tr><td>8<td>15 min, once, in your business hours<td>Find integrations whose alerts nobody watches
+<tr><td>6<td>15 min, twice, different time zones<td>Reach partners in other regions
+<tr><td>4<td>1 h, weekly, rotating hours<td>Make the cost of not moving visible
+<tr><td>2<td>4 h, twice a week<td>Final stragglers, with direct phone calls
+<tr><td>0<td>Permanent 410<td>Removal
+</tbody></table></div></div>
+<p>Before each step, check the number of distinct API keys that hit v1 in the last 30 days, not only request volume. Then call the ones that did not change after the previous brownout. The aim is that removal day breaks nobody you have not already spoken to.</p>
+
+<h2 id=dd-api-versioning-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-api-versioning-fm-enum level=3>1. An "additive" enum value crashes the iOS app</h3>
+<p><strong>Symptom.</strong> The team adds <code>"partially_shipped"</code> to <code>order.status</code>. It is additive by the rulebook, so it ships without a version bump. iOS crash reports spike within the hour, all on the order detail screen.</p>
+<p><strong>Mechanism.</strong> The app's generated model uses a Swift enum with <code>Codable</code>. Decoding an unknown raw value throws, and the whole order fails to parse. The server kept its promise to tolerant readers. This client was not one.</p>
+<p><strong>Detect.</strong> Client crash and decode-error telemetry, broken out by app version and endpoint. Consumer-driven contract tests with a fixture that contains a value the client has never seen.</p>
+<p><strong>Fix.</strong> Short term, the mobile BFF maps the new value to <code>"processing"</code> for app builds older than the one that knows it. Long term, document enums as open, ship SDKs and codegen templates with an <code>unknown</code> fallback, and add a CI fixture that sends unknown enum values to the client test suite.</p>
+
+<h3 id=dd-api-versioning-fm-default level=3>2. Unversioned requests default to latest, so every release breaks someone</h3>
+<p><strong>Symptom.</strong> Each v2 release causes a few partner tickets: "your API changed overnight". Those partners are all calling <code>/orders</code> without a version.</p>
+<p><strong>Mechanism.</strong> Early on, the gateway routed unversioned paths to the newest version, for convenience. Every partner who copied an example without the prefix is now on a moving target.</p>
+<p><strong>Detect.</strong> The share of requests with no explicit version, per API key. It should be zero for keys created after the version scheme existed.</p>
+<p><strong>Fix.</strong> Pin unversioned traffic to a fixed version, ideally the one that was current when the key was created. Send a warning header on every such request. Then require explicit versions for all new keys. Date-pinned APIs do this naturally: the account's pin <em>is</em> the default.</p>
+
+<h3 id=dd-api-versioning-fm-cache level=3>3. A CDN serves v2 bodies to v1 clients</h3>
+<p><strong>Symptom.</strong> After a header-versioning rollout, about 1 in 20 v1 requests for public catalog data gets a v2-shaped response. The ratio changes with cache hit rate.</p>
+<p><strong>Mechanism.</strong> The version lives in <code>Accept: application/vnd.bookstore.v2+json</code>. The <a href="#cdn">CDN</a> cache key is method plus URL. Whichever version fills the cache first is served to everyone until it expires.</p>
+<p><strong>Detect.</strong> Response-shape validation in synthetic checks that call each version through the CDN. Also compare origin and edge responses for the same request.</p>
+<p><strong>Fix.</strong> Send <code>Vary: Accept</code> and confirm the CDN honours it, or add the normalised version to the cache key explicitly. Many CDNs handle <code>Vary</code> on arbitrary headers poorly, splitting the cache on every distinct <code>Accept</code> string. A normalised key is safer. This is one of the strongest practical arguments for path versioning: distinct URLs give distinct cache entries for free.</p>
+
+<h3 id=dd-api-versioning-fm-adapter-drift level=3>4. The v1 adapter quietly returns wrong data</h3>
+<p><strong>Symptom.</strong> Months after v2 shipped, a partner reports that v1 shows some orders as <code>"delivered"</code> that are actually still in transit.</p>
+<p><strong>Mechanism.</strong> The core added a state, <code>"out_for_delivery"</code>. The v1 adapter's mapping table had no entry for it, so it fell through to the last case in a switch, which happened to be <code>"delivered"</code>. Nobody owned the adapter after the v2 launch, and no test fed it the new state.</p>
+<p><strong>Detect.</strong> Golden-response tests per live version, run on every build, with fixtures regenerated whenever the core enum grows. Also a counter on the adapter's "unmapped value" path. That counter should be zero, and it should alert if it is not.</p>
+<p><strong>Fix.</strong> Make unmapped values fail loudly in tests and map to an explicit, documented fallback in production, never to a real business state. Give each adapter a named owner until its version is removed. Add a CI rule: a change to any enum in the core schema requires a change or explicit sign-off in every live adapter.</p>
+
+<h3 id=dd-api-versioning-fm-rare-client level=3>5. Removal breaks a client that calls once a year</h3>
+<p><strong>Symptom.</strong> v1 is removed in October after three months at zero traffic. In January, a large partner's annual tax-reconciliation job fails, and their finance team escalates.</p>
+<p><strong>Mechanism.</strong> The retirement dashboard measured request volume over the trailing 30 or 90 days. A client that runs once a year was invisible to it.</p>
+<p><strong>Detect.</strong> Track distinct API keys per version over at least a full business cycle, often twelve months, from long-retention logs or a daily rollup table. Cross-check against the partner list for known batch integrations.</p>
+<p><strong>Fix.</strong> Before removal, contact every key that used the version in the last year, not the last quarter. For the rare stragglers, consider keeping a minimal read-only path, or give their key a time-boxed exception. That is cheaper than a lost partner.</p>
+
+<h3 id=dd-api-versioning-fm-brownout-storm level=3>6. A brownout triggers a retry storm</h3>
+<p><strong>Symptom.</strong> During a 15-minute v1 brownout, total request rate on v1 jumps from 1,200 to 9,000 per second. The gateway's CPU alarms fire.</p>
+<p><strong>Mechanism.</strong> Several partner SDKs retry every non-2xx response with short, fixed delays. A 410 is not retryable, but their code does not know that. Each original request turns into five or more.</p>
+<p><strong>Detect.</strong> Requests per API key during the brownout window versus the hour before. A brownout should hold the rate flat or cut it, not multiply it.</p>
+<p><strong>Fix.</strong> Serve brownout responses from the cheapest layer you have, the gateway or the edge, with a tiny cached body. Include a clear error code (<code>version_sunset</code>) and a link to the migration guide. Apply the normal per-key <a href="#rate-limiting">rate limits</a> so a retry loop cannot exceed its usual budget. Then fix your own SDKs so they never retry 4xx except 408 and 429.</p>
+
+<h3 id=dd-api-versioning-fm-semantic level=3>7. A "bug fix" changes behaviour for everyone</h3>
+<p><strong>Symptom.</strong> A team fixes a validation hole: emails longer than 254 characters are now rejected with 422. Two partners' bulk import jobs start failing, because their data has a few junk rows they used to push through.</p>
+<p><strong>Mechanism.</strong> Tightening validation turns valid-yesterday requests into invalid-today ones. The schema diff did not flag it, because <code>maxLength</code> was added in the service code, not in the OpenAPI document.</p>
+<p><strong>Detect.</strong> The rate of 4xx responses per API key, per endpoint, before and after each deploy. A step change in 422s right after a release points straight at this.</p>
+<p><strong>Fix.</strong> Keep validation rules in the schema so the diff tool sees them. Roll stricter validation out in two steps: log-only for a few weeks while you contact affected clients, then enforce. For security-critical tightening, enforce right away, but tell partners first.</p>
+
+<h2 id=dd-api-versioning-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Scheme<th>Version lives in<th>Granularity<th>Strength<th>Weakness<tbody>
+<tr><td>Path major version<td><code>/v2/orders</code><td>Whole API, rare bumps<td>Visible everywhere; trivial caching and routing<td>Big-bang migrations; URLs change
+<tr><td>Media-type or custom header<td><code>Accept: …v2+json</code><td>Whole API or resource<td>Stable URLs; closest to REST purism<td>Invisible in logs and links; cache keys need care
+<tr><td>Date-pinned per account<td>Account setting, header override<td>Every breaking change<td>Small, frequent, opt-in upgrades; no big migration<td>Transformer chain grows; needs a dedicated platform team
+<tr><td>Query parameter<td><code>?api-version=2024-05-01</code><td>Whole API<td>Easy to try in a browser<td>Easy to lose when building URLs; caches may strip it
+<tr><td>No versions, evolution only<td>Schema with deprecations (often GraphQL)<td>Single fields<td>Field-level usage data; retire fields one by one<td>Needs disciplined additive design; breaking changes still need a plan
+<tr><td>Package versions (gRPC/protobuf)<td><code>bookstore.orders.v1</code> service name<td>Service<td>Field numbers make additive change safe and cheap<td>Internal-first; browser clients need a translation layer
+</tbody></table></div></div>
+
+<h3 id=dd-api-versioning-var-guidance level=3>How to choose</h3>
+<ul>
+<li><strong>Default to path major versions plus additive change.</strong> It is the simplest scheme that survives contact with partners, CDNs and support engineers reading logs. Expect a major version every few years, not every quarter.</li>
+<li><strong>Choose date pinning only with the team to support it.</strong> It works well when integrations are expensive for customers to touch and you have engineers whose job is the transformer chain. Without that team, the chain turns into the forked backend you were trying to avoid.</li>
+<li><strong>Use field-level evolution where clients declare what they read.</strong> GraphQL queries, sparse fieldsets, and protobuf with field numbers all give you evidence about field usage. With evidence, you can retire a field instead of a whole version.</li>
+<li><strong>Put shape adapters at the edge and semantic adapters in the service.</strong> Gateways are good at renames and drops. They should never contain business rules, for the same reason the <a href="#api-gateway">gateway lesson</a> keeps domain words out.</li>
+<li><strong>Keep webhooks and events on the same clock.</strong> If the REST API moves to v2 but webhook payloads silently follow the latest internal shape, partners get both pain and confusion. Version webhook payloads per endpoint subscription, and retire them on the same lifecycle.</li>
+</ul>
+
+<h2 id=dd-api-versioning-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the written definition of a breaking change here, and does it include enum additions, nullability, defaults, validation and status codes?</li>
+<li>Which CI check fails the build on a breaking schema change, and does the schema contain the validation rules the code enforces?</li>
+<li>Where does the version come from on each request, and what happens to a request with no version or an unknown one?</li>
+<li>Where do the adapters live? Who owns each one, and what is the test that proves it still maps every current value?</li>
+<li>Are enums documented as open, and do the official SDKs handle unknown values?</li>
+<li>If the version is in a header, how do the CDN and any other caches key on it?</li>
+<li>When a version is created, what are its deprecation and sunset dates? Are they in the headers and the partner dashboard?</li>
+<li>What does the usage dashboard count: requests, or distinct clients over a full business cycle?</li>
+<li>What is the brownout schedule, which layer serves the brownout response, and what stops a retry storm?</li>
+<li>How many versions are live today, and what is the plan if a third appears?</li>
+<li>Are webhook and event payloads versioned on the same lifecycle as the REST API?</li>
+<li>For the mobile app, what is the minimum supported build, and what does the API return to a build below it?</li>
+</ol>
+
+<h2 id=dd-api-versioning-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Adding a field is safe. Is adding an enum value safe?"</summary>
+<p>Only if clients were told to expect it. Many generated clients decode enums strictly and fail on unknown values, so a new value is breaking for them. The fix is in the contract: document the enum as open, ship SDKs with an <code>unknown</code> case, and test clients with values they have never seen. Where you cannot rely on that, as with old mobile builds, map the new value to an old one for those clients in the BFF.</p>
+</details>
+<details>
+<summary>"Explain how Stripe-style date versions work internally, and what they cost."</summary>
+<p>The core always produces the newest shape. Each breaking change ships as a small, dated transformer that can undo itself on a response, and upgrade a request where needed. A request from an account pinned to an older date runs through every transformer between now and that date, newest first. You get tiny, opt-in upgrades and no big migration. The costs are a chain that only grows, per-request work proportional to how old the pin is, and a large test surface. You need a platform team whose job is that chain.</p>
+</details>
+<details>
+<summary>"Your v1 traffic is 0.5% of requests. Can you remove it?"</summary>
+<p>Not on request share alone. Ask how many distinct clients that 0.5% is, and look over a full business cycle, because annual and quarterly jobs are invisible in a 30-day window. Then ask who they are. One of them may be your largest partner's month-end settlement. Removal is a decision about named clients, made after outreach and brownouts. A percentage on a graph does not settle it.</p>
+</details>
+<details>
+<summary>"Why not just run the old version's code as a separate deployment?"</summary>
+<p>Because then you have two backends. Every bug fix, security patch and schema migration has to land twice, and the old one drifts. Business rules diverge, so v1 and v2 clients see different prices or states for the same order. A thin adapter onto one backend keeps one source of truth and limits the old version to translation. The exception is a short, planned overlap during a migration that is too semantic to adapt, with a hard end date.</p>
+</details>
+<details>
+<summary>"Header versioning is more RESTful. Why do you still prefer paths?"</summary>
+<p>Operations. A path shows up in every access log, browser address bar, curl command and support ticket, so you can see which version someone used. It also gives each version a distinct cache key without relying on <code>Vary</code> support at the CDN. Header versioning works, but every cache, log pipeline and debugging session has to be taught about the header. Header-based schemes tend to fail exactly when one of those layers was not taught.</p>
+</details>
+<details>
+<summary>"How would you retire a single field instead of a whole version?"</summary>
+<p>Mark it deprecated in the schema and the docs, and keep serving it. Then get evidence that nobody reads it. In GraphQL that is per-field usage. In REST, it means sparse fieldsets, or SDK telemetry if your SDK is the main client, plus outreach to the rest. Once you have evidence, stop populating it for new API keys, then remove it in the next major version. Without field-level evidence, a REST field is effectively retired only by a version bump.</p>
+</details>
+<details>
+<summary>"What should a brownout response actually look like?"</summary>
+<p>A <code>410 Gone</code> with a small JSON body: a stable error code such as <code>version_sunset</code>, a human message with the sunset date, and a link to the migration guide. Keep the <code>Sunset</code> and <code>Deprecation</code> headers too. Serve it from the gateway or edge so it costs almost nothing. No <code>Retry-After</code> that suggests retrying will work, because it will not. And keep the normal per-key rate limit in force, so that badly written retry loops cannot multiply the load.</p>
+</details>

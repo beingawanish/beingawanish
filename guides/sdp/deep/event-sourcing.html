@@ -1,0 +1,289 @@
+<h2 id=dd-event-sourcing-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson describes an event store as "an append-only place to keep events, one stream per entity." That sentence hides most of the engineering. A real event store has to do four things at once: append without losing a race, load one entity fast, let projections read every event in a stable order, and keep working while the event formats change under it. This section takes them in that order, using order 7f3a from the bookstore.</p>
+
+<h3 id=dd-event-sourcing-table level=3>The events table</h3>
+<p>Many teams start with an event store inside Postgres, and it is a good way to see the moving parts. Libraries such as Marten (for .NET) work this way, and purpose-built stores such as EventStoreDB (now KurrentDB) keep the same logical fields.</p>
+<pre><code>CREATE TABLE events (
+  global_position  BIGSERIAL PRIMARY KEY,     -- order across ALL streams
+  stream_id        TEXT        NOT NULL,      -- 'order-7f3a'
+  stream_version   INT         NOT NULL,      -- 1, 2, 3 ... within the stream
+  event_type       TEXT        NOT NULL,      -- 'OrderCancelled'
+  schema_version   SMALLINT    NOT NULL,      -- 1, 2 ... of that event type
+  payload          JSONB       NOT NULL,
+  metadata         JSONB       NOT NULL,      -- actor, correlation_id, causation_id
+  occurred_at      TIMESTAMPTZ NOT NULL,      -- business time
+  recorded_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (stream_id, stream_version)
+);</code></pre>
+<p>Every column earns its place:</p>
+<ul>
+<li><strong><code>(stream_id, stream_version)</code> unique</strong> is the concurrency control. More on that next.</li>
+<li><strong><code>global_position</code></strong> is the order projections read in. Entity loads never use it.</li>
+<li><strong><code>schema_version</code></strong> says which shape the payload has. You will need it the first time a field changes, which is sooner than anyone expects.</li>
+<li><strong><code>metadata</code></strong> holds who did it and why. <code>correlation_id</code> ties all events from one user request together. <code>causation_id</code> points at the event or command that caused this one. During an incident these two fields let you follow a chain like "the cancel at 14:02 caused a refund, which caused an email" without guessing.</li>
+<li><strong><code>occurred_at</code> versus <code>recorded_at</code></strong> are two clocks. A courier scan that happened at 09:10 but reached you at 11:40 is one event with two times. Keep both, or "what did we know at 10:00?" becomes unanswerable.</li>
+</ul>
+
+<h3 id=dd-event-sourcing-occ level=3>Appending with an expected version</h3>
+<p>Two requests touch order 7f3a at the same moment. A customer clicks cancel. The shipping job marks it dispatched. That is exactly the race from the lesson's incident, and the event store is where you stop it.</p>
+<p>Each writer loads the stream, notes the version it saw (say 4), decides what to append, and then appends <em>at version 5</em>. Only one of them can win, because the unique key on <code>(stream_id, stream_version)</code> rejects the second insert. The loser gets a concurrency error. It reloads the stream, now at version 5, and runs its decision again against the new state. The shipping job now sees <code>OrderCancelled</code> and refuses to dispatch.</p>
+<p>This is <strong>optimistic concurrency</strong>: no locks are held while the code thinks, and conflicts are caught at write time. EventStoreDB exposes it as an "expected revision" on every append, with special values for "the stream must not exist yet" and "any version is fine." The second one is an escape hatch. Using it on a stream that has business rules quietly brings back the lost-update bug the pattern exists to remove.</p>
+<p>The whole command cycle is small enough to read in one go. Here it is with Python's standard library and SQLite, so you can run it:</p>
+<pre><code>import json, sqlite3
+
+db = sqlite3.connect(":memory:")
+db.execute("""CREATE TABLE events (
+  pos INTEGER PRIMARY KEY AUTOINCREMENT,
+  stream TEXT, version INT, type TEXT, data TEXT,
+  UNIQUE (stream, version))""")
+
+def evolve(state, etype, data):            # pure: state + event -&gt; state
+    if etype == "OrderPlaced":     return {"status": "placed", "total": data["total"]}
+    if etype == "CheckedOut":      return {**state, "status": "checked_out"}
+    if etype == "OrderCancelled":  return {**state, "status": "cancelled"}
+    if etype == "ShipmentDispatched": return {**state, "status": "shipped"}
+    return state                           # unknown types are ignored, not fatal
+
+def load(stream):
+    state, version = None, 0
+    for v, t, d in db.execute(
+            "SELECT version, type, data FROM events WHERE stream=? ORDER BY version",
+            (stream,)):
+        state, version = evolve(state, t, json.loads(d)), v
+    return state, version
+
+def decide(state, command):                # pure: state + command -&gt; new events
+    if command == "dispatch":
+        if state["status"] == "cancelled":
+            raise ValueError("order was cancelled")
+        return [("ShipmentDispatched", {"carrier": "UPS"})]
+    if command == "cancel":
+        if state["status"] == "shipped":
+            raise ValueError("already shipped")
+        return [("OrderCancelled", {"by": "customer"})]
+
+def handle(stream, command, retries=3):
+    for _ in range(retries):
+        state, version = load(stream)
+        new = decide(state, command)
+        try:
+            with db:                       # one transaction for the whole batch
+                for i, (t, d) in enumerate(new, start=1):
+                    db.execute("INSERT INTO events (stream, version, type, data) "
+                               "VALUES (?,?,?,?)", (stream, version + i, t, json.dumps(d)))
+            return new
+        except sqlite3.IntegrityError:     # someone appended first: reload, re-decide
+            continue
+    raise RuntimeError("too much contention on " + stream)</code></pre>
+<p>Two design choices in that snippet matter more than they look. <code>evolve</code> and <code>decide</code> are pure functions, so replay is deterministic and both are trivial to unit test. And <code>evolve</code> never calls the outside world. A replay that sends an email or reads today's exchange rate gives a different answer every time you run it. Anything the decision needed from outside (a price, a tax rate, a fraud score) gets copied <em>into the event</em> when it is written.</p>
+
+<h3 id=dd-event-sourcing-global-order level=3>The global order, and the gap that bites projections</h3>
+<p>A projection reads "every event after position N" and saves N as its checkpoint. That sounds safe. On Postgres it has a famous hole.</p>
+<p>A <code>BIGSERIAL</code> hands out the number at insert time, not at commit time. Transaction A takes position 101 and is slow to commit. Transaction B takes 102 and commits first. A projection polls, sees 102, processes it, and stores checkpoint 102. Then A commits 101. The projection never asks for anything below 102 again, so event 101 is skipped forever. No error, no log line, just a wrong read model.</p>
+<p>There are three common fixes, each with a cost:</p>
+<ul>
+<li><strong>Serialize appends</strong> with a single lock (for example a Postgres advisory lock held during the insert). Positions then commit in order. Simple and correct, but it caps the whole store at one append at a time, which may be a few thousand per second.</li>
+<li><strong>Read only below a safe high-water mark.</strong> The projection treats a gap as "not yet committed" and waits a short time for it to fill before moving past it. Marten's async daemon does a version of this. The cost is a little extra lag and some care around gaps that never fill (a rolled-back transaction leaves one forever).</li>
+<li><strong>Use a store that assigns positions at commit.</strong> Purpose-built event stores write a single log in commit order, so the problem does not arise.</li>
+</ul>
+<p>Whatever you pick, write it down in the design doc. "We checkpoint on <code>global_position</code>" without one of these three is a bug report waiting to be filed.</p>
+
+<h3 id=dd-event-sourcing-snapshots level=3>Snapshots are a cache, so treat them like one</h3>
+<p>A snapshot row looks like <code>(stream_id, stream_version, snapshot_schema, state)</code>. Loading becomes: read the latest snapshot, then read events where <code>stream_version &gt; snapshot.stream_version</code>, then apply the tail.</p>
+<p>The trap is that a snapshot is the output of <em>today's</em> <code>evolve</code> code. If you fix a bug in <code>evolve</code>, every snapshot written by the old code is now wrong, and the events are still right. So a snapshot needs a version stamp tied to the code that produced it. On load, a snapshot whose stamp does not match the current one is ignored and rebuilt from events. Deleting every snapshot must always be safe. If it is not, your snapshots have become a second source of truth.</p>
+<p>When should you snapshot? Most order streams never need one. Twelve events load in about a millisecond. Snapshots matter for long-lived streams: a wallet, a warehouse bin, a subscription that has run for six years. A rule like "write a snapshot when the tail exceeds 200 events" keeps loads bounded without snapshotting every stream on every write.</p>
+
+<h3 id=dd-event-sourcing-projections level=3>Projections: subscriptions, checkpoints and rebuilds</h3>
+<p>A projector is a loop: read a batch after the checkpoint, apply each event to the read table, save the new checkpoint. The single most important detail is <strong>where the checkpoint lives</strong>.</p>
+<p>If the read table and the checkpoint sit in the same database, update both in one transaction. Then a crash either keeps both changes or neither, and each event takes effect exactly once in the read model. If they live in different systems (the checkpoint in Kafka, the table in Elasticsearch), a crash between the two replays some events. The apply step must then be idempotent, usually by storing the last applied <code>stream_version</code> per row and ignoring anything older or equal.</p>
+<p>Rebuilds should be boring. The safe routine is blue-green:</p>
+<ol>
+<li>Create <code>current_orders_v2</code> next to the live <code>current_orders_v1</code>.</li>
+<li>Start a second projector for v2 at position 0, with its own checkpoint.</li>
+<li>Let it catch up to the head. Compare row counts and a sample of rows against v1.</li>
+<li>Point readers at v2 (a view rename or a config flag), then drop v1.</li>
+</ol>
+<p>Readers never see a half-built table, and if v2 is wrong you simply never switch.</p>
+
+<h3 id=dd-event-sourcing-reactors level=3>Projectors versus reactors</h3>
+<p>Not every subscriber builds a table. Some <em>do</em> things: send the cancellation email, call the refund API, publish to Kafka. Call those reactors (or process managers when they coordinate several steps). Keep them on their own subscription with their own checkpoint, and never run them during a projection rebuild. The failure mode is covered below, and it is the one that ends up in the news.</p>
+<p>The Kafka publisher is also a reactor. This is how the event store doubles as the outbox: the events are committed once, and a subscriber forwards them. One refinement is worth making early. The events inside your store (domain events) are an internal format you will change freely. What other teams consume should be integration events: a smaller, stable public contract, translated by the publisher. Publish domain events raw and every internal refactor becomes a cross-team migration.</p>
+
+<h3 id=dd-event-sourcing-evolution level=3>Changing event formats when old events live forever</h3>
+<p>Events written in 2026 will be replayed in 2031. Three tools cover nearly every change:</p>
+<ul>
+<li><strong>Tolerant reading.</strong> New optional fields get defaults when absent. Unknown fields are ignored. This covers most changes, and it is why the lesson insists on additive changes.</li>
+<li><strong>Upcasting.</strong> For a real shape change, write a small function that turns <code>OrderPlaced</code> v1 into v2 as it is read. Chain them: v1 to v2, v2 to v3. Domain code only ever sees the newest shape. The stored bytes never change.</li>
+<li><strong>Copy and transform the stream.</strong> The last resort, for mistakes too big to upcast (a wrong stream boundary, say). Write a new stream from the old one, then switch. It is a data migration with all the risk that implies, so it is rare.</li>
+</ul>
+<p>Renaming an event type is the change people underestimate. To an event store, <code>OrderShipped</code> and <code>ShipmentDispatched</code> are different types. A rename is an upcaster that maps the old name, kept for as long as the old events exist. In practice that means forever.</p>
+
+<figure>
+<svg role="img" aria-labelledby="dd-event-sourcing-svg-title dd-event-sourcing-svg-desc" viewBox="0 0 720 290" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-event-sourcing-svg-title">Write path and read path of an event store</title>
+<desc id="dd-event-sourcing-svg-desc">A command handler loads the latest snapshot and the tail of events for one stream, decides new events, and appends them with an expected version. The append succeeds or returns a conflict that causes a reload and retry. The events table assigns a global position. Two kinds of subscribers read from it by global position, each with its own checkpoint: projectors that update read tables, and reactors that send emails or publish integration events to Kafka.</desc>
+<rect x="10" y="20" width="150" height="70" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="85" y="45" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Command handler</text>
+<text x="85" y="63" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">load → decide →</text>
+<text x="85" y="79" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">append @ version 5</text>
+<rect x="10" y="130" width="150" height="56" rx="6" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="85" y="153" text-anchor="middle" style="fill:var(--ink,#1c2430)">snapshot @ v200</text>
+<text x="85" y="171" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">+ tail v201..v214</text>
+<line x1="85" y1="130" x2="85" y2="92" style="stroke:var(--muted,#5c6b7c)"/>
+<text x="92" y="116" style="fill:var(--muted,#5c6b7c)">load</text>
+<rect x="210" y="20" width="200" height="166" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="310" y="42" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">events table</text>
+<text x="310" y="62" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">UNIQUE(stream, version)</text>
+<rect x="225" y="74" width="170" height="20" rx="3" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="310" y="88" text-anchor="middle" style="fill:var(--ink,#1c2430)">pos 101  order-7f3a v4</text>
+<rect x="225" y="98" width="170" height="20" rx="3" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="310" y="112" text-anchor="middle" style="fill:var(--ink,#1c2430)">pos 102  order-9c1e v1</text>
+<rect x="225" y="122" width="170" height="20" rx="3" style="fill:var(--bg,#eef2f6);stroke:var(--accent,#1f5f99)"/>
+<text x="310" y="136" text-anchor="middle" style="fill:var(--ink,#1c2430)">pos 103  order-7f3a v5</text>
+<text x="310" y="166" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">append-only, by position</text>
+<line x1="160" y1="55" x2="208" y2="55" style="stroke:var(--accent,#1f5f99)"/>
+<polygon points="208,55 200,51 200,59" style="fill:var(--accent,#1f5f99)"/>
+<text x="185" y="110" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">conflict:</text>
+<text x="185" y="125" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">reload</text>
+<rect x="470" y="20" width="240" height="70" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="590" y="43" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Projectors</text>
+<text x="590" y="61" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">checkpoint + table update</text>
+<text x="590" y="77" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">in one transaction; rebuildable</text>
+<rect x="470" y="116" width="240" height="70" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="590" y="139" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Reactors</text>
+<text x="590" y="157" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">email, refund, publish to Kafka</text>
+<text x="590" y="173" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">own checkpoint; never on rebuild</text>
+<line x1="410" y1="55" x2="468" y2="55" style="stroke:var(--accent,#1f5f99)"/>
+<polygon points="468,55 460,51 460,59" style="fill:var(--accent,#1f5f99)"/>
+<line x1="410" y1="150" x2="468" y2="150" style="stroke:var(--accent,#1f5f99)"/>
+<polygon points="468,150 460,146 460,154" style="fill:var(--accent,#1f5f99)"/>
+<text x="10" y="230" style="fill:var(--ink,#1c2430)">Entity loads read one stream by version. Subscribers read all streams by global position.</text>
+<text x="10" y="252" style="fill:var(--muted,#5c6b7c)">Two indexes, two access patterns: that split is the whole data model of an event store.</text>
+</svg>
+</figure>
+
+<h2 id=dd-event-sourcing-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The assumptions, stated once: the bookstore takes 400,000 orders a day, each order stream averages 12 events of about 300 bytes (the lesson's numbers), and the evening peak runs at 5 times the daily average.</p>
+
+<h3 id=dd-event-sourcing-sizing-writes level=3>Append rate and storage</h3>
+<ul>
+<li>Events per day: 400,000 × 12 = 4.8 million. Average rate: 4.8M / 86,400 ≈ 56 events per second. Peak: about 280 per second. A single Postgres instance does this without noticing, even with serialized appends.</li>
+<li>Raw bytes per day: 4.8M × 300 B ≈ 1.4 GB. With the primary key, the stream index and row overhead, budget roughly double: about 3 GB a day, or about 1 TB a year.</li>
+<li>After five years: about 5 TB of events plus projections. That is the 10–15× multiplier from the lesson, made concrete. Five terabytes on one machine is workable but uncomfortable, and it is why big event stores partition the events table by time (old partitions become cheap, read-only, and can sit on slower storage) or shard by stream.</li>
+</ul>
+
+<h3 id=dd-event-sourcing-sizing-load level=3>Load latency and the snapshot threshold</h3>
+<p>Loading a stream is one index range scan plus deserialization. Assume about 10 µs to read and apply each event (it varies a lot with payload size and language). Then:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Stream<th>Events<th>Replay cost at 10 µs/event<th>Needs a snapshot?<tbody>
+<tr><td>A typical order<td>12<td>0.12 ms (the query round trip dominates)<td>No
+<tr><td>A busy customer wallet<td>5,000<td>50 ms<td>Yes, threshold around 200 events
+<tr><td>A warehouse bin stream, 6 years<td>2,000,000<td>20 s<td>Yes, and consider closing the books (below)
+</tbody></table></div></div>
+<p>With a threshold of 200, the worst load is one snapshot read plus 200 events: about 2 ms of apply work. The cost is one snapshot write per 200 events, which is noise. The threshold is a dial between write amplification (snapshot often) and load latency (snapshot rarely). Set it from your p99 load budget, not from habit.</p>
+
+<h3 id=dd-event-sourcing-sizing-contention level=3>Contention: when optimistic concurrency stops being optimistic</h3>
+<p>A command takes some time between loading and appending. Call that the window, <em>w</em>. If commands for one stream arrive at rate <em>r</em>, the chance that another one lands inside your window is roughly <em>r × w</em> when that number is small.</p>
+<ul>
+<li>An order stream gets a command every few minutes. With <em>w</em> = 10 ms, conflicts are essentially zero.</li>
+<li>A single stream for "stock of the bestselling title" during a launch gets 50 commands a second. With <em>w</em> = 10 ms, <em>r × w</em> = 0.5. Half of all attempts collide, retries add more load, and throughput falls exactly when demand peaks.</li>
+</ul>
+<p>The fix is never "retry harder." It is a smaller consistency boundary. Split the stock into per-warehouse or per-bin streams, or model reservations as their own streams and reconcile against stock in the background. As a rule of thumb, if one stream needs more than a few writes per second, its boundary is too wide.</p>
+
+<h3 id=dd-event-sourcing-sizing-rebuild level=3>Projection rebuild time: the number that decides your design</h3>
+<p>Take the lesson's 100 million orders: 1.2 billion events. How long does rebuilding <code>current_orders</code> take?</p>
+<ul>
+<li>A naive projector that does one read-modify-write per event, at about 1 ms each, manages 1,000 events per second. 1.2 billion events at that rate is 1.2 million seconds: about 14 days. Unusable.</li>
+<li>Batch it. Read 5,000 events, fold them in memory into row changes, write with one multi-row upsert. A realistic rate is 20,000 events per second on one worker: 60,000 s, about 17 hours.</li>
+<li>Partition it. Events for different streams are independent, so run 8 workers, each owning <code>hash(stream_id) % 8</code>. If the target database keeps up, that is a little over 2 hours.</li>
+</ul>
+<p>So the rebuild plan is part of the design, not an afterthought. Decide up front whether a projection can be rebuilt in parallel, and measure the real rate on a copy of production before you promise anyone "we can always rebuild it."</p>
+
+<h3 id=dd-event-sourcing-sizing-lag level=3>Projection lag</h3>
+<p>Normal lag is the poll interval plus batch time: tens to a few hundred milliseconds. The number to watch is how lag behaves after a stall. If a projector was down for 10 minutes at 280 events/s, it returns to a backlog of 168,000 events. Draining at 20,000/s while new events still arrive at 280/s takes 168,000 / (20,000 − 280) ≈ 9 seconds. Fine. A projector that can only manage 400/s needs 168,000 / 120 = 23 minutes. Catch-up headroom (drain rate divided by arrival rate) is the metric that tells you which one you have.</p>
+
+<h2 id=dd-event-sourcing-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-event-sourcing-fm-gap level=3>1. A projection quietly skips events</h3>
+<p><strong>Symptom:</strong> a handful of orders show the wrong status on the orders page forever. Replaying their streams gives the right answer. Nothing errored. <strong>Mechanism:</strong> the out-of-order commit described above. Position 101 committed after 102, and the checkpoint had already moved past it. It shows up only under concurrent load, so tests rarely catch it. <strong>Detect:</strong> a reconciliation job that compares, per stream, the latest <code>stream_version</code> in the events table with the version stored in the read model row. Any row that stays behind for more than a few minutes is a skip, not lag. <strong>Fix:</strong> serialize appends or read below a high-water mark, then rebuild the affected projection. Keep the reconciliation job running afterwards. It is cheap and it catches the next bug too.</p>
+
+<h3 id=dd-event-sourcing-fm-replay-side-effects level=3>2. A rebuild re-sends every email from the last three years</h3>
+<p><strong>Symptom:</strong> customers receive "your order was cancelled" for orders from 2024. Support lines light up. <strong>Mechanism:</strong> the email sender was registered as one more handler on the same subscription as the projections. Someone reset that subscription's checkpoint to 0 to rebuild a table. The handler did what it was told. <strong>Detect:</strong> before anything else, an outbound-email rate alarm. Then trace a sample email's <code>causation_id</code> back to an old event. <strong>Fix:</strong> separate reactors from projectors, give reactors their own checkpoints, and make "reset checkpoint" impossible for a reactor without a deliberate override. Reactors should also refuse to act on events older than a sane age (say 24 hours) unless asked, and pass the event ID to the email provider as an idempotency key.</p>
+
+<h3 id=dd-event-sourcing-fm-poison level=3>3. A rebuild stops at an event nobody can read</h3>
+<p><strong>Symptom:</strong> the v2 projection rebuild runs for six hours and then stops at position 384,112,907. Its lag is flat and growing. <strong>Mechanism:</strong> an event written in 2023 by a version of the code that put the amount in a string. The upcaster for that shape was deleted last year because "nothing writes that any more." The projector throws, retries, and throws again. It is a poison message, and because order matters, it blocks everything behind it. <strong>Detect:</strong> projector error rate and a "stuck position" alert (the checkpoint has not moved in N minutes while the head has). <strong>Fix:</strong> restore the upcaster. Then prevent the class of bug: keep a corpus of real production events of every type and schema version, anonymized, and replay it in CI against current code. Never delete an upcaster while events of that version exist.</p>
+
+<h3 id=dd-event-sourcing-fm-hot-stream level=3>4. Concurrency errors spike on one stream during a launch</h3>
+<p><strong>Symptom:</strong> checkout errors climb from 0.01% to 8% at 09:00, all for one title. p99 checkout latency triples. <strong>Mechanism:</strong> stock for the title is one stream, and the contention math from the sizing section has crossed 0.5. Retries pile onto the same stream and make it worse. <strong>Detect:</strong> concurrency-conflict count by stream (or by stream category, to keep cardinality sane), and retry count per command. <strong>Fix:</strong> short term, cap retries with jittered backoff and shed load gracefully. Long term, split the stream (per warehouse, or a pool of stock buckets) or move to a reservation model. This is a modeling bug that only looks like a capacity bug.</p>
+
+<h3 id=dd-event-sourcing-fm-stale-snapshot level=3>5. Snapshot and replay disagree after a deploy</h3>
+<p><strong>Symptom:</strong> a wallet shows $412 on the account page. A support engineer replays the stream by hand and gets $398. <strong>Mechanism:</strong> a deploy fixed how <code>evolve</code> handles partial refunds. Snapshots written before the deploy still contain the old, wrong balance, and the loader trusts them. <strong>Detect:</strong> a background job that picks random streams, loads them both ways (snapshot plus tail, and full replay), and alerts on any difference. <strong>Fix:</strong> stamp snapshots with a version that changes whenever <code>evolve</code> changes, and ignore mismatches on load. Then let snapshots rebuild lazily. For money, add the shadow-replay job to the release checklist.</p>
+
+<h3 id=dd-event-sourcing-fm-long-stream level=3>6. One entity's load time grows without limit</h3>
+<p><strong>Symptom:</strong> p99 latency for one merchant's payout command creeps from 5 ms to 900 ms over two years. <strong>Mechanism:</strong> the merchant's ledger is one stream with millions of events. Snapshots help, but the stream itself, its index and every rebuild keep growing. <strong>Detect:</strong> events-per-stream distribution and load time by stream; watch the top 0.1%, not the average. <strong>Fix:</strong> <em>close the books</em>, which is what accountants do every period. At month end, append a <code>PeriodClosed</code> event with the closing balance to the old stream, and start a new stream whose first event is <code>PeriodOpened</code> with that balance. Loads read only the current period. History is still all there, one stream per month.</p>
+
+<h3 id=dd-event-sourcing-fm-shredding level=3>7. An erasure request leaves plaintext behind</h3>
+<p><strong>Symptom:</strong> an audit after a deletion request finds the customer's name and address in the search index and in the analytics warehouse. <strong>Mechanism:</strong> crypto-shredding was applied in the event store, but projections decrypted the fields and stored plaintext. Destroying the key does nothing to a copy that is no longer encrypted. <strong>Detect:</strong> an automated erasure test. Create a synthetic customer, let data flow everywhere, shred, then search every store for the canary values. <strong>Fix:</strong> keep personal data out of projections that do not need it. Where a projection does need it, either store it still encrypted with the same per-person key, or make the projector subscribe to a <code>PersonErased</code> event and delete its copy. Backups of projections age out on a schedule shorter than the legal deadline.</p>
+
+<h2 id=dd-event-sourcing-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>How to choose<tbody>
+<tr><td>Where events live<td>A table in your existing relational database<td>A purpose-built store (EventStoreDB/KurrentDB, Axon Server)<td>Start with A when volume is modest and you want events, the uniqueness table and the read model in one transaction. Choose B for built-in subscriptions, commit-ordered positions and very long streams, and budget for running a new kind of database.
+<tr><td>Kafka as the event store<td>Kafka topic is the source of truth<td>Kafka carries published events; a store holds the truth<td>Almost always B. Kafka has no per-entity expected-version append, so it cannot stop the cancel/dispatch race. Loading one entity means scanning a partition shared with many others. Compaction keeps only the latest value per key, which deletes history. Kafka is a fine company-wide log of facts, and a poor store for entity decisions.
+<tr><td>Stream (aggregate) size<td>Large: one stream per customer<td>Small: one per order, per bin, per payment<td>Smaller wins. A stream is a consistency boundary, and every write to it serializes. Make it as small as your invariants allow, and enforce rules that span streams with a process manager.
+<tr><td>Projection consistency<td>Inline: update the read table in the append transaction<td>Async: a subscriber updates it later<td>Inline gives read-your-writes for free and is fine for one or two small tables in the same database. It slows every write and couples schemas. Async is the default for everything else.
+<tr><td>Snapshots<td>None<td>On a tail threshold, versioned with the code<td>None until load time says otherwise. Most order-shaped streams never need them.
+<tr><td>Schema change<td>Upcast on read<td>Rewrite streams (copy and transform)<td>Upcast. Rewrites are for mistakes in stream boundaries, done rarely and with a rollback plan.
+<tr><td>What other teams consume<td>Domain events, as stored<td>Integration events, translated by a publisher<td>B, unless the consumers are in the same team and deploy together. Domain events change every sprint. Contracts should not.
+<tr><td>Uniqueness across streams<td>Reservation table in the same transaction as the append<td>Reservation stream plus a process manager<td>A when the event store shares a database with the table: <code>INSERT INTO usernames</code> and the append commit together. B when they cannot share a transaction, accepting a short pending state.
+</tbody></table></div></div>
+<p>The row that causes the most arguments is the Kafka one, so it deserves a plain opinion. Teams say "Kafka is a log, event sourcing needs a log, done." The log they need is <em>per entity, with conditional append</em>. Kafka gives you a per-partition log with unconditional append. Those are different tools. The "Kafka-centric" architectures in the lesson's examples use Kafka as the company's shared history and let each service keep its own decision state. That is a perfectly good design. It just is not the same thing as storing orders as event streams.</p>
+<p>The second argument is about aggregate size. Big streams feel natural ("everything about a customer in one place") and they make some rules easy. They also turn every write for that customer into a queue, and they grow without limit. When in doubt, go smaller and pay with a process manager for the occasional cross-stream rule.</p>
+
+<h2 id=dd-event-sourcing-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Which domains are event-sourced, and what is the business reason for each one? Which domains are deliberately <em>not</em>?</li>
+<li>Do the event names read as business facts (<code>OrderCancelled</code>) rather than row changes (<code>OrderUpdated</code>)? Show five real ones.</li>
+<li>Does every append carry an expected version? Where, if anywhere, is "any version" used, and why is that safe?</li>
+<li>What is the largest stream you expect, and what is its write rate? Have you done the contention math for the hottest one?</li>
+<li>How do projections read in order? If it is a sequence column, how do you handle out-of-order commits?</li>
+<li>Where is each projection's checkpoint stored, and is it updated in the same transaction as the read table? If not, how is apply idempotent?</li>
+<li>How long does a full rebuild of the biggest projection take, measured, and can it run in parallel? How do readers switch to the rebuilt version?</li>
+<li>Which subscribers have side effects? Can a rebuild ever trigger them?</li>
+<li>Is every external input to a decision (price, rate, score) captured in the event, so replay is deterministic?</li>
+<li>How does each event type evolve? Where are the upcasters, and is there a CI job replaying real historical events of every version?</li>
+<li>Which fields are personal data, which key encrypts them, and which projections and backups hold copies? Has an erasure been tested end to end?</li>
+<li>What do other teams consume: stored domain events or a translated integration contract?</li>
+</ol>
+
+<h2 id=dd-event-sourcing-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Two requests modify the same order at once. How does your event store stop a lost update?"</summary>
+<p>Each append states the version it was decided against. The store enforces uniqueness on <code>(stream_id, stream_version)</code>, so only one append at version 5 can succeed. The loser gets a conflict, reloads the stream including the winner's event, and runs its decision again. That re-decision is the point: the shipping job sees <code>OrderCancelled</code> and refuses. Retrying the same append blindly would be wrong. You retry the <em>decision</em>, not the write.</p>
+</details>
+<details>
+<summary>"Why not just use Kafka as your event store?"</summary>
+<p>Three gaps. No conditional append per entity, so the concurrency check above is not available. No cheap read of one entity's history, because a partition interleaves many entities and you would scan it. And compaction keeps only the latest record per key, which is the opposite of keeping history. Kafka is excellent for distributing events after they are decided. The decision needs a store with per-stream versions.</p>
+</details>
+<details>
+<summary>"Your projection lags by 30 seconds after a deploy. Is it lag or is it broken?"</summary>
+<p>Look at two numbers: the checkpoint position over time and the head position over time. If the checkpoint is moving and the gap is shrinking, it is catching up, and catch-up headroom tells you how long it will take. If the checkpoint is flat while the head moves, it is stuck, usually on a poison event, and the error log will name the position. A third case is silent: the checkpoint is current but rows are wrong. That is a skip or a logic bug, and only a reconciliation job against the event store finds it.</p>
+</details>
+<details>
+<summary>"How do you guarantee that a username is unique if each user is its own stream?"</summary>
+<p>A stream only guards its own invariants, so a cross-stream rule needs something else. If the event store lives in a relational database, insert into a <code>usernames</code> table with a unique constraint in the same transaction as the <code>UserRegistered</code> append. If it cannot share a transaction, use a reservation: claim the name in a reservation stream keyed by the name itself, then register, then confirm, with a timeout that releases abandoned claims. Saying "check the projection first" is the wrong answer, because the projection lags and two registrations can both pass the check.</p>
+</details>
+<details>
+<summary>"You fix a bug in how refunds are applied. What happens to existing state?"</summary>
+<p>The events are unchanged and still correct, because they record what happened, not the computed result. Replaying with the fixed <code>evolve</code> gives correct state. Three things need attention: snapshots written by the old code (invalidate them by version), projections built by the old code (rebuild), and any decision already made on the wrong state (for example a refund paid twice). That last group is handled with compensating events, plus a query over the event log that lists exactly which streams were affected.</p>
+</details>
+<details>
+<summary>"An event-sourced account has ten years of history. Walk me through a balance read."</summary>
+<p>Normally no replay happens at request time at all: the balance comes from a projection kept current by a subscriber. For the command path, the handler loads the latest snapshot and the tail since it, bounded by a threshold such as 200 events. If the stream itself has become huge, close the books periodically. A <code>PeriodClosed</code> event carries the closing balance into a new stream, so the live stream only covers the current period.</p>
+</details>
+<details>
+<summary>"What is the difference between occurred_at and recorded_at, and when does it matter?"</summary>
+<p><code>occurred_at</code> is when the thing happened in the world. <code>recorded_at</code> is when your system learned about it. They split whenever data arrives late: offline devices, courier scans, bank settlements. "What was the order's status at 10:00?" uses <code>occurred_at</code>. "What did support see on screen at 10:00?" uses <code>recorded_at</code>. Disputes and audits often need the second, and you can only answer it if both clocks were stored from the first event.</p>
+</details>
+<details>
+<summary>"When would you event-source only part of a service?"</summary>
+<p>Most of the time. In the bookstore, orders and payments are ledgers, so they are event-sourced. The product catalog, customer preferences and content pages are current-state data, so they stay as tables, maybe with CDC for history. The boundary follows the question "will someone ever dispute or audit how this value got here?" A service with one event-sourced aggregate and five plain tables is normal and healthy.</p>
+</details>

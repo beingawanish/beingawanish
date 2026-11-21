@@ -24,8 +24,9 @@ def build() -> str:
     text = SRC.read_text()
     source_ids = set(_ids(text))
     new_ids: list[str] = []
-    for frag_path in sorted((HERE / "deep").glob("*.html")):
-        slug = frag_path.stem
+    # <slug>.html is a lesson's deep dive; <slug>--<part>.html adds further parts after it.
+    for frag_path in sorted((HERE / "deep").glob("*.html"), key=lambda p: (p.stem.split("--")[0], p.stem)):
+        slug = frag_path.stem.split("--")[0]
         frag = frag_path.read_text().strip()
         new_ids += _ids(frag)
         m = re.search(rf'<template id="t-{re.escape(slug)}">(.*?)</template>', text, re.S)
@@ -36,6 +37,8 @@ def build() -> str:
             if "TL;DR" in h.group(1):
                 tldr = h
         at = m.start(1) + (tldr.start() if tldr else len(body))
+        # A later part for the same lesson goes after the parts already inserted (they sit right
+        # before the TL;DR too, so inserting at the TL;DR keeps file order).
         text = text[:at] + frag + "\n" + text[at:]
     # The course reuses ids across lessons (one lesson renders at a time), so only the new
     # sections' ids are checked: unique among themselves and absent from the course.

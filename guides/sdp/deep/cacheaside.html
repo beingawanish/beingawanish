@@ -1,0 +1,282 @@
+<h2 id=dd-cacheaside-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's version of cache-aside fits in four lines: check, fetch, set, return. A production version is closer to forty. The extra lines are where the real decisions live: what happens when the cache is slow, what a key looks like, how expiry actually works inside Redis, and which races the delete-on-write rule still leaves open.</p>
+
+<h3 id=dd-cacheaside-real-read-path level=3>The read path, written out properly</h3>
+<p>Here is the product read with the details that matter in production. It uses the redis-py client API; the shape is the same in any language.</p>
+<pre><code>import json, random
+
+TTL = 3600            # one hour for product records
+JITTER = 0.10         # spread expiries by +/- 10%
+NEG_TTL = 60          # remember "no such product" for a minute
+MISSING = b"__none__"
+
+def get_product(pid):
+    key = f"product:v3:{pid}"            # namespace + schema version + id
+    try:
+        raw = cache.get(key)             # client socket timeout ~10-20 ms
+    except CacheError:
+        raw = None                       # a slow or dead cache is a miss, not an outage
+    if raw == MISSING:
+        return None
+    if raw is not None:
+        return json.loads(raw)
+
+    row = db.query("SELECT ... FROM products WHERE id = %s", pid)
+    try:
+        if row is None:
+            cache.set(key, MISSING, ex=NEG_TTL)
+        else:
+            ttl = int(TTL * random.uniform(1 - JITTER, 1 + JITTER))
+            cache.set(key, json.dumps(row), ex=ttl)
+    except CacheError:
+        pass                             # failing to fill never fails the read
+    return row</code></pre>
+<p>Each line answers a question the four-line version skips.</p>
+<ul>
+<li><strong>Cache errors become misses.</strong> The cache is an optimisation, so a broken cache must never break a read. That is also why the client timeout must be short. A cache hit takes about 1 ms, so a 10–20 ms timeout is generous. A 1-second timeout turns a sick cache into a 1-second outage on every request.</li>
+<li><strong>The key carries a schema version.</strong> When the record's shape changes, you bump <code>v3</code> to <code>v4</code>. New code reads new keys and never parses old blobs. The old keys simply expire.</li>
+<li><strong>TTLs get jitter.</strong> Without it, every key filled in the same minute (after a deploy, a restart or a warm-up script) expires in the same minute an hour later.</li>
+<li><strong>Absence gets cached too.</strong> A request for a product that does not exist is a miss every time, unless you remember the absence. This is called negative caching, and it uses a short TTL so a newly created product appears quickly.</li>
+</ul>
+
+<h3 id=dd-cacheaside-redis-internals level=3>What Redis does with your keys</h3>
+<p>Three Redis behaviours decide how cache-aside behaves under pressure. They are configuration, not code, so they are easy to miss in review.</p>
+<p><strong>Eviction policy.</strong> Redis evicts only when <code>maxmemory</code> is set and full. What it does then depends on <code>maxmemory-policy</code>, and the default is <code>noeviction</code>. With that default, a full cache does not drop old keys. It rejects new writes with an out-of-memory error. For a pure cache that is almost never what you want.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Policy<th>Evicts<th>Good for<th>Trap<tbody><tr><td><code>noeviction</code> (default)<td>Nothing; writes fail when full<td>Redis used as a primary store<td>A cache that silently stops filling<tr><td><code>allkeys-lru</code><td>Least recently used key, any key<td>Most caches<td>One big scan of cold keys pushes out hot ones<tr><td><code>allkeys-lfu</code><td>Least frequently used key, any key<td>Skewed catalogs with a stable hot set<td>Slower to adapt when popularity shifts suddenly<tr><td><code>volatile-lru</code> / <code>volatile-lfu</code><td>Only keys that have a TTL<td>Mixing cache keys and keys that must stay<td>If no key has a TTL, it behaves like <code>noeviction</code><tr><td><code>volatile-ttl</code><td>The key closest to expiry<td>Rarely the best choice<td>Ignores how hot a key is</table></div></div>
+<p>Redis's LRU and LFU are approximations. On each eviction it samples a few keys (<code>maxmemory-samples</code>, 5 by default) and evicts the best candidate among them. Raising the sample size makes eviction closer to true LRU and costs CPU. For most caches the default is fine.</p>
+<p><strong>Expiry is lazy plus sampled.</strong> An expired key is removed when someone touches it, or when the background expiry cycle samples it (that cycle runs at a rate set by <code>hz</code>, 10 times per second by default). So expired keys can sit in memory for a while. Readers never see them, but your memory graph does. If millions of keys expire in the same minute, the active cycle also spends noticeable CPU deleting them.</p>
+<p><strong>Replication is asynchronous.</strong> A Redis primary acknowledges a <code>SET</code> or <code>DEL</code> before its replicas have it. For cache-aside this rarely matters, because a lost <code>SET</code> is just a later miss. A lost <code>DEL</code> is different: after a failover, the promoted replica may still hold the value you deleted. The TTL is what bounds that.</p>
+<p>Memcached differs in ways worth knowing. It has no persistence and no replication, which suits a cache well. It stores items in a <strong>slab allocator</strong>: memory is split into size classes, and each class has its own LRU. Items are capped at 1 MB by default (the <code>-I</code> flag raises it). Older versions could get "calcified", with memory stuck in size classes the workload no longer used. Modern versions rebalance slabs automatically. Memcached also has <code>add</code> (store only if absent) and <code>cas</code> (store only if unchanged since you read it), which are the building blocks for the race fixes below.</p>
+
+<h3 id=dd-cacheaside-key-design level=3>Key design</h3>
+<p>Keys look trivial until three teams share a cluster. A good key has four parts: a namespace (<code>product</code>), a version (<code>v3</code>), the identity (<code>8412</code>), and any variant that changes the value (<code>:en-GB</code> for a localised description). Missing the variant is a real bug. If the key for a localised page omits the locale, the first reader's language wins for an hour.</p>
+<p>Keys should be computable from the write side too. The write path must delete exactly the keys the read path fills. If the read path caches <code>product:v3:8412:en-GB</code> and <code>product:v3:8412:de-DE</code>, the writer must know every locale, or must use a different scheme. Two schemes are common.</p>
+<ul>
+<li><strong>Generation keys.</strong> Store a small counter, <code>product:8412:gen</code>, and include its value in every derived key: <code>product:v3:8412:g17:en-GB</code>. A writer increments the counter once. Every derived key becomes unreachable at once, and the old entries age out through eviction or TTL. This costs one extra cache read per lookup.</li>
+<li><strong>Tags.</strong> Some frameworks keep a set of keys per tag and delete the set. This works, but the tag set itself is a cache entry that can be evicted or go stale. Generation keys are usually simpler.</li>
+</ul>
+
+<h3 id=dd-cacheaside-races level=3>The races delete-on-write still leaves</h3>
+<p>The lesson shows why <code>DEL</code> beats <code>SET</code> on write. Deleting removes the write-write race. It does not remove every race, and it helps to see the remaining ones on a timeline.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-cacheaside-svg-title dd-cacheaside-svg-desc" viewBox="0 0 720 360" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-cacheaside-svg-title">The read-repopulation race in cache-aside</title>
+<desc id="dd-cacheaside-svg-desc">Four lifelines: reader, cache, database and writer. The reader misses in the cache and reads the price of 40 dollars from the database. Before the reader stores it, the writer updates the database to 45 dollars and deletes the cache key. The reader then sets the key to 40 dollars. The cache now holds the old price until the TTL expires.</desc>
+<defs><marker id="dd-cacheaside-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="360" fill="#ffffff"/>
+<rect x="40" y="16" width="120" height="36" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="100" y="39" font-size="14" fill="#1c2430" text-anchor="middle">Reader</text>
+<rect x="240" y="16" width="120" height="36" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="300" y="39" font-size="14" fill="#1c2430" text-anchor="middle">Cache</text>
+<rect x="420" y="16" width="120" height="36" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="480" y="39" font-size="14" fill="#1c2430" text-anchor="middle">Database</text>
+<rect x="580" y="16" width="120" height="36" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="640" y="39" font-size="14" fill="#1c2430" text-anchor="middle">Writer</text>
+<line x1="100" y1="52" x2="100" y2="340" stroke="#d5dee8" stroke-width="2"/>
+<line x1="300" y1="52" x2="300" y2="340" stroke="#d5dee8" stroke-width="2"/>
+<line x1="480" y1="52" x2="480" y2="340" stroke="#d5dee8" stroke-width="2"/>
+<line x1="640" y1="52" x2="640" y2="340" stroke="#d5dee8" stroke-width="2"/>
+<line x1="100" y1="84" x2="296" y2="84" stroke="#1c2430" marker-end="url(#dd-cacheaside-arrow)"/>
+<text x="200" y="76" font-size="12" fill="#1c2430" text-anchor="middle">1. GET product:8412 → miss</text>
+<line x1="100" y1="124" x2="476" y2="124" stroke="#1c2430" marker-end="url(#dd-cacheaside-arrow)"/>
+<text x="290" y="116" font-size="12" fill="#1c2430" text-anchor="middle">2. SELECT → $40 (reader then pauses: GC, slow network)</text>
+<line x1="640" y1="170" x2="484" y2="170" stroke="#1c2430" marker-end="url(#dd-cacheaside-arrow)"/>
+<text x="560" y="162" font-size="12" fill="#1c2430" text-anchor="middle">3. UPDATE → $45</text>
+<line x1="640" y1="214" x2="304" y2="214" stroke="#1c2430" marker-end="url(#dd-cacheaside-arrow)"/>
+<text x="470" y="206" font-size="12" fill="#1c2430" text-anchor="middle">4. DEL product:8412 (nothing to delete)</text>
+<line x1="100" y1="260" x2="296" y2="260" stroke="#c898a4" stroke-width="2" marker-end="url(#dd-cacheaside-arrow)"/>
+<text x="200" y="252" font-size="12" fill="#1c2430" text-anchor="middle">5. SET product:8412 = $40</text>
+<rect x="190" y="282" width="220" height="44" rx="8" fill="#f8ebee" stroke="#c898a4"/>
+<text x="300" y="301" font-size="12" fill="#1c2430" text-anchor="middle">Cache: $40, database: $45</text>
+<text x="300" y="317" font-size="12" fill="#5c6b7c" text-anchor="middle">wrong until the TTL expires</text>
+</svg>
+<figcaption>The delete in step 4 lands before the stale fill in step 5, so it deletes nothing. Every fix below either rejects step 5 or makes its damage short.</figcaption>
+</figure>
+
+<p>The window is narrow: the reader must pause between its database read and its cache fill, and a write must land inside that pause. At 12,000 reads per second that still happens. Three related races share the same shape.</p>
+<ul>
+<li><strong>Delete before commit.</strong> If the writer deletes inside its transaction and commits afterwards, any reader in between refills the cache with the old row. The delete must come <em>after</em> the commit.</li>
+<li><strong>Replica lag.</strong> The writer commits on the primary and deletes the key. A reader misses, reads a replica that is 200 ms behind, and refills the cache with the old row. This one is common, because replica lag is often longer than any GC pause.</li>
+<li><strong>Lost delete.</strong> The writer commits, then crashes or times out before the <code>DEL</code>. Nothing retries it.</li>
+</ul>
+<p>The fixes, from cheapest to strongest:</p>
+<ol>
+<li><strong>Short TTLs on data that matters.</strong> This does not prevent anything. It bounds the damage, which for a product description is often enough.</li>
+<li><strong>Delayed double delete.</strong> Delete after commit, then delete again after a delay longer than replica lag plus a slow read (say 1–2 seconds). It catches most repopulation races cheaply. It is a heuristic, not a guarantee.</li>
+<li><strong>Fill from the primary after a recent write.</strong> Facebook's memcache paper describes a "remote marker": a writer sets a marker key, and a reader that sees it reads from the primary instead of a lagging replica.</li>
+<li><strong>Leases.</strong> Also from the Facebook paper. On a miss, the cache hands the reader a lease token. A <code>DEL</code> on that key invalidates outstanding tokens. The reader's later fill succeeds only with a valid token, so step 5 in the diagram is rejected. Memcached does not ship leases as a feature, but you can build the same thing with <code>cas</code>, or with a small Lua script in Redis.</li>
+<li><strong>Versioned fills.</strong> Store a version (an <code>updated_at</code> or a row version column) with the value, and let a fill replace an entry only if its version is newer. This stops stale fills that arrive after a newer fill. It does not stop a stale fill into an empty slot, which is the diagram's case, so it pairs with leases or a short TTL.</li>
+</ol>
+
+<h3 id=dd-cacheaside-cdc level=3>Moving invalidation out of the application</h3>
+<p>The lesson's worst bug was the write path that forgets to delete. The structural fix is to stop asking write paths to remember. Instead, a separate process reads the database's change log and deletes keys for every committed change.</p>
+<p>On MySQL that means tailing the binlog; on Postgres, logical decoding of the WAL (see <a href="#writeahead-log">Write-Ahead Log</a>). Debezium is a common off-the-shelf choice. Facebook's paper describes the same idea: a daemon called mcsqueal reads the MySQL commit log and broadcasts deletes.</p>
+<p>This catches every writer: the admin panel, the bulk import, the manual <code>UPDATE</code> someone runs at 2 a.m. It also deletes strictly after commit, which removes the delete-before-commit race. The costs are a new component to run, invalidation lag (usually milliseconds to a second, and much worse if the tailer falls behind), and a mapping from table rows to cache keys that someone has to maintain. Monitor the tailer's lag as carefully as replica lag, because it is the cache's staleness.</p>
+
+<h2 id=dd-cacheaside-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The numbers below use the lesson's bookstore: 2,000,000 products, 12,000 reads per second at peak, a 15 ms database read, a 1 ms cache hit, and eight database replicas before the cache.</p>
+
+<h3 id=dd-cacheaside-memory-math level=3>How much memory</h3>
+<p>Start with the bytes you store, then add overhead.</p>
+<ul>
+<li><strong>Value size.</strong> A serialised product record is about 2 KB. Measure it; JSON with long field names can easily double this. Compression (zstd, or just shorter field names) often halves it.</li>
+<li><strong>Per-key overhead.</strong> Redis adds its own bookkeeping per key: the key string, the dictionary entry, expiry metadata. Plan on tens of bytes to around 100 bytes per key, and measure with <code>MEMORY USAGE</code> on real keys.</li>
+<li><strong>Fragmentation.</strong> The allocator never packs memory perfectly. Watch <code>mem_fragmentation_ratio</code> in <code>INFO memory</code>; values around 1.1–1.5 are typical for churny caches.</li>
+</ul>
+<p>The whole catalog: 2,000,000 × (2,048 + 100) bytes ≈ 4.3 GB. With a fragmentation allowance of 1.3, that is about 5.6 GB. A node with 8 GB and <code>maxmemory</code> at 6 GB fits the entire catalog.</p>
+<p>That result changes the question. When the full data set fits in one modest machine, you are not choosing what to cache. You are choosing TTLs. Eviction policy only matters once the data outgrows memory, for example when you add per-locale and per-currency variants. Ten variants per product makes it 56 GB, and then the hit-ratio curve below starts to matter.</p>
+
+<h3 id=dd-cacheaside-hit-ratio-math level=3>Predicting the hit ratio</h3>
+<p>Two separate effects set the hit ratio. Capacity decides which keys can stay. TTL decides how often even a resident key misses.</p>
+<p><strong>The TTL effect.</strong> Suppose a key receives λ requests per second and its TTL is T seconds, with no invalidations. Each TTL window starts with one miss followed by about λT hits. So its miss ratio is about 1 / (1 + λT).</p>
+<ul>
+<li>Item 8412: λ = 4,000 per minute ≈ 67 per second, T = 3,600 s. λT ≈ 240,000, so the miss ratio is about 0.0004%. This is the lesson's "next 240,000 reads".</li>
+<li>A long-tail product read twice an hour: λT = 2, so one read in three misses.</li>
+<li>The same tail product with a 5-minute TTL: λT ≈ 0.17, and 86% of its reads miss. Short TTLs barely cost anything on hot keys and wipe out the benefit on cold ones.</li>
+</ul>
+<p><strong>The capacity effect.</strong> Popularity in catalogs is often roughly Zipf-shaped: the k-th most popular item gets traffic proportional to 1/k. Under a pure Zipf curve with exponent 1, caching the top k of N items captures about H(k) / H(N) of requests, where H(n) ≈ ln n + 0.577.</p>
+<ul>
+<li>Top 200,000 of 2,000,000 (10%): (ln 200,000 + 0.577) / (ln 2,000,000 + 0.577) ≈ 12.78 / 15.09 ≈ 85%.</li>
+<li>To reach 99%, you need H(k) ≈ 14.94, so k ≈ 1.7 million: about 86% of the catalog.</li>
+</ul>
+<p>That second number surprises people. Under a pure 1/k curve, the last few percent of hit ratio are expensive. Real traffic is often more skewed than that, and requests repeat in short bursts, which helps. Even so, never assume a 99% hit ratio from a back-of-envelope cache size. Measure it: replay a day of access logs against simulated cache sizes and plot hit ratio against memory. That plot is called a miss-ratio curve, and it is the honest way to size a cache.</p>
+
+<h3 id=dd-cacheaside-fanout-math level=3>Fan-out turns rare misses into common slow pages</h3>
+<p>The lesson's average of 1.1 ms is per lookup. Pages rarely do one lookup. A product page might fetch the product, its seller, three recommendations, stock status and reviews: say 20 keys.</p>
+<p>If each lookup hits independently with probability 0.992, the page sees at least one miss with probability 1 − 0.992<sup>20</sup> ≈ 15%. If the lookups are sequential, a miss adds about 16 ms. So roughly one page in seven pays at least one database round trip, even with a "99.2% cache".</p>
+<p>The fixes are structural. Fetch keys in parallel, or with one <code>MGET</code>, so a miss costs one database read instead of a chain. And for the hottest pages, cache the composed page fragment, so one key replaces twenty.</p>
+
+<h3 id=dd-cacheaside-throughput-math level=3>Throughput and the hot key</h3>
+<p>A single Redis process handles on the order of 100,000 simple <code>GET</code>s per second on one core; the exact figure depends on value size, pipelining and hardware. The bookstore's 12,000 per second is far below that. Bandwidth is the more likely ceiling: 12,000 × 2 KB = 24 MB/s, which is also fine.</p>
+<p>Now imagine a flash sale where one product takes 200,000 reads per second. In Redis Cluster, a key maps to one of 16,384 hash slots, and each slot lives on exactly one primary. Every one of those reads goes to the same node. 200,000 × 2 KB = 400 MB/s, about 3.2 Gbps of response traffic, from one process on one core. Adding shards does nothing, because the key does not split.</p>
+<p>There are two usual fixes. The first is a small in-process cache in front of Redis for the hottest keys. Even a 1-second TTL removes almost all of that load, since each server then asks Redis about once a second. The second is spreading copies of the hot key across several keys (<code>product:8412#0</code> to <code>#7</code>) and picking one at random on read. Copies make invalidation harder, because a write must delete all of them.</p>
+
+<h3 id=dd-cacheaside-cold-math level=3>The question nobody sizes: the database without the cache</h3>
+<p>The lesson says six of the eight replicas were shut down. Before that decision, do this calculation.</p>
+<p>Eight replicas served 12,000 reads per second, so each handles at least 1,500. Two replicas handle about 3,000. If the cache cluster is lost or restarted empty, 12,000 reads per second arrive at a database sized for 3,000. That is a 4× overload. Queues grow, latency climbs from 15 ms to seconds, and timeouts plus retries make the load worse.</p>
+<p>You have three honest options, and you should write down which one you chose:</p>
+<ol>
+<li><strong>Keep enough database capacity</strong> to survive a cold cache at peak. Expensive, but simple.</li>
+<li><strong>Make the cache highly available</strong> (replicas, multiple nodes, a spare "gutter" pool as Facebook did) so that losing all of it is very unlikely, and accept the risk.</li>
+<li><strong>Shed load when cold.</strong> Rate-limit database reads, serve degraded pages, and warm the cache gradually. See <a href="#graceful-degradation">Graceful Degradation</a> and <a href="#cache-stampede-prevention">Cache Stampede Prevention</a>.</li>
+</ol>
+<p>Teams that remove replicas without picking one have quietly made the cache part of the database's capacity. That is a reasonable choice, but it should be a deliberate one.</p>
+
+<h3 id=dd-cacheaside-cost-math level=3>The cost comparison</h3>
+<p>Assume a database replica is a large machine and the cache is one 8 GB node with one replica for failover. Two small cache nodes replace six large database machines. The exact prices vary by provider, but the ratio is usually lopsided: RAM in a cache node is cheap per gigabyte compared with a full database replica's CPU, memory, storage and licence. The cache wins on cost as long as the hit ratio is high. The fan-out and cold-start sections are what keep that true.</p>
+
+<h2 id=dd-cacheaside-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-cacheaside-fm-replica-lag level=3>1. The price that changes back</h3>
+<p><strong>Symptom.</strong> An admin changes a price. The new price shows briefly, then the old price comes back and stays for up to an hour. It happens only sometimes, and mostly at peak.</p>
+<p><strong>Mechanism.</strong> The write goes to the primary, and the app deletes the key. The next reader misses and reads a replica that has not yet applied the update. It fills the cache with the old price, which now lives for a full TTL. Under peak load, replica lag grows, so the window grows.</p>
+<p><strong>Detect.</strong> Compare the cache's value against the primary for recently written keys, using a sampled checker job. Correlate the incidents with the replica lag metric (on MySQL, <code>Seconds_Behind_Source</code>; on Postgres, the replay lag in <code>pg_stat_replication</code>).</p>
+<p><strong>Fix.</strong> Fill from the primary for a short window after a write (a remote marker), or delete again after a delay longer than worst-case lag, or invalidate from the change log of the replica the readers use. Keep TTLs short on prices.</p>
+
+<h3 id=dd-cacheaside-fm-slow-cache level=3>2. The cache that is slow, not down</h3>
+<p><strong>Symptom.</strong> p99 page latency jumps from 40 ms to 1.2 s. The database looks idle. Nothing reports an error.</p>
+<p><strong>Mechanism.</strong> One Redis node is struggling: a slow command such as <code>KEYS *</code> or a large <code>DEL</code> blocks its single thread, a background save forks a large process, or the host is swapping. Clients wait for their full timeout, which someone set to 1 second, before treating it as a miss. A dead cache would have been faster: connection refused returns in microseconds.</p>
+<p><strong>Detect.</strong> Client-side cache latency histograms, split by node. On the server, <code>SLOWLOG GET</code> and the latency monitor. Watch the client's connection pool wait time too; pool exhaustion looks exactly like this.</p>
+<p><strong>Fix.</strong> Tight client timeouts (a few times the normal p99, so 10–20 ms), a circuit breaker around the cache so a sick node is skipped quickly (see <a href="#circuit-breaker">Circuit Breaker</a>), and banning <code>KEYS</code> in production (use <code>SCAN</code>). Use <code>UNLINK</code> instead of <code>DEL</code> for large values, so the memory is freed in the background.</p>
+
+<h3 id=dd-cacheaside-fm-full-cache level=3>3. The cache that stopped filling</h3>
+<p><strong>Symptom.</strong> Hit ratio drifts down over days. Database load creeps up. The application logs show occasional <code>OOM command not allowed</code> errors, swallowed by the "cache errors are misses" handler.</p>
+<p><strong>Mechanism.</strong> <code>maxmemory</code> was set and the policy was left at <code>noeviction</code>, or it was <code>volatile-lru</code> and a new feature wrote keys without TTLs. Either way, memory filled with keys that cannot be evicted, and every new <code>SET</code> fails. Reads still work for old keys, so nothing looks broken.</p>
+<p><strong>Detect.</strong> Alert on <code>used_memory</code> approaching <code>maxmemory</code> combined with <code>evicted_keys</code> staying at zero. Count failed cache writes as a metric instead of only logging them. Track the share of keys without a TTL (an <code>INFO keyspace</code> line shows <code>keys</code> and <code>expires</code> per database).</p>
+<p><strong>Fix.</strong> Set <code>allkeys-lru</code> or <code>allkeys-lfu</code> on cache clusters. Keep data that must not be evicted (sessions, rate-limit counters, locks) on a separate cluster with its own policy.</p>
+
+<h3 id=dd-cacheaside-fm-expiry-wave level=3>4. The hourly wave</h3>
+<p><strong>Symptom.</strong> Database CPU spikes at roughly the same minute every hour after a deploy. The spike shrinks over the day, then returns after the next deploy.</p>
+<p><strong>Mechanism.</strong> The deploy flushed or changed the cache keys (a version bump, a new namespace), so the hot set was refilled within a few minutes. Every key got the same fixed 3,600-second TTL. An hour later they all expire together, and their refills land together. Each cycle spreads out a little, because refill times vary.</p>
+<p><strong>Detect.</strong> Plot cache misses per minute and database queries per minute on the same chart. A sawtooth with an exact 60-minute period is the signature.</p>
+<p><strong>Fix.</strong> TTL jitter of ±10–20%. For the hottest keys, refresh before expiry rather than after (probabilistic early refresh, covered in <a href="#cache-stampede-prevention">Cache Stampede Prevention</a>). Roll out key-version bumps gradually, or warm the new keys before switching readers to them.</p>
+
+<h3 id=dd-cacheaside-fm-hot-key level=3>5. One shard on fire</h3>
+<p><strong>Symptom.</strong> During a promotion, one Redis node runs at 100% CPU and its network interface is saturated. The other nodes are calm. Timeouts appear only for keys on that node, which includes many unrelated products that happen to share it.</p>
+<p><strong>Mechanism.</strong> One key gets a large share of all traffic, and a key cannot be split across shards. The node's single thread or its NIC becomes the bottleneck for everything stored there.</p>
+<p><strong>Detect.</strong> Per-node ops and bandwidth on a dashboard, not just cluster totals. <code>redis-cli --hotkeys</code> works when the policy is LFU. Client-side sampling of keys per second is more reliable.</p>
+<p><strong>Fix.</strong> A short-TTL in-process cache for the hottest keys, or several copies of the hot key under different names. Detect hot keys automatically and promote them to the local tier, because the hot key during a sale is rarely the one you predicted.</p>
+
+<h3 id=dd-cacheaside-fm-schema level=3>6. The deploy that broke reads</h3>
+<p><strong>Symptom.</strong> Halfway through a rolling deploy, product pages start returning errors on some servers. Rolling back does not fully fix it.</p>
+<p><strong>Mechanism.</strong> The new code changed the cached object: it renamed a field or switched serialisation. New servers write the new format into the same keys that old servers read, and vice versa. Each version crashes on the other's blobs. After rollback, the new-format entries are still in the cache, so old code keeps failing until they expire.</p>
+<p><strong>Detect.</strong> Deserialisation errors as a named metric. Errors that correlate with the deploy's progress rather than with traffic.</p>
+<p><strong>Fix.</strong> Put the schema version in the key. During a rolling deploy, the two versions then use separate keys and never read each other's data. The cost is a temporary drop in hit ratio while the new keys fill, so do it off-peak.</p>
+
+<h3 id=dd-cacheaside-fm-missing-ids level=3>7. The scraper that missed every time</h3>
+<p><strong>Symptom.</strong> Database load doubles overnight while cache hit ratio for real users looks normal. The slow-query log is full of lookups that return zero rows.</p>
+<p><strong>Mechanism.</strong> A scraper or a buggy client requests product IDs that do not exist. Nothing is cached for "not found", so every request is a miss that reaches the database. Overall hit ratio drops, and the cache gives no protection at all for this traffic.</p>
+<p><strong>Detect.</strong> Count database lookups that return no row, and miss ratio split by response status.</p>
+<p><strong>Fix.</strong> Negative caching with a short TTL, as in the read-path snippet. For very large ID spaces, a Bloom filter of valid IDs in front of the cache rejects most invalid lookups without storing each one. Rate-limit the client as well.</p>
+
+<h2 id=dd-cacheaside-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-cacheaside-choose-invalidation level=3>How the cache learns about writes</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach<th>Worst-case staleness<th>Catches bypassing writers?<th>Extra parts<th>Fits<tbody><tr><td>TTL only<td>One full TTL<td>Yes, eventually<td>None<td>Data where minutes or hours of staleness are harmless<tr><td>Delete-on-write in app code + TTL<td>Milliseconds normally; one TTL when a path forgets or a race hits<td>No<td>None<td>The default for most teams<tr><td>Delete via change-data capture + TTL<td>Tailer lag, usually under a second<td>Yes, every committed change<td>Log tailer, row-to-key mapping<td>Many writers, bulk jobs, several services sharing tables<tr><td>Generation or version keys<td>Milliseconds after the counter bump<td>No<td>One extra lookup per read<td>Many derived keys per entity (locales, page fragments)<tr><td>Leases or versioned fills<td>Removes the fill races; forgotten deletes still need TTL<td>No<td>Custom cache commands or Lua<td>Large scale, where the rare races happen daily</table></div></div>
+<p>Most systems should start with delete-on-write plus TTLs, and route every write through one data-access module. Move to change-data capture when you can no longer list every writer, which usually happens once a second service or a data pipeline writes the same tables. Leases are worth building when you can measure the races, not before.</p>
+
+<h3 id=dd-cacheaside-choose-topology level=3>Where the cache lives</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th>In-process (per server)<th>Shared remote (Redis, Memcached)<th>Two tiers (in-process in front of shared)<tbody><tr><td>Hit latency<td>Microseconds<td>About 1 ms including the network<td>Microseconds for L1 hits<tr><td>Copies of each key<td>One per server (40)<td>One (plus replicas)<td>Up to 41<tr><td>Invalidation<td>Hard: must reach every server<td>One delete<td>Delete in L2 plus a broadcast or a very short L1 TTL<tr><td>Survives deploys<td>No, every restart is cold<td>Yes<td>L2 survives<tr><td>Hot-key protection<td>Excellent<td>Poor<td>Excellent<tr><td>Best fit<td>Tiny, read-constantly, staleness-tolerant data (feature flags, config)<td>Most application caching<td>Very hot keys, very high read rates</table></div></div>
+<p>A two-tier design needs a story for L1 invalidation. The simplest is a short L1 TTL (1–5 seconds), which bounds staleness and still absorbs hot-key traffic. Redis 6 and later can also push invalidations to clients that opt in with <code>CLIENT TRACKING</code>, so the client's local copy is dropped when the key changes. Pub/sub broadcasts of deletes work too, but a dropped message leaves one server stale, so keep the short TTL anyway.</p>
+
+<h3 id=dd-cacheaside-choose-engine level=3>Redis or Memcached</h3>
+<p>For plain cache-aside of serialised objects, both work well. Memcached is multi-threaded, so one node can use many cores. It has no persistence or replication to manage, and its slab allocator gives predictable memory behaviour. Redis has richer data types (hashes, sorted sets), Lua scripting for things like leases and versioned fills, replication, and client-side tracking. Choose Redis if you need any of those features. Choose Memcached if you want a simple, very fast, disposable cache and you will use none of them. Running both is common, and it is fine.</p>
+
+<h2 id=dd-cacheaside-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the measured or simulated hit ratio, from real access logs, and what memory does it need? Is there a miss-ratio curve, or only a guess?</li>
+<li>Can the database survive the full read load if the cache restarts empty at peak? If not, which choice was made: spare capacity, a highly available cache, or load shedding?</li>
+<li>Which code paths write each cached entity? Do all of them go through one module that invalidates, and what about bulk imports, migrations and manual fixes?</li>
+<li>Is the delete strictly after the commit, and what happens when it fails or times out?</li>
+<li>Do readers fill from replicas? If so, how is the replica-lag repopulation race handled for data where staleness matters?</li>
+<li>What is the TTL for each data type, and what is the business cost of serving a wrong value for that long?</li>
+<li>Do TTLs have jitter? What happens to load an hour after a deploy that changes key versions?</li>
+<li>What is <code>maxmemory-policy</code>? Are cache keys separated from data that must not be evicted?</li>
+<li>What are the client timeouts and pool sizes for cache calls, and does a slow cache degrade to a miss quickly?</li>
+<li>Does the key include a schema version and every input that changes the value (locale, currency, user tier)?</li>
+<li>Is "not found" cached? Is there protection against lookups for IDs that never exist?</li>
+<li>Which metrics exist: hit ratio per key prefix, per-node ops and bandwidth, evictions, failed cache writes, deserialisation errors?</li>
+</ol>
+
+<h2 id=dd-cacheaside-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"You delete on write. Can the cache still end up stale? Show me how."</summary>
+<p>Yes, in three ways. First, the read-repopulation race: a reader misses, reads the old row, pauses, and fills the cache after the writer's delete. Second, replica lag: the reader misses after the delete but reads a replica that has not applied the write yet, then caches the old row. Third, a lost delete: the writer commits and dies before deleting. All three leave a wrong value for one TTL. Short TTLs bound them; a delayed second delete catches most fill races; filling from the primary after recent writes handles lag; leases or change-data-capture invalidation close the gaps properly.</p>
+</details>
+
+<details>
+<summary>"Why delete after the commit and not before? Deleting first seems safer."</summary>
+<p>Deleting first opens a window between the delete and the commit. Any reader in that window misses, reads the still-old committed row, and refills the cache with it. The commit then lands, and nothing deletes the stale copy. Deleting after commit means any refill sees the new row, apart from replica lag. Some teams delete both before and after to shrink stale reads during the write, but the after-commit delete is the one that matters.</p>
+</details>
+
+<details>
+<summary>"The cache cluster dies at peak. Walk me through the next five minutes."</summary>
+<p>Every read becomes a miss, so the database sees the full 12,000 reads per second. If it was sized for the miss load only, it overloads: latency rises, connection pools fill, application timeouts trigger retries, and the retries add more load. Meanwhile the cache client may be adding its own timeout to every request. What should happen instead: the client's circuit breaker trips quickly, so reads skip the dead cache. The database tier rate-limits or sheds low-priority reads, and pages degrade. When the cache returns, it refills gradually, with stampede protection so each hot key is fetched once. The real answer is the capacity decision made beforehand.</p>
+</details>
+
+<details>
+<summary>"How would you choose TTLs if you had no business guidance?"</summary>
+<p>From two numbers per data type: the cost of serving a stale value and the read rate. The miss ratio per key is about 1 / (1 + λT), so a hot key gets nearly all its benefit from even a short TTL, while cold keys need long TTLs to be worth caching at all. With invalidation in place, the TTL is insurance, so set it to the longest staleness you could tolerate if invalidation silently failed. Then add jitter. Then measure the hit ratio by key prefix and adjust.</p>
+</details>
+
+<details>
+<summary>"One product is getting 200,000 reads a second. Adding Redis shards doesn't help. Why, and what do you do?"</summary>
+<p>A key maps to one hash slot on one node, so all its reads land on one Redis thread and one network interface, no matter how many shards exist. At 2 KB per read that is around 3 Gbps from one node. Put a small in-process cache with a 1–2 second TTL in front of Redis for hot keys. Each of 40 servers then asks Redis about once a second instead of thousands of times. Or store several copies of the key and read one at random. Both trade a little staleness or invalidation complexity for removing the single-node bottleneck.</p>
+</details>
+
+<details>
+<summary>"When would you rather not have the application do invalidation at all?"</summary>
+<p>When you cannot list every writer: several services share the tables, a data pipeline backfills prices, or operators run manual fixes. Then I would tail the database's change log (binlog or logical decoding, often with Debezium) and delete keys from there. It sees every committed change, always after commit. The cost is a component whose lag becomes the cache's staleness, plus a mapping from rows to keys that has to stay current as the cache layout changes.</p>
+</details>
+
+<details>
+<summary>"Is a 99% hit ratio good?"</summary>
+<p>It depends on fan-out and on what the misses cost. Per lookup, 99% gives an average near 1.2 ms against 15 ms. But a page with 20 lookups has an 18% chance of at least one miss, so p90 page latency may be set by misses. And if the remaining 1% is 120 reads per second of expensive queries, that might still be most of the database's load. I would look at hit ratio per key prefix, miss cost per prefix, and page-level latency, not one global number.</p>
+</details>
+
+<details>
+<summary>"How do you deploy a change to the cached object's format without an outage?"</summary>
+<p>Version the key. New code reads and writes <code>product:v4:*</code>; old code keeps <code>product:v3:*</code>. During the rolling deploy each version only sees its own format, and a rollback is safe because the old keys are still there. The cost is a temporary drop in hit ratio while v4 fills. Do it off-peak, consider warming the hottest v4 keys first, and check that the database can absorb the extra misses.</p>
+</details>

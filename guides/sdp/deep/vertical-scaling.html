@@ -1,0 +1,295 @@
+<h2 id=dd-vertical-scaling-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson treats "a bigger machine" as one dial. In a design review it is four dials, and they do not move together: cores, memory, storage I/O and network. Each one hits its own limit. And the software on the machine decides how much of the new hardware it can actually use. So the real question is never "how big?" but "bigger in which dimension, and can this program use it?"</p>
+
+<h3 id=dd-vertical-scaling-dimensions level=3>What "bigger" buys, dimension by dimension</h3>
+<ul>
+<li><strong>Cores.</strong> Cloud instances add vCPUs, and a vCPU is usually one hardware thread, so two vCPUs share one physical core. Going from 16 to 64 vCPUs gives 4x the threads, not 4x the speed of any one request. A single-threaded hot path runs exactly as fast as before. Clock speed rarely changes inside one instance family.</li>
+<li><strong>Memory.</strong> More RAM matters in two ways. Capacity decides whether the working set (the data touched in a typical hour) fits in memory. Bandwidth decides how fast many cores can read it at once. On big multi-socket hosts the second one becomes the limit long before the first.</li>
+<li><strong>Storage I/O.</strong> On network block storage the disk is a separate product. AWS gp3 volumes, for example, start at 3,000 IOPS and 125 MiB/s whatever instance they are attached to, and you provision more separately. The instance also has its own cap on block-storage bandwidth, which grows with instance size. A bigger CPU does nothing for a database that is waiting on its volume.</li>
+<li><strong>Network.</strong> Instance network bandwidth scales with size too. Smaller sizes are often listed as "up to" some figure, which means a burst allowance, not a sustained rate. A cache or proxy box can saturate its NIC while the CPU sits at 30%.</li>
+</ul>
+<p>The practical consequence: before resizing, find which of the four is saturated. A memory-bound database wants a memory-optimised family (more GB per vCPU), not twice the cores. A compression job wants a compute-optimised family. Picking the right family is often worth more than going up a size.</p>
+
+<h3 id=dd-vertical-scaling-numa level=3>NUMA: the big machine is secretly two machines</h3>
+<p>Past a certain size, a server has more than one CPU socket. Each socket has its own memory controller and its own bank of RAM. A core reading memory attached to its own socket is fast. Reading memory attached to the other socket crosses an interconnect and is noticeably slower, and the interconnect has limited bandwidth. This layout is called <strong>NUMA</strong>, non-uniform memory access.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-vertical-scaling-svg-title dd-vertical-scaling-svg-desc" viewBox="0 0 720 260" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-vertical-scaling-svg-title">A two-socket NUMA server</title>
+<desc id="dd-vertical-scaling-svg-desc">Two sockets, each with its own cores and its own local memory bank. A thread on socket 0 reads local memory quickly. When it reads memory attached to socket 1, the request crosses the socket interconnect, which is slower and shared by all cores.</desc>
+<defs><marker id="dd-vertical-scaling-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="260" fill="#ffffff"/>
+<rect x="30" y="30" width="270" height="200" rx="10" fill="#eef2f6" stroke="#d5dee8"/>
+<text x="165" y="52" font-size="14" fill="#1c2430" text-anchor="middle">Socket 0 (NUMA node 0)</text>
+<rect x="50" y="70" width="230" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="165" y="96" font-size="14" fill="#1c2430" text-anchor="middle">Cores 0-31</text>
+<text x="165" y="115" font-size="12" fill="#5c6b7c" text-anchor="middle">thread T runs here</text>
+<rect x="50" y="155" width="230" height="56" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="165" y="180" font-size="14" fill="#1c2430" text-anchor="middle">Local RAM, 256 GB</text>
+<text x="165" y="198" font-size="12" fill="#5c6b7c" text-anchor="middle">fast path</text>
+<rect x="420" y="30" width="270" height="200" rx="10" fill="#eef2f6" stroke="#d5dee8"/>
+<text x="555" y="52" font-size="14" fill="#1c2430" text-anchor="middle">Socket 1 (NUMA node 1)</text>
+<rect x="440" y="70" width="230" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="555" y="104" font-size="14" fill="#1c2430" text-anchor="middle">Cores 32-63</text>
+<rect x="440" y="155" width="230" height="56" rx="8" fill="#f8ebee" stroke="#c898a4"/>
+<text x="555" y="180" font-size="14" fill="#1c2430" text-anchor="middle">Remote RAM, 256 GB</text>
+<text x="555" y="198" font-size="12" fill="#5c6b7c" text-anchor="middle">slower from socket 0</text>
+<line x1="165" y1="130" x2="165" y2="151" stroke="#1c2430" stroke-width="2" marker-end="url(#dd-vertical-scaling-arrow)"/>
+<rect x="315" y="95" width="90" height="34" rx="6" fill="#ffffff" stroke="#1f5f99" stroke-width="2"/>
+<text x="360" y="117" font-size="12" fill="#1c2430" text-anchor="middle">interconnect</text>
+<path d="M280,100 L315,108" fill="none" stroke="#c898a4" stroke-width="2"/>
+<path d="M405,116 C430,130 450,150 470,160" fill="none" stroke="#c898a4" stroke-width="2" marker-end="url(#dd-vertical-scaling-arrow)"/>
+<text x="360" y="155" font-size="12" fill="#1c2430" text-anchor="middle">remote read:</text>
+<text x="360" y="171" font-size="12" fill="#1c2430" text-anchor="middle">extra hop, shared link</text>
+</svg>
+<figcaption>Software that ignores NUMA sees "512 GB of RAM". The hardware sees two 256 GB banks with a toll road between them.</figcaption>
+</figure>
+
+<p>What this means in practice:</p>
+<ul>
+<li>Linux reports the layout with <code>numactl --hardware</code> and per-node hit and miss counts with <code>numastat</code>. A high <code>numa_miss</code> or <code>other_node</code> count means threads keep reading the far bank.</li>
+<li>The kernel's automatic NUMA balancing migrates pages toward the threads that use them. It helps many workloads and hurts some, so databases sometimes document their own advice on it.</li>
+<li>A big JVM or database buffer pool spread across both sockets pays the remote penalty on a large share of reads. Running two smaller processes, each pinned to one socket, can beat one process on the whole box.</li>
+<li>Cloud instances that span sockets expose NUMA too. The very largest sizes in a family usually do. The one-socket sizes below them often give better per-core results for memory-heavy work.</li>
+</ul>
+<p>This is the first reason a 2x machine can give less than 2x. It is also why "just get the biggest box" deserves a benchmark before it gets a purchase order.</p>
+
+<h3 id=dd-vertical-scaling-software level=3>Can the software use the hardware?</h3>
+<p>Every runtime has its own answer. A reviewer should know the common ones by heart.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Software<th>Concurrency model<th>What more cores give you<th>Knob to retune after resizing<tbody>
+<tr><td>Redis<td>Commands execute on one main thread (I/O threads exist since 6.0)<td>Little for command throughput; I/O threads help network-heavy loads<td><code>io-threads</code>; or run more instances / Redis Cluster
+<tr><td>Node.js<td>One event loop per process<td>Nothing, unless you run more processes<td>Cluster mode or one process per core behind a local balancer
+<tr><td>CPython<td>The GIL serialises Python bytecode in one process (free-threaded builds are new and still maturing)<td>Nothing for CPU-bound code in one process<td>Process count, e.g. gunicorn's rule of thumb of 2 &times; cores + 1 workers
+<tr><td>PostgreSQL<td>One OS process per connection, plus parallel query workers<td>More concurrent queries, if they do not fight over the same rows<td><code>shared_buffers</code>, <code>work_mem</code>, <code>max_parallel_workers</code>, <code>effective_cache_size</code>
+<tr><td>JVM services<td>Thread pools<td>Real gains, if pools and GC are sized for it<td>Heap size (<code>-Xmx</code>), GC choice, pool sizes
+<tr><td>nginx<td>Event-driven worker processes<td>Near-linear for TLS and proxying<td><code>worker_processes auto</code>, <code>worker_connections</code>
+</table></div></div>
+<p>Two patterns follow. Single-threaded engines scale up only by becoming several processes, which is a small step toward horizontal scaling on one host. And multi-threaded engines need their config raised, or the new memory and cores sit idle. A Postgres box that grows from 64 GB to 256 GB while <code>shared_buffers</code> stays at 16 GB has bought mostly page cache. That still helps, but it is not the plan anyone presented.</p>
+
+<h3 id=dd-vertical-scaling-scalability-law level=3>Why returns fall: contention and coherency</h3>
+<p>The lesson's "a database limited by lock contention gains little from core #96" has a formal shape. Neil Gunther's <strong>Universal Scalability Law</strong> (USL) models throughput on N cores as:</p>
+<pre><code>C(N) = N / (1 + &sigma;(N - 1) + &kappa;N(N - 1))</code></pre>
+<ul>
+<li><strong>&sigma; (sigma), contention:</strong> the share of work that must happen one at a time. A hot lock, a single log writer, one busy row. This is Amdahl's law. It flattens the curve.</li>
+<li><strong>&kappa; (kappa), coherency:</strong> the cost of cores keeping each other's view consistent. Cache lines bouncing between cores, lock handoffs, cross-socket traffic. It grows with the number of <em>pairs</em> of cores, so past a peak it makes the curve go <em>down</em>.</li>
+</ul>
+<p>The peak sits at N* = &radic;((1 - &sigma;) / &kappa;). Past that, adding cores makes the system slower. That is not a theoretical oddity. It is what a hot-row workload looks like on a big box: CPU climbs, throughput falls, and spinlock time dominates the profile.</p>
+<p>You can fit &sigma; and &kappa; from a few load tests at different core counts (restrict cores with <code>taskset</code> or container CPU limits). The next section works an example.</p>
+
+<h3 id=dd-vertical-scaling-resize level=3>How a resize actually happens</h3>
+<p>"Change the instance type" is a sequence of steps, and each step has its own way to go wrong.</p>
+<ol>
+<li><strong>Stop.</strong> On most clouds you cannot change the type of a running VM. The instance stops. Anything on local instance-store (ephemeral NVMe) disks is gone. Network block volumes survive.</li>
+<li><strong>Change type and start.</strong> The provider must find a host with room for the new size. Near the top of a catalog, or in a busy zone, it may not. You then have a stopped production server and an "insufficient capacity" error.</li>
+<li><strong>Warm up.</strong> The OS page cache, the database buffer pool and the JIT all start cold. The first minutes after a resize can be slower than the old, smaller box was.</li>
+</ol>
+<p>Because of steps 2 and 3, teams that resize often stop resizing in place. They <strong>build the new machine beside the old one and switch</strong>. For a stateless box that means launching the larger instance, warming it, then moving traffic. For a database it means upgrading a replica first, letting it catch up, and promoting it in a controlled failover. Managed databases with a standby often do this for you: they resize the standby, fail over, then resize the old primary. The downtime is the failover, usually seconds to a minute or two, rather than a full stop-start-warm cycle. Measure it in a rehearsal. Don't trust a number from a slide.</p>
+<p>Containers have their own version. Kubernetes historically resized a pod by replacing it. In-place pod resize (beta as of Kubernetes 1.33) can change CPU and memory limits on a running pod, though memory decreases and some runtimes still have caveats. The Vertical Pod Autoscaler recommends or applies requests, and in its default mode it applies them by evicting pods. Vertical scaling of one pod is cheap. Vertical scaling of a stateful pod is still a failover.</p>
+
+<h2 id=dd-vertical-scaling-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-vertical-scaling-runway level=3>How much time does one resize buy?</h3>
+<p>Take the lesson's Q2: a primary database at 80% CPU, growing 5% a month. The question a review panel asks is "how many months until we are back here?" The answer depends on how well the software scales, so do it three ways. The target is to stay below 70% CPU.</p>
+<p>After a resize by factor f with scaling efficiency e, utilisation becomes 80% / (f &times; e). Load grows by 1.05 each month, so the months until 70% are ln(70 / new utilisation) / ln(1.05).</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Move<th>Assumed efficiency<th>Utilisation after<th>Months until 70% again<tbody>
+<tr><td>2x, perfect scaling<td>100%<td>40%<td>about 11.5
+<tr><td>2x, realistic<td>85%<td>47%<td>about 8
+<tr><td>4x, realistic for a big jump<td>75%<td>27%<td>about 20
+</table></div></div>
+<p>Three things stand out. First, the honest 2x buys eight months, not a year. That is still plenty of time to plan a shard key, but not to execute a migration at a relaxed pace. Second, the 4x move buys well over a year, which is why the lesson says "one or two instance sizes". Third, the efficiency number matters as much as the size. Measure it before quoting a runway.</p>
+<p>Growth also compounds. At 5% a month, load nearly doubles every 14 months (ln 2 / ln 1.05 &asymp; 14.2). A team that resizes 2x each time is resizing about once a year forever, with each step pricier than the last.</p>
+
+<h3 id=dd-vertical-scaling-usl-example level=3>A worked USL curve</h3>
+<p>Suppose load tests on the store's database fit &sigma; = 0.05 and &kappa; = 0.0002. Plug them in:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Cores (N)<th>Relative throughput C(N)<th>Gain from the step<tbody>
+<tr><td>8<td>5.9<td>&ndash;
+<tr><td>16<td>8.9<td>+51%
+<tr><td>32<td>11.6<td>+30%
+<tr><td>64<td>12.9<td>+11%
+<tr><td>96<td>12.7<td>slightly worse
+<tr><td>128<td>12.1<td>worse
+</table></div></div>
+<p>The peak is &radic;(0.95 / 0.0002) &asymp; 69 cores. Doubling from 32 to 64 cores roughly doubles the bill and buys 11%. The next doubling loses throughput. On this workload the ceiling is not the catalog at all. It is the software, at about 13x the single-core rate, and no purchase moves it. Only reducing &sigma; (shorter transactions, fewer hot rows) or &kappa; (less shared state, socket pinning) does.</p>
+<p>Here is the calculator, Python standard library only:</p>
+<pre><code>import math
+
+def usl(n, sigma, kappa):
+    return n / (1 + sigma * (n - 1) + kappa * n * (n - 1))
+
+def peak_cores(sigma, kappa):
+    return math.sqrt((1 - sigma) / kappa)
+
+def months_of_runway(util_now, factor, efficiency, target=0.70, growth=0.05):
+    util_after = util_now / (factor * efficiency)
+    return math.log(target / util_after) / math.log(1 + growth)
+
+for n in (8, 16, 32, 64, 96, 128):
+    print(n, round(usl(n, 0.05, 0.0002), 1))
+print("peak at", round(peak_cores(0.05, 0.0002)), "cores")
+print("2x at 85%:", round(months_of_runway(0.80, 2, 0.85), 1), "months")</code></pre>
+
+<h3 id=dd-vertical-scaling-memory-cliff level=3>The memory cliff</h3>
+<p>Memory is where a resize pays most, and where its absence hurts most. Consider a query that touches 50 pages. Assume a page served from RAM costs almost nothing, and a miss to network block storage costs about 0.5 ms.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Buffer hit ratio<th>Misses per query<th>Added I/O time per query<th>Reads/s at 2,000 queries/s<tbody>
+<tr><td>99.9%<td>0.05<td>~0.025 ms<td>100
+<tr><td>99%<td>0.5<td>~0.25 ms<td>1,000
+<tr><td>95%<td>2.5<td>~1.25 ms<td>5,000
+</table></div></div>
+<p>A drop from 99.9% to 95% sounds small. It is 50x the disk reads. At 5,000 reads a second, a volume at the gp3 baseline of 3,000 IOPS is already queueing, and queueing makes the 0.5 ms miss cost much worse. This is the cliff: the working set grows a little past RAM, and latency jumps far more than the growth suggests.</p>
+<p>The fix is often a memory-optimised instance with the <em>same</em> core count. It costs less than going up a general-purpose size, and it targets the actual bottleneck. Watch the buffer hit ratio (Postgres: <code>blks_hit</code> and <code>blks_read</code> in <code>pg_stat_database</code>) as a leading indicator. It starts sliding months before latency does.</p>
+
+<h3 id=dd-vertical-scaling-price level=3>Where the price curve really bends</h3>
+<p>A precise point, because reviewers get it wrong in both directions. On the major clouds, price per vCPU inside one general-purpose family is close to linear. The largest size costs about its multiple of the smallest. So in the cloud the "steep curve" is not mostly the sticker price. It comes from three other places:</p>
+<ul>
+<li><strong>Software efficiency.</strong> In the USL example, the 64-core box costs 2x the 32-core box and delivers 1.11x. The effective price per unit of <em>work</em> rose about 80%.</li>
+<li><strong>Specialised tiers.</strong> Very high-memory machines (terabytes of RAM) are their own families, with their own pricing and limited availability.</li>
+<li><strong>Licences and support.</strong> Commercial databases often license per core, so the bill scales with cores whether the software uses them or not.</li>
+</ul>
+<p>On-premises hardware is different. Top-bin CPUs and four- or eight-socket servers do carry a real price premium per core. Either way, the number to compare is cost per unit of measured throughput, not cost per core.</p>
+
+<h3 id=dd-vertical-scaling-idle-cost level=3>The cost of idling a big box</h3>
+<p>The lesson's spiky-load case, priced. Say the peak is 5x the daily average and you size for peak with 30% headroom. Average utilisation is then about 100% / (5 &times; 1.3) &asymp; 15%. You pay for about seven units to use one on an average hour.</p>
+<p>A horizontal fleet that follows load might average 50% to 60%. That is roughly a 3x to 4x difference in spend for the same work. Below a few hundred dollars a month nobody should care. At a six-figure monthly bill the gap pays for the statelessness work many times over.</p>
+
+<h3 id=dd-vertical-scaling-availability-math level=3>Availability arithmetic for one machine</h3>
+<p>A single VM's availability is bounded by its host and its zone. Provider SLAs for a single instance are typically lower than for a multi-zone deployment, and the credits they pay are tiny next to the cost of an outage. Add your own causes:</p>
+<ul>
+<li>Two planned resizes a year at 10 minutes each: 20 minutes.</li>
+<li>One unplanned host failure with a 40-minute recovery, as in the lesson's Q3: 40 minutes.</li>
+<li>Kernel and database patching that needs a reboot, four times a year at 5 minutes: 20 minutes.</li>
+</ul>
+<p>That is about 80 minutes a year, or roughly 99.985%, if nothing else goes wrong. It fits a 99.9% target (8.8 hours a year) with room to spare. It cannot meet 99.99% (53 minutes) with any honesty, because one bad host recovery uses the whole budget. That is the sizing argument in one line: a single big machine can be "three nines", rarely "four".</p>
+
+<h2 id=dd-vertical-scaling-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-vertical-scaling-fm-one-core level=3>1. The upgrade that changed nothing</h3>
+<p><strong>Symptom.</strong> The team doubles the cores. Latency and throughput stay exactly where they were. Overall CPU drops from 60% to 30%, which looks like headroom.</p>
+<p><strong>Mechanism.</strong> The hot path is single-threaded. Redis's main thread, a Node.js event loop, one Python process held by the GIL, or one lock everyone queues on. That one core was already at 100%. The average hid it, because the other cores were idle.</p>
+<p><strong>Detect.</strong> Look per core, never on average: <code>mpstat -P ALL 1</code> or <code>top</code> with per-CPU view shows one core pinned. Per-thread CPU (<code>top -H</code>, <code>pidstat -t</code>) names the thread. For Redis, the main thread's CPU in <code>INFO cpu</code> tells the same story.</p>
+<p><strong>Fix.</strong> More processes, not a bigger process: Node cluster mode, more gunicorn workers, several Redis instances or Redis Cluster. Or remove the serial section. Always ask "is it one core or all cores?" before approving a resize.</p>
+
+<h3 id=dd-vertical-scaling-fm-numa level=3>2. The bigger box that got slower</h3>
+<p><strong>Symptom.</strong> A move from a 32-vCPU to a 96-vCPU instance makes p99 latency worse, not better. Throughput rises a little, nowhere near 3x.</p>
+<p><strong>Mechanism.</strong> The new size spans two sockets. The buffer pool and the hot data structures sit mostly on one NUMA node. Half the threads now read through the interconnect, and the interconnect saturates. Lock handoffs between sockets are slower too, so the coherency term &kappa; jumped.</p>
+<p><strong>Detect.</strong> <code>numastat</code> shows large <code>numa_miss</code> or <code>other_node</code> counts. <code>perf</code> shows more cycles stalled on memory. A benchmark pinned to one socket (<code>numactl --cpunodebind=0 --membind=0</code>) beats the unpinned run.</p>
+<p><strong>Fix.</strong> Choose the largest single-socket size instead. Or run one instance per socket, each pinned. Or enable the engine's NUMA settings where it has them. This is why a resize needs a load test on the target size, not on the current one scaled up on paper.</p>
+
+<h3 id=dd-vertical-scaling-fm-untuned level=3>3. Nobody retuned the config</h3>
+<p><strong>Symptom.</strong> After a 4x memory upgrade the database still reads from disk at the old rate. Free memory reports 150 GB unused. The cache hit ratio did not move.</p>
+<p><strong>Mechanism.</strong> Configuration was sized for the old box. <code>shared_buffers</code>, the JVM heap, connection pools and worker counts are all explicit numbers. The upgrade changed the hardware and none of the numbers. Some engines do benefit indirectly through the OS page cache, which hides the problem partly and makes it harder to notice.</p>
+<p><strong>Detect.</strong> Compare the config against the instance size as part of the change. Watch buffer hit ratio, heap usage and pool saturation before and after.</p>
+<p><strong>Fix.</strong> Treat a resize as a config change too. Keep sizing formulas in config management, tied to the instance's cores and memory, rather than literal numbers. Review the diff of effective settings, not just the instance type.</p>
+
+<h3 id=dd-vertical-scaling-fm-gc level=3>4. The heap that grew into a pause</h3>
+<p><strong>Symptom.</strong> A JVM service moves from a 16 GB heap to a 96 GB heap. Average latency improves. Every few minutes there is a multi-second stall, and health checks time out during it.</p>
+<p><strong>Mechanism.</strong> Collectors that copy or mark the old generation in a stop-the-world phase take time roughly proportional to the live data they scan. Six times the live heap means a much longer worst-case pause. The tuning that worked at 16 GB is wrong at 96 GB.</p>
+<p><strong>Detect.</strong> GC logs (<code>-Xlog:gc*</code>) show pause times and their causes. Latency spikes line up with the pauses to the second.</p>
+<p><strong>Fix.</strong> Use a low-pause collector designed for large heaps (ZGC, Shenandoah), or tune G1's pause target. Or do not give it all to the heap: leave memory to the OS page cache or run two smaller JVMs. Large memory and short pauses do not come together by default.</p>
+
+<h3 id=dd-vertical-scaling-fm-capacity level=3>5. The resize that could not start</h3>
+<p><strong>Symptom.</strong> In a planned window, the instance stops for its resize. The start fails with an insufficient-capacity error. Production is down, and the "10-minute maintenance" turns into an hour of trying other zones and sizes.</p>
+<p><strong>Mechanism.</strong> Stop-change-start gives up the old host before securing the new one. Large and specialised sizes have the thinnest supply. Anything on local instance-store disks was also lost at the stop.</p>
+<p><strong>Detect.</strong> You find out at the worst moment, unless you rehearse. Check the API error in the start call, and audit which volumes are ephemeral before the window.</p>
+<p><strong>Fix.</strong> Build beside, then switch. Launch the new size first, warm it, then move traffic or promote it. For large sizes, use a capacity reservation for the window. Never keep anything you need on instance-store without a copy elsewhere.</p>
+
+<h3 id=dd-vertical-scaling-fm-burst level=3>6. The credits ran out</h3>
+<p><strong>Symptom.</strong> A service on a small burstable instance runs fine for days, then slows to a crawl every afternoon. Nothing changed in traffic. The team's response is to "scale up", which does not obviously help either.</p>
+<p><strong>Mechanism.</strong> Burstable families (AWS T-series and similar) give a baseline CPU share and bank credits for bursts above it. Sustained load drains the bank, and the instance drops to its baseline, which can be a small fraction of a core. Storage can burst the same way on some volume types.</p>
+<p><strong>Detect.</strong> CPU credit balance metrics (on AWS, <code>CPUCreditBalance</code>) trend to zero before the slowdown. CPU "steal" time rises in the guest.</p>
+<p><strong>Fix.</strong> Move steady workloads to a fixed-performance family, or enable unlimited mode and budget for it. Burstable sizes suit spiky, low-average work. They are a trap for anything that runs hot all day.</p>
+
+<h3 id=dd-vertical-scaling-fm-blast-radius level=3>7. Consolidation's bigger blast radius</h3>
+<p><strong>Symptom.</strong> To save money, three services move onto one large host. Months later, a memory leak in the reporting job triggers the kernel's OOM killer, which kills the database process. Checkout goes down because of a report.</p>
+<p><strong>Mechanism.</strong> A big machine shared by many workloads makes them one failure domain. The Linux OOM killer picks a victim by its own scoring, and the biggest process is often the most important one. CPU and disk contention leak across workloads the same way.</p>
+<p><strong>Detect.</strong> <code>dmesg</code> or the journal shows "Out of memory: Killed process". Per-process memory in your metrics climbs before it.</p>
+<p><strong>Fix.</strong> Isolate with cgroups (container memory and CPU limits), set <code>oom_score_adj</code> so the database is the last choice, or keep critical stateful services on their own hosts. That is the bulkhead pattern, applied inside one machine.</p>
+
+<h2 id=dd-vertical-scaling-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-vertical-scaling-choose-method level=3>How to resize</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Method<th>Downtime<th>Risk<th>Rollback<th>Fits<tbody>
+<tr><td>Stop, change type, start<td>Minutes, plus warm-up<td>Capacity errors; lost instance-store data<td>Another stop-start<td>Small internal tools; dev and test
+<tr><td>Build beside, switch traffic<td>Near zero for stateless; a cutover for stateful<td>Low; you test before switching<td>Switch back to the old box<td>Most production servers
+<tr><td>Resize replica, then promote<td>One failover, seconds to minutes<td>Replica lag at cutover; client reconnects<td>Fail back to the old primary<td>Self-managed primary databases
+<tr><td>Managed DB modify (with standby)<td>One failover<td>You control less of the timing<td>Another modify<td>Managed databases with a standby
+<tr><td>In-place pod resize / VPA<td>None to a pod restart<td>Runtime must notice new limits; memory decrease is limited<td>Resize back<td>Containers with stateless or restart-tolerant work
+</table></div></div>
+<p>Default to "build beside, then switch" for anything in production. In-place stop-start is the cheapest method only until the first capacity error.</p>
+
+<h3 id=dd-vertical-scaling-choose-shape level=3>What shape of machine</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Bottleneck you measured<th>Wrong move<th>Right move<tbody>
+<tr><td>All cores busy, CPU-bound code<td>Memory-optimised family<td>Compute-optimised family, or more cores in the same family
+<tr><td>One core at 100%<td>More cores<td>More processes, or remove the serial section
+<tr><td>Cache hit ratio falling, disk reads rising<td>More cores<td>Memory-optimised family, same cores
+<tr><td>Disk queue length high, iowait high<td>Bigger CPU<td>Provision volume IOPS and throughput; check instance storage bandwidth; local NVMe if data is reproducible
+<tr><td>NIC saturated<td>More CPU<td>Network-optimised size, or spread across hosts
+<tr><td>Lock waits dominate<td>Anything bigger<td>Fix contention: shorter transactions, fewer hot rows
+</table></div></div>
+
+<h3 id=dd-vertical-scaling-choose-direction level=3>Up, out, or diagonal</h3>
+<p>Real fleets scale <strong>diagonally</strong>. They pick a server size that suits the workload, then change the count. The size decision follows a few rules:</p>
+<ul>
+<li><strong>Stateful, single-writer components</strong> (a primary database, a single-leader queue) scale up first. Splitting them is the expensive last resort the sharding lesson describes.</li>
+<li><strong>Stateless compute</strong> prefers many units, because each failure costs a smaller share. But not too small. Every instance has fixed overhead: runtime memory, sidecars, agents, connections to the database. Ten tiny servers can waste more than three medium ones.</li>
+<li><strong>Per-instance caches and JIT warm-up</strong> push toward fewer, larger units, because each unit warms once and sees more of the traffic.</li>
+<li><strong>Failure-domain math</strong> pushes the other way. With three zones, at least three units, and often six, so one zone loss leaves enough.</li>
+</ul>
+<p>A sensible middle: medium-to-large units, sized so one unit is no more than about 10% to 20% of fleet capacity once the fleet is big enough to allow it.</p>
+
+<h2 id=dd-vertical-scaling-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Which of the four dimensions is saturated (cores, memory, storage I/O, network)? Show the metric, per core where it matters.</li>
+<li>Can the software use the new hardware? Is any hot path single-threaded or behind one lock?</li>
+<li>What scaling efficiency do we expect, and where does it come from: a load test on the target size, or an assumption?</li>
+<li>Does the target size cross a NUMA boundary, and have we benchmarked it?</li>
+<li>Which config values must change with the size (buffer pool, heap, pools, worker counts), and are they in the same change?</li>
+<li>How many months of runway does this buy at the measured growth rate, and what is the next step when it runs out?</li>
+<li>How is the resize performed: in place, or build beside and switch? What happens if the new size cannot start?</li>
+<li>Is any data on ephemeral instance storage? Where is its copy?</li>
+<li>What is the availability target, and can a single machine meet it, counting resizes, patching and one host failure a year?</li>
+<li>What else shares this host, and what stops one workload from killing another?</li>
+<li>Are we on a burstable or "up to" tier for a sustained load?</li>
+<li>What work is scheduled during the runway to make horizontal scaling possible (statelessness, shard key, read replicas)?</li>
+</ol>
+
+<h2 id=dd-vertical-scaling-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"We doubled the cores and throughput went up 10%. What happened?"</summary>
+<p>Either the bottleneck was not CPU, or the work does not parallelise. Check per-core CPU first: one pinned core means a single-threaded path. If all cores are busy but throughput is flat, it is contention or coherency, the &sigma; and &kappa; terms of the Universal Scalability Law. Lock waits, a hot row, a single log writer or cross-socket traffic on a NUMA box. A profile showing time in spinlocks or waiting on locks confirms it. The fix is to reduce the serial part, not to buy more cores. Past the USL peak, more cores make it slower.</p>
+</details>
+
+<details>
+<summary>"Isn't the cloud price per vCPU linear? Then where is the 'steep curve'?"</summary>
+<p>Within a general-purpose family, close to linear, yes. The steepness is in cost per unit of <em>work</em>. If 64 cores deliver 11% more than 32 cores, the effective price per request rose about 80% even though the per-core price did not move. Add the specialised high-memory tiers, per-core software licences and thinner capacity at the top of a catalog. On-prem, the sticker price itself bends upward for top-bin and multi-socket parts.</p>
+</details>
+
+<details>
+<summary>"How would you resize a primary database with minimal downtime?"</summary>
+<p>Resize a replica, not the primary. Bring up a replica on the larger instance, or resize an existing one, and let it catch up. Warm its cache if you can. Then do a controlled failover: stop writes briefly or wait for lag to reach zero, promote the replica, repoint clients through DNS or a proxy. The old primary becomes a replica, which is also the rollback path. Downtime is the failover, seconds to a minute or two, and clients need retry logic for the reconnect. Rehearse it on staging first and time it.</p>
+</details>
+
+<details>
+<summary>"The working set is 300 GB and the biggest box has 256 GB. Now what?"</summary>
+<p>First check whether it really has to be in memory. A 95% hit ratio may be acceptable if the misses go to fast local NVMe. Then cut the working set: archive cold rows, drop unused indexes, use partial indexes, compress. If it still does not fit, move the excess somewhere else: read replicas serving different query types so each caches a different subset, a cache in front, or sharding so each shard's working set fits its own RAM. Look at memory-optimised families too, since general-purpose catalogs top out well below them.</p>
+</details>
+
+<details>
+<summary>"Three small servers or one big one, same total capacity, for a stateless API?"</summary>
+<p>Three, mostly for availability. One failure leaves two-thirds instead of zero. But check the fixed cost per instance. If each instance carries a 2 GB runtime, agents, a sidecar and 20 database connections, many tiny units waste memory and multiply downstream connections. And size so N&minus;1 survivors can carry peak. Three servers at 70% each cannot absorb one loss, because two would need to run at 105%. Either run them cooler or run four.</p>
+</details>
+
+<details>
+<summary>"When does vertical scaling make availability <em>worse</em>?"</summary>
+<p>When it concentrates more onto fewer failure domains. Consolidating services onto one big host turns a reporting bug into a checkout outage. A larger node in a small cluster means losing one node loses a bigger share. Resizes themselves are planned outages. And a larger heap or buffer pool can lengthen recovery: longer GC pauses, longer crash recovery, longer cache warm-up after a restart. Bigger units should come with stronger isolation and a rehearsed failover.</p>
+</details>
+
+<details>
+<summary>"How do you decide that it's time to stop scaling up?"</summary>
+<p>Set the exit condition in advance, in numbers. For example: the next size up buys less than six months at measured growth, or the measured scaling efficiency of the next step is under 60%, or the availability target rises above what one machine can meet. Any one of those triggers the move to horizontal or sharding. The point is to decide the threshold while you have runway, so the migration starts with a year left, not a week.</p>
+</details>
+
+<details>
+<summary>"Redis is at 100% CPU on a 4-core box. Do you move it to 16 cores?"</summary>
+<p>Not before checking which core. Redis executes commands on one main thread, so "100%" on a 4-core box is often one core pinned. More cores will not speed up command execution. I/O threads can offload network reads and writes, which helps when many clients send small commands. Beyond that, look for expensive commands in <code>SLOWLOG</code> (a <code>KEYS</code> or big <code>SMEMBERS</code> can dominate), then split the keyspace across several instances or Redis Cluster. That is horizontal scaling, done for a single-threaded engine.</p>
+</details>

@@ -1,0 +1,199 @@
+<h2 id=dd-cdn-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson gives you the shape: proxies with caches in 200 cities, fingerprinted assets, short-TTL HTML, a shield. This section opens one edge and follows a request through it. A CDN decision in a design review almost always comes down to one of four things: how the user reaches an edge, what the cache key is, what the cache does when an entry is stale or missing, and how you remove something on purpose.</p>
+
+<h3 id=dd-cdn-routing level=3>Step 1: reaching an edge, by DNS or by anycast</h3>
+<p>There are two ways to send Sydney to the Sydney edge, and they fail differently.</p>
+<ul>
+<li><strong>DNS steering.</strong> The CDN's authoritative DNS answers <code>shop.example.com</code> with an address chosen for the asker. The catch is that the asker is the user's DNS resolver, not the user. A Sydney user on a public resolver whose nearest instance is in Singapore can be sent to Singapore. The EDNS Client Subnet extension lets resolvers pass part of the user's address along, but not every resolver sends it. DNS answers are also cached for their TTL, so moving traffic away from a sick edge takes as long as the TTL, and some resolvers hold answers longer than they should.</li>
+<li><strong>Anycast.</strong> Every edge announces the same IP prefix over BGP, and the internet's routing picks the nearest one, measured in network hops and policy rather than kilometres. Failover is fast: withdraw the route and traffic moves within seconds to minutes. The catch is that "nearest by BGP" is not always nearest by latency. A routing change in the middle of a long TCP connection can also send its packets to a different edge, which does not know the connection and resets it. Providers mitigate this, and it is rare, but it is why anycast is easiest for short HTTP requests.</li>
+</ul>
+<p>Many large CDNs use anycast for the front door and DNS for finer steering. For a reviewer the question is simple: if one edge goes bad, how long until users stop going there, and who decides?</p>
+
+<h3 id=dd-cdn-cache-key level=3>Step 2: the cache key and the Vary header</h3>
+<p>The edge turns the request into a cache key. By default that is roughly scheme, host, path and query string. Everything about hit ratio and most of CDN security lives in this one value.</p>
+<ul>
+<li><strong>Query strings.</strong> <code>/cover.jpg?utm_source=newsletter</code> and <code>/cover.jpg</code> are different keys unless you tell the CDN to ignore or sort parameters. A marketing campaign that adds tracking parameters can halve your hit ratio overnight. Most CDNs let you include only an allowlist of parameters in the key.</li>
+<li><strong>Vary.</strong> The origin's <code>Vary</code> response header names request headers that change the response, and caches add their values to the key. <code>Vary: Accept-Encoding</code> is normal: you store a gzip copy and a Brotli copy. <code>Vary: User-Agent</code> is a disaster, because there are thousands of distinct user-agent strings, so every copy is shared by almost nobody. <code>Vary: Cookie</code> makes the response effectively per-user. Normalise first: collapse <code>Accept-Encoding</code> to two or three values, map user agents to "mobile" or "desktop" in edge logic, then vary on the normalised header.</li>
+<li><strong>Unkeyed inputs.</strong> This is the subtle one. If the origin uses a request header that is <em>not</em> in the key to build the response (say it writes <code>X-Forwarded-Host</code> into an absolute URL), an attacker can send one request with a poisoned header. The edge caches the poisoned response under the normal key and serves it to everyone. Anything the origin reads must be in the key, or the origin must ignore it.</li>
+</ul>
+
+<svg role="img" aria-labelledby="dd-cdn-svg-title dd-cdn-svg-desc" viewBox="0 0 720 270" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-cdn-svg-title">Request path through an edge, a shield and the origin</title>
+<desc id="dd-cdn-svg-desc">A user request reaches the nearest edge. The edge builds a cache key from host, path, the allowed query parameters and normalised Vary headers. On a fresh hit it answers directly. On a stale hit within stale-while-revalidate it answers with the stale copy and starts one background revalidation. On a miss, concurrent requests for the same key are collapsed into one fetch, which goes to the origin shield. The shield does the same collapsing and only its misses reach the origin, often as conditional requests that return 304 Not Modified.</desc>
+<rect x="10" y="90" width="90" height="60" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="55" y="116" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">User</text>
+<text x="55" y="134" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">Sydney</text>
+<rect x="130" y="20" width="250" height="220" rx="8" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="255" y="40" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Edge (15 ms away)</text>
+<rect x="145" y="52" width="220" height="34" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="255" y="74" text-anchor="middle" style="fill:var(--ink,#1c2430)">key = host + path + allowed query + Vary</text>
+<rect x="145" y="96" width="220" height="34" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="255" y="118" text-anchor="middle" style="fill:var(--ink,#1c2430)">fresh hit: answer now</text>
+<rect x="145" y="140" width="220" height="34" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="255" y="162" text-anchor="middle" style="fill:var(--ink,#1c2430)">stale (SWR): answer + 1 refresh</text>
+<rect x="145" y="184" width="220" height="40" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="255" y="201" text-anchor="middle" style="fill:var(--ink,#1c2430)">miss: collapse N waiters</text>
+<text x="255" y="217" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">into 1 upstream fetch</text>
+<rect x="430" y="170" width="120" height="60" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="490" y="195" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Shield</text>
+<text x="490" y="213" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">collapses again</text>
+<rect x="600" y="170" width="110" height="60" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="655" y="195" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Origin</text>
+<text x="655" y="213" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">304 or 200</text>
+<path d="M100 120 H130" style="stroke:var(--ink,#1c2430);fill:none"/>
+<path d="M365 204 H430 M550 200 H600" style="stroke:var(--muted,#5c6b7c);fill:none;stroke-dasharray:4 3"/>
+<path d="M365 157 C400 157 410 185 430 190" style="stroke:var(--muted,#5c6b7c);fill:none;stroke-dasharray:4 3"/>
+</svg>
+
+<h3 id=dd-cdn-freshness level=3>Step 3: freshness, revalidation and the stale extensions</h3>
+<p>Once the edge has a key, it looks for a stored response. HTTP caching (RFC 9111) gives every stored response an age and a freshness lifetime. For a shared cache, the lifetime comes from <code>s-maxage</code> if present, else <code>max-age</code>, else <code>Expires</code>. Three outcomes follow.</p>
+<ol>
+<li><strong>Fresh hit.</strong> Age is below the lifetime. Serve it. The response carries an <code>Age</code> header, which is your best debugging clue for "how old is this copy?".</li>
+<li><strong>Stale hit.</strong> Age has passed the lifetime. The cache should revalidate: send the origin a conditional request with <code>If-None-Match</code> (the stored <code>ETag</code>) or <code>If-Modified-Since</code>. If nothing changed, the origin replies <code>304 Not Modified</code> with no body, and the edge resets the entry's age. A 304 costs a round trip but almost no bandwidth or origin work, if the origin computes ETags cheaply.</li>
+<li><strong>Miss.</strong> Nothing stored, or it was evicted. Fetch from upstream.</li>
+</ol>
+<p>The RFC 5861 extensions change what happens in the stale case. <code>stale-while-revalidate=300</code> lets the edge serve the stale copy at once and revalidate in the background, so no user waits for the origin. <code>stale-if-error=86400</code> lets the edge serve the stale copy when the origin returns 5xx or cannot be reached. Support varies by provider, and some expose these as their own settings rather than honouring the header, so check before you rely on them.</p>
+<p>Watch out for <strong>heuristic freshness</strong>. If a response has no explicit lifetime but does have a <code>Last-Modified</code> header, HTTP lets a cache pick its own lifetime, commonly 10% of the time since last modification. An image last modified a year ago could then be cached for about 36 days without anyone asking for that. Always send an explicit <code>Cache-Control</code>, even if it is <code>no-cache</code>.</p>
+<p>Two newer headers help separate the layers. <code>Surrogate-Control</code> (supported by several CDNs) and <code>CDN-Cache-Control</code> (RFC 9213) give the CDN its own policy, which is stripped before the response reaches the browser. That lets you cache HTML at the edge for 5 minutes and purge it on change, while browsers keep it for 0 seconds.</p>
+
+<h3 id=dd-cdn-collapsing level=3>Step 4: request collapsing and the tiers</h3>
+<p>When 10,000 Sydney users request a cold hero image in the same second, the edge should not send 10,000 fetches. It sends one, parks the other requests on that fetch, and answers them all when it returns. Varnish calls this the waiting list. Fastly, Cloudflare and CloudFront each have their own form of it, usually called request collapsing or coalescing. It only works for responses the edge believes are cacheable. If the response comes back <code>private</code> or with a <code>Set-Cookie</code>, the parked requests must each go to the origin in turn, and you get a serialised stampede. Varnish's "hit-for-pass" (or hit-for-miss) object exists to remember "this URL is not cacheable, don't wait for it next time".</p>
+<p>The shield is the same idea one level up. Each edge's misses go to one designated mid-tier location instead of the origin. Some providers build deeper hierarchies (regional tiers, then a shield), but the effect is the same: the origin sees roughly one fetch per object per freshness period, not one per edge.</p>
+
+<h3 id=dd-cdn-storage level=3>Step 5: what "cache forever" really means</h3>
+<p>An edge is a finite cache, typically RAM for the hottest objects and SSD for the rest, with an LRU-like eviction policy. <code>max-age=31536000, immutable</code> means "you may keep this for a year". It does not mean the edge will. A rarely requested product image in a small city edge may be evicted within hours. That is the long-tail problem: hit ratio is excellent for the top 1% of objects and much worse for the bottom 80%, and tiers exist mostly to give the long tail a second chance before the origin.</p>
+<p>This is also why the lesson's deploy drill keeps old assets on the origin after a deploy. A user with a cached old HTML page can still ask for <code>app.3f9a2c.js</code>, and if the edge has evicted it and the origin deleted it, that user gets a 404 and a broken page.</p>
+
+<h3 id=dd-cdn-purge level=3>Step 6: purge, soft purge and surrogate keys</h3>
+<p>A purge is a message fanned out to every edge: "drop this key". Speed and semantics vary by provider, from well under a second to minutes, so treat the published figure as a target rather than a guarantee.</p>
+<ul>
+<li><strong>URL purge</strong> drops one key. It misses variants: the gzip and Brotli copies, the mobile variant, the URL with a tracking parameter that was cached separately.</li>
+<li><strong>Tag purge</strong> (Fastly's <code>Surrogate-Key</code>, Cloudflare's <code>Cache-Tag</code> on some plans, and similar features elsewhere) lets the origin label responses, for example <code>Surrogate-Key: product-4521 author-88</code>. Purging <code>product-4521</code> drops the product page, its JSON, and every listing page that included it. This is how event-driven invalidation works at the edge: the catalog service emits "product 4521 changed" and a worker purges the tag.</li>
+<li><strong>Soft purge</strong> marks entries stale instead of deleting them. The next request revalidates, and <code>stale-while-revalidate</code> or <code>stale-if-error</code> can still serve the old copy. A hard purge of a popular object sends every edge to the origin at once. A soft purge does not.</li>
+</ul>
+
+<h2 id=dd-cdn-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Use the bookstore after the Australian launch. Assumptions:</p>
+<ul>
+<li>30 million page views a day worldwide, peaking at 3 times the mean.</li>
+<li>Each page view: 1 HTML document (60 KB), 60 assets averaging 25 KB (1.5 MB), and 5 API calls.</li>
+<li>About 200,000 distinct cacheable objects (product images in several sizes, JS, CSS, fonts).</li>
+<li>300 edge locations, of which the bookstore's traffic touches about 120 often.</li>
+</ul>
+
+<h3 id=dd-cdn-sizing-traffic level=3>Requests and bytes</h3>
+<ul>
+<li>Requests per day: 30M × 66 ≈ 2 billion. Mean rate: about 23,000 per second; peak about 70,000 per second.</li>
+<li>Bytes per day: 30M × (1.5 MB + 60 KB) ≈ 47 TB. Most of it is assets.</li>
+</ul>
+<p>Two hit ratios matter, and they are different numbers. The <strong>request hit ratio</strong> counts requests served from cache. The <strong>byte hit ratio</strong> counts bytes. Fingerprinted assets are most of the bytes and cache very well, so byte hit ratio is often higher than request hit ratio. API calls are many requests and few bytes, and mostly uncacheable. Report both. Request hit ratio drives origin CPU; byte hit ratio drives origin bandwidth and egress cost.</p>
+<p>Suppose assets hit 97%, HTML hits 80% (60 s <code>s-maxage</code> with SWR), and APIs hit 10% (only public catalog endpoints). Origin requests per second at peak:</p>
+<ul>
+<li>Assets: 70,000 × (60/66) × 0.03 ≈ 1,900/s</li>
+<li>HTML: 70,000 × (1/66) × 0.20 ≈ 210/s</li>
+<li>API: 70,000 × (5/66) × 0.90 ≈ 4,800/s</li>
+</ul>
+<p>The origin now sees about 6,900 requests per second instead of 70,000, and 70% of what remains is API traffic. That is the honest picture: after a CDN, your origin capacity plan is almost entirely an API capacity plan. The asset misses are mostly long-tail images, which the shield (next) cuts further.</p>
+
+<h3 id=dd-cdn-sizing-shield level=3>Why the shield matters: revalidation math</h3>
+<p>Take one product page HTML with <code>s-maxage=60</code>. Without a shield, each of the 120 busy edges revalidates it once a minute while it is popular. That is 120 conditional requests per minute, or 2 per second, for one URL. Multiply by the 5,000 product pages that are popular at any moment and the origin sees about 10,000 revalidations per second, more than all the other traffic combined.</p>
+<p>With a shield, the edges revalidate against the shield and only the shield revalidates against the origin: 5,000 pages × 1/60 s ≈ 83 per second. The shield turns a cost that scales with the number of edges into one that scales with the number of objects. That is the single most important number in this section, and it is why a short TTL on HTML is affordable.</p>
+<p>The same arithmetic applies to purges. A hard purge of a hot object across 120 edges is up to 120 origin fetches in the next second without a shield, and one with it.</p>
+
+<h3 id=dd-cdn-sizing-latency level=3>Latency for uncacheable requests</h3>
+<p>The lesson says even dynamic requests benefit. Here is how much, for a Sydney user calling a Virginia API:</p>
+<ul>
+<li>Without a CDN: TCP (1 RTT) + TLS 1.3 (1 RTT) + request (1 RTT) at 200 ms each = 600 ms for the first API call on a new connection.</li>
+<li>With an edge: TCP + TLS to the edge at 15 ms each = 30 ms. The edge forwards on an already-open, warm connection to the origin: one 200 ms round trip, often a little less, because the provider's backbone can be faster than the public internet. Total about 250 ms.</li>
+</ul>
+<p>The gain on repeat calls over an open connection is small, since the ocean round trip is still there. The big win is the handshake, which is why mobile apps that open many short connections benefit most.</p>
+
+<h3 id=dd-cdn-sizing-cost level=3>Cost</h3>
+<p>CDN pricing varies widely by provider, region and commitment, so take any rate as an assumption. At an illustrative $0.02 to $0.08 per GB, 47 TB a day is roughly 1,400 TB a month, or about $28,000 to $110,000 a month in delivery fees before discounts. Two things move this number more than the provider choice: image formats and sizes (serving a 400 KB JPEG where a 60 KB WebP would do), and the share of traffic in expensive regions. Per-request fees and fees for purge calls, edge compute and logs also exist on many plans. Origin egress to the CDN still costs money too, which is another reason the shield pays for itself.</p>
+
+<h2 id=dd-cdn-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-cdn-fm-deception level=3>1. Web cache deception: the account page cached as a stylesheet</h3>
+<p><strong>Symptom:</strong> a security researcher reports that <code>/account/orders/x.css</code> returns another customer's order history. <strong>Mechanism:</strong> the CDN has a rule "cache anything ending in <code>.css</code>". The origin's router ignores the trailing segment and serves the logged-in user's orders page. An attacker tricks a victim into loading that URL, the edge caches the victim's page under a public key, and the attacker fetches it. <strong>Detect:</strong> responses cached at the edge that also carry <code>Set-Cookie</code>, <code>private</code> or personal data; scan the edge logs for cache hits on authenticated paths. <strong>Fix:</strong> let the origin's <code>Cache-Control</code> decide cacheability, rather than file extensions. Make the origin return 404 for paths it does not recognise instead of falling back to a parent route, and send <code>private, no-store</code> on every authenticated response.</p>
+
+<h3 id=dd-cdn-fm-poisoning level=3>2. Cache poisoning through an unkeyed header</h3>
+<p><strong>Symptom:</strong> the homepage loads scripts from a strange host for everyone in one region, for exactly the TTL of the page. <strong>Mechanism:</strong> the origin builds absolute URLs from <code>X-Forwarded-Host</code>, which the CDN does not include in the cache key. One request with <code>X-Forwarded-Host: evil.example</code> produced a page that pointed at the attacker's scripts, and the edge cached it for everyone. <strong>Detect:</strong> monitoring that fetches key pages from several regions and checks script origins; alerts on responses whose body references unexpected hosts. <strong>Fix:</strong> make the origin ignore forwarding headers from anything but the CDN, strip them at the edge, and audit every request header the origin reads against the cache key. Purge the poisoned entries.</p>
+
+<h3 id=dd-cdn-fm-set-cookie level=3>3. Hit ratio collapses after a harmless-looking deploy</h3>
+<p><strong>Symptom:</strong> origin traffic triples within an hour of a release; the CDN dashboard shows hit ratio falling from 95% to 30%. <strong>Mechanism:</strong> the new release added a session or analytics middleware that sets a cookie on every response, including assets. Many CDNs will not cache a response with <code>Set-Cookie</code>, and if collapsing was on, the parked requests now fall through one by one. A similar effect comes from <code>Vary: User-Agent</code> added by a framework, or a new query parameter appended to asset URLs. <strong>Detect:</strong> alert on hit ratio per content type, not only overall; log the cache status header (<code>cf-cache-status</code>, <code>x-cache</code> or similar) and break down "pass" and "miss" by reason. <strong>Fix:</strong> strip <code>Set-Cookie</code> from static routes at the origin or edge, normalise <code>Vary</code>, and put a CI check on response headers for a sample of asset and page URLs.</p>
+
+<h3 id=dd-cdn-fm-purge-stampede level=3>4. A purge takes down the origin</h3>
+<p><strong>Symptom:</strong> someone purges "everything" to fix one wrong image, and the origin falls over for ten minutes. <strong>Mechanism:</strong> a hard purge empties every edge at once. The next requests for every popular object miss together. With no shield, or a shield that was also purged, the origin receives a share of global peak traffic it was never sized for. <strong>Detect:</strong> origin request rate jumping right after a purge API call; keep purge calls in an audit log with who and what. <strong>Fix:</strong> prefer tag purges and soft purges; restrict "purge all" to a break-glass role; size the shield to absorb a cold start; keep <code>stale-if-error</code> on so the edge can serve stale copies while the origin recovers.</p>
+
+<h3 id=dd-cdn-fm-deploy-order level=3>5. Broken pages for a few minutes after every deploy</h3>
+<p><strong>Symptom:</strong> right after each release, some users see an unstyled page or a JavaScript error, then it fixes itself. <strong>Mechanism:</strong> a deploy-order race. New HTML referencing <code>app.8c1d4e.js</code> went live before the asset was uploaded to the origin. An edge requested the asset, got a 404, and some CDNs cache that 404 for a while (negative caching). The opposite race exists too: old assets deleted while cached HTML still points at them. <strong>Detect:</strong> 404 rate on fingerprinted asset paths, broken out by deploy time. <strong>Fix:</strong> upload assets first, then switch the HTML; keep old assets for at least the longest HTML lifetime plus a margin (a week is common); set a short or zero TTL on 404s for asset paths.</p>
+
+<h3 id=dd-cdn-fm-origin-bypass level=3>6. Attackers skip the CDN and hit the origin directly</h3>
+<p><strong>Symptom:</strong> the CDN shows nothing unusual, but the origin is overloaded with requests from many IP addresses. <strong>Mechanism:</strong> the origin's address leaked: an old DNS record, a mail server on the same host, a certificate transparency log, or a historical DNS database. The CDN's DDoS protection only protects traffic that goes through the CDN. <strong>Detect:</strong> origin traffic that does not come from the CDN's published address ranges, or lacks the shared secret header. <strong>Fix:</strong> lock the origin firewall to the CDN's ranges, and also require proof that the request came through your account. Authenticated origin pulls (mutual TLS from the CDN) or a secret header checked by the origin are the usual options, because CDN address ranges are shared by all its customers.</p>
+
+<h3 id=dd-cdn-fm-stale-error-cache level=3>7. An error is cached and served for an hour</h3>
+<p><strong>Symptom:</strong> the origin had a 30-second blip, but users in some regions see an error page for an hour. <strong>Mechanism:</strong> the origin returned a 500 or a 200 error page with the normal <code>Cache-Control: s-maxage=3600</code>, because the header was set by middleware that ran regardless of status. The edge cached the failure. <strong>Detect:</strong> cache hits on 5xx responses; synthetic checks from several regions. <strong>Fix:</strong> send <code>no-store</code> on error responses at the origin, configure the CDN not to cache 5xx (or only for a few seconds, to protect the origin from a stampede), and use <code>stale-if-error</code> so the edge serves the last good copy instead.</p>
+
+<h2 id=dd-cdn-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Routing to the edge<td>Anycast<td>DNS steering<td>Most traffic is short HTTP requests and you want fast failover. DNS steering gives finer control per resolver or region, at the cost of resolver-location errors and DNS-TTL lag.
+<tr><td>Change propagation<td>Fingerprinted URLs<td>Purge (URL or tag)<td>The object is referenced by something else (assets via HTML). Purge for the referencing documents, API responses and emergencies.
+<tr><td>HTML caching<td>Short <code>s-maxage</code> + SWR<td>Long edge TTL + event-driven tag purge<td>Content changes often and a minute of staleness is fine. Choose tag purge when pages change rarely but must update quickly, and you can wire change events to purges reliably.
+<tr><td>Purge semantics<td>Soft purge (mark stale)<td>Hard purge (delete)<td>Almost always. Hard purge for legal removal, leaked data and anything that must never be served again.
+<tr><td>Tiering<td>Shield / tiered cache on<td>Edges go straight to origin<td>Your edge count is large relative to object count, TTLs are short, or the origin is fragile. Turn it off only if the shield's extra hop hurts a latency-critical, uncacheable path.
+<tr><td>Dynamic API traffic<td>Through the CDN, uncached<td>Direct to origin<td>Users are far from the origin and connections are short-lived (handshake savings), or you want edge DDoS protection and rate limits. Go direct when users are close and every extra layer costs debugging time.
+<tr><td>Edge compute<td>Logic at the edge (auth checks, redirects, A/B bucketing)<td>Keep all logic at the origin<td>The logic is small, stateless and latency-sensitive. Keep it at the origin when it needs a database, changes often, or must be tested with the rest of the app.
+<tr><td>Providers<td>Single CDN<td>Multi-CDN<td>Your team is small and one provider's reliability meets your target. Multi-CDN for very large traffic, negotiating power or resilience against a provider-wide outage, with the cost of keeping two configs, two purge paths and two cert setups consistent.
+</tbody></table></div></div>
+<p>The most consequential choice is HTML. Short TTL plus SWR is simple and fails safe: the worst case is one minute of staleness. Long TTL plus tag purge gives better hit ratios and instant updates, but it depends on every change reliably producing a purge. A lost purge event means stale content that never fixes itself. If you choose it, add a ceiling TTL (an hour, say) as a safety net, so a missed purge is a bounded bug.</p>
+<p>The second is personalisation. A page that is 95% shared and 5% personal (a cart count, a greeting) should not be uncacheable. Serve the shared page from cache and fetch the personal fragment with a small client-side API call, or assemble it at the edge. Making the whole page <code>private</code> because of a cart badge gives up most of the CDN's value.</p>
+
+<h2 id=dd-cdn-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the cache key for each route class (assets, HTML, public API)? Which query parameters and headers are in it, and which are stripped?</li>
+<li>Does every response carry an explicit <code>Cache-Control</code>, including errors, redirects and 404s? Is anything relying on heuristic freshness?</li>
+<li>What is the default for authenticated routes, and what stops a framework or middleware change from making them cacheable?</li>
+<li>Which request headers does the origin read to build a response, and is each one either in the cache key or ignored?</li>
+<li>Can a URL with an unexpected suffix on an authenticated path be cached (web cache deception)?</li>
+<li>Is there a shield or tiered cache, and what is the origin's request rate on a fully cold cache?</li>
+<li>In what order are assets and HTML deployed, and how long are old assets kept on the origin?</li>
+<li>How do you purge: by URL, by tag, soft or hard? Who may purge everything, and is it logged?</li>
+<li>Are <code>stale-while-revalidate</code> and <code>stale-if-error</code> configured and actually honoured by this provider?</li>
+<li>Is the origin reachable only through the CDN, with proof beyond source IP ranges?</li>
+<li>Are hit ratio (request and byte) and cache status reasons monitored per content type, with alerts on sudden drops?</li>
+<li>What happens if the CDN provider has a global outage: is there a DNS fallback, a second provider, or an accepted risk?</li>
+</ol>
+
+<h2 id=dd-cdn-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Your HTML has s-maxage=60 and you have 300 edges. How many requests per minute does the origin get for one popular page?"</summary>
+<p>Without a shield, up to one revalidation per edge per minute, so up to 300, and that scales with edge count, not with traffic. With a shield, one per minute. Revalidations can be cheap 304s if the origin computes ETags without rendering the page. This is why short HTML TTLs need tiering: otherwise the origin load is proportional to the size of the CDN.</p>
+</details>
+<details>
+<summary>"You set max-age=31536000, immutable on assets. Why does the origin still see asset requests?"</summary>
+<p>Because "may keep for a year" is not "will keep for a year". Edges are finite and evict cold objects, so long-tail images and assets in small edges get re-fetched. New deploys produce new URLs that miss once per tier. Variants (compression, image sizes) are separate keys. A shield cuts these to roughly one fetch per object per tier, and the number to watch is shield hit ratio, not just edge hit ratio.</p>
+</details>
+<details>
+<summary>"What is the difference between no-cache and no-store?"</summary>
+<p><code>no-cache</code> allows storing but requires revalidation with the origin before every reuse, so a 304 can still save bandwidth. <code>no-store</code> forbids storing at all. For personal data in shared caches you want <code>private, no-store</code>. <code>no-cache</code> on a personal page still allows a shared cache to hold it, and a revalidation bug would then expose it.</p>
+</details>
+<details>
+<summary>"How does request collapsing go wrong?"</summary>
+<p>Collapsing makes later requests wait on the first fetch for the same key. If that response turns out to be uncacheable (<code>private</code>, <code>Set-Cookie</code>), the waiters cannot share it and each goes to the origin in turn, so you get a serialised queue and very high latency. Caches remember such URLs as "pass" objects to avoid waiting next time. The fix is to make cacheability predictable by route, so the edge knows before the first fetch.</p>
+</details>
+<details>
+<summary>"An attacker sends a request with a weird header and every user gets a defaced page. Explain."</summary>
+<p>Cache poisoning. The origin used a request header that was not part of the cache key, such as <code>X-Forwarded-Host</code>, to build the response. The edge stored that response under the normal key and served it to everyone until it expired. Prevent it by making the cache key include everything the origin varies on, or by stripping and ignoring such headers at the edge. Treat any unkeyed input that affects the body as a vulnerability.</p>
+</details>
+<details>
+<summary>"Should a personalised API go through the CDN at all?"</summary>
+<p>Often yes, but not for caching. Users far from the origin save most of the handshake cost because TLS terminates at a nearby edge and the edge reuses warm connections to the origin. You also get edge DDoS protection and rate limits. Mark the responses <code>private, no-store</code> so nothing is stored. If users are close to the origin and connections are long-lived, the benefit is small and the extra layer may not earn its debugging cost.</p>
+</details>
+<details>
+<summary>"Marketing wants a price change visible worldwide within ten seconds, but the product page has a 5-minute edge TTL. Options?"</summary>
+<p>Three. Tag the page with <code>Surrogate-Key: product-4521</code> and purge the tag from the pricing service's change event, which gives fast updates with a long TTL, as long as the purge path is reliable. Or drop the edge TTL to a few seconds with SWR and accept more revalidations, which the shield absorbs. Or render the price client-side from a small, short-TTL price API. For prices that matter legally, the checkout must read the price from the pricing service anyway, so the page is a display copy and a few seconds of staleness there is a product decision.</p>
+</details>
+<details>
+<summary>"Why might moving to anycast break long downloads for a few users?"</summary>
+<p>Anycast routes each packet to the nearest announcing location by BGP. If routing changes mid-connection, packets for an existing TCP connection can land at a different edge that has no state for it, and the connection resets. Short requests rarely notice. Long downloads and long-lived connections can. Providers reduce this with stable routing and connection handling between nearby machines, and clients should support resumable downloads with range requests.</p>
+</details>

@@ -1,0 +1,249 @@
+<h2 id=dd-minicapstone-order-fulfillment-built-twice-capacity level=2>Deep Dive: The Capacity Plan</h2>
+<p>The lesson compares the two builds by how they fail. A review panel will also want to know whether each build survives a normal release day at all. The answer turns on one number: how long the hot SKU's inventory row stays locked per order.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-assumptions level=3>Assumptions</h3>
+<ul>
+<li><strong>Load.</strong> 200 orders per second in a busy hour, rising to 1,000 per second for about 10 minutes after a popular release. The brief gives the first number. The 5× spike is an assumption; use your own launch history if you have it.</li>
+<li><strong>Hot SKU.</strong> 30% of checkouts, so 60 orders per second normally and 300 during the spike, all wanting one inventory row.</li>
+<li><strong>Infrastructure.</strong> Same-datacenter round trip 0.5 ms. A durable commit (an fsync on SSD) about 2 ms.</li>
+<li><strong>Payment provider.</strong> Authorization takes 400 ms at p50 and 1.5 s at p99. Providers vary a lot; measure yours.</li>
+<li><strong>Money.</strong> Average order $60.</li>
+</ul>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-lock-math level=3>How long the hot row is locked</h3>
+<p>A row lock caps throughput on that row at <code>1 / hold time</code>. Everything else follows from that.</p>
+<p><strong>Build One, with 2PC.</strong> Inventory locks the row when it prepares and releases it when the commit is applied. In between, the row waits for its own prepare record to be durable, for every other participant to vote, for the coordinator to make its decision durable, and for the commit message and commit record.</p>
+<pre><code>inventory prepare fsync            2.0 ms
+slowest other vote (local DBs)     2.5 ms   (round trip + their fsync)
+coordinator decision fsync         2.0 ms
+commit message                     0.5 ms
+inventory commit fsync             2.0 ms
+----------------------------------------
+hold per order, best case       ≈  9 ms   →  row capacity ≈ 110 orders/s
+</code></pre>
+<p>Normal load is 60 per second, so the row runs at about 55% utilization. Queueing theory (an M/M/1 approximation) gives an average wait of <code>ρ / (1 − ρ) × S</code>, about 11 ms. That is fine. The spike is not: 300 per second against a capacity of 110 is nearly three times what the row can serve, and the queue grows without limit.</p>
+<p>And "best case" is doing a lot of work there. If shipping's prepare takes its normal 100 ms p99 instead of 2.5 ms, the 1% of orders that hit it hold the row for 100 ms each. During shipping's bad deploy (the lesson's Drill 2), the hold reaches 4 seconds. One slow vote then blocks 240 hot-SKU orders behind it.</p>
+<p><strong>Build Two, with a saga.</strong> The reserve step is a single local transaction: a conditional decrement on the stock row. The lock is held from the update until the commit fsync, about 2 ms. Capacity is about 500 per second. The spike runs at 60% utilization, with an average wait near 3 ms.</p>
+<p>The saga is not immune to hot rows. It just moves the limit from 110 to 500 per second. Beyond that, split the stock into buckets: eight rows of 1,000 units each instead of one row of 8,000. A reserve picks a random bucket and falls back to others when it is empty. Capacity grows to roughly eight times as many orders per second, at the cost of a slightly more complex "sold out" check.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-latency-budget level=3>The 2-second checkout budget</h3>
+<p>Only the steps the customer waits for belong in the budget. For the saga:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Step<th>p50<th>p99<th>Customer waits?<tbody><tr><td>Write order and saga row (one transaction)<td>3 ms<td>10 ms<td>Yes<tr><td>Reserve stock<td>3 ms<td>15 ms<td>Yes<tr><td>Authorize payment (external)<td>400 ms<td>1,500 ms<td>Yes<tr><td>Create shipment<td>50 ms<td>100 ms<td>No: runs after the response<tr><td>Capture payment<td>300 ms<td>1,200 ms<td>No</table></div></div>
+<p>The p99 sits at about 1.5 seconds, nearly all of it the provider. That leaves little headroom. So the checkout endpoint needs a fallback. If authorization has not returned by 1.8 seconds, respond "we're processing your order" and finish asynchronously. The order is durable at that point, so nothing is lost by not waiting.</p>
+<p>2PC cannot use that trick. The coordinator must hear every vote before anything commits, so shipping's latency joins the customer's wait whether the product needs it or not.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-log-sizing level=3>Saga log writes and storage</h3>
+<p>Count durable writes per order. Each state change is one, and each command sent to a service through an outbox row is one more. A typical path (created, reserving, reserved, authorizing, authorized, shipping, shipped, capturing, completed) with four outbox rows comes to about 13 small writes.</p>
+<pre><code>200 orders/s × 13 writes    =  2,600 writes/s   (busy hour)
+1,000 orders/s × 13 writes  = 13,000 writes/s   (release spike)
+</code></pre>
+<p>A single well-tuned Postgres primary can absorb the busy hour comfortably. The spike is where group commit and a fast disk matter, and where you should plan to partition the saga table by <code>order_id</code> before the next big launch rather than after it.</p>
+<p>Storage is modest. Assume about 3 KB per order for the saga row, its history and its outbox rows, and an average of 50 orders per second across the day. That is 4.3 million orders per day, or about 13 GB. Keep 90 days hot for support and disputes, roughly 1.2 TB, and archive the rest. Disputes can arrive months after purchase, so the archive must stay queryable.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-outage-cost level=3>What a 20-minute outage costs</h3>
+<p>The lesson's Drill 2 counts 340 orders caught mid-saga. Now follow the orders that keep arriving. At 200 per second for 20 minutes, that is 240,000 more orders. If the saga charges each one and then compensates because shipping is down, the store issues 240,000 refunds.</p>
+<p>Many providers keep their processing fee when you refund. Assume about 3% of a $60 order, roughly $1.80. That is around $430,000 in fees for one outage, plus 240,000 customers who see a charge and a refund on their statements. The saga did exactly what it was designed to do, and the result is still terrible. The trade-off section below shows the two design changes that turn this into a non-event.</p>
+
+<h2 id=dd-minicapstone-order-fulfillment-built-twice-inside-2pc level=2>Deep Dive: Inside Build One</h2>
+<p>The lesson treats 2PC as a protocol. In a real deployment it is a set of database features and a transaction manager, and each one has operational edges that the protocol diagram hides.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-prepared level=3>What "prepared" means in a real database</h3>
+<p>In Postgres, a participant runs its work inside a transaction, then calls <code>PREPARE TRANSACTION 'order-7f3a'</code>. The transaction is written to disk and detached from the session. It survives a crash and a restart, still holding its locks. Later the coordinator calls <code>COMMIT PREPARED 'order-7f3a'</code> or <code>ROLLBACK PREPARED 'order-7f3a'</code>, possibly from a different connection.</p>
+<p>Three details matter in production:</p>
+<ul>
+<li><strong>It is off by default.</strong> <code>max_prepared_transactions</code> defaults to 0. You must set it to at least the number of prepared transactions you expect in flight, and changing it needs a restart. If you size it by Little's law at 200 orders per second and a 9 ms hold, you need only 2. Size it for the bad day instead: at 4-second holds you need 800.</li>
+<li><strong>Prepared transactions pin vacuum.</strong> A prepared transaction keeps its snapshot horizon open. While it lives, vacuum cannot remove dead rows newer than it, anywhere in the database. One forgotten prepared transaction causes table bloat across the whole cluster within days.</li>
+<li><strong>They are visible.</strong> <code>SELECT gid, prepared, owner FROM pg_prepared_xacts</code> lists them with their age. Alert on any older than a minute.</li>
+</ul>
+<p>MySQL offers the same shape through <code>XA START</code>, <code>XA END</code>, <code>XA PREPARE</code> and <code>XA COMMIT</code>, with <code>XA RECOVER</code> to list what is in doubt. On the Java side, a transaction manager speaking the XA interface (JTA implementations such as Narayana or Atomikos) usually plays coordinator.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-coordinator level=3>The coordinator's log is the real system of record</h3>
+<p>A participant that voted yes can only learn the outcome from the coordinator. So the coordinator must write its decision durably <em>before</em> it sends a single commit. If its disk is lost after sending some commits and before sending the rest, nobody can finish those transactions correctly.</p>
+<p>Most implementations use <strong>presumed abort</strong>. If the coordinator has no record of a transaction, the answer is "abort". That keeps the log small, since only commit decisions need recording. It also means a lost coordinator log aborts transactions that some participants may already have committed.</p>
+<p>When a coordinator is gone for good, operators can force an outcome on a participant. XA calls these <strong>heuristic</strong> decisions: heuristic commit, heuristic rollback, and the "heuristic mixed" outcome where participants went different ways. A heuristic decision is a human breaking atomicity on purpose to release locks. If your runbook contains one, your system is not all-or-nothing in the cases that matter most.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-encapsulation level=3>The hidden architectural cost</h3>
+<p>For 2PC to span inventory, payment intent and shipping, each service must let the coordinator drive its database transaction directly. In practice that means exposing XA endpoints or holding transactions open across network calls. Services can no longer change their schema or database independently, because the coordinator is part of their transaction. This is why 2PC lives comfortably inside one database cluster, as in the lesson's gift-card example, and badly across services owned by different teams.</p>
+
+<h2 id=dd-minicapstone-order-fulfillment-built-twice-inside-saga level=2>Deep Dive: Inside Build Two</h2>
+<p>A saga's correctness lives in one table and a handful of rules about when to write it. Here is a version that works on Postgres.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-schema level=3>The saga table</h3>
+<pre><code>CREATE TABLE order_saga (
+  order_id         uuid PRIMARY KEY,
+  state            text        NOT NULL,   -- RESERVING, RESERVED, AUTHORIZING, ...
+  version          bigint      NOT NULL DEFAULT 0,
+  owner            text,                    -- orchestrator instance holding the lease
+  lease_until      timestamptz,
+  attempts         int         NOT NULL DEFAULT 0,
+  next_attempt_at  timestamptz NOT NULL DEFAULT now(),
+  last_error       text,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX order_saga_due ON order_saga (next_attempt_at)
+  WHERE state NOT IN ('COMPLETED', 'COMPENSATED', 'NEEDS_HUMAN');
+
+-- Workers claim due sagas without blocking each other.
+SELECT order_id, state, version FROM order_saga
+WHERE next_attempt_at &lt;= now()
+  AND state NOT IN ('COMPLETED', 'COMPENSATED', 'NEEDS_HUMAN')
+ORDER BY next_attempt_at
+LIMIT 100
+FOR UPDATE SKIP LOCKED;
+
+-- Advance only if nobody else has.
+UPDATE order_saga
+SET state = 'AUTHORIZED', version = version + 1, attempts = 0, updated_at = now()
+WHERE order_id = $1 AND state = 'AUTHORIZING' AND version = $2;
+-- 0 rows updated: another worker moved it. Re-read; do not act.
+</code></pre>
+<p>The partial index is the operator's best friend. It makes "sagas in state X older than Y" a cheap query, which is what support and on-call will ask every day.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-intent-states level=3>Intent states: write before you act</h3>
+<p>The lesson's rule is that each state change must be durable before its external effect begins. In practice that means two states per external step: an intent state (<code>AUTHORIZING</code>) written before the call, and a result state (<code>AUTHORIZED</code>) written after.</p>
+<p>A worker that finds a saga in <code>AUTHORIZING</code> after a crash knows one thing: the call may or may not have happened. So it repeats the call with the same idempotency key. It never skips ahead, and it never compensates an unknown. If there were only a result state, a crash between the call and the write would leave no trace that money might have moved.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-idempotency-keys level=3>Idempotency keys that survive retries</h3>
+<p>Derive keys from the order, not from the attempt: <code>7f3a:authorize</code>, <code>7f3a:capture</code>, <code>7f3a:refund</code>. A key generated fresh on each retry is not an idempotency key; it is a duplicate-charge generator.</p>
+<p>Check how long the provider remembers keys. Stripe, for one, documents that keys may be pruned after 24 hours. A saga parked longer than that must not retry blindly with an expired key. It should look the charge up first, by order reference or by the provider's own id stored in the saga row.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-outbox level=3>Commands through an outbox</h3>
+<p>"Ask shipping to create a shipment" is a message, and sending it from the same code that updates the saga row is a dual write. If the process dies between the two, the row says <code>SHIPPING</code> and shipping never heard about it, or the reverse. Write the command into an outbox table in the same transaction as the state change, and have a relay publish it. Shipping deduplicates by the command's key. Synchronous calls, such as the provider's HTTP API, follow the intent-state rule instead.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-reservations level=3>Reservations with an expiry</h3>
+<p>The reserve step is one statement that cannot oversell:</p>
+<pre><code>UPDATE stock SET available = available - $2
+WHERE sku = $1 AND available &gt;= $2;
+-- 0 rows: out of stock. A business failure: end the saga, nothing to undo.
+</code></pre>
+<p>Record each reservation with an <code>expires_at</code>, say 30 minutes. A sweeper returns expired reservations to stock. If the orchestrator and its log both fail in some unforeseen way, stock still comes back on its own. The saga converts the reservation to "committed" when shipment is created, with a conditional update so the sweeper and the saga cannot both win.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-engines level=3>Hand-rolled or a durable execution engine</h3>
+<p>Everything above is a few hundred lines of code, and teams write it. Durable execution engines such as Temporal or AWS Step Functions provide the same guarantees as a product: persisted step history, timers, retries, and resumption after a crash. You still write idempotent activities and compensations. The engine just stops you from reinventing the table, the claim query and the timer wheel. The trade is a new piece of infrastructure to run or buy, and a programming model with its own rules (Temporal workflows, for instance, must be deterministic on replay).</p>
+
+<h2 id=dd-minicapstone-order-fulfillment-built-twice-drills level=2>Deep Dive: More Failure Drills</h2>
+<p>The lesson ran three drills against each build. These six are the ones that show up in real incident reviews. Each has the same shape: what you see, why it happens, how you notice, and what you change.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-unknown level=3>Drill 4: The charge times out, outcome unknown</h3>
+<p><strong>Symptom.</strong> The provider call times out at 10 seconds. The saga sits in <code>AUTHORIZING</code>. Some customers later see a pending charge for an order the site says failed.</p>
+<p><strong>Mechanism.</strong> A timeout tells you nothing about the outcome. The provider may have authorized the card and lost the response. A saga that treats the timeout as "declined" and releases inventory has created exactly the forbidden half-state: money held, nothing shipping.</p>
+<p><strong>Detect.</strong> Count sagas in intent states older than a few minutes. Reconcile the provider's authorization report against your saga table daily.</p>
+<p><strong>Fix.</strong> Treat "unknown" as its own state. Retry with the same idempotency key until you get a definite answer, or query the provider by order reference. Only a definite decline ends the saga.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-split-brain level=3>Drill 5: Two orchestrators advance one order</h3>
+<p><strong>Symptom.</strong> A small number of customers receive two parcels.</p>
+<p><strong>Mechanism.</strong> Worker A claims a saga with a 30-second lease, then stalls in a long garbage-collection pause. The lease expires. Worker B claims the saga and sends "create shipment". Worker A wakes up, still believing it owns the saga, and sends the same command.</p>
+<p><strong>Detect.</strong> Alert on conditional updates that return 0 rows. Each one is a worker that acted on a stale view. Also count shipments per order in shipping's database; any value above one is an incident.</p>
+<p><strong>Fix.</strong> Two layers. Every state change uses the version check, so A's late write fails. And every command carries a fencing token (the saga version), which shipping stores. Shipping rejects a command whose token is not newer than the last one it accepted for that order. Shipping's idempotency on <code>7f3a:ship</code> should also catch the duplicate. Do not rely on the lease alone.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-comp-fails level=3>Drill 6: The compensation fails</h3>
+<p><strong>Symptom.</strong> Refunds stuck in retry. The customer is charged for an order that will never ship.</p>
+<p><strong>Mechanism.</strong> Compensations are supposed to always succeed eventually, but the world disagrees. The card was closed, the authorization expired, or the provider rejects refunds older than its limit. The saga keeps retrying a step that can never work.</p>
+<p><strong>Detect.</strong> The business rule from the brief, written as a query: orders charged, with no shipment and not refunded, older than 30 minutes. Run it every few minutes and page on any growth. This one query catches drills 4, 5 and 6 together.</p>
+<p><strong>Fix.</strong> Cap retries, then move the saga to <code>NEEDS_HUMAN</code> with the last error, and route it to a payments operations queue (a dead-letter queue for workflows). Give that queue an owner and a response target. A stuck compensation is a customer's money.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-orphan level=3>Drill 7: An orphaned prepared transaction (Build One)</h3>
+<p><strong>Symptom.</strong> Hot-SKU checkouts time out. Days later, every table in the inventory database is bloated and queries slow down.</p>
+<p><strong>Mechanism.</strong> The coordinator's host was replaced, and its transaction log went with it. One inventory transaction is still prepared, holding the hot row's lock and pinning vacuum's horizon. Nobody is left who knows whether it should commit.</p>
+<p><strong>Detect.</strong> Age of the oldest row in <code>pg_prepared_xacts</code>. Also watch the age of the oldest transaction id that vacuum cannot pass.</p>
+<p><strong>Fix.</strong> Look for the decision in the other participants. If any committed, commit; if none did, roll back. That is a heuristic decision, so log it as an incident. Then put the coordinator's log on replicated storage, so losing one host never loses decisions again.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-leak level=3>Drill 8: Phantom sold-out</h3>
+<p><strong>Symptom.</strong> The product page says "sold out" during a launch while the warehouse has stock.</p>
+<p><strong>Mechanism.</strong> Reservations from abandoned or failed sagas were never released. Perhaps the compensation path had a bug, or the sweeper was down. Or the sweeper ran, but its timeout was shorter than the saga's longest legitimate pause, and the saga then "committed" a reservation that had already been returned. That last one oversells instead.</p>
+<p><strong>Detect.</strong> Compare <code>available + reserved + committed</code> with physical stock every few minutes. During a launch, also graph reserved units by saga state.</p>
+<p><strong>Fix.</strong> Reservation expiry longer than the saga's longest parked state, plus conditional conversion, so an expired reservation cannot be committed. When the saga parks for longer, it extends the reservation explicitly.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-cart level=3>Drill 9: Pay is pressed while the cart has siblings</h3>
+<p><strong>Symptom.</strong> A customer is charged for an item she removed on her other device a second earlier. Or the order total does not match the cart she saw.</p>
+<p><strong>Mechanism.</strong> This is where the lesson's postscript meets fulfillment. The leaderless cart can hold siblings at the moment of checkout. If checkout reads one sibling, or merges without tombstones, the saga charges for a cart that never existed as the customer saw it.</p>
+<p><strong>Detect.</strong> Log whether the cart had siblings at checkout, and compare the charged total with the total on the page the customer confirmed.</p>
+<p><strong>Fix.</strong> Checkout resolves siblings, writes the merged cart back, and shows the resolved cart and total before Pay. The order then stores a snapshot of the lines and prices together with the cart's clock. A cart write that arrives after that clock does not change the order. The two consistency domains meet in one place, and that place is a snapshot.</p>
+
+<h2 id=dd-minicapstone-order-fulfillment-built-twice-debates level=2>Deep Dive: The Trade-off Debates</h2>
+<p>A review panel will not argue about "2PC or saga" for long. The lesson settles that. The arguments that take the time are the decisions inside the saga.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Lean, for this brief<tbody><tr><td>Payment step<td>Charge at checkout, refund on failure<td>Authorize at checkout, capture after shipment is created, void on failure<td><strong>B.</strong> A void before capture is cheap, and customers barely notice it<tr><td>Dependency outage<td>Compensate after a short retry<td>Park the saga, retry with backoff up to a business deadline<td><strong>B</strong> for infrastructure failures. Compensate on business failures and at the deadline<tr><td>Coordination style<td>Orchestrator with a saga log<td>Choreography: services react to each other's events<td><strong>A.</strong> Three steps with money involved want one place that knows the state<tr><td>Engine<td>Hand-rolled table and workers<td>Durable execution engine<td><strong>A</strong> for one workflow. <strong>B</strong> once there are several<tr><td>Hot SKU<td>One stock row<td>Bucketed stock rows<td><strong>A</strong> until the spike math says otherwise, then <strong>B</strong><tr><td>Customer message<td>Confirm only when shipped<td>Acknowledge "received", confirm at a terminal state<td><strong>B.</strong> Honest and fast, and nothing is promised that a compensation can take back</table></div></div>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-auth-capture level=3>Authorize, then capture</h3>
+<p>Card payments come in two parts. An <strong>authorization</strong> places a hold on the customer's funds. A <strong>capture</strong> actually moves the money. Holds expire after a period set by the card network and provider, typically days. Within that window, releasing the hold (a void) costs little or nothing and usually never shows on the statement as a charge.</p>
+<p>This changes the saga. The steps become reserve, authorize, create shipment, capture. Undoing an authorization is now cheap, so compensation stops being an embarrassment. The capture happens after the shipment exists, so "charged with nothing shipping" becomes very hard to reach.</p>
+<p>The new risk is the opposite half-state, shipped but not captured. A capture can fail if the hold expired, for example. Capture promptly after the shipment is created, monitor "shipped but not captured" like the other invariant, and keep the window between authorization and capture short.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-park level=3>Park, don't compensate, when a dependency is down</h3>
+<p>The brief says fulfillment may lag by minutes. A 20-minute shipping outage is a delay, not a failed order. So the saga should distinguish two kinds of failure:</p>
+<ul>
+<li><strong>Business failures</strong> are final: out of stock, card declined, address undeliverable. Compensate at once.</li>
+<li><strong>Infrastructure failures</strong> are temporary: timeouts, 503s, an open circuit breaker. Park the saga in <code>AWAITING_SHIPPING</code> and retry with backoff. Compensate only if a business deadline passes, for example 2 hours, after which the order is cancelled with an apology.</li>
+</ul>
+<p>Combine this with authorize-then-capture, and the 240,000-order outage from the capacity section changes shape. Those orders hold authorizations and reservations for 20 minutes, then ship. There are no refunds and no fees. The circuit breaker on shipping stops workers from hammering a dead service. A banner can tell new customers that dispatch is delayed.</p>
+<p>The panel's objection will be: "now inventory is reserved for orders that might not ship." True. That is why the reservation expiry must exceed the business deadline, and why the deadline is a product decision, not an engineering default.</p>
+
+<h3 id=dd-minicapstone-order-fulfillment-built-twice-pivot level=3>Where the pivot really is</h3>
+<p>The lesson places the pivot at "ship". Look closer. Creating a shipment record is a database write, and it can be cancelled. The step that cannot be undone is the parcel leaving the warehouse. Most warehouse systems allow cancellation until picking or labelling starts.</p>
+<p>So the true pivot is later than the code suggests. That is good news, because it gives the saga a window where capture can fail and the shipment can still be stopped. Model it explicitly: a <code>SHIPMENT_CREATED</code> state that can still compensate, and a <code>DISPATCHED</code> event from the warehouse after which only customer-service processes (returns, refunds) apply.</p>
+
+<h2 id=dd-minicapstone-order-fulfillment-built-twice-evolution level=2>Deep Dive: The Evolution Path</h2>
+<p>A strong review answer admits something the lesson's framing hides. At 200 orders per second, this whole system fits in one database.</p>
+<ol>
+<li><strong>Stage 0: one database, one local transaction.</strong> Orders, stock and the saga row live in one Postgres. Reserve-and-record is an ordinary transaction, with no 2PC and no saga needed for the internal part. The payment provider is still external, so the intent-state and idempotency-key rules apply to it, and commands to shipping go through an outbox. This is the cheapest correct design, and the one to start with.</li>
+<li><strong>Stage 1: services split.</strong> Inventory and shipping become separate services with their own databases, usually for team reasons rather than load. The internal transaction becomes saga steps. The orchestrator is the Stage 0 code, now calling services instead of tables.</li>
+<li><strong>Stage 2: payment-aware saga.</strong> Authorize-then-capture, park-on-outage with a business deadline, reservation expiry, and the invariant queries on a dashboard. Most of the real reliability arrives here, not in Stage 1.</li>
+<li><strong>Stage 3: more workflows.</strong> Returns, exchanges, split shipments and pre-orders each need their own saga. This is when a durable execution engine pays for itself.</li>
+<li><strong>Stage 4: multi-region.</strong> Each order gets a home region where its saga log lives, chosen at checkout. Other regions forward to it. A region partition stalls the sagas homed on the far side rather than letting two regions advance one order. This is the lesson's first "extend it yourself" exercise, and the answer is the same as Drill 5: one writer per saga, with fencing.</li>
+</ol>
+<p>The step people skip is Stage 0. Splitting services first and then discovering you need a saga is common. It is also a choice, not a law of nature.</p>
+
+<h2 id=dd-minicapstone-order-fulfillment-built-twice-review level=2>Deep Dive: Design-Review Questions</h2>
+<ol>
+<li>What is the lock hold time on the hottest row, and what spike rate does <code>1 / hold</code> allow? Show the arithmetic.</li>
+<li>Which steps are inside the customer's 2-second wait, and what does checkout return when the provider is slow?</li>
+<li>Does every external step have an intent state written before the call? What does a worker do when it finds one after a crash?</li>
+<li>How are idempotency keys derived, and what happens to a saga parked longer than the provider remembers its keys?</li>
+<li>Which failures compensate at once and which park? Who set the business deadline, and does reservation expiry exceed it?</li>
+<li>Is the payment flow authorize-then-capture? What monitors "shipped but not captured"?</li>
+<li>How do you stop two workers from advancing one saga: version checks, fencing tokens downstream, or both?</li>
+<li>What happens to a compensation that cannot succeed? Who owns the <code>NEEDS_HUMAN</code> queue, and what is its response target?</li>
+<li>Which queries express the brief's two invariants, how often do they run, and who is paged?</li>
+<li>Which systems read order state, and do they all know which states are provisional?</li>
+<li>How does checkout turn a cart with siblings into one order snapshot, and what does the customer see first?</li>
+<li>If any 2PC remains, where is the coordinator's log stored, and what is the alert on prepared-transaction age?</li>
+</ol>
+
+<h2 id=dd-minicapstone-order-fulfillment-built-twice-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Your saga charged the card and then shipping went down for an hour. Walk me through what the customer experiences."</summary>
+<p>With the improved design, the customer never sees a charge and a refund. At checkout we authorized rather than charged, and acknowledged "order received". When shipping failed with a timeout, the saga classified it as an infrastructure failure and parked in <code>AWAITING_SHIPPING</code>, retrying with backoff behind a circuit breaker. If shipping returns within the business deadline, the shipment is created, we capture, and the customer gets "your order is on its way", a little late. If the deadline passes, we void the authorization, release stock and send a cancellation. On most statements a void never appears as a charge.</p>
+</details>
+
+<details>
+<summary>"Why not just use 2PC with a timeout so participants don't block forever?"</summary>
+<p>Because a participant that voted yes has promised to commit if told to. If it times out and aborts on its own, and the coordinator had decided commit, the participants disagree. That is precisely the atomicity 2PC exists to provide. A timeout turns 2PC into "usually atomic", which is a saga without compensations or a log. Protocols that tolerate coordinator failure, such as running the coordinator's state through consensus as Spanner-class systems do, fix this by replicating the decision, not by timing out.</p>
+</details>
+
+<details>
+<summary>"The payment call timed out. Do you retry or compensate?"</summary>
+<p>Neither, until you know the outcome. A timeout is "unknown", not "failed". The saga is in <code>AUTHORIZING</code>, so a recovery worker retries with the same idempotency key, which either returns the original result or performs the authorization once. If the key may have expired, it looks the payment up by order reference first. Compensating an unknown can release stock for an order whose money is held. Retrying with a fresh key can charge twice.</p>
+</details>
+
+<details>
+<summary>"Orchestration or choreography for this checkout?"</summary>
+<p>Orchestration. With three steps, money and a strict invariant, I want one durable record that says where each order is. Support can query it, the invariant monitors can join against it, and compensations have one owner. Choreography spreads the state across three services' event handlers, so "where is order 7f3a?" becomes a distributed trace. Choreography is better for loosely coupled reactions, such as analytics or loyalty points, that should not hold up the order.</p>
+</details>
+
+<details>
+<summary>"How would you test that this design never charges without shipping?"</summary>
+<p>Three layers. First, a model-level test: enumerate every state and every crash point between "intent written" and "result written", and check that recovery from each leads to shipped-and-captured or voided-and-released. Second, fault injection in staging: kill workers mid-step, delay provider responses past the timeout, return duplicate webhooks, and run the invariant queries afterwards. Third, production: the invariant queries run continuously, and the daily reconciliation against the provider's settlement report catches anything the first two missed.</p>
+</details>
+
+<details>
+<summary>"Given 200 orders per second, would you build this as microservices at all?"</summary>
+<p>Not to start with. 200 orders per second fits one Postgres primary with room to spare. Orders, stock and the saga row in one database make the internal part a local transaction. The only distributed piece is the payment provider, which needs the intent-state and idempotency rules anyway. I would split inventory and shipping into services when team ownership or independent deployment demands it. When that happens, the local transaction becomes saga steps, and the orchestrator code already exists.</p>
+</details>
+
+<details>
+<summary>"Where does the cart's consistency model stop and the order's begin?"</summary>
+<p>At the snapshot. The cart is leaderless, uses vector clocks and may hold siblings, because it must accept writes during failures. Checkout resolves the siblings, shows the customer the merged cart, and writes an order containing a copy of the lines, the prices and the cart clock it was taken from. From that moment the order belongs to the saga, which has a single writer and an ordered log. Later cart writes cannot change it. Mixing the two, for example by letting the saga re-read the live cart, would import siblings into a workflow that has no way to merge them.</p>
+</details>

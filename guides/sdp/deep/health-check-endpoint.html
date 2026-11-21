@@ -1,0 +1,255 @@
+<h2 id=dd-health-check-endpoint-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson gives you the two verdicts. A design review goes one level lower: who actually sends the probes, what they do with the answer, and how long each step takes. Most health-check incidents are not bad ideas. They are a sensible idea meeting a prober whose behaviour nobody looked up.</p>
+
+<h3 id=dd-health-check-endpoint-who-probes level=3>Three probers, three different reactions</h3>
+<p>A typical service on Kubernetes behind a cloud load balancer is probed by at least three separate systems. Each one reads a different endpoint and takes a different action.</p>
+<ul>
+<li><strong>The kubelet</strong>, the agent on each node. It runs the liveness, readiness and startup probes defined in the pod spec. A liveness failure makes it kill and restart the container. A readiness failure makes the control plane remove the pod from the Service's EndpointSlices, so kube-proxy and any mesh stop sending it new connections.</li>
+<li><strong>The external load balancer.</strong> An AWS target group, a GCP backend service or an nginx upstream runs its own active checks on its own schedule. Its only action is to stop routing to the target. It knows nothing about the kubelet's verdict unless you wire the two to the same endpoint.</li>
+<li><strong>The mesh sidecar or client-side balancer.</strong> Envoy and gRPC clients often do <em>passive</em> health checking, called outlier detection. They watch real responses and eject a host that returns, say, five consecutive 5xx responses, for a base ejection time that grows with each repeat.</li>
+</ul>
+<p>The practical consequence: you cannot reason about "the health check" as one thing. Write down each prober, which path it calls, its interval, its timeout and its action. That table is usually the first artefact a reviewer asks for, and it is often missing.</p>
+
+<h3 id=dd-health-check-endpoint-k8s-knobs level=3>The Kubernetes probe knobs, and what each one trades</h3>
+<p>Every Kubernetes probe has the same five fields. The defaults are worth knowing because many teams never change them.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Field<th>Default<th>What it trades<tbody>
+<tr><td><code>periodSeconds</code><td>10<td>Faster detection against more probe load. Halving it doubles the probe rate fleet-wide.
+<tr><td><code>timeoutSeconds</code><td>1<td>A short timeout catches hangs quickly, but a 1.2 s GC pause becomes a failure. Too long, and a stuck handler holds the probe for seconds.
+<tr><td><code>failureThreshold</code><td>3<td>How many consecutive failures before acting. Higher means fewer false restarts and slower reaction.
+<tr><td><code>successThreshold</code><td>1<td>Consecutive passes before a failed readiness probe counts as ready again. Must be 1 for liveness and startup.
+<tr><td><code>initialDelaySeconds</code><td>0<td>A fixed wait before the first probe. Mostly replaced by a startup probe, which adapts to actual start time.
+</tbody></table></div></div>
+<p>Probes come in four kinds: <code>httpGet</code> (any status from 200 to 399 passes), <code>tcpSocket</code> (the port accepts a connection), <code>grpc</code> (the standard <code>grpc.health.v1.Health/Check</code> call), and <code>exec</code> (run a command inside the container). The <code>exec</code> kind deserves suspicion. It forks a process every period on every pod. On a busy node with dozens of pods that is real CPU, and a slow fork looks exactly like a failed check.</p>
+
+<h3 id=dd-health-check-endpoint-startup-probe level=3>The startup probe: a third verdict the lesson implies</h3>
+<p>The lesson says readiness starts false while the instance warms up. There is a related problem on the liveness side. A JVM service that takes 90 seconds to load its caches will fail a liveness probe with default settings after about 30 seconds (three failures, ten seconds apart). The kubelet kills it. It starts again, takes 90 seconds again, and is killed again. That is a crash loop with nothing actually broken.</p>
+<p>The old fix was a big <code>initialDelaySeconds</code>. That delays deadlock detection on every start, even fast ones. The better fix is a <strong>startup probe</strong>. While it is still failing, the kubelet does not run liveness or readiness at all. Once it passes once, it never runs again for that container and the normal probes take over. Its budget is <code>failureThreshold × periodSeconds</code>, so <code>30 × 10</code> allows up to 300 seconds to start, and a fast start hands over after the first pass.</p>
+<p>So in practice there are three questions, asked in sequence: "have I finished starting?", then continuously "am I alive?" and "should I get traffic?"</p>
+
+<h3 id=dd-health-check-endpoint-lifecycle level=3>The lifecycle, step by step, including the shutdown race</h3>
+<p>The lesson describes the readiness lifecycle in words. Here it is as a timeline, because the shutdown half contains a race that catches almost everyone once.</p>
+<svg role="img" aria-labelledby="dd-health-check-endpoint-svg-title dd-health-check-endpoint-svg-desc" viewBox="0 0 720 270" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-health-check-endpoint-svg-title">Readiness across one instance's lifecycle</title>
+<desc id="dd-health-check-endpoint-svg-desc">A horizontal timeline. The instance starts, the startup probe runs while caches and pools warm, then readiness turns true and the instance receives traffic. On termination, the pod is marked terminating, which starts endpoint removal and the preStop hook at the same time. The preStop sleep keeps the process serving until removal has propagated. Then SIGTERM arrives, the server stops accepting new connections, finishes in-flight requests, and exits before the grace period ends.</desc>
+<line x1="20" y1="120" x2="700" y2="120" style="stroke:var(--ink,#1c2430)"/>
+<rect x="20" y="70" width="170" height="40" rx="5" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="105" y="88" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Starting</text>
+<text x="105" y="104" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">startup probe, warm pools</text>
+<rect x="195" y="70" width="230" height="40" rx="5" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="310" y="88" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Ready: serving traffic</text>
+<text x="310" y="104" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">liveness + readiness every period</text>
+<rect x="430" y="70" width="130" height="40" rx="5" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="495" y="88" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">preStop sleep</text>
+<text x="495" y="104" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">still serving</text>
+<rect x="565" y="70" width="135" height="40" rx="5" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="632" y="88" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">SIGTERM: drain</text>
+<text x="632" y="104" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">finish in-flight, exit</text>
+<line x1="195" y1="60" x2="195" y2="135" style="stroke:var(--accent,#1f5f99);stroke-dasharray:4 3"/>
+<text x="195" y="150" text-anchor="middle" style="fill:var(--ink,#1c2430)">ready = true</text>
+<line x1="430" y1="60" x2="430" y2="135" style="stroke:var(--accent,#1f5f99);stroke-dasharray:4 3"/>
+<text x="430" y="150" text-anchor="middle" style="fill:var(--ink,#1c2430)">pod marked terminating</text>
+<line x1="700" y1="60" x2="700" y2="135" style="stroke:var(--accent,#1f5f99);stroke-dasharray:4 3"/>
+<text x="690" y="150" text-anchor="end" style="fill:var(--ink,#1c2430)">grace period ends</text>
+<rect x="430" y="180" width="270" height="34" rx="5" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="565" y="201" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">in parallel: endpoint removal propagates (seconds)</text>
+<path d="M430 135 V180" style="stroke:var(--muted,#5c6b7c);fill:none;stroke-dasharray:4 3"/>
+<text x="20" y="245" style="fill:var(--muted,#5c6b7c)">Rule: preStop sleep &gt; removal propagation; grace period &gt; preStop sleep + longest request.</text>
+</svg>
+<p>When Kubernetes deletes a pod, two things start at the same moment. The control plane begins removing the pod from EndpointSlices, and the kubelet runs the pod's <code>preStop</code> hook and then sends SIGTERM. Removal is not instant. kube-proxy on every node has to rewrite its rules, ingress controllers have to reload, and an external load balancer has to deregister the target. That takes from a second to several seconds.</p>
+<p>If the process exits on SIGTERM straight away, callers that have not yet heard about the removal keep sending it requests. They get connection refused. Every deploy then produces a small burst of 502s that nobody can reproduce. Failing readiness on SIGTERM does not fix this on its own, because readiness only matters to the same slow propagation path.</p>
+<p>The standard fix is boring and effective. Put a short sleep in <code>preStop</code> (5 to 15 seconds is common), so the process keeps serving while the removal spreads. Recent Kubernetes versions offer a built-in sleep action for this; older setups run <code>sleep</code> in an exec hook. Then on SIGTERM, stop accepting new connections, finish in-flight requests, close keep-alive connections, and exit. Set <code>terminationGracePeriodSeconds</code> (default 30) larger than the sleep plus your longest normal request. If the grace period runs out, the kubelet sends SIGKILL and whatever was in flight is lost.</p>
+
+<h3 id=dd-health-check-endpoint-handler level=3>What the handler itself should look like</h3>
+<p>The lesson's rule is "be nearly free". In code that means the probe handler reads state, it does not compute it. Background tasks maintain a few flags and timestamps. The handler only looks at them.</p>
+<pre><code>import threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+state = {"started": False, "draining": False, "db_pool_ok": False,
+         "worker_heartbeat": time.monotonic()}
+
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        now = time.monotonic()
+        if self.path == "/livez":
+            # Only what a restart fixes: the main loop is still turning.
+            ok = now - state["worker_heartbeat"] &lt; 30
+        elif self.path == "/readyz":
+            ok = state["started"] and not state["draining"] and state["db_pool_ok"]
+        else:
+            self.send_response(404); self.end_headers(); return
+        self.send_response(200 if ok else 503)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def log_message(self, *args):  # probes would flood the access log
+        pass
+
+# Served on its own port and thread pool, so request overload
+# cannot starve the probe.
+threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", 8081), Health).serve_forever,
+                 daemon=True).start()</code></pre>
+<p>Three details in that sketch matter more than the language. The liveness check reads a heartbeat that the real work loop updates, so a deadlocked worker fails it even while the HTTP server is fine. The readiness flag for the database is set by the connection pool's own event hooks, not by a query in the probe. And probes are served on a separate port and thread pool, which is the subject of the first failure mode below.</p>
+<p>Some ecosystems give you this shape ready-made. Spring Boot Actuator exposes <code>/actuator/health/liveness</code> and <code>/actuator/health/readiness</code> as separate groups. gRPC services implement <code>grpc.health.v1</code> and can report <code>NOT_SERVING</code> per service name. Kubernetes' own API server uses <code>/livez</code> and <code>/readyz</code>, which is where the naming convention comes from.</p>
+
+<h3 id=dd-health-check-endpoint-fail-open level=3>Fail-open: what the balancer does when everyone is red</h3>
+<p>There is one more mechanism that changes the lesson's "deep check removes the whole fleet" story, and it is easy to miss. Several load balancers refuse to believe that every backend is down.</p>
+<ul>
+<li>Envoy has a <strong>panic threshold</strong>, 50% by default. If fewer than half the hosts in a cluster are healthy, Envoy ignores health and spreads traffic across all hosts.</li>
+<li>AWS Application and Network Load Balancers <strong>fail open</strong>: if no target in any zone is healthy, they route to all targets.</li>
+<li>Kubernetes Services do not. An endpoint that is not ready receives no traffic from kube-proxy, even if that leaves zero endpoints.</li>
+</ul>
+<p>Fail-open is a safety net, not a design. It means a deep readiness check that goes red fleet-wide may cause a full outage behind kube-proxy and almost nothing behind an ALB. Same code, different blast radius. Know which one you are behind before you decide what readiness may include.</p>
+
+<h2 id=dd-health-check-endpoint-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Health checks look free until you add up the probers, the detection delays and the drain windows. Here is the arithmetic for the lesson's example fleet: 30 services, 40 instances each, 1,200 instances in all.</p>
+
+<h3 id=dd-health-check-endpoint-probe-load level=3>Probe load, counted honestly</h3>
+<p>The lesson counts one prober at one probe every 2 seconds: 600 checks per second. Count every prober and the number grows quickly.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Prober<th>Per instance<th>Fleet (1,200 instances)<tbody>
+<tr><td>kubelet liveness, every 10 s<td>0.1/s<td>120/s
+<tr><td>kubelet readiness, every 5 s<td>0.2/s<td>240/s
+<tr><td>Cloud load balancer, every 10 s, from 3 nodes<td>0.3/s<td>360/s
+<tr><td>Mesh sidecar active checks, every 5 s, from 20 client pods<td>4/s<td>4,800/s
+<tr><td><strong>Total</strong><td><strong>~4.6/s</strong><td><strong>~5,500/s</strong>
+</tbody></table></div></div>
+<p>Two rows surprise people. Cloud load balancers run one checker per load balancer node, so a target sees the configured rate times the number of nodes. And a mesh that does active checks from every client to every server grows with clients times servers. That is why most meshes lean on passive outlier detection and leave active probing to the kubelet.</p>
+<p>At about 1 ms of in-memory work each, 5,500 checks per second costs about 5.5 CPU-seconds per second across the fleet. That is fine. Now put a 5 ms database query inside the readiness path and the database receives an extra 240 queries per second from the kubelet alone, forever, carrying no user value. Put it in the mesh path and it is thousands. This is the lesson's "be nearly free" rule in real numbers.</p>
+
+<h3 id=dd-health-check-endpoint-detection-time level=3>Detection time and recovery time</h3>
+<p>The time from "instance breaks" to "prober acts" is roughly:</p>
+<p><code>detection ≈ periodSeconds × failureThreshold + timeoutSeconds</code></p>
+<p>With Kubernetes defaults that is <code>10 × 3 + 1 = 31 s</code>. For readiness with a 5-second period, about 16 seconds. Add EndpointSlice propagation (a few seconds) and the real de-routing time is around 20 seconds. During that time the broken instance still gets its share of traffic. With 40 instances, that is 2.5% of requests failing for 20 seconds.</p>
+<p>Recovery is asymmetric. A de-routed instance comes back after <code>successThreshold × periodSeconds</code>. A restarted one has to start, warm and pass its startup probe first. If start-up takes 60 seconds, a single false liveness restart costs a minute of that instance's capacity. Repeated false restarts back off: the kubelet waits 10 s, 20 s, 40 s and so on between restarts, capped at five minutes. That cap is how a 90-second database failover turns into the lesson's 20-minute outage. The pods are still sitting in back-off long after the database is fine.</p>
+
+<h3 id=dd-health-check-endpoint-choosing-thresholds level=3>Choosing thresholds from the worst pause you expect</h3>
+<p>Pick liveness settings from the longest legitimate stall, not from how fast you would like to detect deadlocks. Suppose the service's worst observed stop-the-world GC pause is 2 seconds and a traffic spike can stretch probe latency to 3 seconds. Then:</p>
+<ul>
+<li><code>timeoutSeconds: 5</code> keeps one slow answer from counting as failure.</li>
+<li><code>failureThreshold: 3</code> with <code>periodSeconds: 10</code> means a stall must last about 30 seconds to trigger a restart.</li>
+<li>A real deadlock is caught in about 35 seconds. That is slow, and that is fine. A deadlock that costs 35 seconds of one instance's capacity is cheap. A false restart storm across the fleet is not.</li>
+</ul>
+<p>Readiness can be tighter, because its action is reversible: period 5, threshold 2, timeout 2. You want an overloaded or draining instance out of rotation quickly, and back quickly once it recovers.</p>
+
+<h3 id=dd-health-check-endpoint-drain-math level=3>Drain timing for a deploy</h3>
+<p>Take a service whose p99 request is 800 ms and whose slowest legitimate request, a large export, takes 20 seconds. Endpoint removal takes up to 5 seconds to reach every node and the external balancer.</p>
+<ul>
+<li><code>preStop</code> sleep: 10 s, double the observed propagation.</li>
+<li>Drain after SIGTERM: up to 20 s for the longest request.</li>
+<li><code>terminationGracePeriodSeconds</code>: 10 + 20 + 5 s margin = <strong>35 s</strong>, just above the default 30.</li>
+</ul>
+<p>Now the deploy cost. A rolling deploy of 40 pods with <code>maxSurge: 25%</code> and <code>maxUnavailable: 0</code> replaces about 10 pods at a time. Each wave takes start-up (say 40 s) plus readiness passing (5 s) plus termination (up to 35 s), so roughly 80 seconds per wave and about 5 to 6 minutes for the fleet. If the external load balancer uses a 300-second deregistration delay (the AWS target group default), each wave can stretch to five minutes. Tune that delay down to match your real drain time.</p>
+
+<h2 id=dd-health-check-endpoint-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+<p>The lesson covers the classic: a database check inside liveness. These are the ones that show up after the team has already fixed that.</p>
+
+<h3 id=dd-health-check-endpoint-fm-starved level=3>1. The probe waits in the same queue as the traffic</h3>
+<p><strong>Symptom.</strong> Under a traffic spike, pods start restarting one after another. Each restart pushes more load onto the survivors, and they restart too. The liveness check contains no dependencies at all.</p>
+<p><strong>Mechanism.</strong> The probe is served by the same thread pool or event loop as user requests. When the pool is saturated, the probe waits behind 500 queued requests and times out after 1 second. The kubelet reads "not alive" and restarts a process that was merely busy. Restarted pods come back cold and slower. The overload gets worse, not better.</p>
+<p><strong>Detection.</strong> Container restart count rises together with request latency and CPU saturation. Kubernetes events show <code>Liveness probe failed: ... context deadline exceeded</code> rather than a non-200 status.</p>
+<p><strong>Fix.</strong> Serve probes on a separate port with a dedicated small thread pool or a separate listener. Base liveness on a heartbeat from the work loop rather than on whether an HTTP request gets through the main queue. Handle overload with load shedding and <a href="#rate-limiting">rate limiting</a>, not with restarts.</p>
+
+<h3 id=dd-health-check-endpoint-fm-cascade level=3>2. Readiness that tracks load, and the cascade it causes</h3>
+<p><strong>Symptom.</strong> A moderate spike turns into a full outage within a minute. Ready pod count drops from 40 to 30, then 15, then 0.</p>
+<p><strong>Mechanism.</strong> Someone made readiness fail when the in-flight count exceeds a limit, which sounds sensible. An overloaded pod goes unready. Its traffic moves to the other 39, which pushes several of them over the limit. They go unready, and the remaining pods receive even more. Readiness has become positive feedback.</p>
+<p><strong>Detection.</strong> Ready endpoint count falls in steps while total traffic is flat or only mildly up. Each step follows a spike in per-pod in-flight requests.</p>
+<p><strong>Fix.</strong> Readiness answers "can I serve", not "am I busy". An overloaded instance should stay in rotation and reject the excess quickly with 429 or 503, which balancers and clients handle better than disappearing capacity. If you must signal load, use a weighting mechanism (least-request balancing, or Envoy's outlier detection with <code>max_ejection_percent</code> capped, which defaults to 10%), not a binary in/out switch.</p>
+
+<h3 id=dd-health-check-endpoint-fm-flap level=3>3. Flapping between ready and unready</h3>
+<p><strong>Symptom.</strong> One pod's readiness toggles every 10 to 20 seconds. Its connection pool is constantly being rebuilt by callers. Error rates show a sawtooth.</p>
+<p><strong>Mechanism.</strong> The readiness condition sits right on a threshold, for example "replication lag under 1 second" on a read service. Each de-routing removes load, lag drops, the pod comes back, load returns, lag rises. With <code>successThreshold: 1</code> and <code>failureThreshold: 1</code> there is no damping.</p>
+<p><strong>Detection.</strong> Count readiness transitions per pod per hour. More than a handful is a signal on its own.</p>
+<p><strong>Fix.</strong> Add hysteresis. Fail at one threshold and recover at a stricter one (fail above 5 s of lag, recover below 1 s). Raise <code>successThreshold</code> to 2 or 3 so recovery needs sustained evidence.</p>
+
+<h3 id=dd-health-check-endpoint-fm-502 level=3>4. A burst of 502s on every deploy</h3>
+<p><strong>Symptom.</strong> Each rolling deploy produces a few dozen 502 or connection-reset errors at the ingress, always during termination of old pods.</p>
+<p><strong>Mechanism.</strong> The shutdown race from the mechanism section. The process exits on SIGTERM while kube-proxy rules or the ingress still point at it. A second version of the same bug is keep-alive: the ingress holds a pooled connection to the old pod, sends a request on it just as the pod closes it, and gets a reset.</p>
+<p><strong>Detection.</strong> Correlate ingress 502s with pod termination timestamps. Ingress logs will show "upstream prematurely closed connection" or connection refused to a pod IP that no longer exists.</p>
+<p><strong>Fix.</strong> A <code>preStop</code> sleep longer than propagation. On SIGTERM, stop accepting new connections but keep serving existing ones. Send <code>Connection: close</code> on responses during drain, or an HTTP/2 GOAWAY, so clients stop reusing the connection cleanly. Make sure the server's keep-alive idle timeout is longer than the ingress's, so the ingress always closes first.</p>
+
+<h3 id=dd-health-check-endpoint-fm-hidden-dependency level=3>5. The dependency that sneaked in through a library</h3>
+<p><strong>Symptom.</strong> A Redis outage de-routes every instance of a service that was designed to degrade without Redis.</p>
+<p><strong>Mechanism.</strong> The framework's health endpoint auto-registers a check for every client it sees on the classpath: database, Redis, message broker, mail server. A library upgrade added the Redis client. The aggregated status turned DOWN when Redis did, and readiness was wired to the aggregate. Nobody wrote the check. It arrived with a dependency bump.</p>
+<p><strong>Detection.</strong> Probe responses that include a component list. Diff the list between releases. A new component appearing in a release that "only upgraded libraries" is the red flag.</p>
+<p><strong>Fix.</strong> Configure readiness and liveness as explicit groups with an allowlist of checks, never "everything the framework found". Add a test that fails the build when a new component joins the readiness group. This is the lesson's "probe code needs an owner" rule turned into automation.</p>
+
+<h3 id=dd-health-check-endpoint-fm-cached-green level=3>6. Green from a cache, or green from the wrong process</h3>
+<p><strong>Symptom.</strong> The balancer keeps sending traffic to an instance whose application has crashed. Every request fails, yet the target shows healthy.</p>
+<p><strong>Mechanism.</strong> One of two things. The health path is answered by something other than the application: an nginx sidecar that returns a static 200, or a CDN or proxy that cached the 200 response. Or the probe is a <code>tcpSocket</code> check, and the port belongs to a sidecar proxy that stays up when the app dies.</p>
+<p><strong>Detection.</strong> High 5xx rate from one target while its health check stays green. Request traces end at the sidecar.</p>
+<p><strong>Fix.</strong> The health path must reach the application process. Send <code>Cache-Control: no-store</code> on probe responses. Prefer HTTP or gRPC probes over TCP. With a sidecar, the readiness check should cover the app itself, as the <a href="#sidecar">sidecar lesson</a> notes, and the app should not report ready before its sidecar is.</p>
+
+<h3 id=dd-health-check-endpoint-fm-exposed level=3>7. The health endpoint as an attack surface</h3>
+<p><strong>Symptom.</strong> The security review finds the public internet can reach <code>/health</code>, and the response lists the database hostname, versions of every library, and the build commit. Or an attacker floods it and, because it does real work, takes the service down.</p>
+<p><strong>Mechanism.</strong> Diagnostic detail that was meant for operators went to every caller. A deep endpoint that runs queries turns into an unauthenticated amplifier.</p>
+<p><strong>Detection.</strong> External scanning of your public routes. Request rate to the health path from non-prober IP addresses.</p>
+<p><strong>Fix.</strong> Serve probes on an internal port that the ingress does not route. Return a bare status to unauthenticated callers. Put rich diagnostics behind authentication on a separate path.</p>
+
+<h2 id=dd-health-check-endpoint-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<p>The lesson settles shallow against deep. A design review usually has to settle five more choices.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when<th>Choose B when<tbody>
+<tr><td>Who detects failure<td>Active probes (prober calls the endpoint)<td>Passive outlier detection (watch real traffic)<td>You need a verdict before any traffic arrives: start-up, low-traffic services<td>Failures are request-specific and only real traffic reveals them. Use both in a mesh.
+<tr><td>Direction<td>Pull (prober calls the instance)<td>Push / TTL heartbeat (instance reports in, as with Consul TTL checks)<td>The prober can reach every instance, which is the normal case on Kubernetes<td>Instances sit behind NAT or firewalls, or a registry needs liveness without network reach
+<tr><td>Where probes are served<td>Same port as traffic<td>Separate admin port and thread pool<td>Tiny services where overload cannot starve the probe<td>Almost always in production. It isolates probes from overload and from the public ingress.
+<tr><td>What liveness measures<td>"Can the HTTP server answer?"<td>"Is the work loop's heartbeat fresh?"<td>Request-driven services where the HTTP server is the work<td>Workers and consumers whose real work happens off the request path
+<tr><td>What the balancer does when all are red<td>Fail closed (no traffic)<td>Fail open (route anyway)<td>Sending traffic to a broken instance is worse than refusing it: payments, writes with side effects<td>A false fleet-wide red is likelier than a true one. Most read paths.
+<tr><td>Response format<td>Status code only<td>Status code plus JSON detail (for example the draft <code>application/health+json</code> format with pass/warn/fail)<td>The prober reads only the code, which is always true for kubelet and balancers<td>Operators and dashboards read the detail. Keep it internal.
+</tbody></table></div></div>
+
+<h3 id=dd-health-check-endpoint-warn level=3>The "warn" state, and why the prober must never see it</h3>
+<p>Many health formats have a third state between pass and fail: degraded, or warn. It is genuinely useful for operators. The cache is down, we are serving from the database, latency is up. The mistake is letting that state change the status code. Probers only understand two answers, so warn must map to 200. Send the detail to metrics and dashboards, where a human or an alert rule can decide what it means.</p>
+
+<h3 id=dd-health-check-endpoint-workers level=3>Workers and consumers</h3>
+<p>The lesson says queue consumers need liveness plus backlog age. Two details make that work. First, liveness should check that the consumer loop has polled recently, not that the broker connection is open. A consumer stuck inside one poison message still has a healthy connection. Second, backlog age belongs to the consumer <em>group</em>, not to one instance. Alert on it centrally. A per-pod probe on backlog would restart the whole group when the backlog grows, which is the opposite of what you want. Consumer lag scaling, as in the <a href="#autoscaling">auto-scaling lesson</a>, is the right reaction.</p>
+
+<h3 id=dd-health-check-endpoint-choosing level=3>A default worth defending</h3>
+<p>If you need one recommendation for a typical HTTP service: three probes on an internal port. A startup probe sized to the slowest start. A liveness probe that reads a heartbeat, period 10 s, timeout 5 s, threshold 3. A readiness probe that reads start-up, drain and essential-pool flags, period 5 s, threshold 2. Passive outlier detection in the mesh. Deep checks only in central monitoring. Deviations from that should come with a reason written down.</p>
+
+<h2 id=dd-health-check-endpoint-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>List every prober (kubelet, load balancer, mesh, service registry). For each: path, interval, timeout, threshold and action. Does anyone own this table?</li>
+<li>What exactly does liveness check, and can a restart fix every condition in it? Show the code, not the config.</li>
+<li>Which dependencies does readiness include? For each one, what happens fleet-wide when it fails, and is that what you want?</li>
+<li>Is the readiness and liveness check list an explicit allowlist, or does the framework add checks automatically when libraries appear?</li>
+<li>Are probes served on a path that user overload cannot starve: separate port, separate thread pool?</li>
+<li>What is the slowest observed start-up, and does the startup probe budget cover it with margin?</li>
+<li>What is the longest legitimate pause (GC, compaction, cold cache) and are the liveness timeout and threshold set above it?</li>
+<li>Walk through termination: preStop sleep, endpoint propagation time, SIGTERM handling, keep-alive closing, grace period. Do the numbers add up?</li>
+<li>Does readiness change with load? If so, what stops the cascade when one pod goes out?</li>
+<li>Does the balancer in front of this service fail open or closed when every target is red, and does that match the service's risk?</li>
+<li>Can the public internet reach the probe paths, and what does an unauthenticated response reveal?</li>
+<li>Which metrics prove the probes behave: restart counts, readiness transitions per pod, ready endpoint count, probe latency?</li>
+</ol>
+
+<h2 id=dd-health-check-endpoint-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Your liveness check has no dependencies, yet pods restart in a cascade during traffic spikes. Why?"</summary>
+<p>The probe is queued behind user requests. When the server's thread pool or event loop saturates, the probe times out and the kubelet reads that as death. Restarts remove capacity and bring back cold pods, so load per survivor rises and more probes time out. Fix it by serving probes on a separate listener with its own threads, and basing liveness on a work-loop heartbeat. Handle overload by shedding load, never by restarting.</p>
+</details>
+<details>
+<summary>"Should readiness fail when the instance is overloaded?"</summary>
+<p>Usually no. Binary removal moves all of that pod's traffic onto the others, which pushes them over the same limit, and the fleet collapses in steps. An overloaded instance should stay in rotation and reject excess fast with 429 or 503, so the system degrades smoothly. If you want load-aware routing, use least-request balancing or outlier ejection with a cap on the ejected percentage.</p>
+</details>
+<details>
+<summary>"We mark readiness false on SIGTERM. Why do we still see 502s during deploys?"</summary>
+<p>Because readiness changes travel the same slow path as pod deletion. Endpoint removal takes seconds to reach every kube-proxy, ingress and external balancer, while SIGTERM arrives immediately. If the process stops serving on SIGTERM, late callers hit a closed port. Add a preStop sleep longer than the propagation delay, keep serving during it, then drain, and close keep-alive connections with <code>Connection: close</code> or GOAWAY.</p>
+</details>
+<details>
+<summary>"Why do we need a startup probe if readiness already starts false?"</summary>
+<p>Readiness protects users from a cold instance. It does nothing to stop liveness from killing a slow starter. Without a startup probe, a 90-second start meets a 30-second liveness budget and the pod crash-loops forever. The startup probe holds liveness and readiness off until start-up succeeds, with its own budget of threshold times period. Fast starts hand over immediately, so you do not slow down deadlock detection for everyone.</p>
+</details>
+<details>
+<summary>"Your database proxy includes the database in readiness. The database fails over. What happens behind kube-proxy versus behind an ALB?"</summary>
+<p>Behind kube-proxy, every pod goes unready and the Service has zero endpoints. Callers get connection errors immediately, which is honest and lets their breakers trip fast. Behind an ALB, once every target is unhealthy the balancer fails open and routes to all of them anyway, so callers get slow errors from the proxy instead. Same check, different behaviour. You should choose deliberately, and probably make the proxy return fast 503s itself during the failover.</p>
+</details>
+<details>
+<summary>"How do you health-check a Kafka consumer that has no HTTP traffic?"</summary>
+<p>Liveness is a heartbeat: the poll loop updated a timestamp in the last N seconds. That catches a deadlock or an endless stall on one message, which a restart can fix. Readiness barely applies, because nothing routes to it. Consumer lag and the age of the oldest unprocessed record are group-level signals. They feed alerts and lag-based scaling centrally, never a per-pod restart. Restarting consumers because lag is high causes rebalances and makes lag worse.</p>
+</details>
+<details>
+<summary>"An engineer proposes probing every 1 second for faster failover. What do you ask?"</summary>
+<p>What failover time they actually need, and what it costs. Detection is period times threshold, so going from 10 s to 1 s cuts 30 seconds to about 3, but raises probe load tenfold and makes every short GC pause a candidate for a false verdict. Passive outlier detection usually gives faster, more accurate removal for real failures, because it reacts to real errors within a few requests. Keep active probes moderate and let traffic itself be the fast signal.</p>
+</details>
+<details>
+<summary>"Where should the 'is checkout working end to end?' check live, and what does it trigger?"</summary>
+<p>In central monitoring, as a synthetic transaction run every minute or so from a few locations. It triggers alerts and pages, never routing or restarts, because a failure there says nothing about which instance to act on. Link it to <a href="#distributed-tracing">distributed tracing</a> so a failed synthetic run comes with a trace that shows where it broke.</p>
+</details>

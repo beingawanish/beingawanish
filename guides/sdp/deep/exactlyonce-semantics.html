@@ -1,0 +1,283 @@
+<h2 id=dd-exactlyonce-semantics-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson gives the rule: at-least-once delivery underneath, plus two atomic couplings. This section opens the boxes. Each coupling is a small protocol with its own state, its own timeouts and its own way of going wrong. Kafka, Flink and Spark build them differently, and the differences decide what you will debug at 3 a.m.</p>
+
+<h3 id=dd-exactlyonce-semantics-idempotent-producer level=3>The idempotent producer: sequence numbers per partition</h3>
+<p>Start at the lowest layer. A producer sends a batch, the broker writes it, and the acknowledgment is lost. The producer retries. Without help, the partition now holds the batch twice.</p>
+<p>The idempotent producer fixes this with three pieces of state:</p>
+<ul>
+<li><strong>Producer ID (PID).</strong> The broker hands each producer session a 64-bit ID when it starts.</li>
+<li><strong>Epoch.</strong> A small counter attached to the PID. It matters for transactions, below.</li>
+<li><strong>Sequence number.</strong> Per PID and per partition, every batch carries the sequence of its first record. The next batch must continue exactly where the last one ended.</li>
+</ul>
+<p>The broker remembers the last few batches it accepted for each (PID, partition) pair. Kafka keeps five. A retried batch whose sequence it has already seen is acknowledged and not written again. A batch that skips ahead means something was lost in between, and the broker rejects it with an out-of-order sequence error.</p>
+<p>That "five" is why <code>max.in.flight.requests.per.connection</code> must be 5 or less when idempotence is on. With more batches in flight, the broker could not tell a retry from a gap. Since Kafka 3.0, <code>enable.idempotence=true</code> and <code>acks=all</code> are the producer defaults, so most clients get this layer for free. Check older clients and non-Java libraries explicitly. The defaults differ.</p>
+<p>Notice what this layer does <em>not</em> cover. The sequence lives in one producer session. If the producer process restarts, it gets a new PID and its retries of old data are new data. It also says nothing about the consumer side. So the idempotent producer removes network-retry duplicates on one hop, and nothing more.</p>
+
+<h3 id=dd-exactlyonce-semantics-transactions level=3>Kafka transactions: the coordinator, the markers and the last stable offset</h3>
+<p>Transactions add the second coupling for a read-process-write loop: consume from Kafka, compute, produce to Kafka, and commit the consumed offsets, all as one unit. The moving parts are:</p>
+<ul>
+<li><strong><code>transactional.id</code>.</strong> A stable name you give the producer. It survives restarts, unlike the PID.</li>
+<li><strong>Transaction coordinator.</strong> A broker role. The coordinator for a given <code>transactional.id</code> is the leader of one partition of the internal <code>__transaction_state</code> topic, chosen by hashing the ID. That topic is the coordinator's write-ahead log, so a new coordinator can pick up after a broker dies.</li>
+<li><strong>Control markers.</strong> Special records written into each data partition the transaction touched. A COMMIT or ABORT marker tells readers how to treat the records before it.</li>
+</ul>
+<p>One transaction runs like this:</p>
+<ol>
+<li><strong><code>initTransactions()</code>.</strong> The producer registers its <code>transactional.id</code>. The coordinator bumps the epoch and finishes or aborts anything the previous holder of that ID left open. Any older producer with the same ID and a lower epoch is now <em>fenced</em>: its next write fails with a fencing error. This is how a zombie, such as an old instance waking from a long GC pause, is kept out.</li>
+<li><strong><code>beginTransaction()</code>.</strong> Local only. Nothing goes over the network yet.</li>
+<li><strong>Sends.</strong> Before the first write to a new partition, the producer tells the coordinator, which records the partition in the transaction's state. The records are written to the partitions immediately, with the PID, epoch and sequence. They are in the log, but not yet decided.</li>
+<li><strong><code>sendOffsetsToTransaction()</code>.</strong> The consumed offsets go to the consumer group's coordinator as part of the same transaction. They are held pending, not applied.</li>
+<li><strong><code>commitTransaction()</code>.</strong> The coordinator writes PREPARE_COMMIT to its log. From this moment the commit is decided, even if the coordinator dies. It then writes COMMIT markers into every partition in the transaction, including the offsets partition, and finally writes COMPLETE_COMMIT.</li>
+</ol>
+<p>That is the two-phase commit from the <a href="#twophase-commit">2PC lesson</a>, with one important difference. The coordinator and the participants are all replicated brokers in one system, so a coordinator crash does not leave participants blocked forever. The new leader of the <code>__transaction_state</code> partition reads the log and finishes the job.</p>
+<p>On the read side, the key idea is the <strong>last stable offset (LSO)</strong>. It is the offset of the first record that belongs to a still-open transaction. A consumer with <code>isolation.level=read_committed</code> reads only up to the LSO. When it reaches records from a transaction that later aborted, it skips them using an index of aborted transactions that the broker keeps alongside each log segment.</p>
+<p>Two consequences follow, and both come up in production:</p>
+<ul>
+<li>One open transaction holds back <em>every</em> read_committed reader of that partition, including records from other producers written after it. A slow or stuck transaction is a partition-wide stall.</li>
+<li>The default <code>isolation.level</code> is <code>read_uncommitted</code>. A consumer that never set it sees aborted records as if they were real. Exactly-once on the write side means nothing to a reader that did not opt in.</li>
+</ul>
+<p>Two timeouts bound all of this. The producer's <code>transaction.timeout.ms</code> (60 seconds by default) is how long the coordinator waits before aborting an open transaction on its own. The broker's <code>transaction.max.timeout.ms</code> (15 minutes by default) caps what any producer may ask for. Keep both in mind for Flink, below.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-exactlyonce-semantics-svg-title dd-exactlyonce-semantics-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-exactlyonce-semantics-svg-title">One Kafka read-process-write transaction</title>
+<desc id="dd-exactlyonce-semantics-svg-desc">The application reads from an input partition, writes output records to two output partitions and sends its consumed offsets to the consumer offsets topic. All three writes are pending. The transaction coordinator writes prepare-commit to its own log, then writes a commit marker into each of the three partitions. A read-committed consumer of an output partition reads only up to the last stable offset, which stops at the first record of any open transaction.</desc>
+<defs><marker id="dd-exactlyonce-semantics-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="300" fill="#ffffff"/>
+<rect x="20" y="40" width="130" height="56" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="85" y="65" font-size="14" fill="#1c2430" text-anchor="middle">Input partition</text>
+<text x="85" y="84" font-size="12" fill="#5c6b7c" text-anchor="middle">usage-events p3</text>
+<rect x="210" y="40" width="130" height="56" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="275" y="65" font-size="14" fill="#1c2430" text-anchor="middle">Application</text>
+<text x="275" y="84" font-size="12" fill="#5c6b7c" text-anchor="middle">transactional.id=bill-3</text>
+<line x1="150" y1="68" x2="206" y2="68" stroke="#1c2430" marker-end="url(#dd-exactlyonce-semantics-arrow)"/>
+<text x="178" y="60" font-size="12" fill="#1c2430" text-anchor="middle">read</text>
+<rect x="420" y="20" width="160" height="44" rx="8" fill="#fdf3e1" stroke="#d6a74f"/>
+<text x="500" y="47" font-size="13" fill="#1c2430" text-anchor="middle">counts p0 (pending)</text>
+<rect x="420" y="76" width="160" height="44" rx="8" fill="#fdf3e1" stroke="#d6a74f"/>
+<text x="500" y="103" font-size="13" fill="#1c2430" text-anchor="middle">counts p5 (pending)</text>
+<rect x="420" y="132" width="160" height="44" rx="8" fill="#fdf3e1" stroke="#d6a74f"/>
+<text x="500" y="152" font-size="13" fill="#1c2430" text-anchor="middle">__consumer_offsets</text>
+<text x="500" y="168" font-size="12" fill="#5c6b7c" text-anchor="middle">offset 10,412 (pending)</text>
+<line x1="340" y1="58" x2="416" y2="44" stroke="#1c2430" marker-end="url(#dd-exactlyonce-semantics-arrow)"/>
+<line x1="340" y1="72" x2="416" y2="98" stroke="#1c2430" marker-end="url(#dd-exactlyonce-semantics-arrow)"/>
+<line x1="320" y1="96" x2="416" y2="150" stroke="#1c2430" marker-end="url(#dd-exactlyonce-semantics-arrow)"/>
+<rect x="190" y="210" width="170" height="64" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="275" y="234" font-size="14" fill="#1c2430" text-anchor="middle">Txn coordinator</text>
+<text x="275" y="253" font-size="12" fill="#5c6b7c" text-anchor="middle">1. PREPARE_COMMIT</text>
+<text x="275" y="268" font-size="12" fill="#5c6b7c" text-anchor="middle">3. COMPLETE_COMMIT</text>
+<line x1="275" y1="96" x2="275" y2="206" stroke="#1c2430" stroke-dasharray="4 3" marker-end="url(#dd-exactlyonce-semantics-arrow)"/>
+<text x="282" y="160" font-size="12" fill="#1c2430">commit</text>
+<path d="M360,236 C430,236 440,190 470,180" fill="none" stroke="#7eae96" stroke-width="2" marker-end="url(#dd-exactlyonce-semantics-arrow)"/>
+<text x="388" y="268" font-size="12" fill="#1c2430">2. COMMIT markers to every partition</text>
+<rect x="610" y="40" width="96" height="70" rx="8" fill="#f8ebee" stroke="#c898a4"/>
+<text x="658" y="64" font-size="13" fill="#1c2430" text-anchor="middle">Reader</text>
+<text x="658" y="82" font-size="12" fill="#5c6b7c" text-anchor="middle">read_committed</text>
+<text x="658" y="98" font-size="12" fill="#5c6b7c" text-anchor="middle">stops at LSO</text>
+<line x1="580" y1="58" x2="606" y2="66" stroke="#1c2430" marker-end="url(#dd-exactlyonce-semantics-arrow)"/>
+</svg>
+<figcaption>Output records and the offset commit are written immediately but stay invisible to read_committed readers until the coordinator's markers land. A crash before step 1 aborts all three together.</figcaption>
+</figure>
+
+<h3 id=dd-exactlyonce-semantics-kafka-streams level=3>Kafka Streams: <code>exactly_once_v2</code></h3>
+<p>Kafka Streams wraps all of the above behind one setting, <code>processing.guarantee=exactly_once_v2</code>. Each stream thread runs one transactional producer. Every commit puts three things in one transaction: output records, changelog records for local state stores, and input offsets. The changelog part is the first coupling, state with position, done through the log instead of a snapshot.</p>
+<p>The "v2" matters. The first version needed one producer per input partition, because fencing worked per <code>transactional.id</code>. A busy application with hundreds of partitions ran hundreds of producers. Since brokers 2.5, the consumer group's generation travels with the offset commit. The group coordinator can then reject a commit from a consumer that has lost its partitions in a rebalance. One producer per thread is enough. The old <code>exactly_once</code> setting is deprecated.</p>
+<p>The other knob that changes under exactly-once is <code>commit.interval.ms</code>. Its default drops from 30 seconds to 100 ms. That is the freshness of read_committed outputs, and it is also how often you pay the transaction's fixed cost.</p>
+
+<h3 id=dd-exactlyonce-semantics-flink level=3>Flink: barriers plus a two-phase-commit sink</h3>
+<p>Flink does the first coupling with a consistent snapshot. The JobManager injects a numbered barrier at every source. Each source records its offsets in the snapshot, then forwards the barrier. When an operator has received barrier <em>n</em> on all its inputs, it snapshots its state and forwards the barrier. The snapshot for checkpoint <em>n</em> is complete when every operator, sinks included, has reported in.</p>
+<p>An operator with several inputs must wait for the barrier on all of them. While it waits, it stops reading from the inputs that have already delivered their barrier. This is <strong>alignment</strong>, and under backpressure it can take a long time. <strong>Unaligned checkpoints</strong> remove the wait by letting the barrier overtake the in-flight data and storing that data in the snapshot instead. Checkpoints then finish quickly under pressure, at the price of bigger snapshots.</p>
+<p>The second coupling lives in the sink. Flink's two-phase-commit sinks follow a fixed lifecycle:</p>
+<ol>
+<li>Between checkpoints, the sink writes into an open external transaction (for Kafka, an open Kafka transaction).</li>
+<li>When the barrier reaches the sink, it <em>pre-commits</em>: it flushes, records the transaction's handle in its checkpoint state, and opens a new transaction for the next interval.</li>
+<li>When the JobManager declares the checkpoint complete, every sink <em>commits</em> the transaction it pre-committed.</li>
+<li>If the job fails after the checkpoint completed but before a commit happened, the restored sink finds the handle in its state and commits it on recovery. Commit must therefore be safe to retry.</li>
+</ol>
+<p>Here is the trap. The Kafka transaction stays open from the start of one checkpoint interval until the commit after the checkpoint completes. If the job is down longer than the transaction's timeout, the broker aborts it. The recovering job then tries to commit a transaction that no longer exists, and that interval's output is gone. Flink's Kafka sink documentation calls this out directly. The broker's 15-minute cap and the sink's own default can disagree, so set <code>transaction.timeout.ms</code> deliberately: longer than the checkpoint interval plus the longest outage you expect to recover from, and within the broker's cap.</p>
+<p>The Kafka sink also needs a <code>transactionalIdPrefix</code> that is unique per job. Two jobs sharing a prefix fence each other's producers.</p>
+
+<h3 id=dd-exactlyonce-semantics-spark level=3>Spark Structured Streaming: the offset log and the commit log</h3>
+<p>Spark runs micro-batches, and each one has an integer <code>batchId</code>. In the checkpoint directory it keeps two logs. The <strong>offset log</strong> records, before a batch runs, exactly which offsets it will read. The <strong>commit log</strong> records that the batch finished. On restart, a batch that appears in the offset log but not in the commit log runs again over exactly the same offsets.</p>
+<p>So Spark guarantees that the <em>same</em> batch is replayed, with the same input. The sink must make the replay harmless. Built-in file and Delta sinks do this by recording the <code>batchId</code> they have written. In <code>foreachBatch</code> you write your own code, and it receives the <code>batchId</code> for exactly this reason. Delta Lake's writer options <code>txnAppId</code> and <code>txnVersion</code> let a write be skipped if that (application, version) pair has already been committed.</p>
+
+<h3 id=dd-exactlyonce-semantics-sink-side level=3>The sink-side options: guarded upserts and offsets in the sink</h3>
+<p>Not every sink is Kafka. For a database sink there are two well-worn mechanisms, and both are simpler than distributed transactions.</p>
+<p><strong>A guarded upsert.</strong> The lesson's <code>UPSERT (partner, day) = count</code> works because the job emits the whole current value. Add a monotonic version, such as the source offset or the checkpoint ID, and the database can also refuse to go backwards:</p>
+<pre><code>INSERT INTO usage_daily (partner_id, day, calls, src_version)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (partner_id, day) DO UPDATE
+  SET calls = EXCLUDED.calls,
+      src_version = EXCLUDED.src_version
+  WHERE usage_daily.src_version &lt; EXCLUDED.src_version;</code></pre>
+<p>A replay writes the same value with the same version, and the <code>WHERE</code> clause makes it a no-op. A slow, stale writer (a zombie) with an older version cannot overwrite newer data.</p>
+<p><strong>Offsets stored in the sink.</strong> If the results and the consumer's position live in the same database, one local transaction couples them. The consumer writes its results and the new offset in the same <code>BEGIN ... COMMIT</code>. On startup it reads its offset from the database and seeks there, ignoring Kafka's committed offsets. This is exactly-once with nothing but a relational database. The cost is that you take over offset management, including during rebalances: a consumer that has lost a partition must not commit for it. Guard the offset row with the partition's owner generation, or with a version check like the one above.</p>
+
+<h2 id=dd-exactlyonce-semantics-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Exactly-once costs latency, throughput and storage. Each cost has a formula, and a review should see them filled in. The running example is the billing pipeline. Assume 20,000 API-call events per second at peak, 400-byte events, 3,000 partners, and 24 input partitions.</p>
+
+<h3 id=dd-exactlyonce-semantics-freshness-math level=3>Freshness of committed outputs</h3>
+<p>A read_committed reader sees an output only after the transaction containing it commits. An event arriving at a random moment waits, on average, half a commit interval, then the commit itself.</p>
+<ul>
+<li>Average added delay ≈ interval / 2 + commit time.</li>
+<li>Worst case ≈ interval + checkpoint duration + commit time.</li>
+</ul>
+<p>With Flink checkpoints every 2 seconds that take 300 ms, and a commit of about 20 ms (an assumption; measure yours), the average delay is about 1.3 seconds and the worst about 2.3 seconds. For invoices this is irrelevant. For a fraud feature with a sub-second budget, it rules out read_committed outputs entirely. That is why the lesson's dashboard reads with plain at-least-once.</p>
+<p>Under backpressure the checkpoint duration grows, because barriers move with the data. A checkpoint that takes 40 seconds makes the committed output 40 seconds stale. Freshness of an exactly-once sink is a backpressure metric in disguise.</p>
+
+<h3 id=dd-exactlyonce-semantics-overhead-math level=3>Transaction overhead</h3>
+<p>Each transaction has a roughly fixed cost: a few coordinator round trips, plus one marker record in every partition it touched. The cost per event is that fixed cost divided by the events in the transaction.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Commit interval<th>Events per transaction (per producer, 20k/s across 4 producers)<th>Transactions per second (all producers)<th>Markers per second (24 output partitions each)<tbody>
+<tr><td>100 ms (Kafka Streams EOS default)<td>500<td>40<td>960<tr><td>1 s<td>5,000<td>4<td>96<tr><td>2 s<td>10,000<td>2<td>48<tr><td>10 s<td>50,000<td>0.4<td>9.6</table></div></div>
+<p>At 100 ms, a thousand control records per second is noticeable but not alarming. The lesson's "3-5% of throughput" is a reasonable order of magnitude for second-scale intervals. It grows when transactions get small. The lever is the interval, and it trades directly against freshness. A pipeline that writes to many output partitions per transaction pays more markers, so fan-out matters too.</p>
+
+<h3 id=dd-exactlyonce-semantics-replay-math level=3>Replay after a crash</h3>
+<p>On failure the job rewinds to the last completed checkpoint. The work redone is, at most, one checkpoint interval of input plus whatever arrived during the outage.</p>
+<ul>
+<li>Redo at most: 2 s × 20,000/s = 40,000 events.</li>
+<li>Plus the outage backlog: a 60-second restart adds 1.2 million events.</li>
+<li>Catch-up time: if the job can run at 60,000/s when unthrottled, the 1.24 million events clear in 1,240,000 / (60,000 − 20,000) = 31 seconds, because new events keep arriving.</li>
+</ul>
+<p>Short checkpoint intervals reduce redo but not the outage backlog, which usually dominates. Do not tune the interval down for recovery speed; tune it for freshness and for state-snapshot cost.</p>
+
+<h3 id=dd-exactlyonce-semantics-dedupe-math level=3>The cost of deduplicating by event ID</h3>
+<p>The lesson's Q3 fix, a client-generated event ID, needs a dedupe stage that remembers IDs it has seen. That memory is often the biggest state in the pipeline.</p>
+<ul>
+<li>IDs per day: 20,000/s × 86,400 s ≈ 1.73 billion. (Peak rate all day is pessimistic; use your daily total.)</li>
+<li>Bytes per remembered ID: a 16-byte UUID, plus key overhead in a RocksDB-backed state store. Assume about 64 bytes including timestamps and overhead.</li>
+<li>One day's window: 1.73 billion × 64 B ≈ 110 GB of state.</li>
+<li>One hour's window: 72 million × 64 B ≈ 4.6 GB.</li>
+</ul>
+<p>The window must cover the longest gap between a client's first send and its last retry. A browser retries for seconds. A mobile SDK that buffers offline may resend days later. Size the window from the SDK's retry policy, not from guesswork, and do something explicit with events older than the window. Rejecting them to a quarantine topic is better than counting them blind.</p>
+<p>If 110 GB is too much, cut it. Dedupe per partner only where billing needs it. Use a Bloom filter as a first pass and check the exact store only on a hit. Or move the dedupe key into the sink as a unique constraint, if the sink can hold it.</p>
+
+<h3 id=dd-exactlyonce-semantics-timeout-math level=3>Choosing the transaction timeout</h3>
+<p>For a Flink job writing to Kafka, the transaction timeout must outlast the worst gap between opening a transaction and committing it:</p>
+<p><code>transaction.timeout.ms</code> &gt; checkpoint interval + max checkpoint duration + max time to detect failure and restart.</p>
+<p>With a 2-second interval, checkpoints that can take up to 60 seconds under pressure, and a restart that takes up to 5 minutes, you need more than about 6 minutes. Fifteen minutes, the broker's default cap, leaves room. An outage longer than the timeout loses the open interval's output. That is a real, if rare, loss path. Know your number, alert on job downtime approaching it, and keep a reconciliation job that would catch the gap.</p>
+<p>The flip side: a long timeout means a crashed producer's open transaction blocks read_committed readers for that long, unless a restarted producer with the same <code>transactional.id</code> fences and aborts it first. Stable IDs keep that window short.</p>
+
+<h2 id=dd-exactlyonce-semantics-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+<p>Most exactly-once failures are not protocol bugs. They are scope errors: a part of the pipeline that someone believed was inside the guarantee and was not.</p>
+
+<h3 id=dd-exactlyonce-semantics-fm-zombie level=3>1. The zombie that kept writing</h3>
+<p><strong>Symptom.</strong> After a rebalance or a deploy, some partners' counts jump by a whole batch. Logs from two different hosts show the same input offsets processed.</p>
+<p><strong>Mechanism.</strong> The application derived its <code>transactional.id</code> from the hostname or a random UUID. The replacement instance got a different ID, so the coordinator saw two unrelated producers. The old instance, frozen in a long GC pause, woke up and committed its transaction. Fencing works only when the new producer reuses the old one's ID.</p>
+<p><strong>Detect.</strong> Duplicate source offsets in the output (store the source offset in each output record). No <code>ProducerFencedException</code> in the logs when you would have expected one.</p>
+<p><strong>Fix.</strong> Make the <code>transactional.id</code> stable for the work it does, or use <code>exactly_once_v2</code> semantics, where the group generation fences stale consumers. In Flink, a unique, stable <code>transactionalIdPrefix</code> per job.</p>
+
+<h3 id=dd-exactlyonce-semantics-fm-timeout-loss level=3>2. The interval that vanished after a long outage</h3>
+<p><strong>Symptom.</strong> The job was down for 25 minutes during a cluster maintenance. It recovered cleanly and reported no errors that anyone noticed. A month later, reconciliation shows one partner's invoice short by two seconds' worth of calls.</p>
+<p><strong>Mechanism.</strong> Checkpoint <em>n</em> had completed, but the sink's commit was still pending when the cluster went down. The Kafka transaction's timeout was 15 minutes. The broker aborted it. On recovery, Flink restored from checkpoint <em>n</em>, so it did not replay those events, and tried to commit a transaction that had been aborted. The output was lost silently: exactly-once became at-most-once for one interval.</p>
+<p><strong>Detect.</strong> Errors on commit during recovery about invalid or fenced transactions. A reconciliation job comparing raw input counts against committed output per hour.</p>
+<p><strong>Fix.</strong> Set the timeout from the formula in the sizing section. Alert when a job's downtime approaches it. Treat any commit failure during recovery as a page, not a warning.</p>
+
+<h3 id=dd-exactlyonce-semantics-fm-hanging level=3>3. The hanging transaction that froze a partition</h3>
+<p><strong>Symptom.</strong> Every read_committed consumer of partition 9 stops making progress. Its consumer lag climbs. Producers are healthy and the partition's high watermark keeps rising. A read_uncommitted tool shows new data arriving.</p>
+<p><strong>Mechanism.</strong> One transaction on partition 9 was never committed or aborted. The usual causes are a client bug or a producer whose ID will never be reused, combined with a long timeout. The last stable offset stays pinned at that transaction's first record, so committed readers cannot pass it, whoever wrote the data after it.</p>
+<p><strong>Detect.</strong> The gap between the high watermark and the LSO for a partition, which shows up as lag only for read_committed groups. Kafka ships <code>kafka-transactions.sh</code>, which can list open transactions and find hanging ones.</p>
+<p><strong>Fix.</strong> Abort the transaction with the same tool. Then fix the root cause: stable transactional IDs, a sane timeout, and current client and broker versions, since newer releases add server-side checks against this class of bug.</p>
+
+<h3 id=dd-exactlyonce-semantics-fm-uncommitted-reader level=3>4. The downstream reader that never opted in</h3>
+<p><strong>Symptom.</strong> The finance team's reconciliation export runs about 0.3% higher than the invoices, mostly on days with deploys.</p>
+<p><strong>Mechanism.</strong> The export was a plain consumer with default settings, so it read with <code>read_uncommitted</code>. On every abort (each deploy and crash produced one), it read records that the invoice tables never saw. The same thing happens with connectors and stream tools that default to uncommitted reads.</p>
+<p><strong>Detect.</strong> Compare a read_committed count with a read_uncommitted count for the same range; they differ only by aborted data. Audit every consumer group on transactional topics for its isolation level.</p>
+<p><strong>Fix.</strong> Set <code>isolation.level=read_committed</code> on every reader of a transactional topic. Make it a lint rule in your client wrapper. A topic written with transactions should be documented as such, because nothing on the topic itself forces readers to honour it.</p>
+
+<h3 id=dd-exactlyonce-semantics-fm-nondeterminism level=3>5. The replay that wrote a different answer</h3>
+<p><strong>Symptom.</strong> Idempotent upserts are in place, yet the dashboard's 14:00 value changes after a restart. A partner screenshot from before the restart disagrees with the invoice.</p>
+<p><strong>Mechanism.</strong> Idempotent sinks assume that a replay produces the <em>same</em> output. Several things break that assumption. Windows on processing time put replayed events into different windows. The code reads the wall clock or a random number. Enrichment looks up a mutable table, whose value changed between the two runs. Each one makes the replay write a different value under the same key.</p>
+<p><strong>Detect.</strong> Log a hash of each output value together with its key and source version. On replay, a key whose hash changes is a determinism bug. Run a nightly "replay one hour into a scratch sink and diff" job.</p>
+<p><strong>Fix.</strong> Event time everywhere, as the <a href="#stream-processing">stream lesson</a> recommends. No wall clock or randomness in business logic. Version reference data: join against the catalog version effective at the event's time, or capture the looked-up value in state so the replay reuses it.</p>
+
+<h3 id=dd-exactlyonce-semantics-fm-dedupe-window level=3>6. Duplicates older than the dedupe window</h3>
+<p><strong>Symptom.</strong> Client event IDs are in place and dedupe is on. Partner C still shows a small number of doubled calls, all with event times two to four days old.</p>
+<p><strong>Mechanism.</strong> Their SDK queues events on the device when offline and retries after reconnecting, with the same event ID. The dedupe state keeps IDs for 24 hours. After that, a retry looks like a new event and is counted again.</p>
+<p><strong>Detect.</strong> A histogram of (arrival time − event time). Any mass to the right of the dedupe window is at risk. Count events that arrive after the window by partner.</p>
+<p><strong>Fix.</strong> Size the window from the client's real retry horizon. If that horizon is unbounded, cap it: the SDK drops events older than N days, and ingestion routes anything older than the window to a quarantine topic for a batch dedupe against the warehouse.</p>
+
+<h3 id=dd-exactlyonce-semantics-fm-checkpoint-stall level=3>7. Committed output frozen by checkpoint timeouts</h3>
+<p><strong>Symptom.</strong> The invoice tables stop updating for 20 minutes. The job is running, consuming and not erroring. Flink's UI shows checkpoints expiring one after another.</p>
+<p><strong>Mechanism.</strong> A slow downstream stage causes backpressure. Barriers queue behind data, alignment waits grow, and checkpoints hit their timeout. With a two-phase-commit sink, no checkpoint means no commit, so nothing reaches read_committed readers. The transaction keeps growing and creeps toward its own timeout, which brings back failure mode 2.</p>
+<p><strong>Detect.</strong> Checkpoint duration and alignment time per operator. The age of the last completed checkpoint, alerted well below the transaction timeout. Per-operator backpressure metrics to find the slow stage.</p>
+<p><strong>Fix.</strong> Unaligned checkpoints and buffer debloating to keep checkpoints moving under pressure. Put a log seam in front of the slow sink, as the <a href="#backpressure">backpressure lesson</a> shows. Make the checkpoint failure tolerance explicit, so the job fails over instead of sitting stuck forever.</p>
+
+<h2 id=dd-exactlyonce-semantics-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<p>"Exactly-once" is several different mechanisms with one name. A review should ask which one, and what it does not cover.</p>
+
+<h3 id=dd-exactlyonce-semantics-choose-mechanism level=3>The mechanisms side by side</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Mechanism<th>What it protects<th>Requires<th>Freshness cost<th>Main way it fails<tbody>
+<tr><td>Idempotent producer only<td>Producer retries on one hop<td>Kafka 0.11+ (default since 3.0)<td>None<td>Producer restarts and consumer replays are not covered<tr><td>Keyed upsert of full values<td>Replays of aggregates written as "current value per key"<td>Deterministic processing; a keyed sink<td>None<td>Non-determinism; outputs that are deltas, not values<tr><td>Guarded upsert (version column)<td>Replays and stale zombie writers<td>A monotonic version (offset, checkpoint ID)<td>None<td>Version that is not truly monotonic across partitions<tr><td>Offsets stored in the sink's transaction<td>State, position and output in one local transaction<td>Results and offsets in the same database<td>One DB commit per batch<td>Offset ownership during rebalances<tr><td>Kafka transactions (read-process-write)<td>Kafka-to-Kafka pipelines, non-keyed and multi-topic outputs<td>Stable transactional IDs; read_committed readers<td>Commit interval<td>Readers left on read_uncommitted; hanging transactions<tr><td>Flink checkpoints + 2PC sink<td>Arbitrary topologies with state, into transactional sinks<td>Sink that supports pre-commit and retryable commit<td>Checkpoint interval + duration<td>Transaction timeout during long outages<tr><td>Spark batchId + idempotent sink<td>Micro-batch replays<td>Sink that records batch IDs<td>Micro-batch interval<td>Custom <code>foreachBatch</code> code that ignores the batch ID<tr><td>Event-ID dedupe store<td>Duplicates created upstream of the log<td>Client-generated IDs reused on retry<td>None (state cost instead)<td>Retries older than the window</table></div></div>
+
+<h3 id=dd-exactlyonce-semantics-choose-guidance level=3>How to choose</h3>
+<p>Work from the sink backwards, because the sink decides what is possible.</p>
+<ol>
+<li><strong>Is the output a value per key?</strong> Then a keyed upsert, with a version guard if zombies are possible, is the default. It costs nothing in freshness and works with almost any database.</li>
+<li><strong>Is the sink a relational database you own?</strong> Store offsets in it and commit both in one local transaction. This is the most underrated option: real atomicity, no coordinator, easy to reason about.</li>
+<li><strong>Is the output Kafka, and is it non-keyed or spread across topics?</strong> Use Kafka transactions, and make every reader read_committed.</li>
+<li><strong>Does the job have large state and a complex topology?</strong> Flink or Kafka Streams with their built-in exactly-once. You are buying the snapshotting more than the sink.</li>
+<li><strong>Is the output an external effect?</strong> None of the above applies. Send with an idempotency key the receiver dedupes on, as in <a href="#idempotency">Idempotency</a> and <a href="#webhooks">Webhooks</a>.</li>
+</ol>
+<p>Then, separately, check the front of the pipeline. Every mechanism in the table starts at the log. Duplicates born before the log need a client-generated ID and a dedupe stage, whatever you chose above.</p>
+
+<h3 id=dd-exactlyonce-semantics-choose-engine level=3>Engines compared</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th>Kafka Streams<th>Flink<th>Spark Structured Streaming<tbody>
+<tr><td>Setting<td><code>processing.guarantee=exactly_once_v2</code><td>Checkpointing on, sink with <code>DeliveryGuarantee.EXACTLY_ONCE</code><td>Checkpoint location + an idempotent or transactional sink<tr><td>State coupling<td>Changelog topics in the same Kafka transaction<td>Distributed snapshot via barriers<td>State store versions per batch in the checkpoint<tr><td>Output coupling<td>Kafka transaction<td>Two-phase-commit sink<td>Batch ID recorded by the sink<tr><td>Sinks covered<td>Kafka only<td>Any sink with a 2PC or idempotent implementation<td>Any sink that dedupes on batch ID<tr><td>Freshness knob<td><code>commit.interval.ms</code> (100 ms default under EOS)<td>Checkpoint interval<td>Trigger interval</table></div></div>
+<p>Kafka Streams is the least machinery when both ends are Kafka. Flink earns its operational weight when the topology and state are large or the sinks are varied. Spark fits teams already on Spark, where seconds of latency are acceptable.</p>
+
+<h2 id=dd-exactlyonce-semantics-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Which outputs need the guarantee, and who audits them? Which outputs are fine with at-least-once?</li>
+<li>Where is the guarantee's boundary drawn, by name? List every external effect the pipeline produces and how each one is made idempotent.</li>
+<li>Where are event IDs generated? Are they created before the first send and reused on every retry, all the way back to the client SDK?</li>
+<li>How long is the dedupe window, what client retry horizon is it sized from, and what happens to events older than it?</li>
+<li>Is processing deterministic on replay: event time, no wall clock, no randomness, versioned reference data?</li>
+<li>Is each output a full value per key (upsert) or a delta? If a delta, what makes it safe to replay?</li>
+<li>Is every <code>transactional.id</code> (or Flink prefix) stable across restarts and unique across jobs?</li>
+<li>Is every consumer of a transactional topic set to <code>read_committed</code>, including connectors, exports and ad hoc tools?</li>
+<li>What is the transaction timeout, how was it derived, and what alerts fire before a job's downtime reaches it?</li>
+<li>What is the committed-output freshness at p99, and does it fit every reader's budget, including during backpressure?</li>
+<li>Is there a reconciliation job comparing input and output counts per period, independent of the pipeline?</li>
+<li>When the logic is wrong, what is the replay plan, and does it keep the guarantee while it reprocesses history?</li>
+</ol>
+
+<h2 id=dd-exactlyonce-semantics-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Kafka's idempotent producer is on by default. Why isn't that exactly-once?"</summary>
+<p>It covers one hop: a producer's network retries into one partition, within one producer session. It does not cover a producer restart, because the new session has a new producer ID and its resends look like new data. It does not cover the consumer side at all. A consumer that processes, crashes before committing, and replays will produce its outputs again. Exactly-once effect needs the offsets and the outputs coupled, which takes transactions or an idempotent sink.</p>
+</details>
+
+<details>
+<summary>"What exactly does read_committed wait for, and what's the risk?"</summary>
+<p>It reads up to the last stable offset: the first record of the earliest transaction still open on that partition. It also filters out records from aborted transactions using the broker's aborted-transaction index. The risk is that one slow or hanging transaction holds back every committed reader of the partition, including data from unrelated producers written after it. So you watch the high-watermark-to-LSO gap, keep transaction timeouts sane, and know how to abort a hanging transaction.</p>
+</details>
+
+<details>
+<summary>"How does Kafka stop a zombie producer from committing?"</summary>
+<p>By epoch fencing. When a producer calls <code>initTransactions()</code> with a <code>transactional.id</code>, the coordinator bumps that ID's epoch and aborts anything left open. Writes and commits carrying the old epoch are rejected. That only works if the replacement uses the same ID, so IDs must be stable per unit of work. With <code>exactly_once_v2</code>, the consumer group generation is also checked on the offset commit, so a consumer that lost its partitions in a rebalance cannot commit offsets for them.</p>
+</details>
+
+<details>
+<summary>"Your Flink job was down for 20 minutes. Can it lose data even with exactly-once on?"</summary>
+<p>Yes. A checkpoint can complete while its sink transaction is still waiting to commit. If the job dies then and stays down past the Kafka transaction timeout, the broker aborts the transaction. On recovery Flink restores from that checkpoint, so it does not replay the interval, and the commit fails. That interval's output is lost. The fix is a timeout longer than the worst outage you expect, within the broker's <code>transaction.max.timeout.ms</code>, plus alerts on downtime and a reconciliation job.</p>
+</details>
+
+<details>
+<summary>"Can you get exactly-once into Postgres without Flink or Kafka transactions?"</summary>
+<p>Yes, two ways. First, store the consumer's offsets in Postgres and write results and offsets in one local transaction. On startup, seek to the stored offset. Second, if each output is a full value per key, use an upsert with a version guard, such as the source offset, so replays and stale writers are no-ops. Both depend on deterministic processing. The first also requires you to handle partition ownership during rebalances yourself.</p>
+</details>
+
+<details>
+<summary>"Why does an idempotent sink fail for a counter but work for a total?"</summary>
+<p>An upsert of "total = 987" is idempotent: writing it twice leaves 987. An output of "count += 412" is a delta, and applying it twice adds 824. Idempotent sinks need the job to emit the whole current value per key, which means the state that computed it must itself have been rewound with the offset. If the job emits deltas, you need either a transactional sink or a dedupe key per delta, such as (partition, offset range).</p>
+</details>
+
+<details>
+<summary>"Exactly-once is on everywhere. The numbers are still wrong after a code fix. What now?"</summary>
+<p>Exactly-once computes your bug faithfully. Fixing the logic needs a replay: run the fixed job from an older offset into a new output, compare, then switch readers. The replay must itself be deterministic and keep the guarantee, which is easiest if it writes to a fresh table or topic instead of overwriting in place. That is the Kappa move from <a href="#lambda-and-kappa">Lambda &amp; Kappa</a>. Also check the replay window: you can only replay what the log still retains.</p>
+</details>
+
+<details>
+<summary>"Where would you not spend on exactly-once, even for money?"</summary>
+<p>Where a simpler mechanism already gives the effect. If the billing output is a daily total per partner, a keyed upsert with a version guard is exactly-once in effect, with no transactions and no freshness penalty. Spend on transactions when outputs are non-keyed, go to several topics atomically, or must move with offsets. And no amount of spending covers effects outside the log system; those need idempotency keys at the receiver.</p>
+</details>
