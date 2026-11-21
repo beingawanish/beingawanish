@@ -110,7 +110,7 @@ WHERE order_id = $1 AND state = 'AUTHORIZING' AND version = $2;
 <p>Check how long the provider remembers keys. Stripe, for one, documents that keys may be pruned after 24 hours. A saga parked longer than that must not retry blindly with an expired key. It should look the charge up first, by order reference or by the provider's own id stored in the saga row.</p>
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-outbox level=3>Commands through an outbox</h3>
-<p>"Ask shipping to create a shipment" is a message, and sending it from the same code that updates the saga row is a dual write. If the process dies between the two, the row says <code>SHIPPING</code> and shipping never heard about it, or the reverse. Write the command into an outbox table in the same transaction as the state change, and have a relay publish it. Shipping deduplicates by the command's key. Synchronous calls, such as the provider's HTTP API, follow the intent-state rule instead.</p>
+<p>"Ask shipping to create a shipment" is a message, and sending it from the same code that updates the saga row is a dual write. If the process dies between the two, the row says <code>SHIPPING</code> and shipping never heard about it, or the reverse. Write the command into an outbox table (the pattern behind <a href="#change-data-capture">change data capture</a> relays) in the same transaction as the state change, and have a relay publish it. Shipping deduplicates by the command's key. Synchronous calls, such as the provider's HTTP API, follow the intent-state rule instead.</p>
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-reservations level=3>Reservations with an expiry</h3>
 <p>The reserve step is one statement that cannot oversell:</p>
@@ -130,7 +130,7 @@ WHERE sku = $1 AND available &gt;= $2;
 <p><strong>Symptom.</strong> The provider call times out at 10 seconds. The saga sits in <code>AUTHORIZING</code>. Some customers later see a pending charge for an order the site says failed.</p>
 <p><strong>Mechanism.</strong> A timeout tells you nothing about the outcome. The provider may have authorized the card and lost the response. A saga that treats the timeout as "declined" and releases inventory has created exactly the forbidden half-state: money held, nothing shipping.</p>
 <p><strong>Detect.</strong> Count sagas in intent states older than a few minutes. Reconcile the provider's authorization report against your saga table daily.</p>
-<p><strong>Fix.</strong> Treat "unknown" as its own state. Retry with the same idempotency key until you get a definite answer, or query the provider by order reference. Only a definite decline ends the saga.</p>
+<p><strong>Fix.</strong> Treat "unknown" as its own state. Retry with the same <a href="#idempotency">idempotency</a> key until you get a definite answer, or query the provider by order reference. Only a definite decline ends the saga.</p>
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-split-brain level=3>Drill 5: Two orchestrators advance one order</h3>
 <p><strong>Symptom.</strong> A small number of customers receive two parcels.</p>
@@ -142,7 +142,7 @@ WHERE sku = $1 AND available &gt;= $2;
 <p><strong>Symptom.</strong> Refunds stuck in retry. The customer is charged for an order that will never ship.</p>
 <p><strong>Mechanism.</strong> Compensations are supposed to always succeed eventually, but the world disagrees. The card was closed, the authorization expired, or the provider rejects refunds older than its limit. The saga keeps retrying a step that can never work.</p>
 <p><strong>Detect.</strong> The business rule from the brief, written as a query: orders charged, with no shipment and not refunded, older than 30 minutes. Run it every few minutes and page on any growth. This one query catches drills 4, 5 and 6 together.</p>
-<p><strong>Fix.</strong> Cap retries, then move the saga to <code>NEEDS_HUMAN</code> with the last error, and route it to a payments operations queue (a dead-letter queue for workflows). Give that queue an owner and a response target. A stuck compensation is a customer's money.</p>
+<p><strong>Fix.</strong> Cap retries, then move the saga to <code>NEEDS_HUMAN</code> with the last error, and route it to a payments operations queue (a <a href="#dead-letter-queue">dead-letter queue</a> for workflows). Give that queue an owner and a response target. A stuck compensation is a customer's money.</p>
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-orphan level=3>Drill 7: An orphaned prepared transaction (Build One)</h3>
 <p><strong>Symptom.</strong> Hot-SKU checkouts time out. Days later, every table in the inventory database is bloated and queries slow down.</p>
@@ -158,7 +158,7 @@ WHERE sku = $1 AND available &gt;= $2;
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-cart level=3>Drill 9: Pay is pressed while the cart has siblings</h3>
 <p><strong>Symptom.</strong> A customer is charged for an item she removed on her other device a second earlier. Or the order total does not match the cart she saw.</p>
-<p><strong>Mechanism.</strong> This is where the lesson's postscript meets fulfillment. The leaderless cart can hold siblings at the moment of checkout. If checkout reads one sibling, or merges without tombstones, the saga charges for a cart that never existed as the customer saw it.</p>
+<p><strong>Mechanism.</strong> This is where the lesson's postscript meets fulfillment. The leaderless cart can hold <a href="#vector-clocks">siblings</a> at the moment of checkout. If checkout reads one sibling, or merges without tombstones, the saga charges for a cart that never existed as the customer saw it.</p>
 <p><strong>Detect.</strong> Log whether the cart had siblings at checkout, and compare the charged total with the total on the page the customer confirmed.</p>
 <p><strong>Fix.</strong> Checkout resolves siblings, writes the merged cart back, and shows the resolved cart and total before Pay. The order then stores a snapshot of the lines and prices together with the cart's clock. A cart write that arrives after that clock does not change the order. The two consistency domains meet in one place, and that place is a snapshot.</p>
 
@@ -175,9 +175,9 @@ WHERE sku = $1 AND available &gt;= $2;
 <p>The brief says fulfillment may lag by minutes. A 20-minute shipping outage is a delay, not a failed order. So the saga should distinguish two kinds of failure:</p>
 <ul>
 <li><strong>Business failures</strong> are final: out of stock, card declined, address undeliverable. Compensate at once.</li>
-<li><strong>Infrastructure failures</strong> are temporary: timeouts, 503s, an open circuit breaker. Park the saga in <code>AWAITING_SHIPPING</code> and retry with backoff. Compensate only if a business deadline passes, for example 2 hours, after which the order is cancelled with an apology.</li>
+<li><strong>Infrastructure failures</strong> are temporary: timeouts, 503s, an open circuit breaker. Park the saga in <code>AWAITING_SHIPPING</code> and <a href="#retry-with-exponential-backoff">retry with backoff</a>. Compensate only if a business deadline passes, for example 2 hours, after which the order is cancelled with an apology.</li>
 </ul>
-<p>Combine this with authorize-then-capture, and the 240,000-order outage from the capacity section changes shape. Those orders hold authorizations and reservations for 20 minutes, then ship. There are no refunds and no fees. The circuit breaker on shipping stops workers from hammering a dead service. A banner can tell new customers that dispatch is delayed.</p>
+<p>Combine this with authorize-then-capture, and the 240,000-order outage from the capacity section changes shape. Those orders hold authorizations and reservations for 20 minutes, then ship. There are no refunds and no fees. The <a href="#circuit-breaker">circuit breaker</a> on shipping stops workers from hammering a dead service. A banner can tell new customers that dispatch is delayed.</p>
 <p>The panel's objection will be: "now inventory is reserved for orders that might not ship." True. That is why the reservation expiry must exceed the business deadline, and why the deadline is a product decision, not an engineering default.</p>
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-pivot level=3>Where the pivot really is</h3>

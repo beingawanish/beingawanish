@@ -113,7 +113,7 @@ instance_group [ { count: 2, kind: KIND_GPU } ]</code></pre>
 </tbody></table></div></div>
 <p>Three things come out of this table.</p>
 <p>First, batch 64 lands at about 2,800 tokens per second, which matches the lesson's 2,500–3,000. Second, per-user pace falls from 140 to 43 tokens per second. People read at perhaps 5–10 tokens per second, so 43 is still comfortably faster than reading. That is why the lesson can say pace is "roughly unchanged" from the user's point of view. Third, at batch 64 the KV reads (32 GB) already outweigh the weights (14 GB). The cache, not the weights, now sets the cost of each extra request.</p>
-<p>A note on the incident's 50 tokens per second at batch 1: the bandwidth ceiling is about 140. Plain framework serving loses the difference to kernel launches, Python overhead and unoptimised attention. Engines close much of that gap even at batch 1, which is part of why "use vLLM-class engines" is the advice.</p>
+<p>A note on the incident's 50 tokens per second at batch 1: the bandwidth ceiling is about 140. Plain framework serving loses the difference to kernel launches, Python overhead and unoptimized attention. Engines close much of that gap even at batch 1, which is part of why "use vLLM-class engines" is the advice.</p>
 <p>Compute check at GQA batch 128: 128 tokens x 14 GFLOPs each ≈ 1.8 TFLOPs per step, about 6 ms at 300 TFLOPS. The step is 15 ms. Still bandwidth-bound, as the arithmetic-intensity argument predicted.</p>
 
 <h3 id=dd-model-serving-tpot-slo level=3>Picking the batch cap from a latency target</h3>
@@ -135,7 +135,7 @@ instance_group [ { count: 2, kind: KIND_GPU } ]</code></pre>
 <p><strong>Symptom.</strong> Throughput drops by half during peak, and TPOT becomes jagged. GPU utilization still looks high.</p>
 <p><strong>Mechanism.</strong> The batch cap was tuned on short test prompts. Real conversations are longer, and the KV pool fills. Each time a running sequence needs a block, the scheduler preempts another and later recomputes its whole prefix. The GPU spends its time recomputing work it already did. Long conversations get preempted repeatedly, so they are the ones that suffer most.</p>
 <p><strong>Detect.</strong> The engine's preemption counter, and KV cache usage pinned near 100%. vLLM logs a warning when it preempts and exposes both as metrics. Watch the ratio of prompt tokens computed to prompt tokens received; above 1 means recompute.</p>
-<p><strong>Fix.</strong> Lower <code>max_num_seqs</code> until preemption is rare. Cap <code>max_model_len</code> and <code>max_tokens</code> to what the product needs. Use a GQA model or a quantised KV cache if quality allows. Admission control at the router should queue requests rather than let the engine overcommit.</p>
+<p><strong>Fix.</strong> Lower <code>max_num_seqs</code> until preemption is rare. Cap <code>max_model_len</code> and <code>max_tokens</code> to what the product needs. Use a GQA model or a quantized KV cache if quality allows. Admission control at the router should queue requests rather than let the engine overcommit.</p>
 
 <h3 id=dd-model-serving-fm-runaway level=3>2. The generation that never stops</h3>
 <p><strong>Symptom.</strong> A handful of requests take two minutes. Their responses end in the same phrase repeated hundreds of times.</p>
@@ -185,14 +185,14 @@ instance_group [ { count: 2, kind: KIND_GPU } ]</code></pre>
 
 <h3 id=dd-model-serving-choose-levers level=3>Other levers, and what each trades</h3>
 <div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Lever</th><th>What it buys</th><th>What it costs</th><th>Use when</th></tr></thead><tbody>
-<tr><td>Weight quantisation (8-bit, 4-bit)</td><td>Fewer bytes per step, so faster decode; more room for KV</td><td>Some quality loss, varying by method and model; measure it</td><td>After batching is fixed, if evaluations hold</td></tr>
-<tr><td>KV cache quantisation</td><td>Up to 2x more context per GPU</td><td>Possible quality loss on long contexts</td><td>Memory-bound fleets with long conversations</td></tr>
+<tr><td>Weight quantization (8-bit, 4-bit)</td><td>Fewer bytes per step, so faster decode; more room for KV</td><td>Some quality loss, varying by method and model; measure it</td><td>After batching is fixed, if evaluations hold</td></tr>
+<tr><td>KV cache quantization</td><td>Up to 2x more context per GPU</td><td>Possible quality loss on long contexts</td><td>Memory-bound fleets with long conversations</td></tr>
 <tr><td>Prefix caching</td><td>Faster TTFT, less KV memory for shared prompts</td><td>Routing must keep prefixes warm</td><td>Long, repeated system prompts; multi-turn chat</td></tr>
 <tr><td>Speculative decoding</td><td>Fewer target-model steps per token at low batch sizes</td><td>A draft model or extra heads; gains shrink as batches grow</td><td>Latency-sensitive, lightly loaded serving</td></tr>
 <tr><td>Tensor parallelism</td><td>Larger models; lower TPOT per request</td><td>Interconnect traffic per layer; whole-node fate sharing</td><td>The model does not fit one GPU, or TPOT targets demand it</td></tr>
 <tr><td>More replicas</td><td>Linear throughput, independent failures</td><td>One full copy of the weights each</td><td>The default way to scale once one replica is tuned</td></tr>
 </tbody></table></div></div>
-<p>A sensible order: get a real engine with continuous batching and paged KV. Turn on prefix caching if prompts share prefixes. Size the batch cap from a TPOT target. Then reach for quantisation, judged by evaluations. Speculative decoding and disaggregation come last, when the fleet is big enough that their gains pay for their complexity.</p>
+<p>A sensible order: get a real engine with continuous batching and paged KV. Turn on prefix caching if prompts share prefixes. Size the batch cap from a TPOT target. Then reach for quantization, judged by evaluations. Speculative decoding and disaggregation come last, when the fleet is big enough that their gains pay for their complexity.</p>
 
 <h2 id=dd-model-serving-checklist level=2>Deep Dive: Design-Review Checklist</h2>
 <ol>
@@ -247,6 +247,6 @@ instance_group [ { count: 2, kind: KIND_GPU } ]</code></pre>
 </details>
 
 <details>
-<summary>"Would quantising to 4-bit fix the incident's cost problem?"</summary>
-<p>It would help a little and miss the cause. At batch 1, 4-bit weights stream about a quarter of the bytes, so one GPU might go from 50 to well over 100 tokens per second. That's maybe a 2–3x saving. Batching gave 30x without touching quality. Fix batching first; then quantise if evaluations show the quality loss is acceptable, and spend the freed memory on KV cache.</p>
+<summary>"Would quantizing to 4-bit fix the incident's cost problem?"</summary>
+<p>It would help a little and miss the cause. At batch 1, 4-bit weights stream about a quarter of the bytes, so one GPU might go from 50 to well over 100 tokens per second. That's maybe a 2–3x saving. Batching gave 30x without touching quality. Fix batching first; then quantize if evaluations show the quality loss is acceptable, and spend the freed memory on KV cache.</p>
 </details>

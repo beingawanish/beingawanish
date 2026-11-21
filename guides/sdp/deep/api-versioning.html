@@ -197,5 +197,5 @@ Link: &lt;https://api.example.com/docs/migrate-v2&gt;; rel="deprecation"; type="
 </details>
 <details>
 <summary>"What should a brownout response actually look like?"</summary>
-<p>A <code>410 Gone</code> with a small JSON body: a stable error code such as <code>version_sunset</code>, a human message with the sunset date, and a link to the migration guide. Keep the <code>Sunset</code> and <code>Deprecation</code> headers too. Serve it from the gateway or edge so it costs almost nothing. No <code>Retry-After</code> that suggests retrying will work, because it will not. And keep the normal per-key rate limit in force, so that badly written retry loops cannot multiply the load.</p>
+<p>A <code>410 Gone</code> with a small JSON body: a stable error code such as <code>version_sunset</code>, a human message with the sunset date, and a link to the migration guide. Keep the <code>Sunset</code> and <code>Deprecation</code> headers too. Serve it from the gateway or edge so it costs almost nothing. <code>Retry-After</code> is a judgement call. Setting it to the end of the brownout window is honest, since a retry then will work, and it stops tight retry loops. But the body must say plainly that the real fix is migrating before the sunset date. And keep the normal per-key rate limit in force, so that badly written retry loops cannot multiply the load.</p>
 </details>

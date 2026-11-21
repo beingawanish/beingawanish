@@ -32,7 +32,7 @@
 <p>The key phrase is "within one process". A library cache coalesces only the callers in its own memory. Forty servers with their own Caffeine caches send up to forty loads for one hot key, one each. That is still far better than 600, but it is not one.</p>
 <p>Getting to one load across the fleet takes one of two designs.</p>
 <ul>
-<li><strong>Route each key to an owner.</strong> groupcache, written by Brad Fitzpatrick for use at Google, hashes each key to one peer in the fleet. Every server asks the owner, and the owner coalesces with singleflight. One load per key per fleet, by design. groupcache deliberately has no expiry or invalidation; it suits immutable data like versioned blobs.</li>
+<li><strong>Route each key to an owner.</strong> groupcache, an open-source Go library that came out of Google, hashes each key to one peer in the fleet. Every server asks the owner, and the owner coalesces with singleflight. One load per key per fleet, by design. groupcache deliberately has no expiry or invalidation; it suits immutable data like versioned blobs.</li>
 <li><strong>A distributed lock around the load.</strong> The first server to miss takes a short lock in the shared cache, for example <code>SET lock:product:8412 &lt;token&gt; NX PX 5000</code>. Others see the lock and either wait briefly and re-read, or serve a stale value if one exists. This is the bridge to <a href="#cache-stampede-prevention">Cache Stampede Prevention</a>.</li>
 </ul>
 
@@ -163,7 +163,7 @@
 
 <details>
 <summary>"You said read-through coalesces misses. Across 40 servers, how many database queries happen when a hot key expires?"</summary>
-<p>With an in-process loading cache, up to 40: one per server that sees a request during the load. That is coalescing per process, not per fleet. To get one load per fleet, either route each key to an owner peer that coalesces for everyone (the groupcache design), or take a short lock in the shared cache so only the first server loads while others wait or serve the stale value. Refresh-ahead also helps: hot keys reload in the background, so no caller blocks at all.</p>
+<p>With an in-process loading cache, up to 40: one per server that sees a request during the load. That is coalescing per process, not per fleet. Getting to one load per fleet takes more. You can route each key to an owner peer that coalesces for everyone, which is the groupcache design. Or you can take a short lock in the shared cache, so only the first server loads while the others wait or serve the stale value. Refresh-ahead also helps: hot keys reload in the background, so no caller blocks at all.</p>
 </details>
 
 <details>

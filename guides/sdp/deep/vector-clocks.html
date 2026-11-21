@@ -118,7 +118,7 @@ k.put("r1", ctx, set().union(*values)) # merged write clears both siblings
 <p>Clocks are compared in four places, and each one is a chance for divergent copies to converge:</p>
 <ul>
 <li><strong>On write,</strong> each replica drops the versions the new clock descends from.</li>
-<li><strong>On read,</strong> the coordinator compares the R responses, returns the maximal versions, and usually sends the winner back to stale replicas. That is <strong>read repair</strong>.</li>
+<li><strong>On read,</strong> the coordinator compares the R responses (see <a href="#quorum">quorum</a>), returns the maximal versions, and usually sends the winner back to stale replicas. That is <strong>read repair</strong>.</li>
 <li><strong>Hinted handoff.</strong> When a replica is down, another node stores its writes as hints and replays them later. The replayed versions go through the same comparison, so old hints cannot overwrite newer data.</li>
 <li><strong>Anti-entropy.</strong> A background process compares replicas, typically by exchanging Merkle-tree hashes of key ranges, and syncs the keys that differ. This is the only path that fixes keys nobody reads.</li>
 </ul>
@@ -141,7 +141,7 @@ k.put("r1", ctx, set().union(*values)) # merged write clears both siblings
 <ul>
 <li><strong>A normal cart.</strong> One write every 30 seconds during an active session, a 300 ms window. <code>λw = (1/30) × 0.3 = 0.01</code>. About 1 write in 100 produces a sibling, and the next read clears it. This is the workload vector clocks were built for.</li>
 <li><strong>A shared cart during a flash sale.</strong> A family of four tapping fast, say 2 writes per second with a 500 ms window. <code>λw = 1</code>. Nearly every write forms a sibling. Siblings get cleared, but reads now carry two or three values each.</li>
-<li><strong>A hot counter.</strong> A "stock remaining" key written 200 times per second with a 50 ms window. <code>λw = 10</code>. Each read returns about ten siblings, each merge races ten more writes, and the key never settles. That is the wrong data model, not a tuning problem. Use a CRDT counter or put the key behind a leader.</li>
+<li><strong>A hot counter.</strong> A "stock remaining" key written 200 times per second with a 50 ms window. <code>λw = 10</code>. Each read returns about ten siblings, each merge races ten more writes, and the key never settles. That is the wrong data model, not a tuning problem. Use a CRDT counter or put the key behind a leader, as in <a href="#primaryreplica">primary-replica</a>.</li>
 </ul>
 <p>The rule of thumb: when <code>λw</code> is well under 1, siblings are rare and cheap. As it approaches 1, sibling handling becomes the normal path and needs to be fast. Above 1, the design is wrong for that key.</p>
 

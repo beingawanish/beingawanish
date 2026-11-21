@@ -145,9 +145,10 @@ spec:
 <p>A local cache with a 60-second TTL works well on one server. Spread the same traffic across 50 servers and each server sees only 1/50 of it.</p>
 <p>Take a product page requested 60 times a minute:</p>
 <ul>
-<li><strong>One server:</strong> one miss per minute, 59 hits. About a 98% hit ratio, and the database sees 1 query a minute.</li>
-<li><strong>50 servers:</strong> each sees about 1.2 requests a minute. Nearly every request lands on a server whose entry has expired. The hit ratio falls toward 17%, and the database sees close to 50 queries a minute for the same page.</li>
+<li><strong>One server:</strong> about one miss a minute and 59 hits. A 98% hit ratio, and the database sees about 1 query a minute.</li>
+<li><strong>50 servers:</strong> each sees about 1.2 requests a minute. Often the entry has expired before the next request arrives. With random arrivals, the hit ratio is &lambda;T / (1 + &lambda;T), where &lambda;T is the requests per server during one TTL. That is 1.2 / 2.2, or about 55%. Each server misses about 0.55 times a minute, so the database sees about 27 queries a minute for the same page.</li>
 </ul>
+<p>Same traffic, same TTL, 27x the database load for that key. The same formula gives 98.4% for the single server (60 / 61), so you can redo it for any key's rate.</p>
 <p>Popular keys survive this. The long tail does not. This is why a horizontally scaled tier usually puts a shared cache behind a small local one (two levels), or routes requests by key with <a href="#consistent-hashing">consistent hashing</a> so each server caches a distinct slice.</p>
 
 <h3 id=dd-horizontal-scaling-rollout level=3>How long a rolling deploy takes</h3>
@@ -290,7 +291,7 @@ spec:
 
 <details>
 <summary>"Why might adding servers lower your cache hit ratio?"</summary>
-<p>Local caches see 1/N of the traffic each. A key requested 60 times a minute with a 60-second TTL is a 98% hit on one server and close to a miss every time on 50 servers. The database then sees about 50x the queries for that key. The fixes: a shared second-level cache, routing by key with consistent hashing so each server owns a slice, or longer TTLs with explicit invalidation where staleness allows.</p>
+<p>Local caches see 1/N of the traffic each. A key requested 60 times a minute with a 60-second TTL is a 98% hit on one server and about a 55% hit on 50 servers, by &lambda;T / (1 + &lambda;T). The database then sees about 27x the queries for that key. The fixes: a shared second-level cache, routing by key with consistent hashing so each server owns a slice, or longer TTLs with explicit invalidation where staleness allows.</p>
 </details>
 
 <details>

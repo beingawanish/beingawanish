@@ -4430,7 +4430,7 @@ category(name, class)                             -- class: security | transacti
 <text x="520" y="228" font-size="12" fill="#1c2430" text-anchor="middle">replay lag: what replica readers cannot see yet</text>
 <text x="360" y="266" font-size="12" fill="#5c6b7c" text-anchor="middle">waits here: remote_apply</text>
 <text x="40" y="266" font-size="12" fill="#5c6b7c">synchronous_commit</text>
-<text x="470" y="282" font-size="12" fill="#5c6b7c" text-anchor="middle">on</text>
+<text x="450" y="282" font-size="12" fill="#5c6b7c" text-anchor="middle">waits here: on</text>
 <text x="540" y="266" font-size="12" fill="#5c6b7c" text-anchor="middle">remote_write</text>
 </svg>
 <figcaption>One replica's four positions on the primary's log. Durability is decided by flush_lsn; staleness of reads is decided by replay_lsn.</figcaption>
@@ -6406,7 +6406,7 @@ def get_product(pid):
 <p>The key phrase is "within one process". A library cache coalesces only the callers in its own memory. Forty servers with their own Caffeine caches send up to forty loads for one hot key, one each. That is still far better than 600, but it is not one.</p>
 <p>Getting to one load across the fleet takes one of two designs.</p>
 <ul>
-<li><strong>Route each key to an owner.</strong> groupcache, written by Brad Fitzpatrick for use at Google, hashes each key to one peer in the fleet. Every server asks the owner, and the owner coalesces with singleflight. One load per key per fleet, by design. groupcache deliberately has no expiry or invalidation; it suits immutable data like versioned blobs.</li>
+<li><strong>Route each key to an owner.</strong> groupcache, an open-source Go library that came out of Google, hashes each key to one peer in the fleet. Every server asks the owner, and the owner coalesces with singleflight. One load per key per fleet, by design. groupcache deliberately has no expiry or invalidation; it suits immutable data like versioned blobs.</li>
 <li><strong>A distributed lock around the load.</strong> The first server to miss takes a short lock in the shared cache, for example <code>SET lock:product:8412 &lt;token&gt; NX PX 5000</code>. Others see the lock and either wait briefly and re-read, or serve a stale value if one exists. This is the bridge to <a href="#cache-stampede-prevention">Cache Stampede Prevention</a>.</li>
 </ul>
 
@@ -6537,7 +6537,7 @@ def get_product(pid):
 
 <details>
 <summary>"You said read-through coalesces misses. Across 40 servers, how many database queries happen when a hot key expires?"</summary>
-<p>With an in-process loading cache, up to 40: one per server that sees a request during the load. That is coalescing per process, not per fleet. To get one load per fleet, either route each key to an owner peer that coalesces for everyone (the groupcache design), or take a short lock in the shared cache so only the first server loads while others wait or serve the stale value. Refresh-ahead also helps: hot keys reload in the background, so no caller blocks at all.</p>
+<p>With an in-process loading cache, up to 40: one per server that sees a request during the load. That is coalescing per process, not per fleet. Getting to one load per fleet takes more. You can route each key to an owner peer that coalesces for everyone, which is the groupcache design. Or you can take a short lock in the shared cache, so only the first server loads while the others wait or serve the stale value. Refresh-ahead also helps: hot keys reload in the background, so no caller blocks at all.</p>
 </details>
 
 <details>
@@ -6930,7 +6930,7 @@ COMMIT;</code></pre>
 
 <h3 id=dd-writebehind-fm-poison level=3>5. One bad row stalls a whole bucket</h3>
 <p><strong>Symptom.</strong> Oldest-dirty age for bucket 17 climbs from 2 seconds to 40 minutes. Other buckets are fine.</p>
-<p><strong>Mechanism.</strong> A product was deleted, and <code>product_views</code> has a foreign key to <code>products</code>. Actually the update simply matches no row for that ID, which is harmless. The real stall came from a different row whose batch hit a check constraint after a schema change. The batch statement is all-or-nothing, so the flusher retried the same 500 rows forever. Every later batch in that bucket waited behind it.</p>
+<p><strong>Mechanism.</strong> A schema change added a check constraint to <code>product_views</code>, and one product's row now violates it on every update. The batch statement is all-or-nothing, so the flusher retried the same 500 rows forever. Every later batch in that bucket waited behind it. (A deleted product, by contrast, is harmless: its update simply matches no row. Count those too, so the deltas don't vanish unnoticed.)</p>
 <p><strong>Detect.</strong> Oldest-dirty age per bucket (the <code>ZRANGE … WITHSCORES</code> of the first member), and consecutive flush failures per bucket. Alert on age, not on errors. Age is what the loss sentence is written in.</p>
 <p><strong>Fix.</strong> On a batch failure, split it in half and retry each half, recursively, until the bad row is isolated. Move that row to a quarantine table with its error and keep going. A 500-row batch finds its poison row in about nine splits. This is the <a href="#dead-letter-queue">dead letter queue</a> idea for a flusher.</p>
 
@@ -8475,7 +8475,7 @@ class Bulkhead:
 <p>Two numbers frame the decision. The <strong>normal size</strong> is L + 3√L at healthy latency. The <strong>ceiling</strong> is rate x timeout, the most a compartment can ever hold, because the timeout ends every call. Checkout at 300/s with a 1 s timeout can never exceed 300. Somewhere between the two is the size you pick. Critical compartments lean toward the ceiling. Low-priority ones sit at the normal size and reject early when latency rises.</p>
 
 <h3 id=dd-bulkhead-sizing-db level=3>Working back from the shared resource</h3>
-<p>Size from the bottom up as well as top down. Start from what the shared resource can take, then divide it. If Postgres stays healthy up to about 80 concurrent active queries on this hardware, and checkout needs 30 of them at peak, then every other workload together gets 50, globally, whatever the pod count. Per pod, divide by the maximum pod count the autoscaler can reach, not the current count. With a maximum of 20 pods, order history's per-pod connection pool is 15 / 20 rounded up to 1. That is absurd, and the absurdity is the lesson. Large fleets cannot enforce shared-resource walls per pod. They need the pooler or a global limiter.</p>
+<p>Size from the bottom up as well as top down. Start from what the shared resource can take, then divide it. If Postgres stays healthy up to about 80 concurrent active queries on this hardware, and checkout needs 30 of them at peak, then every other workload together gets 50, globally, whatever the pod count. Per pod, divide by the maximum pod count the autoscaler can reach, not the current count. Say order history's global share is 15 of those 50. With a maximum of 20 pods, its per-pod connection pool is 15 / 20, rounded up to 1. That is absurd, and the absurdity is the lesson. Large fleets cannot enforce shared-resource walls per pod. They need the pooler or a global limiter.</p>
 
 <h3 id=dd-bulkhead-sizing-cost level=3>What the walls cost in money</h3>
 <p>Put a price on the idle capacity so the "merge the pools" debate from Check Yourself has numbers. Suppose each pod runs 200 request threads and the isolation tax is 23%. At 10 pods, that is roughly 2.3 pods of capacity held back. At, say, $150 per pod-month, the walls cost about $350 a month. One hour of checkout outage on a store doing $40,000 an hour costs more than nine years of that tax. That ratio is why critical paths get walls even though most of the time the walls are idle.</p>
@@ -9638,9 +9638,10 @@ spec:
 <p>A local cache with a 60-second TTL works well on one server. Spread the same traffic across 50 servers and each server sees only 1/50 of it.</p>
 <p>Take a product page requested 60 times a minute:</p>
 <ul>
-<li><strong>One server:</strong> one miss per minute, 59 hits. About a 98% hit ratio, and the database sees 1 query a minute.</li>
-<li><strong>50 servers:</strong> each sees about 1.2 requests a minute. Nearly every request lands on a server whose entry has expired. The hit ratio falls toward 17%, and the database sees close to 50 queries a minute for the same page.</li>
+<li><strong>One server:</strong> about one miss a minute and 59 hits. A 98% hit ratio, and the database sees about 1 query a minute.</li>
+<li><strong>50 servers:</strong> each sees about 1.2 requests a minute. Often the entry has expired before the next request arrives. With random arrivals, the hit ratio is &lambda;T / (1 + &lambda;T), where &lambda;T is the requests per server during one TTL. That is 1.2 / 2.2, or about 55%. Each server misses about 0.55 times a minute, so the database sees about 27 queries a minute for the same page.</li>
 </ul>
+<p>Same traffic, same TTL, 27x the database load for that key. The same formula gives 98.4% for the single server (60 / 61), so you can redo it for any key's rate.</p>
 <p>Popular keys survive this. The long tail does not. This is why a horizontally scaled tier usually puts a shared cache behind a small local one (two levels), or routes requests by key with <a href="#consistent-hashing">consistent hashing</a> so each server caches a distinct slice.</p>
 
 <h3 id=dd-horizontal-scaling-rollout level=3>How long a rolling deploy takes</h3>
@@ -9783,7 +9784,7 @@ spec:
 
 <details>
 <summary>"Why might adding servers lower your cache hit ratio?"</summary>
-<p>Local caches see 1/N of the traffic each. A key requested 60 times a minute with a 60-second TTL is a 98% hit on one server and close to a miss every time on 50 servers. The database then sees about 50x the queries for that key. The fixes: a shared second-level cache, routing by key with consistent hashing so each server owns a slice, or longer TTLs with explicit invalidation where staleness allows.</p>
+<p>Local caches see 1/N of the traffic each. A key requested 60 times a minute with a 60-second TTL is a 98% hit on one server and about a 55% hit on 50 servers, by &lambda;T / (1 + &lambda;T). The database then sees about 27x the queries for that key. The fixes: a shared second-level cache, routing by key with consistent hashing so each server owns a slice, or longer TTLs with explicit invalidation where staleness allows.</p>
 </details>
 
 <details>
@@ -11539,7 +11540,7 @@ k.put("r1", ctx, set().union(*values)) # merged write clears both siblings
 <p>Clocks are compared in four places, and each one is a chance for divergent copies to converge:</p>
 <ul>
 <li><strong>On write,</strong> each replica drops the versions the new clock descends from.</li>
-<li><strong>On read,</strong> the coordinator compares the R responses, returns the maximal versions, and usually sends the winner back to stale replicas. That is <strong>read repair</strong>.</li>
+<li><strong>On read,</strong> the coordinator compares the R responses (see <a href="#quorum">quorum</a>), returns the maximal versions, and usually sends the winner back to stale replicas. That is <strong>read repair</strong>.</li>
 <li><strong>Hinted handoff.</strong> When a replica is down, another node stores its writes as hints and replays them later. The replayed versions go through the same comparison, so old hints cannot overwrite newer data.</li>
 <li><strong>Anti-entropy.</strong> A background process compares replicas, typically by exchanging Merkle-tree hashes of key ranges, and syncs the keys that differ. This is the only path that fixes keys nobody reads.</li>
 </ul>
@@ -11562,7 +11563,7 @@ k.put("r1", ctx, set().union(*values)) # merged write clears both siblings
 <ul>
 <li><strong>A normal cart.</strong> One write every 30 seconds during an active session, a 300 ms window. <code>λw = (1/30) × 0.3 = 0.01</code>. About 1 write in 100 produces a sibling, and the next read clears it. This is the workload vector clocks were built for.</li>
 <li><strong>A shared cart during a flash sale.</strong> A family of four tapping fast, say 2 writes per second with a 500 ms window. <code>λw = 1</code>. Nearly every write forms a sibling. Siblings get cleared, but reads now carry two or three values each.</li>
-<li><strong>A hot counter.</strong> A "stock remaining" key written 200 times per second with a 50 ms window. <code>λw = 10</code>. Each read returns about ten siblings, each merge races ten more writes, and the key never settles. That is the wrong data model, not a tuning problem. Use a CRDT counter or put the key behind a leader.</li>
+<li><strong>A hot counter.</strong> A "stock remaining" key written 200 times per second with a 50 ms window. <code>λw = 10</code>. Each read returns about ten siblings, each merge races ten more writes, and the key never settles. That is the wrong data model, not a tuning problem. Use a CRDT counter or put the key behind a leader, as in <a href="#primaryreplica">primary-replica</a>.</li>
 </ul>
 <p>The rule of thumb: when <code>λw</code> is well under 1, siblings are rare and cheap. As it approaches 1, sibling handling becomes the normal path and needs to be fast. Above 1, the design is wrong for that key.</p>
 
@@ -11890,7 +11891,7 @@ WHERE order_id = $1 AND state = 'AUTHORIZING' AND version = $2;
 <p>Check how long the provider remembers keys. Stripe, for one, documents that keys may be pruned after 24 hours. A saga parked longer than that must not retry blindly with an expired key. It should look the charge up first, by order reference or by the provider's own id stored in the saga row.</p>
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-outbox level=3>Commands through an outbox</h3>
-<p>"Ask shipping to create a shipment" is a message, and sending it from the same code that updates the saga row is a dual write. If the process dies between the two, the row says <code>SHIPPING</code> and shipping never heard about it, or the reverse. Write the command into an outbox table in the same transaction as the state change, and have a relay publish it. Shipping deduplicates by the command's key. Synchronous calls, such as the provider's HTTP API, follow the intent-state rule instead.</p>
+<p>"Ask shipping to create a shipment" is a message, and sending it from the same code that updates the saga row is a dual write. If the process dies between the two, the row says <code>SHIPPING</code> and shipping never heard about it, or the reverse. Write the command into an outbox table (the pattern behind <a href="#change-data-capture">change data capture</a> relays) in the same transaction as the state change, and have a relay publish it. Shipping deduplicates by the command's key. Synchronous calls, such as the provider's HTTP API, follow the intent-state rule instead.</p>
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-reservations level=3>Reservations with an expiry</h3>
 <p>The reserve step is one statement that cannot oversell:</p>
@@ -11910,7 +11911,7 @@ WHERE sku = $1 AND available &gt;= $2;
 <p><strong>Symptom.</strong> The provider call times out at 10 seconds. The saga sits in <code>AUTHORIZING</code>. Some customers later see a pending charge for an order the site says failed.</p>
 <p><strong>Mechanism.</strong> A timeout tells you nothing about the outcome. The provider may have authorized the card and lost the response. A saga that treats the timeout as "declined" and releases inventory has created exactly the forbidden half-state: money held, nothing shipping.</p>
 <p><strong>Detect.</strong> Count sagas in intent states older than a few minutes. Reconcile the provider's authorization report against your saga table daily.</p>
-<p><strong>Fix.</strong> Treat "unknown" as its own state. Retry with the same idempotency key until you get a definite answer, or query the provider by order reference. Only a definite decline ends the saga.</p>
+<p><strong>Fix.</strong> Treat "unknown" as its own state. Retry with the same <a href="#idempotency">idempotency</a> key until you get a definite answer, or query the provider by order reference. Only a definite decline ends the saga.</p>
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-split-brain level=3>Drill 5: Two orchestrators advance one order</h3>
 <p><strong>Symptom.</strong> A small number of customers receive two parcels.</p>
@@ -11922,7 +11923,7 @@ WHERE sku = $1 AND available &gt;= $2;
 <p><strong>Symptom.</strong> Refunds stuck in retry. The customer is charged for an order that will never ship.</p>
 <p><strong>Mechanism.</strong> Compensations are supposed to always succeed eventually, but the world disagrees. The card was closed, the authorization expired, or the provider rejects refunds older than its limit. The saga keeps retrying a step that can never work.</p>
 <p><strong>Detect.</strong> The business rule from the brief, written as a query: orders charged, with no shipment and not refunded, older than 30 minutes. Run it every few minutes and page on any growth. This one query catches drills 4, 5 and 6 together.</p>
-<p><strong>Fix.</strong> Cap retries, then move the saga to <code>NEEDS_HUMAN</code> with the last error, and route it to a payments operations queue (a dead-letter queue for workflows). Give that queue an owner and a response target. A stuck compensation is a customer's money.</p>
+<p><strong>Fix.</strong> Cap retries, then move the saga to <code>NEEDS_HUMAN</code> with the last error, and route it to a payments operations queue (a <a href="#dead-letter-queue">dead-letter queue</a> for workflows). Give that queue an owner and a response target. A stuck compensation is a customer's money.</p>
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-orphan level=3>Drill 7: An orphaned prepared transaction (Build One)</h3>
 <p><strong>Symptom.</strong> Hot-SKU checkouts time out. Days later, every table in the inventory database is bloated and queries slow down.</p>
@@ -11938,7 +11939,7 @@ WHERE sku = $1 AND available &gt;= $2;
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-drill-cart level=3>Drill 9: Pay is pressed while the cart has siblings</h3>
 <p><strong>Symptom.</strong> A customer is charged for an item she removed on her other device a second earlier. Or the order total does not match the cart she saw.</p>
-<p><strong>Mechanism.</strong> This is where the lesson's postscript meets fulfillment. The leaderless cart can hold siblings at the moment of checkout. If checkout reads one sibling, or merges without tombstones, the saga charges for a cart that never existed as the customer saw it.</p>
+<p><strong>Mechanism.</strong> This is where the lesson's postscript meets fulfillment. The leaderless cart can hold <a href="#vector-clocks">siblings</a> at the moment of checkout. If checkout reads one sibling, or merges without tombstones, the saga charges for a cart that never existed as the customer saw it.</p>
 <p><strong>Detect.</strong> Log whether the cart had siblings at checkout, and compare the charged total with the total on the page the customer confirmed.</p>
 <p><strong>Fix.</strong> Checkout resolves siblings, writes the merged cart back, and shows the resolved cart and total before Pay. The order then stores a snapshot of the lines and prices together with the cart's clock. A cart write that arrives after that clock does not change the order. The two consistency domains meet in one place, and that place is a snapshot.</p>
 
@@ -11955,9 +11956,9 @@ WHERE sku = $1 AND available &gt;= $2;
 <p>The brief says fulfillment may lag by minutes. A 20-minute shipping outage is a delay, not a failed order. So the saga should distinguish two kinds of failure:</p>
 <ul>
 <li><strong>Business failures</strong> are final: out of stock, card declined, address undeliverable. Compensate at once.</li>
-<li><strong>Infrastructure failures</strong> are temporary: timeouts, 503s, an open circuit breaker. Park the saga in <code>AWAITING_SHIPPING</code> and retry with backoff. Compensate only if a business deadline passes, for example 2 hours, after which the order is cancelled with an apology.</li>
+<li><strong>Infrastructure failures</strong> are temporary: timeouts, 503s, an open circuit breaker. Park the saga in <code>AWAITING_SHIPPING</code> and <a href="#retry-with-exponential-backoff">retry with backoff</a>. Compensate only if a business deadline passes, for example 2 hours, after which the order is cancelled with an apology.</li>
 </ul>
-<p>Combine this with authorize-then-capture, and the 240,000-order outage from the capacity section changes shape. Those orders hold authorizations and reservations for 20 minutes, then ship. There are no refunds and no fees. The circuit breaker on shipping stops workers from hammering a dead service. A banner can tell new customers that dispatch is delayed.</p>
+<p>Combine this with authorize-then-capture, and the 240,000-order outage from the capacity section changes shape. Those orders hold authorizations and reservations for 20 minutes, then ship. There are no refunds and no fees. The <a href="#circuit-breaker">circuit breaker</a> on shipping stops workers from hammering a dead service. A banner can tell new customers that dispatch is delayed.</p>
 <p>The panel's objection will be: "now inventory is reserved for orders that might not ship." True. That is why the reservation expiry must exceed the business deadline, and why the deadline is a product decision, not an engineering default.</p>
 
 <h3 id=dd-minicapstone-order-fulfillment-built-twice-pivot level=3>Where the pivot really is</h3>
@@ -13578,7 +13579,7 @@ Link: &lt;https://api.example.com/docs/migrate-v2&gt;; rel="deprecation"; type="
 </details>
 <details>
 <summary>"What should a brownout response actually look like?"</summary>
-<p>A <code>410 Gone</code> with a small JSON body: a stable error code such as <code>version_sunset</code>, a human message with the sunset date, and a link to the migration guide. Keep the <code>Sunset</code> and <code>Deprecation</code> headers too. Serve it from the gateway or edge so it costs almost nothing. No <code>Retry-After</code> that suggests retrying will work, because it will not. And keep the normal per-key rate limit in force, so that badly written retry loops cannot multiply the load.</p>
+<p>A <code>410 Gone</code> with a small JSON body: a stable error code such as <code>version_sunset</code>, a human message with the sunset date, and a link to the migration guide. Keep the <code>Sunset</code> and <code>Deprecation</code> headers too. Serve it from the gateway or edge so it costs almost nothing. <code>Retry-After</code> is a judgement call. Setting it to the end of the brownout window is honest, since a retry then will work, and it stops tight retry loops. But the body must say plainly that the real fix is migrating before the sunset date. And keep the normal per-key rate limit in force, so that badly written retry loops cannot multiply the load.</p>
 </details>
 <h2 id=h2-7-tldr level=2>7. TL;DR</h2>
 <div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th><tbody><tr><td><strong>Problem</strong><td>Published APIs have clients you cannot see, update, or schedule. One well-intentioned rename breaks 200 partners and every old mobile build at the same time.<tr><td><strong>Mechanism</strong><td>Additive first (never rename, remove, or re-type, with tolerant readers). Coarse explicit versions through gateway adapters when breaking is unavoidable. Planned retirement: Sunset headers, usage dashboards, outreach, brownouts, removal, and two live versions at most.<tr><td><strong>Costs</strong><td>N-version maintenance, aging adapter code, additive clutter between major versions, and sunset work that is organizational, not only technical.<tr><td><strong>Skip it when</strong><td>You control both sides (coordinated deploys and contract tests), the surface is declared beta, or it is an event schema (covered in the pub/sub lesson).<tr><td><strong>30-second answer</strong><td>Add instead of changing, version coarsely when you must, and retire on a measured lifecycle with brownouts for clients that do not respond, because "deprecated" without a date and a dashboard just means "permanent."</table></div></div>
@@ -16850,9 +16851,9 @@ def on_position(driver_id, pos):
 
 async def publish_positions(send):
     while True:
-        batch, positions_snapshot = None, dict(positions)
+        snapshot = dict(positions)
         positions.clear()
-        for driver_id, pos in positions_snapshot.items():
+        for driver_id, pos in snapshot.items():
             await send(driver_id, pos)    # slow sender? old positions are just replaced
         await asyncio.sleep(0.5)</code></pre>
 <p>The memory for positions is bounded by the number of drivers, not by the rate mismatch. That is what "a buffer with one slot" means in practice.</p>
@@ -17902,7 +17903,7 @@ instance_group [ { count: 2, kind: KIND_GPU } ]</code></pre>
 </tbody></table></div></div>
 <p>Three things come out of this table.</p>
 <p>First, batch 64 lands at about 2,800 tokens per second, which matches the lesson's 2,500–3,000. Second, per-user pace falls from 140 to 43 tokens per second. People read at perhaps 5–10 tokens per second, so 43 is still comfortably faster than reading. That is why the lesson can say pace is "roughly unchanged" from the user's point of view. Third, at batch 64 the KV reads (32 GB) already outweigh the weights (14 GB). The cache, not the weights, now sets the cost of each extra request.</p>
-<p>A note on the incident's 50 tokens per second at batch 1: the bandwidth ceiling is about 140. Plain framework serving loses the difference to kernel launches, Python overhead and unoptimised attention. Engines close much of that gap even at batch 1, which is part of why "use vLLM-class engines" is the advice.</p>
+<p>A note on the incident's 50 tokens per second at batch 1: the bandwidth ceiling is about 140. Plain framework serving loses the difference to kernel launches, Python overhead and unoptimized attention. Engines close much of that gap even at batch 1, which is part of why "use vLLM-class engines" is the advice.</p>
 <p>Compute check at GQA batch 128: 128 tokens x 14 GFLOPs each ≈ 1.8 TFLOPs per step, about 6 ms at 300 TFLOPS. The step is 15 ms. Still bandwidth-bound, as the arithmetic-intensity argument predicted.</p>
 
 <h3 id=dd-model-serving-tpot-slo level=3>Picking the batch cap from a latency target</h3>
@@ -17924,7 +17925,7 @@ instance_group [ { count: 2, kind: KIND_GPU } ]</code></pre>
 <p><strong>Symptom.</strong> Throughput drops by half during peak, and TPOT becomes jagged. GPU utilization still looks high.</p>
 <p><strong>Mechanism.</strong> The batch cap was tuned on short test prompts. Real conversations are longer, and the KV pool fills. Each time a running sequence needs a block, the scheduler preempts another and later recomputes its whole prefix. The GPU spends its time recomputing work it already did. Long conversations get preempted repeatedly, so they are the ones that suffer most.</p>
 <p><strong>Detect.</strong> The engine's preemption counter, and KV cache usage pinned near 100%. vLLM logs a warning when it preempts and exposes both as metrics. Watch the ratio of prompt tokens computed to prompt tokens received; above 1 means recompute.</p>
-<p><strong>Fix.</strong> Lower <code>max_num_seqs</code> until preemption is rare. Cap <code>max_model_len</code> and <code>max_tokens</code> to what the product needs. Use a GQA model or a quantised KV cache if quality allows. Admission control at the router should queue requests rather than let the engine overcommit.</p>
+<p><strong>Fix.</strong> Lower <code>max_num_seqs</code> until preemption is rare. Cap <code>max_model_len</code> and <code>max_tokens</code> to what the product needs. Use a GQA model or a quantized KV cache if quality allows. Admission control at the router should queue requests rather than let the engine overcommit.</p>
 
 <h3 id=dd-model-serving-fm-runaway level=3>2. The generation that never stops</h3>
 <p><strong>Symptom.</strong> A handful of requests take two minutes. Their responses end in the same phrase repeated hundreds of times.</p>
@@ -17974,14 +17975,14 @@ instance_group [ { count: 2, kind: KIND_GPU } ]</code></pre>
 
 <h3 id=dd-model-serving-choose-levers level=3>Other levers, and what each trades</h3>
 <div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Lever</th><th>What it buys</th><th>What it costs</th><th>Use when</th></tr></thead><tbody>
-<tr><td>Weight quantisation (8-bit, 4-bit)</td><td>Fewer bytes per step, so faster decode; more room for KV</td><td>Some quality loss, varying by method and model; measure it</td><td>After batching is fixed, if evaluations hold</td></tr>
-<tr><td>KV cache quantisation</td><td>Up to 2x more context per GPU</td><td>Possible quality loss on long contexts</td><td>Memory-bound fleets with long conversations</td></tr>
+<tr><td>Weight quantization (8-bit, 4-bit)</td><td>Fewer bytes per step, so faster decode; more room for KV</td><td>Some quality loss, varying by method and model; measure it</td><td>After batching is fixed, if evaluations hold</td></tr>
+<tr><td>KV cache quantization</td><td>Up to 2x more context per GPU</td><td>Possible quality loss on long contexts</td><td>Memory-bound fleets with long conversations</td></tr>
 <tr><td>Prefix caching</td><td>Faster TTFT, less KV memory for shared prompts</td><td>Routing must keep prefixes warm</td><td>Long, repeated system prompts; multi-turn chat</td></tr>
 <tr><td>Speculative decoding</td><td>Fewer target-model steps per token at low batch sizes</td><td>A draft model or extra heads; gains shrink as batches grow</td><td>Latency-sensitive, lightly loaded serving</td></tr>
 <tr><td>Tensor parallelism</td><td>Larger models; lower TPOT per request</td><td>Interconnect traffic per layer; whole-node fate sharing</td><td>The model does not fit one GPU, or TPOT targets demand it</td></tr>
 <tr><td>More replicas</td><td>Linear throughput, independent failures</td><td>One full copy of the weights each</td><td>The default way to scale once one replica is tuned</td></tr>
 </tbody></table></div></div>
-<p>A sensible order: get a real engine with continuous batching and paged KV. Turn on prefix caching if prompts share prefixes. Size the batch cap from a TPOT target. Then reach for quantisation, judged by evaluations. Speculative decoding and disaggregation come last, when the fleet is big enough that their gains pay for their complexity.</p>
+<p>A sensible order: get a real engine with continuous batching and paged KV. Turn on prefix caching if prompts share prefixes. Size the batch cap from a TPOT target. Then reach for quantization, judged by evaluations. Speculative decoding and disaggregation come last, when the fleet is big enough that their gains pay for their complexity.</p>
 
 <h2 id=dd-model-serving-checklist level=2>Deep Dive: Design-Review Checklist</h2>
 <ol>
@@ -18036,8 +18037,8 @@ instance_group [ { count: 2, kind: KIND_GPU } ]</code></pre>
 </details>
 
 <details>
-<summary>"Would quantising to 4-bit fix the incident's cost problem?"</summary>
-<p>It would help a little and miss the cause. At batch 1, 4-bit weights stream about a quarter of the bytes, so one GPU might go from 50 to well over 100 tokens per second. That's maybe a 2–3x saving. Batching gave 30x without touching quality. Fix batching first; then quantise if evaluations show the quality loss is acceptable, and spend the freed memory on KV cache.</p>
+<summary>"Would quantizing to 4-bit fix the incident's cost problem?"</summary>
+<p>It would help a little and miss the cause. At batch 1, 4-bit weights stream about a quarter of the bytes, so one GPU might go from 50 to well over 100 tokens per second. That's maybe a 2–3x saving. Batching gave 30x without touching quality. Fix batching first; then quantize if evaluations show the quality loss is acceptable, and spend the freed memory on KV cache.</p>
 </details>
 <h2 id=h2-12-tldr level=2>12. TL;DR</h2>
 <div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th><tbody><tr><td><strong>Problem</strong><td>One-at-a-time LLM serving runs GPUs at about 8% utilization, so a 20 req/s feature needs a $5.6M/year fleet.<tr><td><strong>Mechanism</strong><td>Batch the requests. Dynamic batching shares the weight streaming across ~32 requests for milliseconds of TTFT. LLMs need <em>continuous</em> token-level batching (exit on finish, join mid-flight) to handle 100x variance, plus paged KV memory for 2-4x concurrency. Use vLLM-class engines, and do not hand-write them.<tr><td><strong>Costs</strong><td>A small TTFT floor, shared fate within the batch (giant prompts dominate), a complex engine layer, and per-workload tuning.<tr><td><strong>Skip it when</strong><td>Hard real-time milliseconds, trivial traffic, or bulk offline work, which belongs on batch APIs at half price.<tr><td><strong>30-second answer</strong><td>Weights stream once per step whether the batch holds one request or thirty-two, so fill the batch. Do it at token level, with paged memory, and the fleet cost falls 30x. Use an existing engine, route by queue depth, and keep bulk work off the fleet.</table></div></div><style class=sf-hidden>mjx-container[jax="SVG"]{direction:ltr}mjx-container[jax="SVG"]>svg{overflow:visible;min-height:1px;min-width:1px}mjx-container[jax="SVG"] use[data-c]{stroke-width:3}</style>

@@ -42,7 +42,7 @@
 <text x="520" y="228" font-size="12" fill="#1c2430" text-anchor="middle">replay lag: what replica readers cannot see yet</text>
 <text x="360" y="266" font-size="12" fill="#5c6b7c" text-anchor="middle">waits here: remote_apply</text>
 <text x="40" y="266" font-size="12" fill="#5c6b7c">synchronous_commit</text>
-<text x="470" y="282" font-size="12" fill="#5c6b7c" text-anchor="middle">on</text>
+<text x="450" y="282" font-size="12" fill="#5c6b7c" text-anchor="middle">waits here: on</text>
 <text x="540" y="266" font-size="12" fill="#5c6b7c" text-anchor="middle">remote_write</text>
 </svg>
 <figcaption>One replica's four positions on the primary's log. Durability is decided by flush_lsn; staleness of reads is decided by replay_lsn.</figcaption>

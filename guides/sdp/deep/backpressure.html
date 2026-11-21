@@ -48,9 +48,9 @@ def on_position(driver_id, pos):
 
 async def publish_positions(send):
     while True:
-        batch, positions_snapshot = None, dict(positions)
+        snapshot = dict(positions)
         positions.clear()
-        for driver_id, pos in positions_snapshot.items():
+        for driver_id, pos in snapshot.items():
             await send(driver_id, pos)    # slow sender? old positions are just replaced
         await asyncio.sleep(0.5)</code></pre>
 <p>The memory for positions is bounded by the number of drivers, not by the rate mismatch. That is what "a buffer with one slot" means in practice.</p>

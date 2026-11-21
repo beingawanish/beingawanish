@@ -173,7 +173,7 @@ COMMIT;</code></pre>
 
 <h3 id=dd-writebehind-fm-poison level=3>5. One bad row stalls a whole bucket</h3>
 <p><strong>Symptom.</strong> Oldest-dirty age for bucket 17 climbs from 2 seconds to 40 minutes. Other buckets are fine.</p>
-<p><strong>Mechanism.</strong> A product was deleted, and <code>product_views</code> has a foreign key to <code>products</code>. Actually the update simply matches no row for that ID, which is harmless. The real stall came from a different row whose batch hit a check constraint after a schema change. The batch statement is all-or-nothing, so the flusher retried the same 500 rows forever. Every later batch in that bucket waited behind it.</p>
+<p><strong>Mechanism.</strong> A schema change added a check constraint to <code>product_views</code>, and one product's row now violates it on every update. The batch statement is all-or-nothing, so the flusher retried the same 500 rows forever. Every later batch in that bucket waited behind it. (A deleted product, by contrast, is harmless: its update simply matches no row. Count those too, so the deltas don't vanish unnoticed.)</p>
 <p><strong>Detect.</strong> Oldest-dirty age per bucket (the <code>ZRANGE … WITHSCORES</code> of the first member), and consecutive flush failures per bucket. Alert on age, not on errors. Age is what the loss sentence is written in.</p>
 <p><strong>Fix.</strong> On a batch failure, split it in half and retry each half, recursively, until the bad row is isolated. Move that row to a quarantine table with its error and keep going. A 500-row batch finds its poison row in about nine splits. This is the <a href="#dead-letter-queue">dead letter queue</a> idea for a flusher.</p>
 
