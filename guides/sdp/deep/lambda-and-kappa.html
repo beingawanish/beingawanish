@@ -144,7 +144,7 @@ catch_up adds: (replay_hours × live_rate) / (replay_throughput − live_rate)</
 
 <h3 id=dd-lambda-and-kappa-fm-shared-drift level=3>7. Shared definitions that drifted anyway</h3>
 <p><strong>Symptom.</strong> The team moved to one shared metric library for the warehouse and streaming jobs. Six months later, the gap between them is back.</p>
-<p><strong>Mechanism.</strong> The two jobs pin different versions of the library, because they deploy on separate schedules. Even at the same version, the engines differ. The warehouse truncates dates in UTC, and the streaming job in the server's local time zone. One engine's <code>SUM</code> ignores NULLs, and a hand-written streaming aggregate treats NULL as zero, which happens to be the same; its <code>AVG</code> does not behave the same. "One logic source" held for the code, and failed for its execution.</p>
+<p><strong>Mechanism.</strong> The two jobs pin different versions of the library, because they deploy on separate schedules. Even at the same version, the engines differ. The warehouse truncates dates in UTC, and the streaming job in the server's local time zone. The warehouse's <code>AVG</code> skips NULL amounts, while a hand-written streaming average counts them as zero. "One logic source" held for the code, and failed for its execution.</p>
 <p><strong>Detect.</strong> A daily per-metric reconciliation with a threshold derived as in the sizing section. Record which library version produced each output.</p>
 <p><strong>Fix.</strong> Golden tests: a fixed set of tricky input events (late, NULL, near midnight, multi-currency) run through <em>both</em> engines in CI, with results compared to expected outputs. Deploy the library to both jobs together. Set time zones explicitly in the definitions.</p>
 

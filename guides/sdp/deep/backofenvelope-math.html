@@ -1,0 +1,394 @@
+<h2 id=dd-backofenvelope-math-inside-the-method level=2>Deep Dive: Inside the Method</h2>
+<p>The lesson gives four calculations and a short table of numbers. That covers most interview questions. A senior engineer carries a little more: a repeatable loop for any estimate, a wider set of reference numbers that includes throughput, and a clear sense of when averages lie. This section adds those three things.</p>
+
+<h3 id=dd-backofenvelope-math-loop level=3>The estimation loop</h3>
+<p>Every good estimate follows the same six steps. Most bad estimates skip step 1 or step 5.</p>
+<ol>
+<li><strong>Ask what decision the number serves.</strong> "Do we need to shard?" needs storage and write rate. "How many gateway servers?" needs concurrent connections. If you don't know the decision, you'll compute the wrong thing precisely.</li>
+<li><strong>Break the quantity into factors you can guess.</strong> Storage is records per day x bytes per record x days kept x copies. Each factor is easier to guess than the product.</li>
+<li><strong>State each assumption with its unit.</strong> "1 KB per order row," not "1 KB." Units are how you catch mistakes later.</li>
+<li><strong>Compute in powers of ten.</strong> Turn every number into a digit times a power of ten, multiply the digits, add the exponents.</li>
+<li><strong>Sanity-check against something you know.</strong> Does the answer fit on one machine? Is it more than the world's population? Is it faster than light allows?</li>
+<li><strong>Say the decision, and the number that would flip it.</strong> "500 GB fits on one machine. We'd revisit at around 5 TB."</li>
+</ol>
+
+<h3 id=dd-backofenvelope-math-powers level=3>Arithmetic in powers of ten</h3>
+<p>Mental multiplication with large numbers goes wrong when you count zeros. Exponents are safer. Write 40 million as 4 x 10<sup>7</sup> and 2 KB as 2 x 10<sup>3</sup> bytes. The product is 8 x 10<sup>10</sup> bytes, or 80 GB. You added 7 and 3 and multiplied 4 by 2. Nothing else.</p>
+<p>A few conversions are worth having ready:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Quantity<th>Exact<th>Use in estimates<tbody>
+<tr><td>Seconds per day<td>86,400<td>10<sup>5</sup> (overestimates per-second rate by about 15%... in the safe direction for per-day-to-per-second, it underestimates; see below)
+<tr><td>Seconds per month<td>~2.6 million<td>2.5 x 10<sup>6</sup>
+<tr><td>Seconds per year<td>~31.5 million<td>3 x 10<sup>7</sup> (or π x 10<sup>7</sup>)
+<tr><td>2<sup>10</sup>, 2<sup>20</sup>, 2<sup>30</sup>, 2<sup>40</sup><td>1,024; ~1.05 M; ~1.07 G; ~1.10 T<td>10<sup>3</sup>, 10<sup>6</sup>, 10<sup>9</sup>, 10<sup>12</sup>
+<tr><td>1 Gbps<td>10<sup>9</sup> bits/s<td>125 MB/s (divide by 8)
+<tr><td>Light in fibre<td>~200,000 km/s<td>~1 ms of round trip per 100 km of path
+<tr><td>Requests per day per 1 request/s<td>86,400<td>~100,000
+</table></div></div>
+<p>One caution about the 100,000 shortcut. Dividing a daily count by 100,000 instead of 86,400 gives a per-second rate about 14% too low. That is fine for an order-of-magnitude estimate, and the 3-5x peak factor swamps it. But it is the unsafe direction, so don't then shave the peak factor.</p>
+<p>The gap between powers of two and powers of ten grows with size: 2.4% at kilo, about 7% at giga, about 10% at tera. For a disk-sizing estimate, ignore it. For a billing dispute about "1 TB" of storage, it matters.</p>
+
+<h3 id=dd-backofenvelope-math-reference level=3>A wider set of reference numbers</h3>
+<p>The lesson's table is about latency. Capacity planning also needs throughput: how many bytes or operations per second a component moves. These are rough planning values. Real figures depend on hardware generation, instance type, payload size and tuning, and can easily be off by several times. Use them to find the order of magnitude, then measure.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Component<th>Planning number<th>Notes<tbody>
+<tr><td>Round trip within one availability zone<td>~0.1-0.5 ms<td>Cross-zone in the same region is often around 1 ms
+<tr><td>Round trip, US east to US west coast<td>~60-80 ms<td>Physics sets a floor of roughly 40 ms; routing adds the rest
+<tr><td>Round trip, transatlantic<td>~70-90 ms<td>New York to London is ~5,600 km, so the fibre floor is ~56 ms
+<tr><td>Read 1 MB sequentially from memory<td>~tens of μs<td>Memory bandwidth is tens of GB/s per socket
+<tr><td>Read 1 MB sequentially from NVMe SSD<td>~0.2-1 ms<td>NVMe drives often sustain 1-several GB/s
+<tr><td>Read 1 MB sequentially from spinning disk<td>~5-10 ms<td>Plus a ~10 ms seek; ~100-200 MB/s sustained
+<tr><td>Network interface<td>10-25 Gbps is common on servers<td>10 Gbps is ~1.25 GB/s before protocol overhead
+<tr><td>Relational primary, simple indexed writes<td>Thousands to low tens of thousands per second<td>Very sensitive to row size, indexes, fsync settings and contention
+<tr><td>In-memory key-value store, simple gets<td>~100,000 per second per node, often more<td>Single-threaded designs scale per core; large values cut this sharply
+<tr><td>Log partition (Kafka-style) for planning<td>~5-10 MB/s per partition<td>A conservative planning figure many teams use; brokers can do far more
+<tr><td>Web server, simple JSON endpoint<td>Hundreds to thousands of requests/s per core<td>Depends entirely on the work per request
+</table></div></div>
+<p>If you are unsure of a number in an interview, give a range and say which end you're planning for. "A Postgres primary does somewhere between a few thousand and twenty thousand simple writes a second. I'll plan on 5,000 until we measure." That is an honest estimate, and interviewers trust it more than a confident single value.</p>
+
+<h3 id=dd-backofenvelope-math-percentiles level=3>Averages, percentiles and fan-out</h3>
+<p>The lesson's cache formula uses average latency. Users don't feel averages; they feel the slow requests. A latency <strong>percentile</strong> says what share of requests finish within a time. The p99 is the time that 99% of requests beat. One in a hundred is slower.</p>
+<p>Two rules decide how percentiles combine:</p>
+<ul>
+<li><strong>Sequential calls add.</strong> A page that calls A, then B, then C waits for the sum. Roughly, the sum of medians gives the typical case. The p99 of the sum is less than the sum of p99s, because all three are rarely slow at once, but it is well above the sum of medians.</li>
+<li><strong>Parallel calls take the maximum.</strong> A request that fans out to N backends and waits for all of them is as slow as the slowest. If each backend is slow 1% of the time, independently, the chance that at least one is slow is 1 - 0.99<sup>N</sup>.</li>
+</ul>
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-backofenvelope-math-svg-title dd-backofenvelope-math-svg-desc" viewBox="0 0 720 270" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-backofenvelope-math-svg-title">How fan-out turns a 1% slow backend into a slow request</title>
+<desc id="dd-backofenvelope-math-svg-desc">A horizontal bar chart. Each bar shows the chance that a request waiting on N parallel backends hits at least one backend slower than its p99. One backend: 1 percent. Ten backends: about 10 percent. Fifty backends: about 39 percent. One hundred backends: about 63 percent. Five hundred backends: about 99 percent.</desc>
+<rect x="0" y="0" width="720" height="270" fill="#ffffff"/>
+<text x="360" y="26" font-size="15" fill="#1c2430" text-anchor="middle">Chance a request hits at least one slow backend (each slow 1% of the time)</text>
+<line x1="150" y1="44" x2="150" y2="232" stroke="#d5dee8"/>
+<line x1="650" y1="44" x2="650" y2="232" stroke="#d5dee8" stroke-dasharray="4 4"/>
+<text x="650" y="250" font-size="12" fill="#5c6b7c" text-anchor="middle">100%</text>
+<text x="150" y="250" font-size="12" fill="#5c6b7c" text-anchor="middle">0%</text>
+<text x="140" y="70" font-size="13" fill="#1c2430" text-anchor="end">N = 1</text>
+<rect x="150" y="56" width="5" height="22" fill="#7ea4c8"/>
+<text x="162" y="72" font-size="12" fill="#1c2430">1%</text>
+<text x="140" y="106" font-size="13" fill="#1c2430" text-anchor="end">N = 10</text>
+<rect x="150" y="92" width="48" height="22" fill="#7ea4c8"/>
+<text x="205" y="108" font-size="12" fill="#1c2430">9.6%</text>
+<text x="140" y="142" font-size="13" fill="#1c2430" text-anchor="end">N = 50</text>
+<rect x="150" y="128" width="197" height="22" fill="#7ea4c8"/>
+<text x="354" y="144" font-size="12" fill="#1c2430">39%</text>
+<text x="140" y="178" font-size="13" fill="#1c2430" text-anchor="end">N = 100</text>
+<rect x="150" y="164" width="317" height="22" fill="#1f5f99"/>
+<text x="474" y="180" font-size="12" fill="#1c2430">63%</text>
+<text x="140" y="214" font-size="13" fill="#1c2430" text-anchor="end">N = 500</text>
+<rect x="150" y="200" width="497" height="22" fill="#c898a4"/>
+<text x="600" y="194" font-size="12" fill="#1c2430" text-anchor="middle">99.3%</text>
+</svg>
+<figcaption>At 100 backends, a backend's rare slow case becomes the request's common case. This is why fan-out systems care about each backend's p99.9 and beyond.</figcaption>
+</figure>
+<p>This one formula explains a lot of production behaviour. A search tier querying 100 shards will see most requests touch a slow shard. Hedged requests (send a second copy after a short delay, use whichever answers first) and tighter per-shard tails are the usual responses.</p>
+<p>The independence assumption is optimistic. If slowness comes from a shared cause, such as a garbage-collection pause on a common dependency, many backends are slow together. Then the formula underestimates how bad the tail is.</p>
+
+<h3 id=dd-backofenvelope-math-snippet level=3>The calculations as code</h3>
+<p>Writing the formulas once makes them easy to reuse and check. Python's standard library is enough.</p>
+<pre><code>import math
+
+def per_second(per_day, peak_factor=4):
+    avg = per_day / 86_400
+    return avg, avg * peak_factor
+
+def in_flight(rate_per_s, seconds_each):          # Little's law
+    return rate_per_s * seconds_each
+
+def drain_seconds(backlog, capacity_per_s, arrival_per_s):
+    spare = capacity_per_s - arrival_per_s        # new work keeps arriving
+    return math.inf if spare &lt;= 0 else backlog / spare
+
+def p_any_slow(n_backends, p_slow=0.01):           # fan-out tail
+    return 1 - (1 - p_slow) ** n_backends
+
+def storage_bytes(per_day, bytes_each, days, copies=3, overhead=2.0):
+    return per_day * bytes_each * days * copies * overhead
+
+print(per_second(10_000_000))                     # (~116, ~463)
+print(in_flight(2_000, 0.150))                    # 300.0
+print(drain_seconds(900_000, 800, 500) / 60)      # 50.0 minutes
+print(round(p_any_slow(100), 2))                  # 0.63
+print(storage_bytes(10_000_000, 1_000, 365*5) / 1e12)  # ~110 TB</code></pre>
+<p>The <code>overhead</code> and <code>copies</code> defaults in <code>storage_bytes</code> are the multipliers people forget. The drills below explain where they come from.</p>
+
+<h2 id=dd-backofenvelope-math-drills level=2>Deep Dive: Estimation Drills</h2>
+<p>Estimation is a skill you build by repetition. Each drill below states a question and its assumptions. Try it on paper first, then open the worked answer. Every drill ends with the design decision the number supports, because a number with no decision attached is trivia.</p>
+
+<h3 id=dd-backofenvelope-math-drills-traffic level=3>Traffic</h3>
+<p><strong>Drill 1: From daily users to requests per second.</strong> A photo-sharing app has 30 million daily active users. Each views 50 photos and uploads 0.2 photos a day. What are the average and peak read and write rates, and the read:write ratio?</p>
+<details>
+<summary>Worked answer</summary>
+<p>Views: 3 x 10<sup>7</sup> x 50 = 1.5 x 10<sup>9</sup> a day. Divide by 10<sup>5</sup>: 15,000 views a second on average. At a 4x peak, 60,000 a second.</p>
+<p>Uploads: 3 x 10<sup>7</sup> x 0.2 = 6 x 10<sup>6</sup> a day, so 60 a second on average and 240 at peak.</p>
+<p>The ratio is 1.5 x 10<sup>9</sup> / 6 x 10<sup>6</sup> = 250 reads per write.</p>
+<p><strong>Decision:</strong> This is a read-heavy system. Reads go through a CDN and cache. The write path is small enough for one primary database for metadata. The interesting write problem is the image bytes, not the row count.</p>
+</details>
+
+<p><strong>Drill 2: Deriving the peak instead of assuming it.</strong> A food-delivery service takes 10 million orders a day. 60% of them arrive in a 4-hour evening window. What is the peak order rate, and what peak factor does that imply?</p>
+<details>
+<summary>Worked answer</summary>
+<p>The window holds 6 x 10<sup>6</sup> orders over 4 x 3,600 = 14,400 seconds. That is about 420 orders a second.</p>
+<p>The daily average is 10<sup>7</sup> / 86,400 ≈ 116 a second. So the evening average alone is about 3.6x the daily average. And within the window, traffic isn't flat either: the busiest 15 minutes may be another 1.5-2x higher, so 600-800 a second is a reasonable planning peak.</p>
+<p><strong>Decision:</strong> The generic "3-5x" rule would have given 350-580. Deriving it from the traffic shape gives a higher and more defensible number. When you know the shape, use it.</p>
+</details>
+
+<h3 id=dd-backofenvelope-math-drills-latency level=3>Latency</h3>
+<p><strong>Drill 3: A sequential latency budget.</strong> The bookstore's checkout handler makes these calls in order: auth (2 ms), cart (5 ms), pricing (10 ms), inventory (15 ms), payment provider (300 ms). The database is in another region, and the handler makes 3 sequential queries to it. The target is 500 ms. Does it fit?</p>
+<details>
+<summary>Worked answer</summary>
+<p>Local calls: 2 + 5 + 10 + 15 = 32 ms. Payment: 300 ms. Cross-region queries: 3 x ~100 ms = 300 ms. Total ≈ 632 ms, over budget before any tail effects.</p>
+<p>The cross-region queries cost as much as the payment provider. Moving the handler next to the database removes almost all of that 300 ms. Running auth, cart and pricing in parallel saves a few more milliseconds, but that's minor.</p>
+<p><strong>Decision:</strong> Co-locate compute with its database. Count round trips between regions before anything else. They are the biggest line in most latency budgets.</p>
+</details>
+
+<p><strong>Drill 4: Fan-out and the tail.</strong> A search request queries 50 index shards in parallel and waits for all of them. Each shard's p99 is 20 ms. What fraction of search requests wait on at least one shard slower than 20 ms? What per-shard percentile must stay under 20 ms for the whole request to have a p99 of 20 ms?</p>
+<details>
+<summary>Worked answer</summary>
+<p>1 - 0.99<sup>50</sup> ≈ 0.39. About 39% of requests hit at least one slow shard. So 20 ms is close to the request's median, not its p99.</p>
+<p>For the request to be under 20 ms 99% of the time, each shard must be under 20 ms with probability 0.99<sup>1/50</sup> ≈ 0.9998. That is the shard's p99.98.</p>
+<p><strong>Decision:</strong> Either budget the request's p99 at the shards' p99.98 latency, or cut the tail directly: hedge requests to replica shards, or return partial results after a deadline. Fewer, larger shards also help, at the cost of each shard doing more work.</p>
+</details>
+
+<p><strong>Drill 5: The cost of a new connection.</strong> A mobile client in London calls an API hosted only in New York. Each call opens a new TLS connection. Estimate the time to the first response byte.</p>
+<details>
+<summary>Worked answer</summary>
+<p>New York to London is about 5,600 km. Light in fibre does about 200,000 km/s, so one way takes at least 28 ms and a round trip at least 56 ms. Real routes add some; call it 75 ms.</p>
+<p>A new connection needs a TCP handshake (1 round trip) and a TLS 1.3 handshake (1 more), then the request itself (1 more). That's 3 round trips, about 225 ms, before any server work. With TLS 1.2 it's one more round trip. Mobile networks add their own latency on top.</p>
+<p><strong>Decision:</strong> Reuse connections (keep-alive, HTTP/2 or HTTP/3), and terminate TLS close to the user at an edge or <a href="#cdn">CDN</a>. That turns the handshake round trips into short local ones.</p>
+</details>
+
+<h3 id=dd-backofenvelope-math-drills-throughput level=3>Throughput and bandwidth</h3>
+<p><strong>Drill 6: Egress bandwidth.</strong> A product site serves 50 million page views a day. Each page loads about 2 MB of images. How much bandwidth does it need on average and at peak?</p>
+<details>
+<summary>Worked answer</summary>
+<p>5 x 10<sup>7</sup> x 2 x 10<sup>6</sup> bytes = 10<sup>14</sup> bytes = 100 TB a day.</p>
+<p>Per second: 10<sup>14</sup> / 86,400 ≈ 1.16 x 10<sup>9</sup> bytes, about 1.2 GB/s. In bits, multiply by 8: about 9.3 Gbps on average. At 4x peak, about 37 Gbps.</p>
+<p><strong>Decision:</strong> That is several servers' entire network interfaces at peak, all spent on identical bytes. This is what a CDN is for. Image format and size choices also matter: halving image weight halves the bill.</p>
+</details>
+
+<p><strong>Drill 7: Partitions and retention for an event log.</strong> A clickstream produces 50,000 events a second at about 1 KB each. Using a planning figure of 10 MB/s per partition, how many partitions do you need? How much disk does 7 days of retention take with a replication factor of 3?</p>
+<details>
+<summary>Worked answer</summary>
+<p>Ingest: 5 x 10<sup>4</sup> x 10<sup>3</sup> = 5 x 10<sup>7</sup> bytes a second, or 50 MB/s. At 10 MB/s per partition, the floor is 5 partitions. With 2x headroom for peaks and growth, 10. In practice you'd choose more, perhaps 24-48, because partitions also cap consumer parallelism, and adding them later remaps keys.</p>
+<p>Retention: 50 MB/s x 604,800 s ≈ 30 TB per copy. With 3 replicas, about 90 TB. Compression can cut this a lot for text-like events, but how much depends on the data.</p>
+<p><strong>Decision:</strong> Throughput is easy. Storage is the real cost. Consider shorter retention on the log with longer-term copies in object storage (tiered storage), which the cost drill below prices.</p>
+</details>
+
+<p><strong>Drill 8: How many workers.</strong> An image-resize service gets 200 jobs a second. Each takes 400 ms of CPU. How many worker cores are needed if you want to run them at no more than 70% utilization?</p>
+<details>
+<summary>Worked answer</summary>
+<p>By Little's law, busy workers = 200 x 0.4 = 80. At 70% target utilization, 80 / 0.7 ≈ 115 cores.</p>
+<p>Why not run at 100%? Because queueing delay climbs steeply as utilization approaches 100%. At high utilization, a small burst creates a backlog that takes a long time to clear.</p>
+<p><strong>Decision:</strong> About 115 cores, spread over enough machines that losing one doesn't push the rest past 90%. Put a queue in front so bursts wait rather than fail.</p>
+</details>
+
+<p><strong>Drill 9: Draining a backlog.</strong> A consumer group can process 800 messages a second. Messages arrive at 500 a second. The consumers are down for 30 minutes. How long after they recover until the backlog is gone?</p>
+<details>
+<summary>Worked answer</summary>
+<p>Backlog: 500 x 1,800 = 900,000 messages.</p>
+<p>New messages keep arriving at 500 a second during the drain. So only the spare capacity, 800 - 500 = 300 a second, reduces the backlog. 900,000 / 300 = 3,000 seconds, or 50 minutes.</p>
+<p>The common wrong answer is 900,000 / 800 ≈ 19 minutes. It forgets the new arrivals.</p>
+<p><strong>Decision:</strong> A 30-minute outage costs 80 minutes of delay in total. If that's too long, the system needs burst capacity during recovery, such as autoscaling on backlog age, not just enough capacity for steady state.</p>
+</details>
+
+<h3 id=dd-backofenvelope-math-drills-storage level=3>Storage</h3>
+<p><strong>Drill 10: Five years of orders, with the real multipliers.</strong> 10 million orders a day at 1 KB each. Keep 5 years. One primary and two replicas. How much disk?</p>
+<details>
+<summary>Worked answer</summary>
+<p>Raw: 10<sup>7</sup> x 10<sup>3</sup> = 10 GB a day, 3.65 TB a year, about 18 TB over 5 years.</p>
+<p>Now the multipliers. Indexes often add 50-100% of table size, so call it 2x: 36 TB. Three copies: about 110 TB across the cluster. Backups and snapshots add more, kept elsewhere. Then leave 30-50% free space on each disk for growth, maintenance and compaction.</p>
+<p><strong>Decision:</strong> The raw figure (18 TB) suggests one big machine. The real figure (36 TB per node, before free space) suggests archiving orders older than a year or two to cheaper storage, or sharding. The multipliers changed the answer.</p>
+</details>
+
+<p><strong>Drill 11: How long must a short code be?</strong> A URL shortener expects 10 billion links over its life. Codes use 62 characters (a-z, A-Z, 0-9) and are chosen at random. Compare 6 and 7 characters.</p>
+<details>
+<summary>Worked answer</summary>
+<p>62<sup>6</sup> ≈ 5.7 x 10<sup>10</sup>, about 57 billion codes. 62<sup>7</sup> ≈ 3.5 x 10<sup>12</sup>, about 3.5 trillion.</p>
+<p>With 10 billion codes used, a new random 6-character code collides with an existing one with probability 10 / 57 ≈ 18%. So almost one in five creates needs a retry, and it gets worse as the space fills. With 7 characters, the chance is 10 / 3,500 ≈ 0.3%.</p>
+<p><strong>Decision:</strong> 7 characters, with a collision check on insert (a unique constraint is enough). A counter-based scheme could use 6 characters with no collisions, but needs coordination to hand out ranges.</p>
+</details>
+
+<p><strong>Drill 12: Log volume.</strong> 500 servers each write 200 log lines a second at 300 bytes per line. How much log data a day, and for 30 days of retention?</p>
+<details>
+<summary>Worked answer</summary>
+<p>500 x 200 x 300 = 3 x 10<sup>7</sup> bytes a second, or 30 MB/s. Per day: 30 MB/s x 86,400 ≈ 2.6 TB. For 30 days: about 78 TB before compression and before any index the log system builds.</p>
+<p>Logs usually compress well, often by 5-10x, but the search index can add back a large fraction. Check what your log system actually stores.</p>
+<p><strong>Decision:</strong> Logging can cost as much as the product's own database. Sample debug logs, drop health-check noise, and keep detailed logs for days rather than months, with metrics for the long term.</p>
+</details>
+
+<h3 id=dd-backofenvelope-math-drills-memory level=3>Memory and connections</h3>
+<p><strong>Drill 13: Sizing a cache.</strong> You want to cache 20 million user sessions. Each has a 40-byte key and a 400-byte value. How much memory?</p>
+<details>
+<summary>Worked answer</summary>
+<p>Data: 20 x 10<sup>6</sup> x 440 B ≈ 8.8 GB.</p>
+<p>In-memory stores add per-key overhead for pointers, metadata and expiry, often in the range of 50-100 bytes per key. That adds 1-2 GB. Allocator fragmentation can add another 10-50%, depending on the workload. Plan on about 15 GB, and twice that if the cache has a replica.</p>
+<p><strong>Decision:</strong> This fits on one node with room to spare. A small cluster is still worth it for failover, but not for capacity. If values were 4 KB instead, the answer would be closer to 100 GB and you'd be sharding.</p>
+</details>
+
+<p><strong>Drill 14: Database connections.</strong> 300 application instances each keep a connection pool of 20 to one Postgres primary. Is that a problem?</p>
+<details>
+<summary>Worked answer</summary>
+<p>That's 6,000 connections. Postgres uses one backend process per connection. Each takes memory (often several MB, depending on settings and work done), and performance tends to suffer well before thousands of connections are active at once.</p>
+<p>Now apply Little's law to what's actually needed. If the instances send 10,000 queries a second at 2 ms each, only about 20 queries are running at any moment. Six thousand connections are serving twenty queries.</p>
+<p><strong>Decision:</strong> Put a pooler such as PgBouncer between the app and the database, and size the database side for actual concurrency plus headroom (perhaps 50-100 connections). See <a href="#database-connection-pooling">database connection pooling</a>.</p>
+</details>
+
+<p><strong>Drill 15: Long-lived connections.</strong> A chat service expects 2 million concurrent WebSocket connections. Assume about 30 KB of memory per connection on your stack, and that you'll use at most 16 GB per server for connections. How many gateway servers?</p>
+<details>
+<summary>Worked answer</summary>
+<p>Memory: 2 x 10<sup>6</sup> x 30 KB = 60 GB in total. At 16 GB per server, that's 4 servers by memory alone.</p>
+<p>But memory is rarely the only limit. CPU for message traffic, TLS, file-descriptor limits and the blast radius of one server failing all matter. If one server holds 500,000 connections and dies, half a million clients reconnect at once. Many teams cap connections per server well below the memory limit for that reason, say 100,000-200,000, which gives 10-20 servers plus spares.</p>
+<p><strong>Decision:</strong> Size by the strictest of memory, CPU and acceptable reconnect storm, not by memory alone. The 30 KB figure varies widely, so measure it.</p>
+</details>
+
+<h3 id=dd-backofenvelope-math-drills-cost level=3>Cost and availability</h3>
+<p><strong>Drill 16: What retention costs.</strong> Take the 90 TB of event-log storage from Drill 7. Assume block storage at $80 per TB-month and object storage at $20 per TB-month. (These are illustrative; check current prices for your provider and region.) Compare a month of each.</p>
+<details>
+<summary>Worked answer</summary>
+<p>Block storage: 90 x $80 = $7,200 a month. Object storage: a single copy is often enough, because the service replicates internally, so 30 TB x $20 = $600 a month.</p>
+<p><strong>Decision:</strong> Keep a day or two on the brokers' disks for fast replay, and tier the rest to object storage. Then check request and retrieval charges, which can matter for object storage if you replay often.</p>
+</details>
+
+<p><strong>Drill 17: Redundancy and correlated failure.</strong> Two independent replicas each have 99.5% availability. The service is up if either is up. What is its availability? What if both share a single network switch with 99.9% availability?</p>
+<details>
+<summary>Worked answer</summary>
+<p>Independent: both are down at the same time with probability 0.005 x 0.005 = 0.000025. Availability is 99.9975%.</p>
+<p>With the shared switch in series: 0.999975 x 0.999 ≈ 99.897%. The switch dominates. Redundancy multiplied down the replicas' failure rate, but the shared part was left at 0.1%.</p>
+<p><strong>Decision:</strong> Parallel redundancy only helps for failures that are actually independent. Look for shared power, zones, configuration pushes and dependencies. Those set the real ceiling.</p>
+</details>
+
+<h2 id=dd-backofenvelope-math-mistakes level=2>Deep Dive: Common Estimation Mistakes</h2>
+<p>Most bad estimates are wrong in one of a few predictable ways. Each mistake below has a tell you can catch on the whiteboard and a fix that takes seconds.</p>
+
+<h3 id=dd-backofenvelope-math-err-bits level=3>1. Mixing bits and bytes</h3>
+<p><strong>Symptom.</strong> A 10 Gbps link is assumed to carry 10 GB a second. Bandwidth plans come out 8 times too generous.</p>
+<p><strong>Mechanism.</strong> Network speeds are quoted in bits (lower-case b). Storage and payload sizes are quoted in bytes (upper-case B). There are 8 bits in a byte, before protocol overhead.</p>
+<p><strong>How you detect it.</strong> Check the case of every "b" in the units. A network figure in "GB/s" or a file size in "Mb" is suspect.</p>
+<p><strong>Fix.</strong> Convert everything to bytes at the start. 10 Gbps is about 1.25 GB/s raw, and somewhat less after overhead.</p>
+
+<h3 id=dd-backofenvelope-math-err-average level=3>2. Planning for the average</h3>
+<p><strong>Symptom.</strong> The system works on a normal Tuesday and falls over on Black Friday, at the top of the hour, or when a push notification goes out to everyone.</p>
+<p><strong>Mechanism.</strong> Daily averages hide daily cycles, weekly cycles and event spikes. A notification sent to 10 million users can create a minute of traffic far above any daily peak. The ticket-sale example in <a href="#the-five-questions">the five questions</a> deep dive has a peak around 10,000 times its average.</p>
+<p><strong>How you detect it.</strong> Ask "what's the busiest minute this system will ever see, and what causes it?" If the answer is "4x the average," check whether anyone can trigger a synchronized burst.</p>
+<p><strong>Fix.</strong> Derive the peak from the traffic shape where you can (Drill 2). Separately size for known events, and protect the system with <a href="#rate-limiting">rate limiting</a> or queues for the ones you can't afford to size for.</p>
+
+<h3 id=dd-backofenvelope-math-err-multipliers level=3>3. Forgetting the multipliers</h3>
+<p><strong>Symptom.</strong> Storage runs out years ahead of plan. The "1 TB" database uses 6 TB of disk.</p>
+<p><strong>Mechanism.</strong> The raw data size is only one factor. Indexes (often 0.5-1x the table), replicas (2-3x), backups, write-ahead logs, free space for compaction and growth, and per-row storage overhead all stack. Together they easily make 5-10x the raw size.</p>
+<p><strong>How you detect it.</strong> Ask whether the storage estimate is "logical data" or "disk provisioned." If nobody knows, it's logical.</p>
+<p><strong>Fix.</strong> State the multipliers explicitly, as in Drill 10: raw x indexes x copies, plus headroom. Even rough multipliers beat none.</p>
+
+<h3 id=dd-backofenvelope-math-err-mean-latency level=3>4. Using mean latency for user experience</h3>
+<p><strong>Symptom.</strong> The dashboard says average latency is 50 ms. Users complain it's slow.</p>
+<p><strong>Mechanism.</strong> A mean of 50 ms is consistent with 95% of requests at 20 ms and 5% at 600 ms. Users who load a page that makes 20 requests will very likely hit one of the slow ones. And in fan-out systems the tail compounds (Drill 4).</p>
+<p><strong>How you detect it.</strong> Any latency target stated as an average. Any estimate that sums p99s of parallel calls, or averages of sequential ones, and calls it a p99.</p>
+<p><strong>Fix.</strong> Set targets and alerts on percentiles (p50, p99, sometimes p99.9). For fan-out, use 1 - (1 - p)<sup>N</sup> to see how backend tails become request medians.</p>
+
+<h3 id=dd-backofenvelope-math-err-drain level=3>5. Draining backlogs at full capacity</h3>
+<p><strong>Symptom.</strong> The runbook says "the queue will catch up in 20 minutes." It takes an hour.</p>
+<p><strong>Mechanism.</strong> During recovery, new work keeps arriving. Only spare capacity (capacity minus arrival rate) reduces the backlog. If spare capacity is small, drain time is long. If it's zero or negative, the backlog never drains.</p>
+<p><strong>How you detect it.</strong> A drain estimate that divides by total capacity.</p>
+<p><strong>Fix.</strong> Divide by spare capacity, as in Drill 9. Size consumers so that spare capacity at peak is at least a meaningful fraction of the arrival rate, or let them scale up on backlog age.</p>
+
+<h3 id=dd-backofenvelope-math-err-independence level=3>6. Assuming failures are independent</h3>
+<p><strong>Symptom.</strong> The design claims five nines from three replicas at 99% each. It then has a multi-hour outage when a bad config push hits all three.</p>
+<p><strong>Mechanism.</strong> Multiplying failure probabilities is valid only for independent failures. Replicas often share zones, power, network, software versions, configuration and operators. Correlated failures dominate real outage history.</p>
+<p><strong>How you detect it.</strong> Any availability figure above what the shared parts can deliver (Drill 17). Any redundancy claim without a list of what the copies share.</p>
+<p><strong>Fix.</strong> Put shared parts in series in the calculation. Spread copies across failure domains, and roll out changes progressively so one bad push can't hit every copy at once.</p>
+
+<h3 id=dd-backofenvelope-math-err-dau level=3>7. Confusing daily users with concurrent users</h3>
+<p><strong>Symptom.</strong> A 10-million-DAU app is sized for 10 million simultaneous connections, or a load test uses 10 million virtual users.</p>
+<p><strong>Mechanism.</strong> Daily actives spread their sessions over the day. If an average user is active 30 minutes a day, then on average 10<sup>7</sup> x 30 / 1,440 ≈ 210,000 are active at once. That's Little's law again: arrival rate x time in system. Peak concurrency might be 2-3x that, not 50x.</p>
+<p><strong>How you detect it.</strong> A concurrency number equal to a daily count.</p>
+<p><strong>Fix.</strong> Concurrent users = daily users x session length / length of day, then apply a peak factor. If the product keeps an idle connection open all day (chat, for example), concurrency is "users online," which is higher, and needs its own assumption.</p>
+
+<h3 id=dd-backofenvelope-math-err-precision level=3>8. False precision</h3>
+<p><strong>Symptom.</strong> "We need 37.4 TB and 1,183 requests per second." Five minutes go into long multiplication.</p>
+<p><strong>Mechanism.</strong> When each input is uncertain by 2x, the product is uncertain by much more. Extra digits suggest a confidence the inputs don't support. They also slow you down in an interview, where time is the scarce resource.</p>
+<p><strong>How you detect it.</strong> More than two significant figures in any answer that came from guessed inputs.</p>
+<p><strong>Fix.</strong> Round each input to one or two significant figures before multiplying. Quote answers as "about 40 TB." Spend the saved time on which decision the number changes.</p>
+
+<h2 id=dd-backofenvelope-math-approaches level=2>Deep Dive: Estimation Approaches and How to Choose</h2>
+<p>There is more than one way to reach a number, and the best estimates use two of them and compare. If two independent methods agree within a few times, you can trust the order of magnitude.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach<th>How it works<th>Best for<th>Weakness<tbody>
+<tr><td>Top-down (demand)<td>Users x actions x bytes, down to per-second rates<td>Traffic and storage for a new product<td>Each guess about user behaviour can be off by several times
+<tr><td>Bottom-up (capacity)<td>What one node can do, then how many nodes<td>Fleet sizing, cost, "does it fit on one machine?"<td>Needs real per-node numbers; benchmarks rarely match production
+<tr><td>Reference class<td>Compare with a known system of similar shape<td>Sanity checks; when inputs are unknowable<td>Easy to pick a flattering comparison
+<tr><td>Measure and extrapolate<td>Load-test or read production metrics, then scale<td>Existing systems; validating any estimate<td>Extrapolation breaks at nonlinear limits (locks, caches, memory)
+</table></div></div>
+<p>In an interview, top-down is the default. Follow it with a quick bottom-up check: "That's 4,000 requests a second. At a few hundred per core, that's a handful of servers, so compute isn't the hard part." In a real capacity plan, start from measurement and use top-down only for the growth forecast.</p>
+
+<h3 id=dd-backofenvelope-math-choose-metric level=3>Choosing what to measure in the estimate</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Use<th>Not<tbody>
+<tr><td>User-facing latency target<td>p99 (and p99.9 for fan-out)<td>Mean
+<tr><td>Fleet size and cost<td>Peak rate, with utilization headroom<td>Daily average
+<tr><td>Thread pools, connection pools, bulkheads<td>Rate x p99 duration (Little's law at the tail)<td>Rate x mean duration
+<tr><td>Storage provisioning<td>Raw x indexes x copies, plus headroom<td>Raw logical size
+<tr><td>Availability<td>Series for shared parts, parallel only for truly independent ones<td>Parallel for everything
+<tr><td>Backlog recovery<td>Backlog / spare capacity<td>Backlog / total capacity
+</table></div></div>
+<p>The third row deserves a note. Pools sized from mean latency are fine on a good day. During a slowdown, the p99 becomes the typical duration, and the pool runs out. Size pools from the latency you expect during a bad hour, and protect them with <a href="#timeout">timeouts</a> so a stall can't hold them forever.</p>
+
+<h3 id=dd-backofenvelope-math-choose-precision level=3>How precise to be</h3>
+<ul>
+<li><strong>Interview:</strong> one significant figure, powers of ten, spoken assumptions. The goal is the decision, in under two minutes.</li>
+<li><strong>Design document:</strong> two significant figures, assumptions in a table, and a sensitivity note ("if row size is 4 KB instead of 1 KB, storage is 4x and we shard in year one").</li>
+<li><strong>Capacity plan for production:</strong> measured inputs, real percentiles, explicit headroom, and a review date. Estimates become forecasts with error bars.</li>
+</ul>
+
+<h2 id=dd-backofenvelope-math-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<p>Ask these of any estimate in a design document or capacity plan.</p>
+<ol>
+<li>Which decision does this number serve, and what value would change that decision?</li>
+<li>Is every assumption written down with its unit, and is its source stated (measured, guessed, from a reference system)?</li>
+<li>Are network figures in bits and storage in bytes, with conversions shown?</li>
+<li>Is the peak derived from the traffic shape and known events, or just "3-5x"? Can anyone trigger a synchronized burst?</li>
+<li>Does the storage figure include indexes, replicas, backups and free-space headroom?</li>
+<li>Are latency targets percentiles? For fan-out paths, has the 1 - (1 - p)<sup>N</sup> effect been checked?</li>
+<li>Are pools and concurrency limits sized from Little's law using bad-hour latency, not mean latency?</li>
+<li>Do backlog recovery times divide by spare capacity?</li>
+<li>Do availability figures treat shared components as series, and list what redundant copies share?</li>
+<li>Has at least one estimate been cross-checked by a second method (bottom-up or reference class)?</li>
+<li>Which input is least certain, and how and when will it be measured?</li>
+</ol>
+
+<h2 id=dd-backofenvelope-math-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"You estimated 4,000 requests per second. How confident are you, and what would change your design?"</summary>
+<p>Confident to within a few times, not to within 10%, because it rests on a guessed users-times-actions product. What matters is which designs survive the uncertainty. At 1,000 or 15,000 requests a second, the same design (stateless app tier, cache, one primary with replicas) still works, just with a different number of servers. The design would change at around 100x, where writes or data size outgrow one primary. So the decision is robust to the error in the estimate, which is the property you want.</p>
+</details>
+
+<details>
+<summary>"Why do you plan servers to 70% utilization instead of 100%?"</summary>
+<p>Two reasons. First, queueing: as utilization approaches 100%, waiting time grows sharply, so small bursts cause big latency spikes. Second, failure: if one of N servers dies, the others absorb its load. With 10 servers at 70%, losing one puts the rest near 78%. At 95%, losing one overloads everything. The right target depends on burstiness and fleet size, but some headroom is never optional.</p>
+</details>
+
+<details>
+<summary>"Your service has a p99 of 50 ms. A page calls it 20 times in parallel. What's the page's p99?"</summary>
+<p>Much worse than 50 ms. The chance that at least one of 20 calls exceeds 50 ms is 1 - 0.99<sup>20</sup> ≈ 18%. So about one page in five sees a call slower than 50 ms, and the page's p99 sits somewhere deep in the service's tail, perhaps near its p99.95. The fixes are fewer calls (batch them), hedged requests, or a tighter tail on the service.</p>
+</details>
+
+<details>
+<summary>"Estimate how many servers you need for 1 million WebSocket connections."</summary>
+<p>Start with memory: 1 million x an assumed 20-50 KB per connection is 20-50 GB, a handful of servers. Then check the other limits: CPU for the message rate (connections x messages per second), file descriptors and kernel limits, and blast radius. If one server failing must not cause more than, say, 100,000 simultaneous reconnects, that caps you at 100,000 per server: 10 servers, plus spares for a zone failure. State which limit binds, and that the per-connection memory must be measured on the actual stack.</p>
+</details>
+
+<details>
+<summary>"The database is at 60% CPU at peak. Traffic is growing 5% a month. When do you need to act?"</summary>
+<p>5% monthly growth doubles load in about 14 months (the rule of 72: 72 / 5 ≈ 14). From 60%, you reach 80% in about 6 months (since 1.05<sup>6</sup> ≈ 1.34) and 100% in about 10-11 months. Assuming CPU scales linearly with traffic, which it often doesn't near saturation, start the scaling work at around 6 months out. That's now, if the work takes two quarters. Lock contention or cache-miss effects can bring the wall closer than the linear estimate suggests.</p>
+</details>
+
+<details>
+<summary>"Why is going from a 99% to a 90% cache hit ratio so much worse than it sounds?"</summary>
+<p>Because the database sees the misses, not the hits. The miss rate goes from 1% to 10%, which is 10 times the database load. A database sized comfortably for 120 queries a second now receives 1,200. The hit ratio sounds like it dropped by nine points; the backend load went up by 900%. Always convert a hit ratio into backend queries per second before judging it.</p>
+</details>
+
+<details>
+<summary>"How would you sanity-check an estimate that 'one Postgres instance can handle it'?"</summary>
+<p>Cross-check from both sides. Top-down: peak writes and reads per second, data size including indexes, and working set versus RAM. Bottom-up: a benchmark or production metric for this query shape on this instance size. Then look for nonlinear limits the averages hide: hot rows with lock contention, connection count (pool through a pooler), replication lag under write bursts, and vacuum or compaction keeping up. If the peak is within half of measured capacity and the working set fits in memory, it's a reasonable claim.</p>
+</details>
+
+<details>
+<summary>"What's the one estimate you'd never skip in a design review?"</summary>
+<p>Little's law on every pool and queue: concurrency = rate x duration, using the duration during a bad hour. It's the estimate that predicts the most outages. A thread pool sized for 100 ms calls fails when the dependency slows to 2 seconds, because 20 times the threads are suddenly needed. Doing that one multiplication for each pool tells you which timeout, bulkhead or circuit breaker is missing.</p>
+</details>

@@ -1,0 +1,215 @@
+<h2 id=dd-capstone-the-zerodowntime-migration-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The capstone's five stages are the right plan. A review panel will accept the plan in five minutes and then spend an hour on what each stage does inside the database. This section uses Postgres, since its behaviour is well documented, and walks the stages at that level. MySQL has equivalents for most of it, and the differences are noted where they matter.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-expand-locks level=3>Stage 1: the cheap ALTER and the lock queue behind it</h3>
+<p><code>ALTER TABLE orders ADD COLUMN total_cents BIGINT NULL</code> is a metadata-only change in Postgres. No rows are rewritten, and it finishes in milliseconds. That is why the lesson can call it free.</p>
+<p>The trap is the lock. Every <code>ALTER TABLE</code> of this kind needs an <code>ACCESS EXCLUSIVE</code> lock, if only for a moment. If a long-running query holds even a weak lock on <code>orders</code> (a 40-minute analytics query, say), the ALTER waits. And while it waits, every new query on <code>orders</code> queues <em>behind the ALTER</em>, because Postgres grants locks in order. Reads and writes stop. At 400 writes a second, the connection pool is exhausted in seconds. A millisecond change has caused an outage.</p>
+<p>The defence is two settings and a retry loop:</p>
+<pre><code>SET lock_timeout = '2s';           -- give up quickly instead of blocking everyone
+SET statement_timeout = '15s';
+ALTER TABLE orders ADD COLUMN total_cents BIGINT NULL;
+-- on lock_timeout: wait a few seconds, retry, up to N times, then page a human</code></pre>
+<p>The migration tool should do this for every DDL statement, not just the scary ones. This is the "unexpected locks" the lesson mentions, and it is the most common way a "change that changes nothing" pages someone.</p>
+<p>Notice what Stage 1 deliberately avoids. <code>ALTER TABLE orders ALTER COLUMN total TYPE BIGINT USING round(total*100)</code> would do the whole migration in one statement. It also rewrites all 200 million rows while holding <code>ACCESS EXCLUSIVE</code> the whole time. That is the maintenance window the brief says does not exist.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-rounding level=3>The rounding question nobody asks until Stage 3</h3>
+<p>"Set <code>total_cents = round(total × 100)</code>" sounds like one rule. In practice it is three, and they disagree.</p>
+<ul>
+<li><strong>Floating-point input.</strong> <code>total</code> is a binary float, so the value stored for 1.005 is slightly below 1.005. Multiply by 100 and you get 100.49999999999999, which rounds to 100, not 101. The stored float already lost the half-cent.</li>
+<li><strong>Tie rules.</strong> Postgres rounds <code>numeric</code> ties away from zero, but its <code>round(double precision)</code> follows the platform, which is usually round-half-to-even. Python's <code>round()</code> is half-to-even. Java's <code>Math.round</code> rounds half up. A value like 0.125, which is exact in binary, becomes 12.5 cents, and then 12 or 13 depending on who rounded it.</li>
+<li><strong>Two writers.</strong> The backfill runs in SQL. The dual-write runs in application code. If they use different rules, the comparison job in Stage 3 will find mismatches that are not bugs in either path, only disagreements between them.</li>
+</ul>
+<p>So the migration needs a written rounding rule before Stage 2, and both writers must implement it identically. The safest version converts through decimal first: <code>round(total::numeric * 100)</code> in SQL, and <code>Decimal(repr(total)) * 100</code> quantised with the same tie rule in Python. Then ask the harder question, which is a finance question: is <code>round(total × 100)</code> even the right value? The column is being replaced <em>because</em> it drifted from the payment provider's records. For orders where provider data exists, the provider's amount in cents may be the truth, and <code>total</code> is the suspect.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-backfill level=3>Stage 2: a backfill that is safe against concurrent writes</h3>
+<p>The backfill walks the table in primary-key order, one batch per transaction:</p>
+<pre><code>UPDATE orders
+SET    total_cents = round(total::numeric * 100)::bigint
+WHERE  id &gt; $last_id AND id &lt;= $last_id + 5000
+  AND  total_cents IS NULL;
+-- save $last_id + 5000 to the checkpoint table, commit, sleep per throttle</code></pre>
+<p>The detail that makes this safe is that the new value is computed <em>inside</em> the UPDATE, from the row's own <code>total</code>. If the application updates an order while the batch is running, Postgres' row locking makes one of them wait. Under the default READ COMMITTED isolation, the backfill then re-checks the updated row and recomputes from the new <code>total</code>. The <code>IS NULL</code> guard means rows the dual-write already set are skipped.</p>
+<p>Compare the tempting alternative: an application job that SELECTs a batch, computes cents in Python, and writes them back. Between the read and the write, a customer's order total can change and the dual-write can set the new cents. The job then overwrites it with cents computed from the old total. That is a lost update, and it produces exactly the kind of mismatch Stage 3 is designed to find. Keep the computation in the statement.</p>
+<p>Two more details. Keyset batches (<code>id &gt; $last_id</code>) stay fast across the whole table, while <code>OFFSET</code> pagination gets slower with every batch. And each batch should be small enough to hold row locks for well under a second, so it never makes a customer's checkout wait noticeably.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-dualwrite level=3>Dual-write here is atomic, and that is a gift</h3>
+<p>Both columns are in the same row of the same table, so the dual-write is one <code>INSERT</code> or <code>UPDATE</code> that sets both. It succeeds or fails as a unit. There is no window where <code>total</code> is written and <code>total_cents</code> is not.</p>
+<p>This is worth saying out loud in the review, because it is the reason this capstone's dual-write is safe at all. The general dual-write problem, writing to two different systems, has no such guarantee. If the new form lived in a different table in another database, or in a new service, the dual-write would need an outbox or change data capture, as the webhooks and event-driven lessons explain. The "Evolution path" below comes back to this.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-constraints level=3>Tightening the new column without a table scan under lock</h3>
+<p>Once every row has a value, the new column should become <code>NOT NULL</code>. The obvious <code>ALTER TABLE orders ALTER COLUMN total_cents SET NOT NULL</code> scans all 200 million rows while holding <code>ACCESS EXCLUSIVE</code>. The safe sequence takes three steps:</p>
+<pre><code>ALTER TABLE orders ADD CONSTRAINT total_cents_not_null
+  CHECK (total_cents IS NOT NULL) NOT VALID;          -- instant, enforced for new writes
+ALTER TABLE orders VALIDATE CONSTRAINT total_cents_not_null;
+  -- scans, but under a lock that still allows reads and writes
+ALTER TABLE orders ALTER COLUMN total_cents SET NOT NULL;
+  -- Postgres 12+ uses the validated CHECK and skips the scan
+ALTER TABLE orders DROP CONSTRAINT total_cents_not_null;</code></pre>
+<p>The <code>NOT VALID</code> check also works as a tripwire. Any old code path that inserts an order without setting <code>total_cents</code> now fails loudly. Whether that is what you want depends on stage: before the comparison job has found every old writer, a loud failure on a checkout path is an outage. Add it once the comparison count is zero, not before.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-contract-mech level=3>Stage 5: what dropping a column actually breaks</h3>
+<p><code>ALTER TABLE orders DROP COLUMN total</code> is also metadata-only in Postgres. The column is marked dropped, and its space is reclaimed later as rows are rewritten. The database side is easy. The application side is where drops go wrong:</p>
+<ul>
+<li><strong>ORMs that list every column.</strong> A model that still declares <code>total</code> will generate <code>INSERT</code> and <code>SELECT</code> statements naming it. Those fail the moment the column is gone. Before the drop, deploy code that tells the ORM to ignore the column (Rails has <code>ignored_columns</code>; other ORMs have equivalents), and let it run everywhere.</li>
+<li><strong>Cached prepared statements.</strong> A server-side prepared <code>SELECT * FROM orders</code> has a fixed result shape. After the drop, Postgres can reject it with "cached plan must not change result type." Drivers that auto-prepare repeated queries hit this even if your code never says <code>PREPARE</code>.</li>
+<li><strong>Consumers you did not know about.</strong> A finance export, a BI tool's saved query, a CDC consumer whose schema mapping lists <code>total</code>. The tracing lesson's dependency map helps with services. Query logs and <code>pg_stat_statements</code> help with everything else.</li>
+</ul>
+
+<h2 id=dd-capstone-the-zerodowntime-migration-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>A review panel will ask "how long, and what does it cost the database?" These numbers use stated assumptions: 200 million rows, about 200 bytes per row, six indexes on <code>orders</code>, 400 production writes a second, one primary with two streaming replicas, and twelve consumers, several fed by change data capture.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-sizing-rate level=3>Backfill rate: set by the slowest downstream, not by the primary</h3>
+<p>The primary can probably update 20,000 rows a second in batches. That is not the limit. Every backfilled row is an <code>UPDATE</code>, and every update goes everywhere a normal write goes: the WAL, both replicas, and every CDC consumer.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Backfill rate</th><th>Time for 200M rows</th><th>Row changes vs production (400/s)</th><th>What it risks</th></tr></thead><tbody>
+<tr><td>20,000 rows/s</td><td>2.8 h</td><td>50×</td><td>Replica lag in minutes, CDC consumers hours behind, WAL disk pressure</td></tr>
+<tr><td>5,000 rows/s</td><td>11 h</td><td>12.5×</td><td>Likely too fast for consumers sized for peak plus 2× headroom</td></tr>
+<tr><td>2,000 rows/s</td><td>28 h</td><td>5×</td><td>Manageable if consumers have the headroom; check</td></tr>
+<tr><td>1,000 rows/s</td><td>2.3 days</td><td>2.5×</td><td>Safe for most setups</td></tr>
+</tbody></table></div></div>
+<p>Take a CQRS projection sized for 800 events a second (twice production). At a 2,000 rows/s backfill it receives 2,400 a second and falls behind by 1,600 a second. After one hour it is 5.8 million events behind. After the full 28 hours it is days behind, and the read side it feeds is stale for everyone. That is a user-visible incident caused by a step the lesson calls invisible.</p>
+<p>So the throttle should be adaptive. Measure replica lag and the lag of each CDC consumer, and slow the backfill when any of them crosses a budget (say 5 seconds for replicas and 60 seconds for consumers). Pause entirely during the daily peak. Two to three days for the backfill is a perfectly good answer. If CDC consumers can recognise backfill updates, for example because the only changed column is <code>total_cents</code>, they can skip the work quickly, which raises the safe rate.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-sizing-wal level=3>WAL, bloat and vacuum</h3>
+<p>Postgres never updates a row in place. Each backfilled row writes a new row version and leaves a dead one. With the default fill factor of 100, pages are usually full, so most new versions land on other pages and every index gets a new entry too. That is seven writes per row (heap plus six indexes), before full-page images after each checkpoint.</p>
+<p>Rough WAL volume is therefore on the order of the table's size or more: the 40 GB table could easily generate 50 to 100 GB of WAL over the backfill. Treat that figure as an estimate to check on a staging copy, not a promise. The practical consequences:</p>
+<ul>
+<li><strong>WAL disk and archiving.</strong> Backups and point-in-time recovery archive every byte. Check the archive's throughput and storage at the backfill rate.</li>
+<li><strong>Replication slots.</strong> A CDC consumer that falls behind holds WAL on the primary through its slot. A slow consumer plus a fast backfill can fill the primary's disk. Alert on slot lag in bytes.</li>
+<li><strong>Bloat.</strong> 200 million dead row versions is roughly another table's worth of dead space until vacuum reclaims it. Throttled batches give autovacuum time to keep up. Watch dead-tuple counts and run a manual <code>VACUUM</code> between large chunks if needed.</li>
+</ul>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-sizing-verify level=3>Verification cost</h3>
+<p>A full comparison pass reads 200 million rows. At a scan rate of 50,000 rows a second on a replica, that is about 67 minutes per pass. Run full passes daily on a replica, and incremental passes every few minutes over rows whose <code>updated_at</code> is recent.</p>
+<p>Running on a replica creates false positives: the replica may have the new <code>total</code> but not yet the new <code>total_cents</code> if they arrived in different transactions. (In this migration they do not, because the dual-write sets both in one statement. But the backfill sets <code>total_cents</code> later than the original <code>total</code>.) The rule is simple: re-check every mismatch on the primary before counting it. Only confirmed mismatches go on the dashboard.</p>
+<p>Shadow reads are cheap here, because both values are already in the same row the read fetched. The cost is computing the comparison and logging mismatches, which is negligible. They can run on 100% of reads.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-sizing-calendar level=3>The calendar</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Week</th><th>Work</th><th>Gate to move on</th></tr></thead><tbody>
+<tr><td>1</td><td>Expand; deploy dual-write dark; agree the rounding rule</td><td>Golden signals unchanged; rounding rule signed off</td></tr>
+<tr><td>1 to 2</td><td>Flip dual-write; backfill over 2 to 3 days, throttled</td><td>Backfill complete; consumer and replica lag back to normal</td></tr>
+<tr><td>2 to 4</td><td>Comparison job and shadow reads; fix old writers; re-backfill</td><td>Confirmed mismatches at zero for 7 days</td></tr>
+<tr><td>4 to 5</td><td>Read ramp: internal, 1%, 10%, 100%</td><td>Business metrics flat at each step</td></tr>
+<tr><td>5 to 9</td><td>Run on cents with dual-write still on; migrate the twelve consumers</td><td>Every consumer confirmed; finance sign-off</td></tr>
+<tr><td>9</td><td>Stop writing <code>total</code></td><td>The one-way door</td></tr>
+<tr><td>11 to 13</td><td>Ignore column in code; snapshot; drop; delete flags and dead code</td><td>No query touches <code>total</code> for two weeks</td></tr>
+</tbody></table></div></div>
+<p>About three months, for one column. The panel will ask whether that is reasonable. It is, because most of that time is waiting with a free undo button. The engineering effort is a few weeks; the calendar is the cost of keeping rollback cheap until the evidence is in.</p>
+
+<h2 id=dd-capstone-the-zerodowntime-migration-failure-drills level=2>Deep Dive: Failure Drills</h2>
+<p>A good review runs drills: "it is Tuesday of week 2, this happens, what do you do?" For each, the answer should name the signal that fires and the undo button from the capstone's debrief table.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-fm-lockqueue level=3>1. The ALTER freezes checkout for 40 seconds</h3>
+<p><strong>Signal.</strong> Connection pool saturation on every orders service, p99 latency spikes, then a burst of timeouts. <code>pg_stat_activity</code> shows dozens of sessions waiting on a lock, all behind the ALTER, which itself waits behind one long analytics query.</p>
+<p><strong>Mechanism.</strong> The lock queue described in Stage 1. The migration tool did not set <code>lock_timeout</code>.</p>
+<p><strong>Response.</strong> Cancel the ALTER (<code>pg_cancel_backend</code>); the queue drains at once. Re-run with <code>lock_timeout</code> and retries. Long-term: every migration sets a lock timeout by default, and analytics queries run on a replica.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-fm-consumer level=3>2. The backfill makes the order-history page stale</h3>
+<p><strong>Signal.</strong> Customer reports that new orders are missing from "My orders." The CQRS projection's consumer lag is at 3 million events and rising.</p>
+<p><strong>Mechanism.</strong> The backfill's updates flow through CDC to the projection at five times its normal rate.</p>
+<p><strong>Response.</strong> Pause the backfill. It is checkpointed, so it resumes where it stopped. Let the projection catch up, then restart at a rate tied to consumer lag. Undo cost: zero. Lesson: the backfill's throttle needs every downstream's lag as an input, not just the primary's load.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-fm-rounding level=3>3. The comparison job finds 40,000 mismatches of exactly one cent</h3>
+<p><strong>Signal.</strong> The mismatch count is large, stable, and every difference is ±1 cent. The mismatched rows cluster on totals with a third decimal place, often from tax calculations.</p>
+<p><strong>Mechanism.</strong> The backfill rounded in SQL, the dual-write rounded in Python, and their tie rules differ.</p>
+<p><strong>Response.</strong> Nothing user-facing has changed, because reads still use <code>total</code>. Pick one rounding rule, fix the writer that disagrees, and re-run the backfill for those rows with the <code>IS NULL</code> guard removed for that range. This is the drill that justifies Stage 3: without it, 40,000 orders would have silently changed by a cent at read-switch time.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-fm-oldpath level=3>4. Rows keep appearing with total_cents NULL</h3>
+<p><strong>Signal.</strong> After the backfill, a small trickle of new rows (a few hundred a day) has <code>total_cents IS NULL</code>.</p>
+<p><strong>Mechanism.</strong> The lesson's "one old path": here, a nightly job for manual refunds that inserts orders with raw SQL, bypassing the code with the dual-write flag.</p>
+<p><strong>Response.</strong> Find the writer. <code>pg_stat_statements</code> lists every statement shape touching <code>orders</code>; the <code>application_name</code> on the session names the client. Fix the job, re-backfill its rows. Then add the <code>NOT VALID</code> check constraint, so any further unknown writer fails loudly instead of silently. A database trigger that fills <code>total_cents</code> would have caught this path automatically, which is the strongest argument for the trigger option below.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-fm-rampback level=3>5. At 10% of reads, disputes on refunds rise</h3>
+<p><strong>Signal.</strong> The read ramp's business gate shows refund disputes in the canary group at twice baseline. Errors and latency are flat.</p>
+<p><strong>Mechanism.</strong> The refund service computes partial refunds as a fraction of the total. With cents it truncates instead of rounding, so customers get one cent less. The data is right; one consumer's arithmetic is wrong.</p>
+<p><strong>Response.</strong> Flip the read flag back to 0%. Because dual-write is still on, <code>total</code> is current and the flip is safe. Fix the refund arithmetic, add a test, ramp again. This is the drill that shows why Stage 5a waits for every consumer to be confirmed, not just for the column to be correct.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-fm-afterdoor level=3>6. A bug is found two days after old writes stopped</h3>
+<p><strong>Signal.</strong> A reporting consumer, missed by the inventory, still reads <code>total</code>. Its revenue report has been flat for two days because <code>total</code> stopped changing.</p>
+<p><strong>Mechanism.</strong> The one-way door was entered with an incomplete consumer list.</p>
+<p><strong>Response.</strong> Roll forward, as the lesson says. Do not turn dual-write back on as a rollback: that would only fix new rows. Two days of rows would have a stale <code>total</code>, and any consumer reading it would see a mix. Instead, migrate the report to <code>total_cents</code> and re-run it for the two days. If a rollback were truly needed, it would mean a reverse backfill of <code>total</code> from <code>total_cents</code> for every row changed since the flip: a project, not a button. Name that in the runbook before the door, so nobody improvises it under pressure.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-fm-drop level=3>7. The drop breaks a service that never reads the column</h3>
+<p><strong>Signal.</strong> Seconds after <code>DROP COLUMN</code>, one service logs "cached plan must not change result type" on every request.</p>
+<p><strong>Mechanism.</strong> The service used <code>SELECT * FROM orders</code> through a driver that prepares repeated statements on the server. The result shape changed under it.</p>
+<p><strong>Response.</strong> Restarting the service's pods clears the cached plans and fixes it. Before the next drop, grep for <code>SELECT *</code> on the table, and check that drivers or poolers handle plan invalidation. There is no undo for the drop itself short of restoring from the snapshot, which is why the drop is last and the code changes come first.</p>
+
+<h2 id=dd-capstone-the-zerodowntime-migration-variations level=2>Deep Dive: Design Variations and the Panel's Debates</h2>
+<p>The capstone picks one route: application dual-write behind a flag. There are others, and the panel will want to know why this one.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach</th><th>How it keeps the new column current</th><th>Strength</th><th>Weakness</th></tr></thead><tbody>
+<tr><td>In-place <code>ALTER COLUMN TYPE</code></td><td>Rewrites every row in one statement</td><td>One step, no dual state</td><td>Holds an exclusive lock for the whole rewrite. Needs the window the brief forbids.</td></tr>
+<tr><td>Application dual-write behind a flag (the capstone)</td><td>Application sets both columns</td><td>Flaggable, observable, testable in code review; undo is a flip</td><td>Misses writers that bypass the code, such as old jobs, scripts and manual SQL</td></tr>
+<tr><td>Database trigger</td><td>A <code>BEFORE INSERT OR UPDATE</code> trigger computes cents</td><td>Catches every writer, including ones you do not know about</td><td>Logic hidden in the database; harder to flag per request; adds write latency; must be dropped carefully at contract time</td></tr>
+<tr><td>Stored generated column</td><td><code>GENERATED ALWAYS AS (...) STORED</code></td><td>No application change</td><td>Adding one rewrites the table under lock in Postgres, and the column can never be written directly, so it cannot become the new source of truth</td></tr>
+<tr><td>Shadow table and swap (pt-online-schema-change, gh-ost, pg-osc)</td><td>Copies into a new table kept in sync by triggers or the binlog, then renames</td><td>Tool-managed; handles changes that cannot be expanded in place</td><td>Doubles storage during the copy; the cut-over rename needs a brief lock; less control over the read ramp</td></tr>
+<tr><td>CDC into a new store</td><td>A change stream feeds a new table or service</td><td>Works across databases and services</td><td>Eventually consistent; the new side lags; shadow reads must tolerate it</td></tr>
+</tbody></table></div></div>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-debate-trigger level=3>Debate 1: trigger or application dual-write?</h3>
+<p>The trigger's case is strong in this exact capstone. The Stage 3 surprise was "an old code path that writes orders without the dual-write flag." A trigger would have covered it from the first second. The application's case is control: the flag can turn dual-write off in 30 seconds if it causes latency, and the logic sits in reviewed, tested code.</p>
+<p>A good compromise uses both, briefly. The application dual-writes behind the flag. A trigger fills <code>total_cents</code> only when it arrives NULL, and increments a counter every time it fires. The counter is the inventory of unknown writers. When it has read zero for a week, drop the trigger. You get the trigger's coverage and the application's control, and the trigger becomes a detector rather than a hidden piece of business logic.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-debate-bigint level=3>Debate 2: INTEGER or BIGINT?</h3>
+<p>Finance asked for <code>INTEGER</code>. The capstone uses <code>BIGINT</code>. A 32-bit signed integer tops out at 2,147,483,647 cents, which is $21.4 million. No single bookstore order gets near that, so <code>INTEGER</code> is safe for one order's total.</p>
+<p>The trouble is everywhere else the value goes. Sums of totals in reports, in a CQRS projection, in a downstream language with 32-bit ints, can overflow quietly. Postgres' own <code>SUM</code> over an integer column returns a bigint, but not every consumer is Postgres. <code>BIGINT</code> costs 4 more bytes per row, about 800 MB on 200 million rows before alignment, which often absorbs some of it. Most panels take the 800 MB to never have this conversation again. Whatever you choose, write it in the consumer contract.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-debate-truth level=3>Debate 3: what does "verified" mean?</h3>
+<p>The comparison job proves that <code>total_cents</code> equals <code>round(total × 100)</code>. It does not prove that either is right. The audit that started all this found <code>total</code> drifting from the payment provider. A stronger verification adds a third check: for each order with a provider record, compare <code>total_cents</code> with the provider's captured amount. Mismatches there are not migration bugs. They are the original data defect, and finance has to decide which side to trust for each class of difference.</p>
+<p>The panel point: separate "the migration preserved the data" from "the data is correct." The migration can be signed off on the first. The second is a data-repair project that the migration makes possible, because integer cents can finally be compared exactly.</p>
+
+<h3 id=dd-capstone-the-zerodowntime-migration-evolution level=3>Evolution path: when the new form lives somewhere else</h3>
+<p>This capstone is the easy case: same row, same database, atomic dual-write. The same five stages scale up, but each gets harder.</p>
+<ul>
+<li><strong>New table, same database.</strong> Dual-write is still atomic if both writes share a transaction. The backfill becomes <code>INSERT ... SELECT</code> in batches. Shadow reads now cost a second lookup.</li>
+<li><strong>New database or new service.</strong> Dual-write is no longer atomic. Use an outbox or CDC so the new side is fed from the old side's committed changes, and accept that the new side lags. Shadow reads must allow for that lag, as the capstone's multi-region extension anticipates. Ramp reads only for data older than the measured lag, or read-your-writes from the old side.</li>
+<li><strong>Event formats.</strong> The capstone's "queue-format" extension maps cleanly: publish both formats (dual-write), compare consumers' results on both (shadow read), move consumers one at a time behind flags (switch reads), stop publishing the old format after every consumer is confirmed (contract). The schema registry's compatibility rules enforce the expand step.</li>
+</ul>
+<p>In every version, the undo column from the capstone's debrief is the design tool. Write it before you write code. If a stage has no undo button, either redesign it or move it to the end and put gates in front of it.</p>
+
+<h2 id=dd-capstone-the-zerodowntime-migration-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Does every DDL statement run with a <code>lock_timeout</code> and retry, and are long-running queries kept off the primary during it?</li>
+<li>What is the written rounding rule, and do the backfill and the dual-write implement it identically? Who in finance signed it?</li>
+<li>Does the backfill compute new values inside the UPDATE statement, use keyset batches, checkpoint its progress, and skip rows already written?</li>
+<li>What sets the backfill rate: replica lag, CDC consumer lag, WAL disk and archive throughput? Is the throttle adaptive and paused at peak?</li>
+<li>How will you find every writer that bypasses the dual-write flag: a counting trigger, <code>pg_stat_statements</code>, a <code>NOT VALID</code> constraint?</li>
+<li>Does the comparison job re-check mismatches on the primary before counting them, and what count, for how long, gates Stage 4?</li>
+<li>Which business metrics gate each step of the read ramp, and does the group have enough orders at each step to see a one-cent change in disputes?</li>
+<li>Is there a complete list of the twelve consumers, plus a query-log check for unlisted ones, with an owner confirming each migration?</li>
+<li>What exactly gates the one-way door at Stage 5a, and what does the runbook say to do for a bug found after it?</li>
+<li>Before the drop: is the column ignored in every ORM, are <code>SELECT *</code> queries gone, and is the snapshot's retention documented?</li>
+<li>Who deletes both migration flags, the trigger if any, and the dead code paths, and when?</li>
+</ol>
+
+<h2 id=dd-capstone-the-zerodowntime-migration-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Adding a nullable column is instant in Postgres. Why can it still cause an outage?"</summary>
+<p>Because it still needs a brief <code>ACCESS EXCLUSIVE</code> lock. If any long transaction holds a lock on the table, the ALTER waits, and every new query queues behind the ALTER. At 400 writes a second, the pools fill in seconds. Set a short <code>lock_timeout</code> so the ALTER gives up and retries instead of blocking everyone, and keep long queries off the primary.</p>
+</details>
+<details>
+<summary>"Your backfill reads rows in Python, computes cents and writes them back. What's wrong?"</summary>
+<p>A lost update. Between the read and the write, the application can change the order's total and dual-write new cents. The backfill then overwrites them with cents from the old total. Compute the value inside the UPDATE from the row's own column, so the database's row locking and re-check on concurrent update keep it consistent, and guard with <code>total_cents IS NULL</code>.</p>
+</details>
+<details>
+<summary>"Why can the backfill not just run as fast as the database allows?"</summary>
+<p>Every backfilled row is a real update. It goes to the WAL, to every replica and to every CDC consumer. A rate the primary handles easily can put replicas minutes behind and leave a projection days behind, which users see as stale pages. The safe rate is set by the slowest downstream's headroom, so the throttle should watch replica and consumer lag, not just primary CPU.</p>
+</details>
+<details>
+<summary>"Stage 4's rollback is a flag flip. Why is that safe here when the blue-green lesson's rollback broke things?"</summary>
+<p>Because dual-write is still on. The old column receives every write in its old form, so the old read path finds current, correctly shaped data. In the blue-green failure, the new version had written data the old version could not read. The safety comes from the order of stages: reads move only while writes still go to both shapes.</p>
+</details>
+<details>
+<summary>"The comparison job reports thousands of one-cent mismatches. Is the migration broken?"</summary>
+<p>Probably not; it is probably working. One-cent differences clustered on values with three decimals point at two writers using different rounding or tie rules, such as SQL versus Python. Nothing user-facing changed, because reads still use the old column. Agree one rule, fix the writer that differs, re-backfill those rows. This is exactly what Stage 3 exists to catch.</p>
+</details>
+<details>
+<summary>"Would you use a trigger instead of application dual-write?"</summary>
+<p>I would use both, briefly. The application dual-write gives a flag and reviewed code. A trigger that only fills NULLs, and counts how often it fires, catches writers that bypass the application and tells you how many there are. When the counter stays at zero for a week, drop the trigger. Pure trigger dual-write works too, but its logic is harder to see and harder to switch off fast.</p>
+</details>
+<details>
+<summary>"What changes if total_cents lives in a new payments service instead of the same table?"</summary>
+<p>Dual-write stops being atomic, because two systems cannot commit together cheaply. Feed the new service from the old database's committed changes through an outbox or CDC. The new side is then eventually consistent, so the comparison job and shadow reads must allow for its lag, and the read ramp must handle read-your-writes. The stages stay the same; each one needs a lag budget.</p>
+</details>
+<details>
+<summary>"After old writes stop, a missed consumer turns up. Why not just turn dual-write back on?"</summary>
+<p>Because it only fixes rows written from now on. Every row changed since the flip has a stale old column, and turning dual-write back on would leave a mix of fresh and stale values with nothing to tell them apart. The honest options are roll forward (migrate the consumer and re-run its output) or a reverse backfill of the old column, which is a project. That is why the gate before the flip demands a confirmed consumer list.</p>
+</details>

@@ -1,0 +1,197 @@
+<h2 id=dd-backend-for-frontend-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson draws a BFF as a box that turns six phone calls into one. Inside that box are a few decisions that decide whether the screen is fast and reliable or merely fast on a good day. How does it fan out, and what does it do when one of the six is slow? How does it carry the user's identity to the services? What does it cache, and for whom? How does it cope with app versions that are two years old? This section takes the bookstore's mobile product screen and answers each.</p>
+
+<h3 id=dd-backend-for-frontend-call-graph level=3>The screen as a call graph, not a list</h3>
+<p>Six calls are rarely six independent calls. For the product screen they look like this:</p>
+<ul>
+<li><code>catalog.getProduct(id)</code> returns the product, including its <code>author_id</code> and <code>series_id</code>.</li>
+<li><code>pricing.getPrice(id, user)</code>, <code>inventory.getStock(id, store)</code> and <code>reviews.getSummary(id)</code> need only the product ID, so they can start at once.</li>
+<li><code>authors.get(author_id)</code> and <code>recs.forProduct(id, user)</code> need fields from the catalog response, so they wait for it.</li>
+</ul>
+<p>So the graph has two levels. The BFF's latency is the catalog call plus the slowest of its dependents, running alongside the slowest of the independent calls. Write the graph down for each screen. It tells you the critical path, and it shows when a dependent call could be removed by having the client pass the ID it already knows (the phone came from a list that already had <code>author_id</code>).</p>
+
+<h3 id=dd-backend-for-frontend-deadlines level=3>Deadlines and partial responses</h3>
+<p>The hard part of fan-out is not parallelism. It is deciding what happens when one call is slow. The BFF needs three rules per screen:</p>
+<ol>
+<li><strong>A screen deadline.</strong> The total time the BFF will spend, for example 300 ms for the product screen. Pass the remaining budget to each service call (as a gRPC deadline or a header) so services stop working on abandoned requests.</li>
+<li><strong>Required versus optional parts.</strong> Product and price are required: without them the screen is useless, so the BFF returns an error. Reviews, recommendations and author bio are optional: on timeout or error, the BFF omits them and marks them as missing.</li>
+<li><strong>Per-call timeouts shorter than the deadline.</strong> Optional calls get a tight timeout (say 120 ms). Required calls get most of the budget.</li>
+</ol>
+<p>The response contract must make missing parts explicit, so the app can show a placeholder instead of crashing. A common shape is <code>{"product": {...}, "reviews": null, "_partial": ["reviews"]}</code>. Agree on it with the client team; it is the most important line in the BFF's API.</p>
+<p>A minimal version in Python's standard library, using <code>asyncio</code>:</p>
+<pre><code>import asyncio
+
+SCREEN_DEADLINE = 0.300          # seconds for the whole screen
+OPTIONAL_TIMEOUT = 0.120         # per optional call
+
+async def call(fn, *args, timeout):
+    try:
+        return await asyncio.wait_for(fn(*args), timeout)
+    except Exception:            # timeout, connection error, 5xx
+        return None
+
+async def product_screen(svc, product_id, user):
+    loop = asyncio.get_running_loop()
+    end = loop.time() + SCREEN_DEADLINE
+    left = lambda: max(0.0, end - loop.time())
+
+    # Level 1: start everything that needs only the product ID.
+    product_t = asyncio.create_task(svc.catalog(product_id))
+    price_t   = asyncio.create_task(svc.pricing(product_id, user))
+    stock_t   = asyncio.create_task(call(svc.inventory, product_id, timeout=OPTIONAL_TIMEOUT))
+    reviews_t = asyncio.create_task(call(svc.reviews, product_id, timeout=OPTIONAL_TIMEOUT))
+
+    # Required: fail the screen if these miss the deadline.
+    product = await asyncio.wait_for(product_t, left())
+
+    # Level 2: calls that need fields from the product.
+    author_t = asyncio.create_task(call(svc.authors, product["author_id"],
+                                        timeout=min(OPTIONAL_TIMEOUT, left())))
+    price = await asyncio.wait_for(price_t, left())
+
+    stock, reviews, author = await asyncio.gather(stock_t, reviews_t, author_t)
+    parts = {"stock": stock, "reviews": reviews, "author": author}
+    return {
+        "title": product["title"], "cover": product["cover_url"],
+        "price": price["display"],          # official total from pricing, not computed here
+        **{k: v for k, v in parts.items()},
+        "_partial": [k for k, v in parts.items() if v is None],
+    }</code></pre>
+<p>Notice the price line. The BFF displays the price the pricing service computed. It does not apply a discount itself, which is the lesson's Q3 incident.</p>
+
+<h3 id=dd-backend-for-frontend-batching level=3>Batching: the N+1 problem moves to the BFF</h3>
+<p>A list screen is where BFFs quietly get slow. The "Bestsellers" screen shows 30 books, and for each one the BFF needs a price and a stock badge. Written naively, that is 1 catalog call plus 30 pricing calls plus 30 inventory calls, which is the GraphQL N+1 problem from the lesson, now in your BFF.</p>
+<p>Two fixes, used together. First, services offer batch endpoints: <code>pricing.getPrices(ids=[...])</code>. Second, the BFF uses a per-request loader that collects IDs requested in one tick of the event loop and sends one batch call, the pattern popularised by DataLoader. The loader also deduplicates: if two parts of the screen ask for the same author, it is fetched once per request. Keep the loader's cache scoped to a single request. A loader cache shared between users is a personal-data leak waiting to happen.</p>
+
+<h3 id=dd-backend-for-frontend-identity level=3>Identity: the BFF acts for the user, not as itself</h3>
+<p>The BFF calls services on behalf of a user, so services must still see the user. There are two patterns, and only one is safe.</p>
+<ul>
+<li><strong>Propagate the user's identity.</strong> The gateway verifies the user's token and passes a verified identity (a signed internal token, as in the gateway lesson). The BFF forwards it on every service call. Each service authorises the user for its own data.</li>
+<li><strong>Call as a privileged service account.</strong> The BFF calls services with its own credential, which can read anyone's data, and filters by user ID itself. This is the <em>confused deputy</em>: authorisation has moved into the presentation layer. One bug in the BFF's filtering, or one parameter the client controls, exposes other users' orders.</li>
+</ul>
+<p>Use the first. If a service call genuinely needs elevated rights (an internal recommendation index, say), scope that credential to that one call and document it.</p>
+<p>For browser apps, the BFF also has a security role of its own. Current OAuth guidance for browser-based apps (the IETF's work on OAuth for browser-based applications) describes a BFF as the most secure architecture. The BFF is the OAuth client, keeps access and refresh tokens server-side, and gives the browser only an <code>HttpOnly</code>, <code>Secure</code>, <code>SameSite</code> session cookie. JavaScript never sees a token, so a cross-site scripting bug cannot steal one. The price is that the BFF now handles sessions and must defend against CSRF. If you have a web BFF anyway, this is usually worth doing.</p>
+
+<h3 id=dd-backend-for-frontend-caching level=3>Caching inside a BFF</h3>
+<p>A BFF sits at a good point for caching, because it knows the shape of each screen. Split each response into its shared and personal parts:</p>
+<ul>
+<li><strong>Shared parts</strong> (product title, cover, author bio, review summary) can be cached per product for seconds to minutes, in process or in Redis, and reused across users.</li>
+<li><strong>Personal parts</strong> (the user's price tier, "you bought this before", recommendations) are fetched per request or cached under a key that includes the user ID.</li>
+</ul>
+<p>The response as a whole is usually personal, so it gets <code>Cache-Control: private</code>. A BFF that caches the assembled screen under a key without the user ID will show one user's "recommended for you" to another. That is the CDN lesson's private-data failure, one layer further in.</p>
+
+<h3 id=dd-backend-for-frontend-versions level=3>Versions: the BFF serves apps you can no longer change</h3>
+<p>Web clients update on every page load. Mobile apps do not. A noticeable share of users may run a version that is months old, and some run versions more than a year old. The mobile BFF has to serve all of them. That makes it look like a versioned public API for a client you happen to own.</p>
+<p>Practical rules: the app sends its version on every request (<code>X-App-Version: 7.4.1</code>). The BFF branches on version only at the edges of a response, never deep in the logic. Additive changes (new optional fields) need no branch. Removing or renaming a field requires knowing that no supported version reads it. Publish a minimum supported version and force-upgrade below it. Track requests per app version, so you know when an old branch can be deleted.</p>
+
+<h2 id=dd-backend-for-frontend-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions for the mobile BFF at peak:</p>
+<ul>
+<li>2,000 product-screen loads per second, plus 3,000 other screen loads per second averaging 4 service calls each.</li>
+<li>Service calls inside the datacenter: median 5 ms, p99 40 ms.</li>
+<li>Cellular round trip from phone to edge 80 ms on a good network, 300 ms on a poor one (the lesson's figure).</li>
+</ul>
+
+<h3 id=dd-backend-for-frontend-sizing-tail level=3>Fan-out and the tail</h3>
+<p>A screen that waits for six calls is as slow as the slowest one. If each call independently has a 1% chance of exceeding 40 ms, the chance that at least one of six does is 1 − 0.99<sup>6</sup> ≈ 5.9%. So the screen's p94 is already at the services' p99. To get a screen p99 of 40 ms, each call would need to be under 40 ms with probability 0.99<sup>1/6</sup> ≈ 99.83%.</p>
+<p>This is the quantitative case for the previous section's rules. Optional calls with tight timeouts cut off their own tails. Hedged requests help for idempotent reads with bad tails: send a second copy of a request if the first has not answered by the service's p95, and use whichever returns first. That costs about 5% more calls to remove most of the tail.</p>
+
+<h3 id=dd-backend-for-frontend-sizing-fanout level=3>Outbound load and connection pools</h3>
+<ul>
+<li>Outbound calls per second: 2,000 × 6 + 3,000 × 4 = 24,000. The BFF multiplies inbound traffic by about 4.8. Every service team must plan for the BFF's peak, not the app's request count.</li>
+<li>Concurrent outbound calls: by Little's law, rate × time in flight. At a mean of 8 ms, 24,000 × 0.008 ≈ 190 calls in flight. A latency spike to 100 ms in one service multiplies its share of that number by 12.</li>
+<li>Pools: if pricing gets 2,000 calls per second at 8 ms, it needs about 16 concurrent connections across the BFF fleet. Add headroom for the spike: size pools for p99 latency (2,000 × 0.04 = 80), not the mean. With 10 BFF instances, that is about 8 to 10 connections per instance to pricing. Use HTTP/2 or gRPC where possible, because one connection carries many concurrent calls.</li>
+</ul>
+
+<h3 id=dd-backend-for-frontend-sizing-instances level=3>Instances</h3>
+<p>A BFF does little CPU work: parse six JSON responses, build one. Budget 1 to 3 ms of CPU per screen, mostly JSON handling, and measure. At 5,000 screens per second and 2 ms each, that is 10 cores busy, so roughly 20 cores at 50% utilisation, plus zone-failure headroom. An event-loop runtime (Node.js, Go, Python asyncio, the JVM with async clients) matters here more than raw speed. A thread-per-request BFF holds a thread for the whole fan-out wait. At 300 ms deadlines and 5,000 screens per second, that is up to 1,500 threads waiting.</p>
+
+<h3 id=dd-backend-for-frontend-sizing-payload level=3>Payload and battery</h3>
+<p>The lesson's 45 KB to 6 KB reduction is worth turning into time. On a slow 1 Mbit/s connection, 45 KB takes about 360 ms to download and 6 KB about 50 ms. Compression narrows the gap, since JSON compresses well, but parse time and memory on a low-end phone do not shrink with compression. The bigger win is still the round trips: one 300 ms crossing instead of six. Even when the six run in parallel, each one wakes the radio and opens or reuses a connection, which costs battery.</p>
+
+<h2 id=dd-backend-for-frontend-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-backend-for-frontend-fm-slowest level=3>1. One slow optional service makes the whole screen slow</h3>
+<p><strong>Symptom:</strong> product screen p99 jumps from 250 ms to 3 s. Product and pricing services look fine. <strong>Mechanism:</strong> the recommendations service slowed down, and the BFF awaited all six calls with only a default 30-second client timeout. The screen became as slow as its least important part. <strong>Detect:</strong> per-dependency latency recorded inside the BFF, as spans in a trace; a screen latency that tracks one dependency's tail. <strong>Fix:</strong> a screen deadline, tight timeouts on optional parts, a partial-response contract, and a circuit breaker per dependency so the BFF stops calling a failing service and omits that part immediately.</p>
+
+<h3 id=dd-backend-for-frontend-fm-confused-deputy level=3>2. Users can read each other's orders through the BFF</h3>
+<p><strong>Symptom:</strong> a researcher changes <code>?userId=</code> in a mobile request and sees another customer's order history. <strong>Mechanism:</strong> the BFF calls the orders service with a service account that can read all orders, and takes the user ID from a request parameter rather than from the verified identity. Authorisation moved from the domain service into the BFF, and the BFF got it wrong. <strong>Detect:</strong> security tests that swap identifiers; an audit of BFF credentials, asking which ones can read data across users. <strong>Fix:</strong> propagate the verified user identity to every service call and let the service authorise. Never take identity from a request parameter. Remove broad service-account access from BFFs.</p>
+
+<h3 id=dd-backend-for-frontend-fm-n-plus-one level=3>3. The list screen makes 61 calls</h3>
+<p><strong>Symptom:</strong> the bestsellers screen takes 900 ms, and the pricing team complains that the mobile BFF is their biggest caller. <strong>Mechanism:</strong> a per-item loop: one call per book for price and one for stock. <strong>Detect:</strong> spans per request in tracing (dozens of identical child spans per screen); the ratio of outbound to inbound calls per screen. <strong>Fix:</strong> batch endpoints in the services and a per-request loader in the BFF that collects and deduplicates IDs. The 61 calls become 3.</p>
+
+<h3 id=dd-backend-for-frontend-fm-retry-storm level=3>4. The BFF turns a blip into an outage</h3>
+<p><strong>Symptom:</strong> the inventory service has a 20-second slowdown, and its traffic triples, causing a longer outage. <strong>Mechanism:</strong> the app retries the screen, the BFF retries each failed service call twice, and the service client library retries too. Because the BFF multiplies traffic by about five already, each layer's retries compound on top of that. <strong>Detect:</strong> requests per unique request ID at each service; retry counters in the BFF's HTTP client. <strong>Fix:</strong> the BFF does not retry optional calls at all; it omits them. For required calls, at most one retry within the remaining deadline, with a retry budget. The app retries the screen with backoff and jitter.</p>
+
+<h3 id=dd-backend-for-frontend-fm-logic-leak level=3>5. Two devices show two different totals</h3>
+<p><strong>Symptom:</strong> the lesson's loyalty-discount incident, or a subtler version: the web BFF shows "In stock" if inventory &gt; 0 and the mobile BFF if inventory &gt; 2. <strong>Mechanism:</strong> domain rules leaked into presentation, one small convenience at a time. <strong>Detect:</strong> a contract test that renders the same product for both BFFs and compares domain values (price, stock status, eligibility); code review rules that flag arithmetic on money or thresholds in BFF code. <strong>Fix:</strong> move the rule into the owning service and expose the result as a field (<code>stock_status: "in_stock"</code>, <code>display_total</code>). The BFF chooses how to show it, never what it is.</p>
+
+<h3 id=dd-backend-for-frontend-fm-old-app level=3>6. A cleanup breaks a two-year-old app version</h3>
+<p><strong>Symptom:</strong> crash reports spike from users on app version 6.x after a BFF deploy that "only removed an unused field". <strong>Mechanism:</strong> the field was unused by current apps but read by an old version still installed on tens of thousands of phones. <strong>Detect:</strong> request counts by <code>X-App-Version</code>; crash reports grouped by version and correlated with BFF deploys. <strong>Fix:</strong> treat the mobile BFF's response as a versioned contract. Remove fields only when no supported version reads them, which requires knowing what each version reads. Keep contract tests per supported version, and enforce a minimum version with a force-upgrade screen.</p>
+
+<h3 id=dd-backend-for-frontend-fm-launch-herd level=3>7. A push notification takes down the BFF</h3>
+<p><strong>Symptom:</strong> a marketing push to 2 million users brings BFF error rates to 30% within a minute. <strong>Mechanism:</strong> phones that open the notification all load the same deep-linked screen within seconds. The BFF multiplies that spike by its fan-out factor, so services see five times the spike. Personalised parts are uncacheable, so caches do not help. <strong>Detect:</strong> inbound screen rate by screen name; correlation with the push schedule. <strong>Fix:</strong> send large pushes in waves over several minutes; cache the shared parts of the target screen and warm the cache before the push; let the BFF shed optional parts (recommendations) under load, so the core screen survives.</p>
+
+<h2 id=dd-backend-for-frontend-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Composition approach<td>BFF per experience (REST)<td>GraphQL (one graph or per-experience graphs)<td>A few stable experiences with screens that change on the client's release cycle. GraphQL when many clients or teams need flexible queries, and you can invest in query cost limits, batching and persisted queries.
+<tr><td>Endpoint granularity<td>Per-screen endpoints (<code>/screens/product/42</code>)<td>Resource-ish endpoints shaped for the client<td>Screens are stable and you want one call per screen. Choose resource-ish when the same data appears on many screens and per-screen endpoints would multiply.
+<tr><td>Read path<td>Synchronous fan-out per request<td>Precomputed view (a materialised read model updated by events)<td>Data changes often, freshness matters, and fan-out latency is acceptable. Precompute for very hot screens with expensive joins, accepting eventual consistency (the CQRS trade).
+<tr><td>Web BFF form<td>Separate API service<td>Server-side rendering server (the web framework's server) acting as the BFF<td>Several web clients share the API, or the web app is a pure client-side app. Choose SSR-as-BFF when one web app owns its server; avoid putting domain logic in page code.
+<tr><td>Token handling for web<td>BFF holds tokens, browser gets a session cookie<td>Browser holds access tokens<td>You have a web BFF and care about token theft through XSS. Browser-held tokens are simpler but expose tokens to page JavaScript.
+<tr><td>Mobile platforms<td>One mobile BFF for iOS and Android<td>Separate BFFs<td>The apps share screens and release roughly together. Split when the experiences really diverge and separate teams own them.
+<tr><td>Shared code across BFFs<td>Small shared libraries (HTTP clients, auth, tracing)<td>Shared "BFF framework" with business helpers<td>Almost always A. A shared framework that includes business helpers recreates the coupling and becomes a place for domain logic to hide.
+<tr><td>Failure policy<td>Partial responses with explicit gaps<td>All-or-nothing<td>Most screens: an empty reviews block beats a blank screen. All-or-nothing for screens where a partial view would mislead, such as a checkout summary missing a fee.
+</tbody></table></div></div>
+<p>The BFF-versus-GraphQL decision is less binary than it looks. A common path is to start with REST BFFs, then, as screens multiply, implement each BFF internally with a GraphQL layer over the services, owned by the client team. That keeps the ownership model of a BFF while getting GraphQL's batching and field selection. A single company-wide graph is a bigger commitment. It needs a dedicated team, schema governance and query cost controls, and it shifts the coupling problem from APIs to the schema.</p>
+<p>The read-path choice deserves attention for the hottest screens. If the home screen fans out to eight services on every app launch, a precomputed "home feed" view, updated from events, can turn eight calls into one key lookup. The price is staleness and another pipeline to run. Use it for the few screens where fan-out is the bottleneck, not as a default.</p>
+
+<h2 id=dd-backend-for-frontend-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>For each main screen, what is the call graph, and which calls are on the critical path?</li>
+<li>What is the screen deadline, and which parts are required versus optional? What does the client show for a missing optional part?</li>
+<li>Does every service call carry the user's verified identity, and does any BFF credential have access across users?</li>
+<li>Which list screens call services per item, and do batch endpoints exist?</li>
+<li>Which layer retries: app, BFF or service client? What is the worst-case multiplication during a service slowdown?</li>
+<li>What does the BFF compute? Does any of it use domain words: price, discount, eligibility, stock threshold, permission?</li>
+<li>What is cached, under what key, and can a cached value contain another user's data?</li>
+<li>Which app versions are supported, how is the version sent, and how do you know when a field can be removed?</li>
+<li>What is the outbound-to-inbound call ratio at peak, and have the services planned for it?</li>
+<li>Who is on call for the BFF, and do they have the access and runbooks to diagnose a slow downstream service?</li>
+<li>For web: where are OAuth tokens held, and how are sessions protected against CSRF?</li>
+<li>Is there a second BFF that calls this one, or a plan to? (There should not be.)</li>
+</ol>
+
+<h2 id=dd-backend-for-frontend-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Each of your six services has a p99 of 40 ms. What is the screen's p99?"</summary>
+<p>Higher than 40 ms. The screen waits for the slowest call, so the chance that at least one of six exceeds its p99 is 1 − 0.99<sup>6</sup> ≈ 6%. 40 ms is only about the screen's p94. The screen p99 sits further out on the services' tails. To control it, make optional calls time out early and drop them, hedge idempotent reads with bad tails, and shorten the critical path by removing dependent calls.</p>
+</details>
+<details>
+<summary>"Why not let the BFF use a service account that can read everything? It is simpler."</summary>
+<p>Because it moves authorisation into the presentation layer, which is the confused-deputy problem. The BFF would have to filter every response by user correctly, forever, and any bug or client-controlled parameter would leak other users' data. Propagate the user's verified identity so each domain service enforces its own rules, as it would for any other caller.</p>
+</details>
+<details>
+<summary>"How is a BFF different from an API gateway with response transformation plugins?"</summary>
+<p>Ownership and blast radius. The gateway is shared, owned by a platform team, and on the path of every request, so per-client shaping there creates a central approval queue and risks all traffic on each change. A BFF is owned by one client team, deployed on its schedule, and a bad deploy affects one experience. Technically both can reshape JSON. Organisationally they are opposites, and the organisational part is the point of the pattern.</p>
+</details>
+<details>
+<summary>"The BFF gets a request from app version 5.2, which you stopped testing a year ago. What do you do?"</summary>
+<p>Decide on a policy before the question arises. Publish a minimum supported version, enforce it with a force-upgrade response that old apps understand, and track traffic by version so the cut-off is based on data. Above the minimum, the BFF keeps the contract additive. Below it, return the upgrade response rather than a broken screen. Removing a field is safe only once no supported version reads it.</p>
+</details>
+<details>
+<summary>"Can the BFF cache the product screen?"</summary>
+<p>Parts of it. The product details, cover and review summary are the same for everyone and can be cached per product for seconds to minutes. Price tier, recommendations and purchase history are personal and must be fetched per user or cached under a key that includes the user. The assembled response is personal, so mark it <code>private</code>. Caching the whole screen under the product ID shows one user's personal data to the next.</p>
+</details>
+<details>
+<summary>"When would you replace BFF fan-out with a precomputed view?"</summary>
+<p>When one very hot screen fans out widely, its data tolerates a few seconds of staleness, and fan-out cost or latency is the measured bottleneck. An event-driven read model can then serve the screen from one lookup. You pay with an extra pipeline, eventual consistency and a backfill process. For most screens, fan-out with good deadlines is simpler and fresher.</p>
+</details>
+<details>
+<summary>"Checkout needs data from five services and a write to two. Can the BFF do it?"</summary>
+<p>The BFF can gather what the checkout screen displays and submit the user's intent, with an idempotency key, to the domain service that owns checkout. That service coordinates the writes, usually as a saga. If the BFF orchestrates the writes itself, money and inventory rules end up in presentation code, and two BFFs would have to implement them identically. The rule is that presentation composes reads and domains own writes.</p>
+</details>
+<details>
+<summary>"Why might a BFF make the web app more secure, not just faster?"</summary>
+<p>A web BFF can act as the OAuth client and keep access and refresh tokens on the server. The browser holds only an <code>HttpOnly</code>, <code>Secure</code>, <code>SameSite</code> session cookie, so a cross-site scripting bug cannot read a token. Current guidance for browser-based OAuth apps describes this as the strongest architecture. You then own session management and CSRF protection in the BFF.</p>
+</details>

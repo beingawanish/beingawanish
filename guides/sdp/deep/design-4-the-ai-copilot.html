@@ -1,0 +1,182 @@
+<h2 id=dd-design-4-the-ai-copilot-capacity level=2>Deep Dive: The Capacity Plan, Box by Box</h2>
+<p>The lesson's headline is 50 requests per second at peak, which sounds small. For an LLM system, requests are the wrong unit. Tokens are what cost money and GPU time, and an agent task multiplies them in a way a chat turn does not. Here is the plan with its assumptions written down.</p>
+<h3 id=dd-design-4-the-ai-copilot-cap-assume level=3>The extra assumptions</h3>
+<ul>
+<li><strong>Mix at peak:</strong> 40 chat turns per second and 10 new agent tasks per second.</li>
+<li><strong>A chat turn:</strong> about 9,000 input tokens (system prompt and tool schemas ~3,000, retrieved context ~4,000, conversation history ~2,000) and about 400 output tokens. One model call.</li>
+<li><strong>An agent task:</strong> six model calls. The first starts at 5,000 input tokens. Each step adds about 1,500 tokens of tool results and model output to the context. Each call writes about 300 output tokens.</li>
+<li><strong>Daily average:</strong> about a third of peak.</li>
+<li><strong>Prices:</strong> illustrative only, $3 per million input tokens and $15 per million output tokens, with cached input billed at a tenth of that. Real prices vary by model and provider and change often. Redo the line with yours.</li>
+</ul>
+<h3 id=dd-design-4-the-ai-copilot-cap-quadratic level=3>Agent context grows with every step</h3>
+<p>An agent's model calls are not the same size. Each one re-sends everything so far. The six calls in one task carry 5,000, 6,500, 8,000, 9,500, 11,000 and 12,500 input tokens. That is 52,500 input tokens for one task, almost six chat turns' worth, plus 1,800 output tokens.</p>
+<p>The growth is quadratic in the number of steps. A 12-step task carries about 5,000 × 12 + 1,500 × 66 = 159,000 input tokens, three times the 6-step task for twice the steps. This is the single most important number in the plan. It is why a step cap is a cost control, not only a safety control, and why large tool results must not be pasted whole into context.</p>
+<h3 id=dd-design-4-the-ai-copilot-cap-tokens level=3>Tokens per second</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Source<th>Model calls/s<th>Input tokens/s<th>Output tokens/s<tbody>
+<tr><td>Chat (40/s)<td>40<td>360,000<td>16,000
+<tr><td>Agent tasks (10/s × 6 calls)<td>60<td>525,000<td>18,000
+<tr><td>Total at peak<td>100<td>~885,000<td>~34,000
+</table></div></div>
+<p>Two things stand out. Agents are a fifth of requests but most of the tokens. And input outnumbers output by about 26 to 1.</p>
+<h3 id=dd-design-4-the-ai-copilot-cap-cost level=3>What it costs</h3>
+<p>At a third of peak on average, the day carries about 25 billion input tokens and 1 billion output tokens. At the illustrative prices, input is about $76,000 a day and output about $15,000. Input dominates, which surprises people who think of output as the expensive part. It is more expensive per token. There is just far more input.</p>
+<p>That makes prefix caching the biggest cost lever in the design. The system prompt, tool schemas and the growing agent context are the same from one call to the next. If 60% of input tokens hit the provider's prompt cache at a tenth of the price, input cost drops from about $76,000 to about $35,000 a day. Getting that hit rate takes discipline. Keep the stable parts of the prompt first and byte-identical across calls. Put anything that changes per request (timestamps, the user's name) after them. One timestamp near the top of the system prompt can destroy the cache for every call.</p>
+<p>Across 500K sellers, $50,000 a day is about $3 per seller per month. That is a real line on an invoice, which is why per-tenant metering is in the requirements.</p>
+<h3 id=dd-design-4-the-ai-copilot-cap-gpu level=3>If you serve the model yourself</h3>
+<p>Self-hosting changes the unit from dollars to GPU replicas. Output tokens set the size, because generating them is the slow, sequential part. Suppose one replica of the chosen model sustains about 2,500 output tokens per second across its batch while still streaming each user a readable speed. That number depends heavily on the model, hardware and serving stack, so measure it. Then 34,000 output tokens per second needs about 14 replicas for decode. Prefill for 885,000 input tokens per second adds its own load, and prefix caching inside the serving engine cuts that too. Plan around 20 replicas at peak with headroom, and autoscale on queue depth, as the GPU autoscaling lesson describes.</p>
+<h3 id=dd-design-4-the-ai-copilot-cap-other level=3>The other boxes are small</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Box<th>Load at peak<th>Notes<tbody>
+<tr><td>SSE connections<td>Active chats and watched tasks, a few thousand<td>Long-lived but cheap; size for tasks that stream for minutes
+<tr><td>Step log (durable execution)<td>~60 model steps/s + ~60 tool steps/s<td>Each step stores inputs and outputs: tens of KB. ~10 GB/day
+<tr><td>Read tools on projections<td>~60 queries/s<td>Seller analytics; latency matters more than volume
+<tr><td>Metering events<td>~100/s<td>One per model call attempt, plus tool usage
+<tr><td>RAG index (shared help docs)<td>~50 queries/s<td>Small corpus; one replica set is plenty
+<tr><td>Per-seller document indexes<td>Few queries/s per seller<td>500K tenants: the challenge is count, not size
+</table></div></div>
+<p>The last row is the interesting one. Most sellers have a handful of documents. A separate index per seller wastes memory on overhead. A shared index with a mandatory tenant filter wastes nothing, but makes the filter the security boundary. The vector database sharding lesson covers the trade. Here, a common answer is shared indexes partitioned by tenant ID, with the filter applied by the retrieval service from the authenticated tenant, never from anything the model passes in.</p>
+
+<h2 id=dd-design-4-the-ai-copilot-durable level=2>Deep Dive: Inside Durable Execution for an Agent</h2>
+<p>The lesson says the agent loop runs on durable execution and resumes instead of re-running. The mechanism has one detail that matters more for agents than for any other workflow.</p>
+<h3 id=dd-design-4-the-ai-copilot-dur-record level=3>Record the model's output, not only that it ran</h3>
+<p>Durable execution engines such as Temporal work by replay. The workflow code runs again from the start after a crash. Each step that already completed returns its recorded result from the history instead of running again. The code reaches the first unrecorded step and continues from there.</p>
+<p>That only works if the workflow code is deterministic. An ordinary workflow keeps side effects in recorded steps and its own logic is plain code. An agent's logic is a model call, which is not deterministic. Run the same prompt twice and the model may choose a different tool with different arguments.</p>
+<p>So every model call must be a recorded step, with its full output stored. On resume, step three's decision is read from the log, not asked again. If you only recorded "step three ran," the resumed task would ask the model again, get a different plan, and create a second promotion with a different idempotency key. The idempotency keys would not help, because the steps are genuinely different. Recording the decision is what makes resume mean resume.</p>
+<h3 id=dd-design-4-the-ai-copilot-dur-keys level=3>What the step log holds</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Step type<th>Recorded before<th>Recorded after<th>Idempotency key<tbody>
+<tr><td>Model call<td>Prompt hash, model and version, budget remaining<td>Full output, token usage, cost<td><code>(task_id, step_id)</code>; a retry after a crash reuses the output if it was recorded
+<tr><td>Read tool<td>Tool name, arguments<td>Result, or a reference to it, plus data as-of time<td>Not needed for correctness; recorded for audit and replay
+<tr><td>Action tool<td>Tool, arguments, reversibility class, approval token if any<td>Result, created resource IDs, compensation handle<td><code>(task_id, step_id)</code>, passed to the action service
+<tr><td>Approval wait<td>The exact action and its hash<td>Approver, time, decision<td>A durable timer, often hours
+</table></div></div>
+<p>Two practical notes. First, large tool results do not belong in the prompt or the log row. Store them as artifacts and give the model a summary and a handle, which also controls the quadratic context growth from the capacity plan. Second, the prompt and the workflow code will change while tasks are in flight. A task started on prompt version 12 should finish on version 12. Pin the version in the task's history and let new tasks pick up new versions. Durable engines call this workflow versioning, and agents need it more than most, since their behaviour lives in prompts.</p>
+<h3 id=dd-design-4-the-ai-copilot-dur-actions level=3>Idempotency at the action service</h3>
+<p>The key <code>(task_id, step_id)</code> only helps if the action service honours it. The promotions service should store the key with the promotion it created and return that same promotion on a repeat. The messaging service needs the same, plus one more guard. Its send is the pivot, so it should write the message to an outbox keyed by the idempotency key in the same transaction that records the send. A crash between "sent to provider" and "recorded" then cannot cause a second send to 40K customers. These guarantees live in the action services, not in the agent. An action service that ignores idempotency keys cannot be offered to an agent.</p>
+
+<h2 id=dd-design-4-the-ai-copilot-authz level=2>Deep Dive: Authorisation the Model Cannot Touch</h2>
+<p>The lesson's rule is that runtime rules enforce authorisation and prompts do not. Three concrete mechanisms make that true.</p>
+<h3 id=dd-design-4-the-ai-copilot-authz-bind level=3>Bind identity arguments in the runtime</h3>
+<p>A tool like <code>get_sales(seller_id, start, end)</code> invites a confused-deputy bug. The runtime has authority to read any seller's data. If the model fills in <code>seller_id</code>, a prompt injection or a plain mistake can ask for someone else's.</p>
+<p>The fix is to remove identity from the model's view of the tool. The schema the model sees is <code>get_sales(start, end)</code>. The runtime adds <code>seller_id</code> from the authenticated session before the call, and the read service checks it again against the caller's token. The model cannot pass what it cannot see. The same applies to the RAG filter: the tenant ID comes from the session, never from the query the model writes.</p>
+<h3 id=dd-design-4-the-ai-copilot-authz-approve level=3>Approve the exact action, not a description of it</h3>
+<p>Approval gates have a time-of-check problem. The agent asks, "Launch a 10% promo on 12 slow movers?" The seller approves. Then the model, at execution time, produces arguments for 15 items at 20%. The seller approved a sentence. The runtime executed something else.</p>
+<p>So the approval is bound to a hash of the exact, canonical arguments. The runtime executes only an action whose hash matches an approval token, and the token expires.</p>
+<pre>
+import hashlib, hmac, json, time
+
+SECRET = b"rotate-me"            # from the runtime's secret store, never the prompt
+
+def approval_token(task_id: str, tool: str, args: dict, ttl_s: int = 3600) -> str:
+    body = json.dumps({"task": task_id, "tool": tool, "args": args,
+                       "exp": int(time.time()) + ttl_s},
+                      sort_keys=True, separators=(",", ":"))
+    sig = hmac.new(SECRET, body.encode(), hashlib.sha256).hexdigest()
+    return body + "." + sig
+
+def may_execute(token: str, task_id: str, tool: str, args: dict) -> bool:
+    body, _, sig = token.rpartition(".")
+    want = hmac.new(SECRET, body.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, want):
+        return False
+    claim = json.loads(body)
+    return (claim["task"] == task_id and claim["tool"] == tool
+            and claim["args"] == args and claim["exp"] > time.time())
+</pre>
+<p>The seller's approval screen renders from the same canonical arguments that were hashed, not from the model's prose. What the seller sees is what runs.</p>
+<h3 id=dd-design-4-the-ai-copilot-authz-taint level=3>Track taint, and close the exfiltration channels</h3>
+<p>The lesson removes messaging tools from tasks that read customer messages. Generalise it as taint. A task's context becomes tainted the moment untrusted content enters it: a customer message, a seller-uploaded document, a web page. The runtime computes the allowed tool set from the task's taint and the seller's settings, at every step. Taint never decreases within a task.</p>
+<p>The dangerous combination has three parts: access to private data, exposure to untrusted content, and a way to send data out. Some practitioners call it the lethal trifecta. Any two are manageable. All three in one task is how data leaks. A tainted task that can read sales figures must have no outbound channel.</p>
+<p>Outbound channels are not only tools. If the chat UI renders Markdown images, an injected instruction can make the model write an image link whose URL contains private data, and the browser fetches it. Render model output with external images and links disabled, or restricted to an allowlist of domains. This is a front-end control, and it belongs in the threat model next to the tool allowlist.</p>
+
+<h2 id=dd-design-4-the-ai-copilot-tenancy level=2>Deep Dive: Caching and Fairness Across Tenants</h2>
+<h3 id=dd-design-4-the-ai-copilot-ten-cache level=3>The semantic cache has a tenant boundary</h3>
+<p>The lesson puts a semantic cache in front. Its scope decides whether it is safe. "How do I set up shipping rules?" has the same answer for every seller, and can be shared. "Why did my sales dip?" has an answer built from one seller's private data. If that answer is cached globally and another seller's similar question matches it, the cache leaks one seller's numbers to another.</p>
+<p>So the cache key includes a scope. Answers built only from shared help docs are cached globally. Answers that used any private tool or document are cached per tenant, or not at all. The runtime knows which tools a turn called, so it can set the scope automatically. Do not ask the model whether its answer was private.</p>
+<p>Expect the hit rate to be lower than in the RAG chatbot. Shared how-to questions cache well. Analytics questions are personal and time-sensitive, and should usually skip the cache. Measure the hit rate per scope before claiming savings from it.</p>
+<h3 id=dd-design-4-the-ai-copilot-ten-fair level=3>Fairness in numbers</h3>
+<p>One large seller starts a batch of 500 agent tasks to rewrite every listing. At 52,500 input tokens each, that is 26M input tokens, more than half a minute of the whole platform's peak input rate. Without controls, those calls fill the serving queue, and every other seller's chat waits.</p>
+<p>The gateway enforces three layers. A per-tenant token budget per minute, a token bucket refilled at the seller's plan rate. A priority class per request, where interactive chat outranks background tasks. And a concurrency cap per tenant, so one seller's tasks take at most a few percent of in-flight calls. Batch tasks fill the spare capacity and yield when interactive traffic rises. On self-hosted serving, the same priority classes map to the scheduler's preemption, as the GPU lesson describes.</p>
+
+<h2 id=dd-design-4-the-ai-copilot-drills level=2>Deep Dive: Failure Drills</h2>
+<p>The lesson walks the main failures. These seven are the subtler ones that show up once agents act on real data.</p>
+<h3 id=dd-design-4-the-ai-copilot-drill1 level=3>Drill 1: A resumed task takes a different path</h3>
+<p><strong>Symptom.</strong> After a worker restart, some sellers have two promotions where they asked for one, with different discounts. <strong>Mechanism.</strong> The runtime recorded that model step three ran but not its output. On resume it called the model again, which chose 15% instead of 10%, under a new step ID. The idempotency key did not match the first promotion. <strong>Detection.</strong> Compare action counts per task with the plan; count resumed tasks whose replayed steps called the model. <strong>Fix.</strong> Record every model output as a step result and replay it on resume. A model call is a side effect on your bill and your plan, so treat it like one.</p>
+<h3 id=dd-design-4-the-ai-copilot-drill2 level=3>Drill 2: The approved action is not the executed action</h3>
+<p><strong>Symptom.</strong> A seller complains that the copilot discounted items they did not approve. <strong>Mechanism.</strong> Approval was given on the model's summary. The tool call was generated again after approval with different arguments. <strong>Detection.</strong> Log the hash of approved arguments and executed arguments for every gated action, and alert on any mismatch. There should be none. <strong>Fix.</strong> Approval tokens bound to canonical arguments, as above. Render approval screens from those arguments.</p>
+<h3 id=dd-design-4-the-ai-copilot-drill3 level=3>Drill 3: One seller sees another's numbers</h3>
+<p><strong>Symptom.</strong> A seller reports an answer quoting revenue figures that are not theirs. <strong>Mechanism.</strong> A semantic cache keyed only on question meaning. Seller A asked about last week's dip, the answer was cached globally, and seller B's similar question matched it. <strong>Detection.</strong> Canary tenants: synthetic sellers with marker values in their data, and a monitor that searches every response for another tenant's markers. <strong>Fix.</strong> Scope cache entries by the data the answer used. Treat this as a security incident, because it is one.</p>
+<h3 id=dd-design-4-the-ai-copilot-drill4 level=3>Drill 4: A tool returns a 200,000-token CSV</h3>
+<p><strong>Symptom.</strong> Cost per task spikes for some sellers. Some tasks fail with context-length errors. <strong>Mechanism.</strong> An export tool returns all order rows. The runtime pastes the result into context. Every later step re-sends it, so the quadratic growth now starts from 200,000 tokens. <strong>Detection.</strong> Tokens per tool result, and the distribution of input tokens per call. <strong>Fix.</strong> Cap tool result size in the runtime. Store large results as artifacts and give the model a summary, a schema and a handle. Give it tools to query the artifact (filter, aggregate) instead of reading it whole.</p>
+<h3 id=dd-design-4-the-ai-copilot-drill5 level=3>Drill 5: Retries amplify a provider's rate limit</h3>
+<p><strong>Symptom.</strong> The provider starts returning 429 Too Many Requests. Within minutes, the gateway is sending three times its normal request rate and almost everything fails. <strong>Mechanism.</strong> Each layer retries: the SDK, the gateway and the agent runtime. Three layers of three retries is up to 27 attempts per call, all into a provider that is already refusing work. <strong>Detection.</strong> Attempts per logical call, and 429 rate per provider. <strong>Fix.</strong> Retry in exactly one layer, the gateway, with a retry budget (retries capped at, say, 10% of requests). Honour <code>Retry-After</code>. Queue background tasks instead of retrying them, and let interactive chat fall down the provider ladder. The retry lesson's rules apply, with tokens as the unit.</p>
+<h3 id=dd-design-4-the-ai-copilot-drill6 level=3>Drill 6: Data leaves through a rendered link</h3>
+<p><strong>Symptom.</strong> A security review finds outbound requests from sellers' browsers to an unknown domain, with sales numbers in the query string. <strong>Mechanism.</strong> A customer message contained an instruction to "include this tracking image" with a URL template. The task was tainted but had no outbound tools, so it looked safe. The model wrote a Markdown image. The browser fetched it. <strong>Detection.</strong> Content Security Policy violation reports from the browser, and scans of model output for URLs to non-allowlisted domains. <strong>Fix.</strong> Disable external images in rendered output, restrict links to an allowlist, and set a strict Content Security Policy. The output renderer is part of the agent's capability set.</p>
+<h3 id=dd-design-4-the-ai-copilot-drill7 level=3>Drill 7: Billing disagrees with the provider's invoice</h3>
+<p><strong>Symptom.</strong> Monthly provider cost is 8% higher than the sum of tenant usage. <strong>Mechanism.</strong> The metering pipeline recorded usage once per logical model call, keyed by <code>(task_id, step_id)</code>. The provider billed every attempt, including retries that timed out after generating tokens. <strong>Detection.</strong> Reconcile metered tokens against the provider's usage report daily, as the payment design reconciles its books. <strong>Fix.</strong> Meter two things. Cost metering records every attempt, keyed by attempt ID, to match the provider. Billing metering records what the tenant is charged under your pricing policy, which may exclude your own retries. Each consumer gets the guarantee and the definition it needs.</p>
+
+<h2 id=dd-design-4-the-ai-copilot-alternatives level=2>Deep Dive: Alternatives the Panel Will Debate</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>How to choose<tbody>
+<tr><td>Durable execution<td>A workflow engine (Temporal or similar)<td>A homegrown step table and a worker loop<td>A brings replay, timers and versioning for free. B is fine for short, linear tasks; it gets hard at approvals that wait for hours
+<tr><td>Agent shape<td>One agent with a curated toolset<td>Planner plus specialised sub-agents<td>Start with A; it is easier to evaluate and to bound. B helps when toolsets are large or need separate permissions, at the cost of more calls and harder traces
+<tr><td>Model hosting<td>Hosted provider API<td>Self-hosted open-weights model<td>A until volume, latency or data rules justify a GPU fleet; many teams self-host one high-volume small model and use a hosted one for hard tasks
+<tr><td>Live context<td>Tools over CQRS projections<td>Long context stuffed with the seller's data<td>Tools. Stuffing is stale, costly per call and hard to scope; tools return fresh, filtered, auditable data
+<tr><td>Approvals<td>Inline in the chat<td>Async inbox with notifications<td>Inline for interactive tasks; inbox for background tasks that wait for hours. Both use the same bound tokens
+<tr><td>Tool-call format<td>Strict JSON schema validation, reject on mismatch<td>Lenient parsing with repair<td>Strict for actions; lenient is acceptable for reads. An action argument the runtime had to guess at is not an approved action
+</table></div></div>
+<p>The longest debate is usually build versus buy for durable execution. A homegrown step table looks like a weekend of work. Then come durable timers for approvals, replay on resume, versioning across prompt changes, and visibility into stuck tasks. That is the feature list of a workflow engine. If tasks are short and have no approvals, the table is fine. Once approvals arrive, adopt an engine.</p>
+<p>A second debate is about how much autonomy to ship by default. The lesson's answer, autonomy by action class with seller-configured relaxations, is right. The numbers that inform the defaults come from the canary metrics: approval rate, rejection rate at approval, and compensation rate after execution. If sellers approve 99% of listing edits without changes, auto-approving that class with an undo window is a safe step. If they reject 15% of promotion plans, keep promotions gated.</p>
+
+<h2 id=dd-design-4-the-ai-copilot-evolution level=2>Deep Dive: The Evolution Path</h2>
+<ol>
+<li><strong>Stage 1: read-only help assistant.</strong> RAG over shared help docs, SSE streaming, one hosted model behind a thin gateway with per-tenant token limits. No private data, no actions. Ship it and start collecting questions for the eval set.</li>
+<li><strong>Stage 2: read tools.</strong> Seller analytics through projections, identity bound by the runtime, answers stamped with their data's as-of time. Cache scope rules arrive here, because answers now contain private data.</li>
+<li><strong>Stage 3: compensable actions with approval for everything.</strong> Listing edits and promotions, each behind a bound approval token. Durable execution and the step log arrive, because approvals wait.</li>
+<li><strong>Stage 4: budgets, taint and autonomy settings.</strong> Action budgets, loop detection, taint-based tool sets. Some action classes move to auto-approve with undo windows, based on measured approval rates.</li>
+<li><strong>Stage 5: irreversible actions and the provider ladder.</strong> Customer messaging behind the pivot rules, outbox-backed sends, a secondary provider for text, and fail-closed actions on degradation. Metering splits into cost and billing.</li>
+<li><strong>Stage 6: scale and cost.</strong> Self-hosted serving for the highest-volume model, prompt layout tuned for prefix caching, fair scheduling between interactive and batch tasks. Proactive tasks run on schedules, and the same runtime handles them.</li>
+</ol>
+
+<h2 id=dd-design-4-the-ai-copilot-review level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What are input and output tokens per second at peak, and what share comes from agent tasks?</li>
+<li>How does context grow per step, and what caps it: step limits, result size limits, artifacts?</li>
+<li>What is the prefix cache hit rate, and is the prompt laid out to protect it?</li>
+<li>On resume, does a model step return its recorded output or call the model again?</li>
+<li>Does every action service honour the idempotency key, and which ones use an outbox?</li>
+<li>Which tool arguments does the runtime bind, and can the model ever supply a tenant or seller ID?</li>
+<li>Is each approval bound to the exact arguments that will execute? When does it expire?</li>
+<li>How is taint tracked, and which outbound channels (tools, links, images) are closed for tainted tasks?</li>
+<li>What scope does each semantic cache entry have, and who decides it?</li>
+<li>How many layers retry a model call? Where is the retry budget?</li>
+<li>Do metered tokens reconcile against the provider's usage report?</li>
+<li>Which canary metrics block a model or prompt rollout?</li>
+</ol>
+
+<h2 id=dd-design-4-the-ai-copilot-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"It's only 50 requests per second. Why does this need a capacity plan?"</summary>
+<p>Because requests are the wrong unit. One agent task re-sends its growing context on every step, so six steps cost about 52,500 input tokens, and twelve steps cost three times that. At peak the system moves nearly 900,000 input tokens per second, which is tens of thousands of dollars a day at typical prices or a fleet of GPU replicas. The plan exists to show that step count and context size drive cost, and to put caps on both.</p>
+</details>
+<details>
+<summary>"Why record the model's output in the step log? Can't you just re-run the step?"</summary>
+<p>Re-running a model call is not idempotent. The same prompt can produce a different tool choice or different arguments, so a resumed task could follow a new plan and create resources the first plan already created under other keys. Durable execution only means "resume" if every nondeterministic step returns its recorded result on replay. For agents, the model is the main nondeterministic step.</p>
+</details>
+<details>
+<summary>"A seller asks the copilot to email customers who complained. The complaints contain injected instructions. Walk me through it."</summary>
+<p>Reading the complaints taints the task. From that step on, the runtime removes outbound tools from the model's schema. So the task can draft emails but not send them. The drafts go to an approval screen rendered from canonical arguments: recipients, subject, body. The seller approves the exact batch, which produces a token bound to that batch. A separate, untainted execution step sends exactly that batch through the messaging service's outbox. Injected text can change a draft, which the seller sees. It cannot change who receives it after approval, and it cannot trigger a send.</p>
+</details>
+<details>
+<summary>"How do you stop one tenant's batch job from slowing everyone's chat?"</summary>
+<p>Three controls at the gateway: a token bucket per tenant, a priority class per request, and a per-tenant concurrency cap. Interactive chat outranks background tasks, so batch work only uses spare capacity. On self-hosted serving, the scheduler preempts batch requests when interactive load rises. Cost attribution then shows the large tenant on their invoice. Fairness is enforced in the serving path, not requested in the prompt.</p>
+</details>
+<details>
+<summary>"The provider is down. Chat works on the fallback model. Do agent tasks continue?"</summary>
+<p>Their text steps can, labelled as coming from the fallback. Their action steps pause. The action boundary was evaluated with the primary model, and a different model's plan has not passed those evals. The task waits durably, with a status the seller can see, and resumes when the primary returns or the seller chooses to cancel. Durable execution makes pausing cheap: a paused task costs a row, not a thread.</p>
+</details>
+<details>
+<summary>"Can you guarantee the copilot never takes a wrong action?"</summary>
+<p>No, and saying yes would fail the interview. What you can guarantee is the size of the damage. Each action class has a budget, irreversible actions need bound approval, compensable actions have designed undos, and the step log records exactly what ran. Then you measure the rates that matter: actions compensated, approvals rejected, complaints per thousand tasks. Safety here is bounded and observable risk, the same way the payment platform treats money.</p>
+</details>
+<details>
+<summary>"Your per-seller cost is about $3 a month. Product wants to make the copilot free. What changes?"</summary>
+<p>The budgets become the product. Free tiers get a token budget per month, lower step caps and the smaller model for drafting. Heavy users see a usage meter, and the gateway enforces it. Engineering levers lower the baseline: better prefix caching, shorter tool schemas, summarised tool results, and routing easy questions to a small model. The architecture does not change. The cost numbers decide which levers are pulled, and the metering pipeline proves whether they worked.</p>
+</details>
