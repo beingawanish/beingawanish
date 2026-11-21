@@ -132,7 +132,7 @@ def decide(query, neighbours, threshold=0.94, margin=0.02, prompt_version="p7"):
 <p>Never write an answer whose generation included personal context, tool results, or user-supplied text. Those answers belong to one person.</p>
 
 <h3 id=dd-semantic-caching-single-flight level=3>Single-flight by meaning</h3>
-<p>The lesson mentions that the cache collapses a viral question into one generation. The mechanism needs its own small index. When a miss starts generating, register its embedding in an <strong>in-flight table</strong> with a future (a placeholder the result will fill). The next miss checks the in-flight table with the same threshold and guards. If it matches, it waits on the future instead of starting a second generation.</p>
+<p>The lesson mentions that the cache collapses a viral question into one generation, the <a href="#cache-stampede-prevention">Cache Stampede Prevention</a> idea applied by meaning. The mechanism needs its own small index. When a miss starts generating, register its embedding in an <strong>in-flight table</strong> with a future (a placeholder the result will fill). The next miss checks the in-flight table with the same threshold and guards. If it matches, it waits on the future instead of starting a second generation.</p>
 <p>Two details make this work. First, the wait needs a timeout shorter than the user's patience, after which the waiter generates on its own. Second, waiters should receive the stream as it is produced, not just the final text. Otherwise the second asker sees nothing for 2.5 seconds while the first sees tokens arrive.</p>
 
 <h2 id=dd-semantic-caching-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
@@ -202,7 +202,7 @@ def decide(query, neighbours, threshold=0.94, margin=0.02, prompt_version="p7"):
 <p><strong>Symptom.</strong> After the shipping threshold changed, most shipping answers are correct, but a few phrasings still return the old number for days.</p>
 <p><strong>Mechanism.</strong> The purge removed everything tagged <code>shipping-policy</code>. Some entries about shipping were tagged <code>orders</code> or <code>promotions</code> at write time, because the tagger saw the question, not the answer. Those survived until their TTL.</p>
 <p><strong>Detect.</strong> After every policy change, replay a set of probe questions against the cache and diff the answers against fresh generations. A canary per policy (a probe that must reflect the new value within minutes) turns this into an alert.</p>
-<p><strong>Fix.</strong> Record the <code>source_docs</code> an answer was built from, and invalidate by document ID when CDC reports a change to that document. This is precise, because it tracks what the answer actually used. Keep tags for broader purges, and keep the TTL backstop.</p>
+<p><strong>Fix.</strong> Record the <code>source_docs</code> an answer was built from, and invalidate by document ID when <a href="#change-data-capture">CDC</a> reports a change to that document. This is precise, because it tracks what the answer actually used. Keep tags for broader purges, and keep the TTL backstop.</p>
 
 <h3 id=dd-semantic-caching-fm-scope level=3>5. A cross-tenant hit</h3>
 <p><strong>Symptom.</strong> A B2B partner's customer receives an answer naming the store's own return policy, or worse, another partner's.</p>
@@ -247,7 +247,7 @@ def decide(query, neighbours, threshold=0.94, margin=0.02, prompt_version="p7"):
 
 <h3 id=dd-semantic-caching-placement level=3>Where the cache sits, and what goes in the key</h3>
 <ul>
-<li><strong>At the gateway</strong>, as the lesson recommends, so every team shares one cache and one audit process. The cost is that the gateway must know scopes and intents, which pulls product knowledge into a platform component.</li>
+<li><strong>At the <a href="#llm-gateway">LLM gateway</a></strong>, as the lesson recommends, so every team shares one cache and one audit process. The cost is that the gateway must know scopes and intents, which pulls product knowledge into a platform component.</li>
 <li><strong>In each application</strong>, when the products are very different (support answers and marketing copy share nothing). Simpler ownership, no cross-product sharing.</li>
 <li><strong>The key namespace</strong> should include everything that changes the correct answer: tenant, locale, permission scope, prompt version, generation model family, and embedding model version. Leave one out and the cache will eventually serve an answer that was right under different rules.</li>
 </ul>
@@ -306,7 +306,7 @@ def decide(query, neighbours, threshold=0.94, margin=0.02, prompt_version="p7"):
 
 <details>
 <summary>"Where does this cache sit relative to retrieval in a RAG pipeline, and why?"</summary>
-<p>Before retrieval, so a hit skips embedding the question against the corpus, the search, the rerank and the generation. That also means a hit must respect everything retrieval would have enforced. The cache key includes the tenant and permission scope, so a hit never returns an answer built from documents the asker could not retrieve. A cheaper variant caches the retrieval result after the ACL filter and still generates. It saves less, but a false hit there only weakens the context instead of serving a wrong answer.</p>
+<p>Before retrieval (see <a href="#rag-pipeline">RAG Pipeline</a>), so a hit skips embedding the question against the corpus, the search, the rerank and the generation. That also means a hit must respect everything retrieval would have enforced. The cache key includes the tenant and permission scope, so a hit never returns an answer built from documents the asker could not retrieve. A cheaper variant caches the retrieval result after the ACL filter and still generates. It saves less, but a false hit there only weakens the context instead of serving a wrong answer.</p>
 </details>
 
 <details>

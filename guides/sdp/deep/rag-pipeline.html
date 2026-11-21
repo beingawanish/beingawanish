@@ -90,7 +90,7 @@ print(rrf([dense, sparse]))   # c17 and c88 lead: both lists agree on them
 <li>Vectors: 3,000,000 × 1,024 × 4 bytes ≈ 12 GB at float32. Add a graph index and metadata and it is under 20 GB.</li>
 <li>Chunk text and metadata: 3,000,000 × about 2 KB ≈ 6 GB in a document store.</li>
 </ul>
-<p>This fits on one machine with replicas. Most company knowledge bases do. The vector sharding lesson becomes necessary for multi-tenant products with many large tenants, or for corpora in the hundreds of millions of chunks, not for one company's help centre.</p>
+<p>This fits on one machine with replicas. Most company knowledge bases do. The <a href="#vector-database-sharding">Vector Database Sharding</a> lesson becomes necessary for multi-tenant products with many large tenants, or for corpora in the hundreds of millions of chunks, not for one company's help centre.</p>
 
 <h3 id=dd-rag-pipeline-reembed-cost level=3>Ingestion cost and freshness</h3>
 <p>A full re-embedding of 1.18 billion tokens (chunks include overlap) costs, at an assumed $0.02 to $0.13 per million tokens, between about $24 and $150. That is cheap. The real cost of re-embedding is the migration work and the doubled index during the dual-run.</p>
@@ -156,9 +156,9 @@ print(rrf([dense, sparse]))   # c17 and c88 lead: both lists agree on them
 
 <h3 id=dd-rag-pipeline-fm-cdc-stall level=3>6. The index that stopped updating on a Friday</h3>
 <p><strong>Symptom.</strong> On Monday, several teams report the bot "doesn't know" changes made since Friday. Nothing alerted over the weekend.</p>
-<p><strong>Mechanism.</strong> The CDC connector hit a schema change in the CMS, failed to parse an event, and stopped. Ingestion was healthy but idle, because no events arrived. Depending on the database, the stalled connector may also be holding log segments, which slowly fills the database's disk, as the CDC lesson describes.</p>
+<p><strong>Mechanism.</strong> The CDC connector hit a schema change in the CMS, failed to parse an event, and stopped. Ingestion was healthy but idle, because no events arrived. Depending on the database, the stalled connector may also be holding log segments, which slowly fills the database's disk, as the <a href="#change-data-capture">Change Data Capture</a> lesson describes.</p>
 <p><strong>Detect.</strong> Alert on the freshness canary (edit a test document every few minutes and query for it), not on connector "up" status. A connector can be up and doing nothing. Also alert on replication-slot or log retention growth on the source database.</p>
-<p><strong>Fix.</strong> Restart and replay from the last committed position. Route unparseable events to a dead letter queue instead of stopping the connector. Treat CMS schema changes as changes that need an ingestion review.</p>
+<p><strong>Fix.</strong> Restart and replay from the last committed position. Route unparseable events to a <a href="#dead-letter-queue">dead letter queue</a> instead of stopping the connector. Treat CMS schema changes as changes that need an ingestion review.</p>
 
 <h3 id=dd-rag-pipeline-fm-eval-rot level=3>7. Green dashboards, unhappy users</h3>
 <p><strong>Symptom.</strong> Recall@5 holds at 91% and faithfulness at 96% for months. Meanwhile, thumbs-down rates rise and escalations mention new product lines.</p>
@@ -231,7 +231,7 @@ print(rrf([dense, sparse]))   # c17 and c88 lead: both lists agree on them
 
 <details>
 <summary>"A user lost access to a document an hour ago. Can the bot still show it to them?"</summary>
-<p>That depends on two lags: how fast the permission change reaches the chunks' ACL tags, and how long the user's group membership is cached. If either is an hour, then yes. The design answer is to treat permission changes as ingestion events with their own feed, keep group caches short, measure the worst-case lag as an SLO, and, for sensitive content, recheck the final few chunks against the source system at query time. The semantic cache must also be scoped by permission, or it becomes a third lag.</p>
+<p>That depends on two lags: how fast the permission change reaches the chunks' ACL tags, and how long the user's group membership is cached. If either is an hour, then yes. The design answer is to treat permission changes as ingestion events with their own feed, keep group caches short, measure the worst-case lag as an SLO, and, for sensitive content, recheck the final few chunks against the source system at query time. The <a href="#semantic-caching">semantic cache</a> must also be scoped by permission, or it becomes a third lag.</p>
 </details>
 
 <details>

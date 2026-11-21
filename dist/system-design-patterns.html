@@ -21823,7 +21823,7 @@ reduce(category, [amounts]) -&gt; emit (category, sum(amounts))
 <p>A common sound design records all three on every event, uses event time for windows, and clamps it with ingestion time.</p>
 
 <h3 id=dd-stream-processing-choose-join level=3>Stream joins and their state</h3>
-<p>Joins are where streaming state gets expensive, so it is worth naming the three kinds.</p>
+<p>Joins are where streaming state gets expensive. There are three kinds, and each costs state differently.</p>
 <ul>
 <li><strong>Stream–table (enrichment) join.</strong> Each order looks up the current customer record. The table side is kept as keyed state, often fed by <a href="#change-data-capture">CDC</a>. State size is the table size. The catch is timing: a customer updated a second before the order may not have arrived yet.</li>
 <li><strong>Interval join.</strong> Orders joined to payments within 30 minutes of each other. Each side buffers its events for the interval, so state is rate × interval × event size for both sides.</li>
@@ -25774,7 +25774,7 @@ def decide(query, neighbours, threshold=0.94, margin=0.02, prompt_version="p7"):
 <p>Never write an answer whose generation included personal context, tool results, or user-supplied text. Those answers belong to one person.</p>
 
 <h3 id=dd-semantic-caching-single-flight level=3>Single-flight by meaning</h3>
-<p>The lesson mentions that the cache collapses a viral question into one generation. The mechanism needs its own small index. When a miss starts generating, register its embedding in an <strong>in-flight table</strong> with a future (a placeholder the result will fill). The next miss checks the in-flight table with the same threshold and guards. If it matches, it waits on the future instead of starting a second generation.</p>
+<p>The lesson mentions that the cache collapses a viral question into one generation, the <a href="#cache-stampede-prevention">Cache Stampede Prevention</a> idea applied by meaning. The mechanism needs its own small index. When a miss starts generating, register its embedding in an <strong>in-flight table</strong> with a future (a placeholder the result will fill). The next miss checks the in-flight table with the same threshold and guards. If it matches, it waits on the future instead of starting a second generation.</p>
 <p>Two details make this work. First, the wait needs a timeout shorter than the user's patience, after which the waiter generates on its own. Second, waiters should receive the stream as it is produced, not just the final text. Otherwise the second asker sees nothing for 2.5 seconds while the first sees tokens arrive.</p>
 
 <h2 id=dd-semantic-caching-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
@@ -25844,7 +25844,7 @@ def decide(query, neighbours, threshold=0.94, margin=0.02, prompt_version="p7"):
 <p><strong>Symptom.</strong> After the shipping threshold changed, most shipping answers are correct, but a few phrasings still return the old number for days.</p>
 <p><strong>Mechanism.</strong> The purge removed everything tagged <code>shipping-policy</code>. Some entries about shipping were tagged <code>orders</code> or <code>promotions</code> at write time, because the tagger saw the question, not the answer. Those survived until their TTL.</p>
 <p><strong>Detect.</strong> After every policy change, replay a set of probe questions against the cache and diff the answers against fresh generations. A canary per policy (a probe that must reflect the new value within minutes) turns this into an alert.</p>
-<p><strong>Fix.</strong> Record the <code>source_docs</code> an answer was built from, and invalidate by document ID when CDC reports a change to that document. This is precise, because it tracks what the answer actually used. Keep tags for broader purges, and keep the TTL backstop.</p>
+<p><strong>Fix.</strong> Record the <code>source_docs</code> an answer was built from, and invalidate by document ID when <a href="#change-data-capture">CDC</a> reports a change to that document. This is precise, because it tracks what the answer actually used. Keep tags for broader purges, and keep the TTL backstop.</p>
 
 <h3 id=dd-semantic-caching-fm-scope level=3>5. A cross-tenant hit</h3>
 <p><strong>Symptom.</strong> A B2B partner's customer receives an answer naming the store's own return policy, or worse, another partner's.</p>
@@ -25889,7 +25889,7 @@ def decide(query, neighbours, threshold=0.94, margin=0.02, prompt_version="p7"):
 
 <h3 id=dd-semantic-caching-placement level=3>Where the cache sits, and what goes in the key</h3>
 <ul>
-<li><strong>At the gateway</strong>, as the lesson recommends, so every team shares one cache and one audit process. The cost is that the gateway must know scopes and intents, which pulls product knowledge into a platform component.</li>
+<li><strong>At the <a href="#llm-gateway">LLM gateway</a></strong>, as the lesson recommends, so every team shares one cache and one audit process. The cost is that the gateway must know scopes and intents, which pulls product knowledge into a platform component.</li>
 <li><strong>In each application</strong>, when the products are very different (support answers and marketing copy share nothing). Simpler ownership, no cross-product sharing.</li>
 <li><strong>The key namespace</strong> should include everything that changes the correct answer: tenant, locale, permission scope, prompt version, generation model family, and embedding model version. Leave one out and the cache will eventually serve an answer that was right under different rules.</li>
 </ul>
@@ -25948,7 +25948,7 @@ def decide(query, neighbours, threshold=0.94, margin=0.02, prompt_version="p7"):
 
 <details>
 <summary>"Where does this cache sit relative to retrieval in a RAG pipeline, and why?"</summary>
-<p>Before retrieval, so a hit skips embedding the question against the corpus, the search, the rerank and the generation. That also means a hit must respect everything retrieval would have enforced. The cache key includes the tenant and permission scope, so a hit never returns an answer built from documents the asker could not retrieve. A cheaper variant caches the retrieval result after the ACL filter and still generates. It saves less, but a false hit there only weakens the context instead of serving a wrong answer.</p>
+<p>Before retrieval (see <a href="#rag-pipeline">RAG Pipeline</a>), so a hit skips embedding the question against the corpus, the search, the rerank and the generation. That also means a hit must respect everything retrieval would have enforced. The cache key includes the tenant and permission scope, so a hit never returns an answer built from documents the asker could not retrieve. A cheaper variant caches the retrieval result after the ACL filter and still generates. It saves less, but a false hit there only weakens the context instead of serving a wrong answer.</p>
 </details>
 
 <details>
@@ -26129,7 +26129,7 @@ def decide(query, neighbours, threshold=0.94, margin=0.02, prompt_version="p7"):
 
 <h3 id=dd-vector-database-sharding-placement level=3>Placement: directory, not hash</h3>
 <p>For tenant-keyed sharding, a hash of the tenant ID is the obvious placement, and it is usually the wrong one. Tenants differ in size by orders of magnitude. A hash places a giant tenant wherever it lands, and moving it later means changing the hash function.</p>
-<p>Production systems keep a <strong>directory</strong>: a small table mapping tenant to shard group, cached in every coordinator. Small tenants are packed onto shared shards by size, as a bin-packing problem. Giants get dedicated shards. Moving a tenant becomes a controlled operation: build its index on the target, dual-write during the copy, flip the directory entry, drain, delete. The consistent hashing lesson's ring still fits the uniform design, where vectors have no natural owner.</p>
+<p>Production systems keep a <strong>directory</strong>: a small table mapping tenant to shard group, cached in every coordinator. Small tenants are packed onto shared shards by size, as a bin-packing problem. Giants get dedicated shards. Moving a tenant becomes a controlled operation: build its index on the target, dual-write during the copy, flip the directory entry, drain, delete. The <a href="#consistent-hashing">Consistent Hashing</a> lesson's ring still fits the uniform design, where vectors have no natural owner.</p>
 
 <h3 id=dd-vector-database-sharding-replication level=3>Replication and index builds</h3>
 <p>Replicas give read capacity and availability. They also raise a question relational replicas do not: does each replica build its own index? Two designs exist.</p>
@@ -26212,7 +26212,7 @@ print(coordinator_p99(12, hedge_ms=12))   # roughly 20-something ms
 <p><strong>Symptom.</strong> RAG answer quality slides over months. Retrieval latency is fine. No deploy lines up with the decline.</p>
 <p><strong>Mechanism.</strong> Two slow processes. In HNSW, heavy update and delete churn leaves tombstones that the graph must route around, and newly inserted nodes link less well than the original build. In IVF, the centroids were trained on last year's data. New content (a new product line) lands in lists that do not fit it well, and lists grow uneven.</p>
 <p><strong>Detect.</strong> Measure recall directly. For a small random sample of live queries, run an exact brute-force search on one shard in the background and compare its top 10 with the ANN result. Recall@10 against exact search is a metric you can graph and alert on.</p>
-<p><strong>Fix.</strong> Rebuild indexes on a schedule, or when tombstones exceed a set share. Retrain IVF centroids periodically and rebuild. Because the index is a read model, a rebuild is routine, not risky.</p>
+<p><strong>Fix.</strong> Rebuild indexes on a schedule, or when tombstones exceed a set share. Retrain IVF centroids periodically and rebuild. Because the index is a read model (<a href="#cqrs">CQRS</a>), a rebuild is routine, not risky.</p>
 
 <h3 id=dd-vector-database-sharding-fm-filter level=3>3. The filter that empties the results</h3>
 <p><strong>Symptom.</strong> Some queries return 2 or 3 results instead of 10. The assistant says "I don't have information on that" for products that clearly exist. It happens mostly to small tenants and narrow filters like "in stock, under $50".</p>
@@ -26224,13 +26224,13 @@ print(coordinator_p99(12, hedge_ms=12))   # roughly 20-something ms
 <p><strong>Symptom.</strong> On a centroid-routed index, the day a new phone launches, two shards hit 100% CPU while the rest idle. Latency on every query that probes them climbs.</p>
 <p><strong>Mechanism.</strong> Routing follows meaning. Every query about the new phone probes the same two clusters. Traffic per shard tracks topic popularity, which changes daily, while cluster placement changes only when someone re-clusters.</p>
 <p><strong>Detect.</strong> Per-shard query rate and CPU, and the share of probes landing on each cluster. A Gini coefficient or max/mean ratio of shard load is a useful single number.</p>
-<p><strong>Fix.</strong> Give hot shards more replicas, which can be automated from probe share. Split hot centroids during re-clustering. For predictable events, add replicas ahead of the launch, as the autoscaling lesson does with scheduled scaling.</p>
+<p><strong>Fix.</strong> Give hot shards more replicas, which can be automated from probe share. Split hot centroids during re-clustering. For predictable events, add replicas ahead of the launch, as the <a href="#autoscaling">Autoscaling</a> lesson does with scheduled scaling.</p>
 
 <h3 id=dd-vector-database-sharding-fm-version level=3>5. Two embedding models in one index</h3>
 <p><strong>Symptom.</strong> During a re-embedding migration, results for some tenants turn to nonsense: a shipping question retrieves password-reset chunks. Other tenants are fine.</p>
 <p><strong>Mechanism.</strong> The migration rewrote vectors in place, tenant by tenant, in the same collection. Queries were embedded with v2 for migrated tenants, but a routing bug sent some of them to a shard that still held v1 vectors. Distances between vectors from different models mean nothing, and nearly random neighbours came back with normal-looking scores.</p>
 <p><strong>Detect.</strong> Store the model version on every vector and every query. Count, at the shard, every comparison whose versions differ. That counter must be zero. A drop in the mean top-1 score for a tenant is a weaker but useful signal.</p>
-<p><strong>Fix.</strong> Never migrate in place. Put the model version in the collection or index name, so a v2 query physically cannot reach a v1 index. Cut over by flipping the directory entry for each tenant.</p>
+<p><strong>Fix.</strong> Never migrate in place. Follow the <a href="#capstone-the-zerodowntime-migration">zero-downtime migration</a> shape. Put the model version in the collection or index name, so a v2 query physically cannot reach a v1 index. Cut over by flipping the directory entry for each tenant.</p>
 
 <h3 id=dd-vector-database-sharding-fm-node-loss level=3>6. The node loss that takes all afternoon</h3>
 <p><strong>Symptom.</strong> One node fails at 13:00. Its shards drop to one copy. By 17:00, replacement replicas are still rebuilding, and a second failure would mean partial results.</p>
@@ -26541,7 +26541,7 @@ print(rrf([dense, sparse]))   # c17 and c88 lead: both lists agree on them
 <li>Vectors: 3,000,000 × 1,024 × 4 bytes ≈ 12 GB at float32. Add a graph index and metadata and it is under 20 GB.</li>
 <li>Chunk text and metadata: 3,000,000 × about 2 KB ≈ 6 GB in a document store.</li>
 </ul>
-<p>This fits on one machine with replicas. Most company knowledge bases do. The vector sharding lesson becomes necessary for multi-tenant products with many large tenants, or for corpora in the hundreds of millions of chunks, not for one company's help centre.</p>
+<p>This fits on one machine with replicas. Most company knowledge bases do. The <a href="#vector-database-sharding">Vector Database Sharding</a> lesson becomes necessary for multi-tenant products with many large tenants, or for corpora in the hundreds of millions of chunks, not for one company's help centre.</p>
 
 <h3 id=dd-rag-pipeline-reembed-cost level=3>Ingestion cost and freshness</h3>
 <p>A full re-embedding of 1.18 billion tokens (chunks include overlap) costs, at an assumed $0.02 to $0.13 per million tokens, between about $24 and $150. That is cheap. The real cost of re-embedding is the migration work and the doubled index during the dual-run.</p>
@@ -26607,9 +26607,9 @@ print(rrf([dense, sparse]))   # c17 and c88 lead: both lists agree on them
 
 <h3 id=dd-rag-pipeline-fm-cdc-stall level=3>6. The index that stopped updating on a Friday</h3>
 <p><strong>Symptom.</strong> On Monday, several teams report the bot "doesn't know" changes made since Friday. Nothing alerted over the weekend.</p>
-<p><strong>Mechanism.</strong> The CDC connector hit a schema change in the CMS, failed to parse an event, and stopped. Ingestion was healthy but idle, because no events arrived. Depending on the database, the stalled connector may also be holding log segments, which slowly fills the database's disk, as the CDC lesson describes.</p>
+<p><strong>Mechanism.</strong> The CDC connector hit a schema change in the CMS, failed to parse an event, and stopped. Ingestion was healthy but idle, because no events arrived. Depending on the database, the stalled connector may also be holding log segments, which slowly fills the database's disk, as the <a href="#change-data-capture">Change Data Capture</a> lesson describes.</p>
 <p><strong>Detect.</strong> Alert on the freshness canary (edit a test document every few minutes and query for it), not on connector "up" status. A connector can be up and doing nothing. Also alert on replication-slot or log retention growth on the source database.</p>
-<p><strong>Fix.</strong> Restart and replay from the last committed position. Route unparseable events to a dead letter queue instead of stopping the connector. Treat CMS schema changes as changes that need an ingestion review.</p>
+<p><strong>Fix.</strong> Restart and replay from the last committed position. Route unparseable events to a <a href="#dead-letter-queue">dead letter queue</a> instead of stopping the connector. Treat CMS schema changes as changes that need an ingestion review.</p>
 
 <h3 id=dd-rag-pipeline-fm-eval-rot level=3>7. Green dashboards, unhappy users</h3>
 <p><strong>Symptom.</strong> Recall@5 holds at 91% and faithfulness at 96% for months. Meanwhile, thumbs-down rates rise and escalations mention new product lines.</p>
@@ -26682,7 +26682,7 @@ print(rrf([dense, sparse]))   # c17 and c88 lead: both lists agree on them
 
 <details>
 <summary>"A user lost access to a document an hour ago. Can the bot still show it to them?"</summary>
-<p>That depends on two lags: how fast the permission change reaches the chunks' ACL tags, and how long the user's group membership is cached. If either is an hour, then yes. The design answer is to treat permission changes as ingestion events with their own feed, keep group caches short, measure the worst-case lag as an SLO, and, for sensitive content, recheck the final few chunks against the source system at query time. The semantic cache must also be scoped by permission, or it becomes a third lag.</p>
+<p>That depends on two lags: how fast the permission change reaches the chunks' ACL tags, and how long the user's group membership is cached. If either is an hour, then yes. The design answer is to treat permission changes as ingestion events with their own feed, keep group caches short, measure the worst-case lag as an SLO, and, for sensitive content, recheck the final few chunks against the source system at query time. The <a href="#semantic-caching">semantic cache</a> must also be scoped by permission, or it becomes a third lag.</p>
 </details>
 
 <details>

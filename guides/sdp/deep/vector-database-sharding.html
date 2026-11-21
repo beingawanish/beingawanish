@@ -89,7 +89,7 @@
 
 <h3 id=dd-vector-database-sharding-placement level=3>Placement: directory, not hash</h3>
 <p>For tenant-keyed sharding, a hash of the tenant ID is the obvious placement, and it is usually the wrong one. Tenants differ in size by orders of magnitude. A hash places a giant tenant wherever it lands, and moving it later means changing the hash function.</p>
-<p>Production systems keep a <strong>directory</strong>: a small table mapping tenant to shard group, cached in every coordinator. Small tenants are packed onto shared shards by size, as a bin-packing problem. Giants get dedicated shards. Moving a tenant becomes a controlled operation: build its index on the target, dual-write during the copy, flip the directory entry, drain, delete. The consistent hashing lesson's ring still fits the uniform design, where vectors have no natural owner.</p>
+<p>Production systems keep a <strong>directory</strong>: a small table mapping tenant to shard group, cached in every coordinator. Small tenants are packed onto shared shards by size, as a bin-packing problem. Giants get dedicated shards. Moving a tenant becomes a controlled operation: build its index on the target, dual-write during the copy, flip the directory entry, drain, delete. The <a href="#consistent-hashing">Consistent Hashing</a> lesson's ring still fits the uniform design, where vectors have no natural owner.</p>
 
 <h3 id=dd-vector-database-sharding-replication level=3>Replication and index builds</h3>
 <p>Replicas give read capacity and availability. They also raise a question relational replicas do not: does each replica build its own index? Two designs exist.</p>
@@ -172,7 +172,7 @@ print(coordinator_p99(12, hedge_ms=12))   # roughly 20-something ms
 <p><strong>Symptom.</strong> RAG answer quality slides over months. Retrieval latency is fine. No deploy lines up with the decline.</p>
 <p><strong>Mechanism.</strong> Two slow processes. In HNSW, heavy update and delete churn leaves tombstones that the graph must route around, and newly inserted nodes link less well than the original build. In IVF, the centroids were trained on last year's data. New content (a new product line) lands in lists that do not fit it well, and lists grow uneven.</p>
 <p><strong>Detect.</strong> Measure recall directly. For a small random sample of live queries, run an exact brute-force search on one shard in the background and compare its top 10 with the ANN result. Recall@10 against exact search is a metric you can graph and alert on.</p>
-<p><strong>Fix.</strong> Rebuild indexes on a schedule, or when tombstones exceed a set share. Retrain IVF centroids periodically and rebuild. Because the index is a read model, a rebuild is routine, not risky.</p>
+<p><strong>Fix.</strong> Rebuild indexes on a schedule, or when tombstones exceed a set share. Retrain IVF centroids periodically and rebuild. Because the index is a read model (<a href="#cqrs">CQRS</a>), a rebuild is routine, not risky.</p>
 
 <h3 id=dd-vector-database-sharding-fm-filter level=3>3. The filter that empties the results</h3>
 <p><strong>Symptom.</strong> Some queries return 2 or 3 results instead of 10. The assistant says "I don't have information on that" for products that clearly exist. It happens mostly to small tenants and narrow filters like "in stock, under $50".</p>
@@ -184,13 +184,13 @@ print(coordinator_p99(12, hedge_ms=12))   # roughly 20-something ms
 <p><strong>Symptom.</strong> On a centroid-routed index, the day a new phone launches, two shards hit 100% CPU while the rest idle. Latency on every query that probes them climbs.</p>
 <p><strong>Mechanism.</strong> Routing follows meaning. Every query about the new phone probes the same two clusters. Traffic per shard tracks topic popularity, which changes daily, while cluster placement changes only when someone re-clusters.</p>
 <p><strong>Detect.</strong> Per-shard query rate and CPU, and the share of probes landing on each cluster. A Gini coefficient or max/mean ratio of shard load is a useful single number.</p>
-<p><strong>Fix.</strong> Give hot shards more replicas, which can be automated from probe share. Split hot centroids during re-clustering. For predictable events, add replicas ahead of the launch, as the autoscaling lesson does with scheduled scaling.</p>
+<p><strong>Fix.</strong> Give hot shards more replicas, which can be automated from probe share. Split hot centroids during re-clustering. For predictable events, add replicas ahead of the launch, as the <a href="#autoscaling">Autoscaling</a> lesson does with scheduled scaling.</p>
 
 <h3 id=dd-vector-database-sharding-fm-version level=3>5. Two embedding models in one index</h3>
 <p><strong>Symptom.</strong> During a re-embedding migration, results for some tenants turn to nonsense: a shipping question retrieves password-reset chunks. Other tenants are fine.</p>
 <p><strong>Mechanism.</strong> The migration rewrote vectors in place, tenant by tenant, in the same collection. Queries were embedded with v2 for migrated tenants, but a routing bug sent some of them to a shard that still held v1 vectors. Distances between vectors from different models mean nothing, and nearly random neighbours came back with normal-looking scores.</p>
 <p><strong>Detect.</strong> Store the model version on every vector and every query. Count, at the shard, every comparison whose versions differ. That counter must be zero. A drop in the mean top-1 score for a tenant is a weaker but useful signal.</p>
-<p><strong>Fix.</strong> Never migrate in place. Put the model version in the collection or index name, so a v2 query physically cannot reach a v1 index. Cut over by flipping the directory entry for each tenant.</p>
+<p><strong>Fix.</strong> Never migrate in place. Follow the <a href="#capstone-the-zerodowntime-migration">zero-downtime migration</a> shape. Put the model version in the collection or index name, so a v2 query physically cannot reach a v1 index. Cut over by flipping the directory entry for each tenant.</p>
 
 <h3 id=dd-vector-database-sharding-fm-node-loss level=3>6. The node loss that takes all afternoon</h3>
 <p><strong>Symptom.</strong> One node fails at 13:00. Its shards drop to one copy. By 17:00, replacement replicas are still rebuilding, and a second failure would mean partial results.</p>

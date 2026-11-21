@@ -214,7 +214,7 @@
 <p>A common sound design records all three on every event, uses event time for windows, and clamps it with ingestion time.</p>
 
 <h3 id=dd-stream-processing-choose-join level=3>Stream joins and their state</h3>
-<p>Joins are where streaming state gets expensive, so it is worth naming the three kinds.</p>
+<p>Joins are where streaming state gets expensive. There are three kinds, and each costs state differently.</p>
 <ul>
 <li><strong>Stream–table (enrichment) join.</strong> Each order looks up the current customer record. The table side is kept as keyed state, often fed by <a href="#change-data-capture">CDC</a>. State size is the table size. The catch is timing: a customer updated a second before the order may not have arrived yet.</li>
 <li><strong>Interval join.</strong> Orders joined to payments within 30 minutes of each other. Each side buffers its events for the interval, so state is rate × interval × event size for both sides.</li>
