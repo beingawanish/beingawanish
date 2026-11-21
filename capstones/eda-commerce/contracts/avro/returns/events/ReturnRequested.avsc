@@ -1,0 +1,65 @@
+{
+  "type": "record",
+  "name": "ReturnRequested",
+  "namespace": "com.edacommerce.returns",
+  "doc": "A customer asked to return lines of a delivered order inside the return window.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": "string"
+    },
+    {
+      "name": "customerId",
+      "type": "string"
+    },
+    {
+      "name": "lines",
+      "type": {
+        "type": "array",
+        "items": "com.edacommerce.common.ReturnLine"
+      }
+    },
+    {
+      "name": "reason",
+      "type": {
+        "type": "enum",
+        "name": "ReturnReason",
+        "namespace": "com.edacommerce.returns",
+        "doc": "Customer's stated reason. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+        "symbols": [
+          "DAMAGED",
+          "WRONG_ITEM",
+          "NOT_AS_DESCRIBED",
+          "CHANGED_MIND",
+          "OTHER",
+          "UNKNOWN"
+        ],
+        "default": "UNKNOWN"
+      }
+    },
+    {
+      "name": "comment",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "requestedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

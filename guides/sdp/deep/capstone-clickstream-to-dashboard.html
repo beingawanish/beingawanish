@@ -1,0 +1,205 @@
+<h2 id=dd-capstone-clickstream-to-dashboard-capacity level=2>Deep Dive: The Capacity Plan</h2>
+<p>The capstone makes every call for a named customer. A review panel then asks how big each box is, and which one breaks first on Black Friday. This plan uses the brief's numbers and states every other assumption. Change an assumption and redo the line; the arithmetic is the point.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-volume level=3>Volume and bytes</h3>
+<ul>
+<li><strong>Rates.</strong> 30,000 events per second at a normal peak, 90,000 on Black Friday. Assume the daily average is a third of the normal peak: 10,000 per second, or about 864 million events a day.</li>
+<li><strong>Event size.</strong> Assume 1 KB as JSON from the SDK. Batched and compressed on the log, assume 300 bytes. Clickstream compresses well because field names and URLs repeat.</li>
+<li><strong>Orders.</strong> Assume 200 order events per second at a normal peak and 2,000 on Black Friday. Orders are tiny next to clicks, but they are the only stream finance cares about.</li>
+</ul>
+<p>Ingress on Black Friday is 90,000 × 1 KB = 90 MB/s before compression, about 27 MB/s on the log. With replication factor 3, the brokers write about 81 MB/s. Each consumer group reads another 27 MB/s. With four groups (analytics, fraud, warehouse loader, archival), that is about 108 MB/s of reads, much of it served from the page cache because consumers are close to the head of the log.</p>
+<p>That is comfortable for a small cluster. Six brokers, each with a 10 Gbit/s network and a few NVMe disks, carry it at well under half of their capacity, which is the headroom you want for a broker loss in the middle of a peak.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-storage level=3>Retention and storage</h3>
+<ul>
+<li>Per day: 864 million × 300 B ≈ 260 GB on the log, or about 780 GB with three replicas.</li>
+<li>Seven days of retention: about 5.5 TB across the cluster. Add Black Friday week's extra volume and about 30% free space, and plan for roughly 8 TB.</li>
+<li>Raw history beyond seven days lives in the warehouse or object storage, written by the archival consumer. At 260 GB a day compressed, a year is about 95 TB in object storage, which is cheap.</li>
+</ul>
+<p>The retention number is a design decision, not a storage one. It decides how far back the Kappa replay in Stage 5 can go from the log. Anything older replays from the archive. Drill 6 shows why that matters.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-partitions level=3>Partitions and parallelism</h3>
+<ul>
+<li><strong>Clickstream, 96 partitions.</strong> On Black Friday that is about 940 events per second per partition. Assume one analytics subtask handles 5,000 events per second (parse, dedupe, enrich, aggregate). Peak needs 90,000 / 5,000 = 18 subtasks; the partition count allows up to 96, so traffic can grow about five times before the ceiling.</li>
+<li><strong>Orders, 48 partitions</strong>, keyed by customer ID. Throughput needs far fewer. The count is sized for consumer parallelism in finance and fraud, and for growth.</li>
+<li><strong>Catalog CDC, 12 partitions, compacted.</strong> Low volume except during snapshots.</li>
+</ul>
+<p>Pick the Flink jobs' maximum parallelism once, generously (for example 512), because it fixes the number of key groups and cannot be changed later without rewriting state. See <a href="#partitioned-consumption">Partitioned Consumption</a>.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-state level=3>State sizes</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>State<th>Assumption<th>Size<th>Where it lives<tbody>
+<tr><td>Catalog lookup<td>2 million products × 500 B<td>~1 GB per copy<td>Broadcast to every analytics subtask (see the next section)<tr><td>Event-ID dedupe<td>1-hour window, 10,000/s average, 64 B per ID<td>36 M IDs ≈ 2.3 GB<td>Keyed state, RocksDB<tr><td>Open sessions<td>1,500 new sessions/s; each lives ~40 min including the gap<td>1,500 × 2,400 s = 3.6 M sessions × 2 KB ≈ 7 GB<td>Keyed by session ID<tr><td>Dashboard minute aggregates<td>A few hundred metrics × open minutes<td>Megabytes<td>Keyed by (metric, minute)<tr><td>Card velocity<td>2,000 orders/s at peak × 600 s window<td>1.2 M cards × 200 B ≈ 240 MB<td>Fraud job, keyed by card<tr><td>Finance revenue<td>Category × day, plus open orders awaiting amendment<td>Small<td>Finance job, keyed by category</table></div></div>
+<p>The session count comes from Little's law: open sessions = new sessions per second × how long each stays open. Total state is around 12 GB for analytics plus the catalog copies. Checkpointed incrementally to object storage, that is cheap. The number to watch is the dedupe window, because it is the one that grows if someone extends it to "a day, to be safe": 864 million IDs is about 55 GB.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-freshness level=3>The dashboard's two minutes, spent</h3>
+<p>The dashboard's staleness budget is about two minutes. Event-time windows spend most of it before any computing happens:</p>
+<ul>
+<li>SDK batching on mobile: assume flushes every 10 seconds.</li>
+<li>Ingestion to the log: under a second.</li>
+<li>The minute window itself: an event at 12:00:05 sits in the window [12:00, 12:01).</li>
+<li>Watermark delay: the window closes when the watermark passes 12:01, which with a 60-second bound is about 12:02:00 in wall-clock time.</li>
+<li>Sink write and dashboard poll: a few seconds.</li>
+</ul>
+<p>The earliest event in each minute appears about two minutes after it happened. The budget is spent exactly. Any backpressure blows it. There are two honest fixes. One is to tighten the watermark to 30 seconds, which drops more late mobile events from the dashboard. The other is <strong>early firing</strong>: emit the current partial count for the open minute every 10 seconds as an upsert, then overwrite it with the final count when the window closes. The second keeps the late-data policy and makes the dashboard feel live. Upserts make it free, because each early result is overwritten by the next.</p>
+
+<h2 id=dd-capstone-clickstream-to-dashboard-stages level=2>Deep Dive: Inside the Stages</h2>
+<p>The capstone states each stage's decision. Under each one sits a mechanism question a reviewer will ask. These are the ones that change the design.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-enrich-join level=3>Enrichment: broadcast the catalog, or re-key the clicks?</h3>
+<p>Here is a detail the capstone hides. Clicks are partitioned by <code>session_id</code>. The catalog is keyed by <code>product_id</code>. A local keyed join needs both sides partitioned the same way, and they are not. There are two ways out.</p>
+<ul>
+<li><strong>Broadcast the catalog.</strong> Every analytics subtask holds a full copy. In Flink this is broadcast state; in Kafka Streams, a <code>GlobalKTable</code>. Enrichment is a local read with no shuffle, and clicks keep their session partitioning. The cost is memory, about 1 GB per subtask, and every catalog change is applied by every subtask.</li>
+<li><strong>Re-key the clicks by <code>product_id</code>.</strong> Then the catalog can be ordinary keyed state, partitioned. The cost is a full shuffle, 90 MB/s of clicks over the network on Black Friday, and a new hot key problem: the doorbuster product of the day receives a large share of all clicks, all on one subtask. The clicks also lose their session order and must be re-keyed back for sessionization.</li>
+</ul>
+<p>At 1 GB, broadcast wins easily. The decision flips if the reference data grows to tens of gigabytes, or changes thousands of times per second. Then re-keying, or an external lookup with a local cache, becomes the cheaper path. Write the threshold into the design doc so the next engineer knows when to revisit.</p>
+<p>One more rule makes enrichment safe to replay. The dashboard can use "the catalog as it is now". Finance cannot: replaying last month's orders against today's catalog would move revenue between categories after a rename. The finance job therefore does a <strong>temporal join</strong>: each order joins the catalog version that was valid at the order's event time. That needs the catalog's change history with timestamps, which CDC provides. Ask finance which they want, because it is a business decision. Do they report revenue under the category at the time of sale, or under today's category names?</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-watermarks level=3>Watermarks across 96 partitions</h3>
+<p>A Flink source tracks a watermark for each partition it reads and forwards the <em>minimum</em>. Downstream operators again take the minimum across their inputs. So the job's event-time clock is set by its slowest partition. That has three consequences.</p>
+<ul>
+<li><strong>An idle partition stops time.</strong> If one partition receives no events, its watermark never advances, and no window anywhere closes. Configure idleness detection on the source, so a partition with no data for some period, say 30 seconds, is ignored until it produces again.</li>
+<li><strong>A lagging partition holds back everyone.</strong> If one partition falls 10 minutes behind, perhaps because of a bot session, the whole job's windows wait 10 minutes. The dashboard goes stale for every metric, though only one partition is slow. Drill 4 is this failure.</li>
+<li><strong>Watermark alignment</strong> can pause partitions that run too far ahead of the slowest, which bounds the state held for open windows. It is worth turning on when partitions catch up at different speeds after an outage.</li>
+</ul>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-event-time level=3>Trusting event time from devices</h3>
+<p>Event time comes from the phone's clock, and phone clocks are wrong. Some are minutes off. A few are years off. A single event stamped next year, if it reaches a watermark generator, pushes that partition's watermark into the future. Every honest event after it then counts as late and is dropped.</p>
+<p>The ingestion edge should record its own receive time on every event and clamp the device's time to a sane range around it, for example no earlier than 24 hours before receipt and no later than 5 seconds after. Events outside the range keep their raw device time in a separate field, for debugging, and use the clamped time for windows. This is a small rule that prevents a whole class of mystery outages.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-dedupe level=3>Where deduplication is actually needed</h3>
+<p>The capstone requires client-generated event IDs. It is worth being precise about which output depends on them.</p>
+<ul>
+<li><strong>Finance revenue</strong> comes from order events. Each order has an order ID, and revenue is computed per order before aggregation. A duplicate order event becomes an upsert of the same order, so finance is protected by the order key itself, and the transactional sink handles replays.</li>
+<li><strong>The dashboard</strong> counts clicks and orders per minute. A duplicate click inflates a count slightly. The one-hour dedupe window catches retries from browsers and most mobile retries. A few late mobile retries slip through. The dashboard's forgiving accuracy budget absorbs that.</li>
+<li><strong>Fraud features</strong> count distinct order IDs per card, so a duplicate order event does not inflate velocity.</li>
+</ul>
+<p>So the 55 GB "dedupe for a day" proposal buys accuracy only for the one consumer that does not need it. That is the module's rule again: spend on the guarantee where the question needs it.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-jobs level=3>One job or three?</h3>
+<p>The capstone shows one stream serving three consumers. It does not say whether one stream-processing job serves all three. It should not. Run three jobs that share a metric library and read the same topics.</p>
+<ul>
+<li><strong>Fraud</strong> has a sub-second budget. It cannot sit behind a 60-second watermark or a checkpoint-paced transactional sink. It evaluates each order on arrival.</li>
+<li><strong>Finance</strong> uses two-phase-commit sinks. A slow commit or a long checkpoint there must not backpressure the dashboard.</li>
+<li><strong>Analytics</strong> (the dashboard plus enrichment and sessions) is the heaviest and changes most often. Its deploys should not touch the other two.</li>
+</ul>
+<p>Separate jobs are a <a href="#bulkhead">bulkhead</a>. Each has its own checkpoints, its own failure domain and its own release schedule. The cost is reading the order topic two or three times, a few MB/s, which is nothing.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-day-close level=3>What "frozen at the day's close" means</h3>
+<p>Finance's daily report is a view of the streaming aggregates at the close. Pin down three things before anyone signs off.</p>
+<ol>
+<li><strong>Which day.</strong> Midnight in which time zone? A global store usually reports in the company's accounting time zone, not UTC.</li>
+<li><strong>When the day is closed.</strong> The event-time watermark must pass midnight plus an allowed lateness, say 2 hours, before the day's numbers are published as "final for now". Publishing at wall-clock midnight would miss every mobile event still in a tunnel.</li>
+<li><strong>What happens after.</strong> Events for a closed day still arrive. They go to an amendments stream, and the report shows "as of" a time, with restatements logged. Finance already works this way with refunds; the pipeline should match their process, not invent a new one.</li>
+</ol>
+
+<h2 id=dd-capstone-clickstream-to-dashboard-drills level=2>Deep Dive: Failure Drills</h2>
+<p>A review panel walks failures through the finished design. Each drill below says what breaks, who notices, what the design does, and what you would change.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-drill-broker level=3>Drill 1: A broker dies at 11:00 on Black Friday</h3>
+<p><strong>What happens.</strong> One of six brokers fails. Its partition leaderships move to followers within seconds. With replication factor 3, <code>min.insync.replicas=2</code> and <code>acks=all</code>, every acknowledged write already exists on at least two brokers, so nothing acknowledged is lost. Producers see brief errors and retry. The idempotent producer drops the retried batches that had already landed.</p>
+<p><strong>Capacity check.</strong> Five brokers now carry the 81 MB/s of replicated writes and the reads, about 20% more each. That is why the plan kept every broker under half its capacity. When the broker is replaced, re-replicating its data competes with peak traffic, so throttle the reassignment.</p>
+<p><strong>Who notices.</strong> Nobody outside on-call, if the producer settings are right. If some producer used <code>acks=1</code>, its unreplicated writes on the dead leader are gone. Audit producer settings before the peak, not after.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-drill-job level=3>Drill 2: The analytics job crashes at peak</h3>
+<p><strong>What happens.</strong> A task manager dies. Flink restarts the job from the last checkpoint. The job is down for about 2 minutes, during which 90,000 × 120 = 10.8 million events pile up in the log.</p>
+<p><strong>Catch-up.</strong> Assume the job can run at 150,000 events per second when unthrottled, with all its subtasks. The spare rate is 150,000 − 90,000 = 60,000 per second, so the backlog clears in 10.8 M / 60,000 = 180 seconds. The dashboard is about 5 minutes stale in total, which breaks its 2-minute budget for a few minutes.</p>
+<p><strong>What the design protects.</strong> Fraud and finance run in separate jobs and do not notice. The dashboard's upserts make the replay harmless: the re-run minutes overwrite themselves with the same values. Show a "data delayed" banner driven by the job's watermark lag, so operators do not read a stale chart as a sales drop.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-drill-cdc level=3>Drill 3: The catalog connector re-snapshots</h3>
+<p><strong>What happens.</strong> The CDC connector loses its position in the database log, perhaps because the log was cleaned up while the connector was down. Depending on its settings, it takes a fresh snapshot: all 2 million products are published again to the catalog topic in a few minutes. Every analytics subtask applies 2 million broadcast updates, and its main pipeline is backpressured while it does.</p>
+<p><strong>Detect.</strong> A spike in catalog topic throughput, with backpressure on the broadcast input. A connector log entry about starting a snapshot.</p>
+<p><strong>Fix.</strong> Keep enough database log retention to outlast connector outages, and alert on connector lag. Let the catalog input be processed at lower priority, or apply updates in batches. A snapshot of unchanged rows is harmless to correctness, so this is a throughput problem, not a data problem. The opposite failure is quieter. The connector stalls, new products are not in the catalog, and their clicks are enriched as "unknown". Dashboards tolerate a small "unknown" bucket. Alert when it grows past, say, 0.5% of clicks.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-drill-bot level=3>Drill 4: A scraper freezes the whole dashboard</h3>
+<p><strong>What happens.</strong> A scraper runs a single "session" that generates 20,000 events per second. All of them hash to one clickstream partition. That partition's consumer falls further behind every second. Because the job's watermark is the minimum across partitions, every window in the job stops closing. The dashboard freezes for all metrics, even though 95 partitions are healthy.</p>
+<p><strong>Detect.</strong> Maximum lag per partition, in time, not total lag. The gap between wall-clock time and the job's watermark. Events per session in the top-N sessions.</p>
+<p><strong>Fix.</strong> Rate-limit per session and per client at the edge, which is <a href="#rate-limiting">backpressure at the boundary</a>. Classify bot traffic at ingestion and route it to its own topic, which the analytics job does not read. Watermark alignment bounds how far other partitions run ahead, but it does not unblock a stuck one. Removing the hot key does.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-drill-clock level=3>Drill 5: An SDK release with a broken clock</h3>
+<p><strong>What happens.</strong> A new mobile SDK release stamps events in milliseconds where the server expects seconds, or vice versa. Some events now appear to come from the year 2600, others from 1970. Without clamping, the far-future events push watermarks forward, and every correct event is treated as late. The dashboard's per-minute counts fall to near zero.</p>
+<p><strong>Detect.</strong> The distribution of (receive time − event time) by SDK version. A sudden jump in late events dropped. Watermarks ahead of wall-clock time, which should never happen.</p>
+<p><strong>Fix.</strong> The clamping rule from the stages section stops the damage at ingestion. Tag events with SDK version so a bad release is identified in minutes. Reprocess the affected hours from the log with a corrected time parser, using the Kappa replay below.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-drill-replay level=3>Drill 6: Finance changes the definition of revenue</h3>
+<p><strong>What happens.</strong> Finance decides that revenue excludes gift-card purchases, effective for the whole quarter. The shared metric library gets a new version. The Kappa move is to run the new logic over history into a new output, compare, then switch readers.</p>
+<p><strong>Replay math for 30 days.</strong> 30 × 864 million ≈ 26 billion click events. But revenue comes from orders, about 20 million in 30 days, which replays in minutes. The click replay is only needed if dashboard metrics change too. At 480,000 per second (96 subtasks × 5,000), the clicks would take about 15 hours.</p>
+<p><strong>The retention trap.</strong> The log holds 7 days, and the quarter is 90. The replay job must read days 8 to 90 from the archive, then switch to the log for the last 7 days. Build the job's source to do that from the start: a bounded read of the archive followed by an unbounded read of the log, with the switch at a known offset. Without the archive, the Kappa move is limited to the retention window, and the team falls back to a separate batch job, which is the accidental Lambda the capstone set out to avoid.</p>
+
+<h3 id=dd-capstone-clickstream-to-dashboard-drill-warehouse level=3>Drill 7: The warehouse lock, revisited under load</h3>
+<p>The capstone's Stage 6 covers this one, and the seam holds. Two things to add for the review. First, alert on the warehouse loader's backlog age against the topic's 7-day retention, using the growth-rate math from <a href="#backpressure">Backpressure</a>. Second, make the loader's writes idempotent (merge on event ID or batch ID), because when the lock clears, it will retry the batch that was in progress.</p>
+
+<h2 id=dd-capstone-clickstream-to-dashboard-debates level=2>Deep Dive: The Trade-off Debates</h2>
+<p>These are the arguments a review panel will actually have. Each has a defensible default for this store, and a condition that would flip it.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Debate<th>Default here<th>Why<th>Flip it when<tbody>
+<tr><td>Flink vs. Kafka Streams<td>Flink for analytics and finance; either for fraud<td>Event-time windows with watermarks across many partitions, broadcast state, 2PC sinks to non-Kafka stores<td>All outputs are Kafka topics and the team already runs Kafka Streams well<tr><td>One job vs. a job per tier<td>A job per tier<td>Independent checkpoints, failure domains and deploys<td>The team is small and tiers share one budget; accept coupling, but put seams before slow sinks<tr><td>Broadcast vs. re-keyed catalog<td>Broadcast<td>1 GB fits everywhere; no shuffle, no hot product key<td>Reference data grows to tens of GB or changes very fast<tr><td>Dashboard store: relational upserts vs. a real-time OLAP store<td>Relational upserts of pre-aggregated minutes<td>A few hundred metrics per minute is a tiny table<td>Product wants ad hoc slicing (by country, device, campaign); then load enriched events into an OLAP store and aggregate at query time<tr><td>Tighter watermark vs. early firing<td>Early firing every 10 s, 60 s watermark<td>Keeps late mobile events in, still feels live<td>The dashboard's consumers distrust numbers that change<tr><td>Dedupe window: 1 hour vs. 1 day<td>1 hour<td>Only the forgiving dashboard depends on click dedupe<td>Clicks start feeding billing or partner payouts<tr><td>Category at time of sale vs. current category<td>Ask finance; usually time of sale<td>Historic reports should not change on a rename<td>Merchandising wants trend lines under today's taxonomy; offer both views<tr><td>Global ordering anywhere<td>None<td>No consumer needs it; it would cap parallelism at one<td>Never, without a named customer and a measured need</table></div></div>
+<p>The pattern behind the table is the module's rule. Each default is justified by a named consumer's budget, and each flip condition names what would have to change about that consumer.</p>
+
+<h2 id=dd-capstone-clickstream-to-dashboard-evolution level=2>Deep Dive: The Evolution Path</h2>
+<p>Nobody builds the final architecture on day one. A credible plan says what to build first and what signal triggers the next step.</p>
+<ol>
+<li><strong>Version 0: one job, one topic, upserts.</strong> At a few thousand events per second, a single stream job reads one keyed clickstream topic and writes minute aggregates to Postgres. Client event IDs and event time are there from the first day, because they are the expensive things to retrofit. Partition count is already sized for years.</li>
+<li><strong>Version 1: three tiers.</strong> Triggered by finance asking to use the numbers, or fraud asking for features. Split into the three jobs, add the transactional sink for finance, and add CDC enrichment. This is the capstone's design.</li>
+<li><strong>Version 2: seams and archive.</strong> Triggered by the first slow-sink incident or the first metric change older than retention. Put every slow sink behind its own topic, and archive raw events continuously so replays can reach any date.</li>
+<li><strong>Version 3: sessionization and an OLAP store.</strong> Triggered by product teams wanting funnels and ad hoc slicing. Add session windows on the session-keyed stream, and load enriched events into a real-time OLAP store for exploration. The dashboard's headline metrics stay on the precomputed path.</li>
+<li><strong>Version 4: multi-region.</strong> Triggered by a second region's traffic or latency. Regional logs and regional analytics, with per-region watermarks, merged into a global view only at the aggregate level. A slow region then delays only the global rollup, not each region's own dashboard.</li>
+<li><strong>Version 5: features for training.</strong> The fraud features also feed model training through a <a href="#feature-store">feature store</a>. The shared metric library becomes the single definition used for both serving and backfills, which prevents training/serving skew.</li>
+</ol>
+<p>Notice what each step keeps. Event IDs, event time, keyed partitions and the shared metric library are in place from version 0. They are the decisions that are cheap early and very expensive late.</p>
+
+<h2 id=dd-capstone-clickstream-to-dashboard-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>For each output, who is the named consumer, and what are its staleness and accuracy budgets in numbers?</li>
+<li>Has the dashboard's freshness budget been spent line by line (SDK batching, watermark, window, sink), and is there an early-firing or watermark plan if it does not fit?</li>
+<li>Are event IDs generated on the client before the first send, and how long is the dedupe window, sized from which client's retry behaviour?</li>
+<li>Is device event time clamped against server receive time at ingestion?</li>
+<li>Is idleness configured on sources, and is there an alert on the gap between wall-clock time and the watermark?</li>
+<li>How does enrichment join clicks to the catalog: broadcast or re-keyed, and at what reference-data size does that choice flip?</li>
+<li>Does finance join the catalog version valid at the order's time, and did finance agree to that rule?</li>
+<li>Are the tiers separate jobs, so that a slow finance commit or an analytics deploy cannot affect fraud?</li>
+<li>What exactly defines a closed day (time zone, allowed lateness), and how are amendments after close shown?</li>
+<li>For every slow sink, is there a log seam, an alert on backlog age against retention, and idempotent writes for the retry after recovery?</li>
+<li>How far back can a replay reach, and how does the replay job read history older than the log's retention?</li>
+<li>Is there a per-session or per-client rate limit at the edge, and a path that keeps bot traffic out of the analytics topics?</li>
+</ol>
+
+<h2 id=dd-capstone-clickstream-to-dashboard-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Clicks are keyed by session and the catalog by product. How does your enrichment join work?"</summary>
+<p>A keyed join would need both sides partitioned the same way, so I would not use one. I broadcast the catalog: every subtask holds a full copy, about 1 GB, kept current from the CDC topic. Enrichment is then a local read, and clicks keep their session partitioning for funnels. Re-keying clicks by product would cost a 90 MB/s shuffle on Black Friday and create a hot key on the doorbuster product. I would revisit if the catalog grew to tens of gigabytes.</p>
+</details>
+
+<details>
+<summary>"The dashboard has a two-minute budget and a 60-second watermark on one-minute windows. Does it fit?"</summary>
+<p>Only just. The earliest event in a minute waits for the minute to end and then for the watermark, about two minutes in total before any processing. So I add early firing: emit the open minute's running count every 10 seconds as an upsert, then overwrite it with the final value when the window closes. The dashboard feels live, late mobile events still count until the window closes, and upserts make the extra writes harmless.</p>
+</details>
+
+<details>
+<summary>"One partition is 10 minutes behind. Why is the whole dashboard stale?"</summary>
+<p>Because event-time progress is the minimum watermark across all input partitions. One lagging partition holds every window in the job open. The usual cause here is a hot session, such as a scraper, on one partition. The fix is upstream: rate-limit per session at the edge and route bot traffic to its own topic. Idleness detection does not help, because the partition is not idle, just slow. Per-partition lag alerts in time units would have caught it early.</p>
+</details>
+
+<details>
+<summary>"Why three jobs instead of one? Isn't that more to operate?"</summary>
+<p>It is more to deploy, but less to break. The three tiers have different budgets and different sink mechanics. Fraud needs sub-second responses. Finance pays for transactional commits tied to checkpoints. Analytics changes most often. In one job, a slow finance commit would backpressure fraud, and every dashboard tweak would redeploy the fraud path. Separate jobs give each tier its own checkpoints, failure domain and release cycle, for the cost of reading the orders topic a few extra times.</p>
+</details>
+
+<details>
+<summary>"Finance wants to change the revenue definition for the whole quarter. Walk me through it."</summary>
+<p>Update the shared metric library, then run the new version as a separate job over the quarter's history into a new output table. Compare old and new outputs, have finance sign off the differences, and switch the report to the new table. The log keeps only 7 days, so the replay reads the earlier 83 days from the archive and then continues from the log at a known offset. Orders are small, about 20 million, so the finance replay takes minutes. Only a click-based metric change would need the 15-hour replay.</p>
+</details>
+
+<details>
+<summary>"Why not exactly-once for the dashboard too? It's the same stream."</summary>
+<p>Because the dashboard's question does not need it, and it would cost freshness. A transactional sink makes outputs visible only at each commit, which adds seconds to a budget that is already fully spent. Idempotent upserts already make replays harmless for per-minute values. The remaining error, a few late mobile duplicates past the dedupe window, is far inside the dashboard's accuracy budget. The guarantee belongs to the question, not the pipeline.</p>
+</details>
+
+<details>
+<summary>"A product is renamed from Gadgets to Electronics. What happens to last month's revenue report?"</summary>
+<p>That depends on a rule finance must choose, and I would make them choose it explicitly. If reports use the category at the time of sale, the finance job does a temporal join against the catalog version valid at the order's time, and last month's report does not change. If they want today's names, old aggregates must be recomputed on every rename. Most finance teams want the first, with a separate "current taxonomy" view for merchandising trend lines.</p>
+</details>
+
+<details>
+<summary>"Traffic will grow ten times over three years. What breaks first?"</summary>
+<p>Peak would be 900,000 events per second. The 96 clickstream partitions cap analytics at 96 subtasks, about 480,000 per second at 5,000 each, so the partition count breaks first, unless per-subtask throughput improves. Broker throughput and storage scale by adding brokers. The catalog broadcast is unaffected by traffic. The dedupe state grows linearly, to about 23 GB for an hour. So the plan is to migrate the clickstream to a larger topic within about two years, by creating a new topic and cutting over producers, not by changing the count in place.</p>
+</details>

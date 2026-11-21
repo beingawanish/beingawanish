@@ -1,0 +1,67 @@
+{
+  "type": "record",
+  "name": "NotificationSent",
+  "namespace": "com.edacommerce.notification",
+  "doc": "A message left for the customer. Audit trail for the order timeline.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "notificationId",
+      "type": "string"
+    },
+    {
+      "name": "orderId",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "customerId",
+      "type": "string"
+    },
+    {
+      "name": "channel",
+      "type": {
+        "type": "enum",
+        "name": "Channel",
+        "namespace": "com.edacommerce.notification",
+        "doc": "Delivery channel. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+        "symbols": [
+          "EMAIL",
+          "SMS",
+          "PUSH",
+          "UNKNOWN"
+        ],
+        "default": "UNKNOWN"
+      }
+    },
+    {
+      "name": "template",
+      "type": "string",
+      "doc": "Template id, e.g. order-confirmed.v1."
+    },
+    {
+      "name": "sourceEventId",
+      "type": "string",
+      "doc": "eventId of the event that triggered the notification."
+    },
+    {
+      "name": "attachmentCount",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "sentAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

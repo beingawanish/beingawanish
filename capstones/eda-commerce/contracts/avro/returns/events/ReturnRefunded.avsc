@@ -1,0 +1,36 @@
+{
+  "type": "record",
+  "name": "ReturnRefunded",
+  "namespace": "com.edacommerce.returns",
+  "doc": "Money went back to the customer for this return.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": "string"
+    },
+    {
+      "name": "refundId",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "refundedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

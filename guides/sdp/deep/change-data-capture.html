@@ -1,0 +1,242 @@
+<h2 id=dd-change-data-capture-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's promise is that CDC "reads the WAL exactly as a replica would". That is true in spirit. In practice, the database has to translate its physical log into row changes, track how far each reader has got, and keep log files around until that reader confirms. Those three duties explain nearly every CDC incident. This section covers Postgres and MySQL, the two databases most CDC pipelines read, and then Debezium, the connector most of them use.</p>
+
+<h3 id=dd-change-data-capture-logical-decoding level=3>Postgres: from physical WAL to row changes</h3>
+<p>The Postgres WAL is physical. It records "these bytes changed on page 4,812 of this file", which a replica can replay but a search indexer cannot use. <strong>Logical decoding</strong> turns those records back into row-level inserts, updates and deletes. It needs <code>wal_level = logical</code>, which makes the WAL carry the extra information the decoder needs. That adds some WAL volume, how much depends on the workload.</p>
+<p>Decoding runs inside the database server, through an <strong>output plugin</strong> that formats the changes. <code>pgoutput</code> is built in and is what Debezium uses by default. Other plugins, such as <code>wal2json</code>, exist for other consumers. A <strong>publication</strong> lists which tables are captured.</p>
+<p>Three details shape what consumers receive.</p>
+<ul>
+<li><strong>Changes are emitted at commit, in commit order.</strong> A transaction's changes are held until it commits, then sent together. A rolled-back transaction is never sent. A transaction that updates 10 million rows produces nothing until commit, then 10 million events at once. The server spills large transactions to disk while decoding (<code>logical_decoding_work_mem</code>). Postgres 14 and later can stream large in-progress transactions to plugins that support it.</li>
+<li><strong>Replica identity decides what "before" contains.</strong> By default (<code>REPLICA IDENTITY DEFAULT</code>), updates and deletes carry only the primary key of the old row, not its other columns. A delete event therefore says "row 8412 is gone" and nothing more. <code>REPLICA IDENTITY FULL</code> logs the whole old row, at the price of more WAL for every update and delete on that table.</li>
+<li><strong>Unchanged large values may be missing.</strong> Postgres stores large column values out of line (TOAST). If an update does not touch a TOASTed column, the WAL does not repeat it, so the update event has no value for that column. Debezium fills it with a placeholder (by default <code>__debezium_unavailable_value</code>). A consumer that writes every field blindly will overwrite a product description with that placeholder.</li>
+</ul>
+
+<h3 id=dd-change-data-capture-slots level=3>Replication slots: the reader's bookmark that holds the disk</h3>
+<p>A <strong>logical replication slot</strong> is the database-side record of one reader's progress. It stores two positions in the log, called LSNs (log sequence numbers):</p>
+<ul>
+<li><code>confirmed_flush_lsn</code>: the reader has confirmed everything up to here.</li>
+<li><code>restart_lsn</code>: the oldest WAL the database must keep so decoding can resume. WAL older than this can be recycled.</li>
+</ul>
+<p>The slot also holds back cleanup of the system catalog (<code>catalog_xmin</code>), because the decoder needs old table definitions to interpret old WAL. A stalled slot therefore causes catalog bloat as well as WAL growth.</p>
+<p>Two settings are the safety rails. <code>max_slot_wal_keep_size</code> (Postgres 13+) caps how much WAL any slot can retain. Past it, the slot is <strong>invalidated</strong>: the primary's disk is safe, and the connector has lost its place and must resnapshot. The view <code>pg_replication_slots</code> shows each slot's state in <code>wal_status</code>, so you can see a slot heading towards that limit. This is the query to put on a dashboard:</p>
+<pre><code>SELECT slot_name, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+FROM pg_replication_slots
+WHERE slot_type = 'logical';</code></pre>
+<p>Slots and failover have a history worth knowing. For a long time, logical slots existed only on the primary. After a failover, the new primary had no slot, and the connector could not resume without a fresh snapshot. Postgres 16 added logical decoding on standbys, and Postgres 17 added slot synchronization to standbys for failover. HA tools such as Patroni have their own mechanisms. Check which one your setup uses before you trust a failover.</p>
+
+<h3 id=dd-change-data-capture-mysql level=3>MySQL: the binlog, and the opposite retention rule</h3>
+<p>MySQL's change log is the <strong>binary log</strong> (binlog). For CDC it must be in row format with full images: <code>binlog_format = ROW</code> and <code>binlog_row_image = FULL</code>. The connector connects as if it were a replica, with its own <code>server_id</code>, and reads the binlog stream. With <strong>GTIDs</strong> enabled (global transaction IDs), its position is a transaction ID set, not a file name and offset. That lets it resume against a different server after a failover.</p>
+<p>The key difference from Postgres is retention. <strong>MySQL does not keep binlogs for a slow reader.</strong> Binlogs are purged by age (<code>binlog_expire_logs_seconds</code>) whether or not the connector has read them. So the two databases fail in opposite directions:</p>
+<ul>
+<li>A stopped Postgres connector keeps WAL forever (until the cap), and the primary's disk fills.</li>
+<li>A stopped MySQL connector keeps nothing. If it is down longer than binlog retention, its position is purged, and it cannot resume without a new snapshot.</li>
+</ul>
+<p>Debezium's MySQL connector also keeps a <strong>schema history topic</strong>, a record of every DDL statement it has seen. It needs that to interpret older binlog events against the table structure that was current at the time. Losing or truncating that topic breaks restarts.</p>
+
+<h3 id=dd-change-data-capture-envelope level=3>What a change event actually contains</h3>
+<p>Debezium publishes one event per row change, keyed by the table's primary key, to a topic per table (named <code>&lt;topic.prefix&gt;.&lt;schema&gt;.&lt;table&gt;</code>). The value is an envelope:</p>
+<pre><code>{
+  "before": { "id": 8412, "status": "active", ... },     // null for inserts
+  "after":  { "id": 8412, "status": "cancelled", ... },  // null for deletes
+  "source": { "lsn": 2389412776, "txId": 918273, "ts_ms": 1763712000123,
+              "snapshot": "false", "table": "orders", ... },
+  "op": "u",               // c = create, u = update, d = delete, r = snapshot read
+  "ts_ms": 1763712000456   // when the connector processed it
+}</code></pre>
+<p>A few details matter downstream.</p>
+<ul>
+<li>A delete produces two records: a <code>d</code> event with <code>before</code>, then a <strong>tombstone</strong> with the same key and a null value. The tombstone is for Kafka log compaction, so that a compacted topic eventually forgets the key entirely.</li>
+<li>An update that changes the primary key becomes a delete for the old key plus a create for the new key. Consumers keyed by primary key see two rows, not one.</li>
+<li><code>source.lsn</code> (or the binlog position) is a monotonic version for the row. Consumers can use it to reject an older change that arrives after a newer one.</li>
+<li>Ordering is per key, through Kafka partitioning by key. There is no ordering across tables, and a transaction that touches three tables lands in three topics. If a consumer needs transaction boundaries, Debezium can publish them to a separate transaction metadata topic.</li>
+</ul>
+
+<h3 id=dd-change-data-capture-snapshots level=3>Snapshots: initial and incremental</h3>
+<p>The lesson describes "first contact": snapshot, then tail, with no gap. In Postgres the trick is that creating a slot can export a snapshot at exactly the slot's starting LSN. The connector reads every table under that snapshot, so the copy and the stream meet with no gap and no overlap. Snapshot rows are emitted with <code>op: "r"</code>.</p>
+<p>The problem with this initial snapshot is scale. Reading a 2 TB database in one long transaction takes hours. During those hours the slot holds WAL, and the long transaction holds back vacuum. If it fails at hour five, it starts over.</p>
+<p><strong>Incremental snapshots</strong> solve this. The idea comes from Netflix's DBLog paper, and Debezium implements it. The connector reads a table in primary-key chunks while streaming continues. To avoid emitting a chunk row that is older than a change already streamed, it writes low and high watermark markers into the log around each chunk read, through a small signal table. Any key that also appears as a streamed change between the two markers is dropped from the chunk, because the streamed version is newer. Incremental snapshots can be triggered at any time for any table, which is also how you re-seed one consumer without touching the others.</p>
+
+<h3 id=dd-change-data-capture-outbox-impl level=3>The outbox, as implemented</h3>
+<p>The lesson's outbox is a table written in the same transaction as the business change. A common layout has columns <code>id</code>, <code>aggregate_type</code>, <code>aggregate_id</code>, <code>type</code> and <code>payload</code>. Debezium's outbox event router routes each row to a topic named after <code>aggregate_type</code> ("order"), keys it by <code>aggregate_id</code> for per-order ordering, and publishes <code>payload</code> as the event body.</p>
+<p>Two refinements are worth knowing. First, the application can <em>delete</em> the outbox row in the same transaction right after inserting it. The insert is still in the WAL, so CDC publishes it, and the table never grows. Second, Postgres can write a message straight into the WAL without any table, using <code>pg_logical_emit_message()</code> inside the transaction. Debezium can capture those messages too. It is the outbox without the outbox table, at the cost of being Postgres-specific.</p>
+
+<h3 id=dd-change-data-capture-connector-config level=3>The knobs that matter in a connector config</h3>
+<pre><code>{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "plugin.name": "pgoutput",
+  "slot.name": "cdc_orders",
+  "publication.name": "cdc_orders_pub",
+  "topic.prefix": "shop",
+  "table.include.list": "public.orders,public.products,public.outbox",
+  "column.exclude.list": "public.products.internal_notes",
+  "snapshot.mode": "initial",
+  "heartbeat.interval.ms": "10000",
+  "heartbeat.action.query": "UPDATE cdc_heartbeat SET ts = now() WHERE id = 1",
+  "signal.data.collection": "public.debezium_signal",
+  "tombstones.on.delete": "true"
+}</code></pre>
+<ul>
+<li><code>table.include.list</code> and <code>column.exclude.list</code> decide what leaves the database. Excluding columns is also how you keep personal data out of topics that many teams can read.</li>
+<li><code>snapshot.mode</code> decides what happens on first start and when the stored position is unusable. Choose it deliberately; the defaults differ between versions and connectors.</li>
+<li><code>heartbeat.interval.ms</code> with <code>heartbeat.action.query</code> keeps the slot advancing when captured tables are quiet. The failure modes section explains why that matters.</li>
+<li><code>signal.data.collection</code> names the signal table used to trigger incremental snapshots.</li>
+</ul>
+<p>The Postgres connector runs as a single task per database, because one slot is one ordered stream. You scale it by splitting tables across connectors with separate slots, not by adding tasks.</p>
+
+<h2 id=dd-change-data-capture-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions: the orders database takes 400 row writes per second on average, 4,000 at peak. Postgres generates 5 MB/s of WAL on average for the whole server; WAL volume includes index changes, full-page images after checkpoints and tables you do not capture, so it is much larger than the change events. The data disk is 2 TB with 1.2 TB used.</p>
+
+<h3 id=dd-change-data-capture-size-slot level=3>How fast a stopped connector fills the disk</h3>
+<p>A stopped slot retains <em>all</em> WAL for the server, not just the captured tables. At 5 MB/s:</p>
+<ul>
+<li>5 MB/s × 3,600 = <strong>18 GB per hour</strong>, or 430 GB per day.</li>
+<li>Free space is 800 GB, so the disk is full in about <strong>44 hours</strong>.</li>
+<li>During a bulk job generating 50 MB/s of WAL, it is full in under <strong>5 hours</strong>.</li>
+</ul>
+<p>So the slot-lag alert must be sized to the worst WAL rate, not the average. A useful rule is to page when retained WAL would fill the remaining disk within a time a human can act in, for example at 100 GB retained here. Then set <code>max_slot_wal_keep_size</code> as the hard stop, say 400 GB. Past that, the database invalidates the slot and protects itself. You pay with a resnapshot; you never pay with an outage of the primary.</p>
+<p>On MySQL the arithmetic runs the other way. If binlogs are kept for 3 days, a connector down for more than 3 days cannot resume. The alert is on connector downtime against binlog retention.</p>
+
+<h3 id=dd-change-data-capture-size-events level=3>Event volume and topic storage</h3>
+<p>Event size depends heavily on the format. JSON with an embedded schema (Kafka Connect's <code>schemas.enable=true</code>) can easily be 2–5 KB per event, because every message repeats the schema. Avro or Protobuf with a schema registry carries only an ID and the data, often a few hundred bytes for a typical row.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Format<th>Bytes per event (assumed)<th>At 400/s<th>Per day<th>7 days, RF 3<tbody><tr><td>JSON with embedded schema<td>3,000<td>1.2 MB/s<td>104 GB<td>2.2 TB<tr><td>JSON without schema<td>1,000<td>400 KB/s<td>35 GB<td>730 GB<tr><td>Avro + schema registry<td>300<td>120 KB/s<td>10 GB<td>220 GB</table></div></div>
+<p>A tenfold difference from a serialization setting is worth deciding before the first consumer depends on the format. The lesson's 200 KB/s estimate assumed 500-byte events, which sits between the rows here.</p>
+
+<h3 id=dd-change-data-capture-size-snapshot level=3>Snapshot time and what it holds back</h3>
+<p>Suppose the captured tables total 500 GB and the snapshot reads at 50 MB/s, limited by the database's spare I/O. That is 10,000 s, almost <strong>3 hours</strong>.</p>
+<ul>
+<li>With an initial snapshot, the slot retains WAL from its creation: 3 hours × 18 GB = 54 GB. A long snapshot transaction also holds back vacuum on busy tables.</li>
+<li>With an incremental snapshot in 1,024-row chunks, streaming continues, and each chunk is a short query. It takes as long or longer in total, but it can pause, resume and run during business hours.</li>
+</ul>
+<p>Consumers must absorb the snapshot too. 500 GB at an assumed 1 KB per row is 500 million events. A search indexer that applies 5,000 events/s needs about 28 hours to work through them. The snapshot is usually limited by the slowest consumer, not by the database.</p>
+
+<h3 id=dd-change-data-capture-size-catchup level=3>Catch-up after an outage</h3>
+<p>The lesson's drill has the connector down from 6 PM to 8 PM. At 400 events/s, two hours is 2.9 million events. If the pipeline can process 10,000 events/s, catch-up takes 2.9M / (10,000 − 400) ≈ <strong>5 minutes</strong>. For the 30-hour outage in Q3, it is 43 million events and about <strong>75 minutes</strong>, assuming the WAL is still there. That is why "restart if it can catch up" is often the right first move.</p>
+
+<h3 id=dd-change-data-capture-size-latency level=3>End-to-end latency</h3>
+<p>For small transactions, commit to consumer is typically well under a second: decoding is quick, and Kafka adds milliseconds. Three things stretch it.</p>
+<ul>
+<li><strong>Large transactions.</strong> Changes appear only at commit. A 10-minute batch transaction delivers its first event 10 minutes after its first write.</li>
+<li><strong>Bursts.</strong> A 10-million-row update is 10 million events in one go. Every later change, from every table on that connector, queues behind them.</li>
+<li><strong>Consumer apply rate.</strong> The indexer, not CDC, is usually the bottleneck. Measure lag at each consumer, in time, not just at the connector.</li>
+</ul>
+
+<h2 id=dd-change-data-capture-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-change-data-capture-fm-quiet level=3>1. The quiet table that filled the disk</h3>
+<p><strong>Symptom.</strong> Retained WAL on the primary grows steadily for days. The connector is running, healthy and shows no errors. It has nothing to publish.</p>
+<p><strong>Mechanism.</strong> The connector captures only the <code>promotions</code> table, which changes a few times a week. The server, meanwhile, writes WAL constantly for other tables. The slot's confirmed position advances only when the connector confirms an event. With no captured changes, it never confirms anything, so the slot holds all WAL since the last promotion edit. The same happens when one database on a shared Postgres server is quiet and another is busy.</p>
+<p><strong>Detect.</strong> Retained WAL per slot (the query above) growing while the connector reports "running". Time since the connector's last emitted event.</p>
+<p><strong>Fix.</strong> Enable heartbeats. <code>heartbeat.interval.ms</code> makes the connector confirm its position regularly. <code>heartbeat.action.query</code> writes to a small heartbeat table in the captured database, which guarantees there is a change to confirm. Always pair with <code>max_slot_wal_keep_size</code>.</p>
+
+<h3 id=dd-change-data-capture-fm-failover level=3>2. The failover that skipped an hour</h3>
+<p><strong>Symptom.</strong> After a primary failover, the connector restarts and runs normally. A week later, support finds orders from the failover window missing in search.</p>
+<p><strong>Mechanism.</strong> The logical slot lived only on the old primary. The new primary had no slot. The connector's configuration allowed it to create a fresh slot, which started at the new primary's current position. Every change between the old slot's last confirmed position and the moment the new slot was created was never published. The connector did not error, because from its point of view it started cleanly.</p>
+<p><strong>Detect.</strong> Connector logs showing a new slot was created on restart. A reconciliation job comparing row counts or checksums per hour between the database and each consumer. Without one, this is found by customers.</p>
+<p><strong>Fix.</strong> Make slots survive failover: Postgres 17 failover slots, or your HA tool's slot handling. Configure the connector to fail, not silently recreate, if its slot is missing. After any failover without slot continuity, run an incremental snapshot of the affected tables. The consumers' idempotent apply makes the overlap harmless.</p>
+
+<h3 id=dd-change-data-capture-fm-binlog level=3>3. The binlog that was purged first</h3>
+<p><strong>Symptom.</strong> A MySQL connector, stopped over a long weekend for maintenance, will not start. It reports that its stored binlog position is no longer available on the server.</p>
+<p><strong>Mechanism.</strong> MySQL kept binlogs for 3 days and purged them on schedule. The connector's position pointed into a purged file. MySQL never waits for a CDC reader the way a Postgres slot does.</p>
+<p><strong>Detect.</strong> Before it happens: connector downtime compared to binlog retention, and the oldest available binlog compared to the connector's stored position. After it happens: the startup error.</p>
+<p><strong>Fix.</strong> Keep binlog retention well above your longest plausible connector outage, including weekends and holidays. Run with GTIDs so the connector can resume against any replica that still has the transactions. When the position is lost, take a new snapshot. If the connector supports a snapshot mode that only re-reads schema and data when needed, set it deliberately rather than discovering the default during an incident.</p>
+
+<h3 id=dd-change-data-capture-fm-bulk level=3>4. The migration that buried the search index</h3>
+<p><strong>Symptom.</strong> A schema migration backfills a new column on 60 million product rows in one statement. Within minutes, search indexing lag goes from one second to nine hours. Price changes made by merchants that afternoon do not show in search.</p>
+<p><strong>Mechanism.</strong> The backfill was one transaction. At commit, 60 million update events were emitted at once. Each consumer processes events in order per partition, so every price change made after the migration is queued behind its share of backfill events. CDC worked exactly as designed. Every change was faithfully published.</p>
+<p><strong>Detect.</strong> Event rate per table on the connector spiking. Consumer lag measured in time jumping at the same moment. A pre-deploy review that flags any statement touching more than some number of rows.</p>
+<p><strong>Fix.</strong> Treat big backfills as a capacity event. Run them in batches of, say, 10,000 rows with pauses, so live changes interleave. Exclude columns consumers do not need, so updates to them do not produce events that matter. Have consumers skip events whose relevant fields did not change, by comparing <code>before</code> and <code>after</code>. For truly massive changes, pause the consumer, apply the change, and rebuild the derived system from a snapshot instead.</p>
+
+<h3 id=dd-change-data-capture-fm-partial level=3>5. Descriptions replaced with a placeholder</h3>
+<p><strong>Symptom.</strong> Hundreds of product pages in search show the text <code>__debezium_unavailable_value</code> as their description. It began after a pricing job ran.</p>
+<p><strong>Mechanism.</strong> Descriptions are long, so Postgres stores them out of line (TOAST). The pricing job updated only <code>price</code>. The WAL record for that update did not include the unchanged description, so Debezium emitted the placeholder for it. The indexer wrote every field from <code>after</code> into the search document, replacing the real description.</p>
+<p><strong>Detect.</strong> Search the derived store for the placeholder string. Better, have the consumer count events that contain it.</p>
+<p><strong>Fix.</strong> Either set <code>REPLICA IDENTITY FULL</code> on the table, which makes the WAL carry the full old row and costs extra WAL per update, or make the consumer apply partial updates: skip any field holding the placeholder and keep the stored value. The second is cheaper and is the right default for document stores that support partial updates.</p>
+
+<h3 id=dd-change-data-capture-fm-out-of-order level=3>6. The older update that won</h3>
+<p><strong>Symptom.</strong> A product's stock shows "in stock" in search but "sold out" in the database. Reindexing that product fixes it. It happens a few times a day.</p>
+<p><strong>Mechanism.</strong> The indexer retries failed writes on a separate retry queue, to avoid blocking its partition. Update A (in stock) failed once on a timeout and went to the retry queue. Update B (sold out) applied immediately. Then the retry of A applied, overwriting B with older data. The topic was ordered per key; the consumer broke the order. The same thing happens when a consumer processes one partition with several threads, or when two connectors publish the same table.</p>
+<p><strong>Detect.</strong> Periodic sampling that compares derived documents with the source rows. Logs of retried writes for keys that also had later successful writes.</p>
+<p><strong>Fix.</strong> Version every write with the source position. Elasticsearch supports external versioning (<code>version_type=external</code>), which rejects any write whose version is not higher than the stored one; use the LSN or binlog position. In a relational sink, use <code>UPDATE … WHERE source_lsn &lt; :lsn</code>. With versioned writes, retries and reordering become harmless, and the retry queue is safe.</p>
+
+<h3 id=dd-change-data-capture-fm-schema level=3>7. The column rename that stopped three teams</h3>
+<p><strong>Symptom.</strong> On Tuesday morning, the warehouse load, the recommendations feature job and a partner sync all fail at once. The orders team deployed a migration that renamed <code>amount</code> to <code>amount_cents</code>.</p>
+<p><strong>Mechanism.</strong> Raw CDC events mirror the table. The rename changed the event schema for every consumer. Consumers that look up <code>amount</code> got null or failed to deserialize, and some went into a retry loop on the first new-format event. This is the lesson's "schema coupling" cost, arriving as an incident.</p>
+<p><strong>Detect.</strong> Schema registry compatibility checks rejecting a new schema version, if they are enabled. Consumer error rates and dead-letter queue depth jumping right after a database deploy.</p>
+<p><strong>Fix.</strong> Register CDC schemas in a schema registry with a compatibility mode (backward compatibility is the usual choice), so incompatible changes fail at the connector instead of in every consumer. Make database migrations expand-then-contract: add the new column, write both, move consumers, then drop the old one. For data other teams consume, put a transformation layer or an outbox contract between the table and them, as the lesson recommends. See also <a href="#api-versioning">API Versioning</a>.</p>
+
+<h2 id=dd-change-data-capture-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-change-data-capture-choose-capture level=3>Choosing how to capture</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th>Log-based, self-run (Debezium)<th>Log-based, managed (DMS, Datastream, Fivetran)<th>Trigger-based<th>Query-based polling<th>Outbox + log-based<tbody><tr><td>Sees deletes<td>Yes<td>Yes<td>Yes<td>No (unless soft deletes)<td>Yes, if you write an event for them<tr><td>Sees every intermediate change<td>Yes<td>Yes<td>Yes<td>No<td>Every event you write<tr><td>Load on the database<td>Low: reads the log<td>Low<td>Extra write per change, inside the transaction<td>Repeated queries; needs an index on <code>updated_at</code><td>One extra insert per event<tr><td>Latency<td>Sub-second typical<td>Seconds to minutes<td>Sub-second to the change table<td>The poll interval<td>Sub-second typical<tr><td>Consumer coupling<td>Table schema<td>Table schema, mapped by the vendor<td>Change-table schema<td>Query result<td>A designed contract<tr><td>Operational load<td>Connector, Kafka Connect, slots<td>Low; less control<td>Triggers on every table<td>Low<td>Same as log-based, plus the outbox table<tr><td>Good fit<td>Your own derived systems, at scale<td>Warehouse loading, few engineers<td>Databases without log access<td>Small tables, append-only data<td>Domain events for other teams</table></div></div>
+<p>The default for owned infrastructure is log-based. Choose managed when the main consumer is a warehouse and nobody wants to run Kafka Connect. Use triggers only when the database gives no log access. Polling is acceptable for append-only tables, such as an event log table, where there are no deletes and no updates to miss.</p>
+
+<h3 id=dd-change-data-capture-choose-apply level=3>Choosing how consumers apply changes</h3>
+<p>Consumers are where most CDC correctness bugs live, so the apply strategy deserves its own decision.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Apply strategy<th>Handles duplicates<th>Handles reordering<th>Handles partial rows<th>Use for<tbody><tr><td>Blind upsert of <code>after</code><td>Yes<td>No<td>No<td>Strictly ordered, single-threaded consumers only<tr><td>Versioned upsert (write only if LSN is newer)<td>Yes<td>Yes<td>No<td>Search indexes, key-value stores, read models<tr><td>Versioned partial update (skip unavailable fields)<td>Yes<td>Yes<td>Yes<td>Document stores with TOASTed or large columns<tr><td>Invalidate only (delete the cache key)<td>Yes<td>Yes<td>Yes<td>Caches: the next read fetches fresh data<tr><td>Append to history (warehouse raw layer)<td>Dedupe on (key, LSN) later<td>Sort by LSN at query time<td>Merge at query time<td>Warehouses; audit</table></div></div>
+<p>Cache invalidation is the easy case: deleting a key is idempotent and order-insensitive, which is why CDC fits <a href="#cacheaside">Cache-Aside</a> so well. Everything that writes values should use versioned writes.</p>
+
+<h3 id=dd-change-data-capture-choose-route level=3>Where the events go</h3>
+<ul>
+<li><strong>Through Kafka (Kafka Connect).</strong> The usual setup. Events are retained and replayable, many consumers can read them, and per-key order is kept. The cost is running Kafka and Connect.</li>
+<li><strong>Debezium Server or the embedded engine.</strong> The connector runs standalone and sends events to another system, such as Kinesis, Pub/Sub, or Redis Streams. Fewer moving parts, but replay and fan-out depend on that system.</li>
+<li><strong>Straight into a table format.</strong> Managed tools and some streaming jobs write changes directly into Iceberg, Delta or the warehouse, merging them into a mirror table. Good for analytics; not a feed for other services.</li>
+</ul>
+
+<h2 id=dd-change-data-capture-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Which consumers read raw table streams, and do all of them belong to the team that owns the tables? If not, where is the outbox or transformation layer?</li>
+<li>What alerts on replication-slot lag (in bytes and in time), at what threshold, and how was that threshold derived from the peak WAL rate and free disk?</li>
+<li>Is <code>max_slot_wal_keep_size</code> set, and is there a runbook for an invalidated slot?</li>
+<li>Are heartbeats enabled for connectors on quiet tables or shared servers?</li>
+<li>What happens to the slot on primary failover? Has a failover been tested with the connector running, and does the connector fail loudly if its slot is missing?</li>
+<li>For MySQL: is binlog retention longer than the longest plausible connector outage? Are GTIDs on?</li>
+<li>What replica identity does each captured table use, and how do consumers handle missing old values and unavailable TOASTed columns?</li>
+<li>How does each consumer apply changes: is every write versioned by LSN, so retries and reordering are safe?</li>
+<li>How large is a full snapshot of the captured tables, how long does it take each consumer to absorb, and is incremental snapshotting set up for re-seeding?</li>
+<li>How are large backfills and bulk updates coordinated with CDC consumers?</li>
+<li>Are event schemas in a registry with a compatibility mode, and do database migrations follow expand-then-contract?</li>
+<li>Which columns are excluded, especially personal data, and is there a reconciliation job that compares each derived store with the database?</li>
+</ol>
+
+<h2 id=dd-change-data-capture-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"A Postgres CDC connector is healthy but retained WAL keeps growing. What's going on?"</summary>
+<p>Most likely the captured tables are quiet while other tables or databases on the same server generate WAL. The slot only advances when the connector confirms a position, and with nothing to publish it confirms nothing, so the slot pins all WAL since the last captured change. Enable heartbeats, ideally with a heartbeat query that writes to a captured table, so the connector confirms regularly. Other causes: a long-running transaction holding back decoding, or the connector confirming slowly because a downstream write is blocked. Either way, set <code>max_slot_wal_keep_size</code> so a stuck slot cannot take the primary down.</p>
+</details>
+
+<details>
+<summary>"Postgres keeps WAL for a stopped connector; MySQL purges binlogs anyway. Which is better?"</summary>
+<p>Neither; they choose different failures. Postgres chooses completeness: no change is lost, but the primary's disk is at risk, so you need slot-lag alerts and a retention cap. MySQL chooses the primary's health: the disk is safe, but a long outage loses the connector's position and forces a resnapshot. With <code>max_slot_wal_keep_size</code>, Postgres can behave like MySQL past a limit. The right setting in both is the same idea: retain enough log to cover realistic outages, and accept a resnapshot beyond that rather than risking the primary.</p>
+</details>
+
+<details>
+<summary>"How does an initial snapshot avoid missing changes made while it runs?"</summary>
+<p>In Postgres, creating the replication slot can export a snapshot that corresponds exactly to the slot's starting position. The connector reads all tables inside that snapshot, then streams from the slot. Every change committed before the position is in the snapshot; every change after is in the stream. Incremental snapshots work differently: they read chunks while streaming, bracket each chunk with low and high watermark markers written to the log, and drop any chunk row that also appeared as a streamed change between the markers, since the streamed version is newer.</p>
+</details>
+
+<details>
+<summary>"Your search indexer sometimes shows stale data even though CDC is ordered per key. How?"</summary>
+<p>The topic is ordered; the consumer is not necessarily. A retry queue, parallel threads within a partition, or two connectors on the same table can all apply an older change after a newer one. The fix is versioned writes: every write carries the source LSN, and the sink rejects a write whose version is not newer. Elasticsearch external versioning does this directly; in SQL, a conditional update on the stored LSN does the same. Then duplicates and reordering are both harmless.</p>
+</details>
+
+<details>
+<summary>"Why not expose the raw CDC topics as the company's event bus?"</summary>
+<p>Because each topic's schema is a table's schema. Every column rename or table split in that service becomes a breaking change for every consumer in the company, so the owning team can no longer refactor its own database. Raw events also carry no intent: a status column changing from active to cancelled does not say why. Use raw CDC for derived systems the owning team controls, and publish designed domain events through an outbox for everyone else. Then the table can change freely, and the contract changes only on purpose.</p>
+</details>
+
+<details>
+<summary>"A bulk migration updated 60 million rows and search fell nine hours behind. How do you prevent it next time?"</summary>
+<p>Plan backfills as capacity events. Run them in small batches with pauses, so live changes interleave and consumers keep up. Exclude columns that consumers do not use from capture, so changes to them produce no meaningful work. Have consumers compare before and after and skip events that do not change fields they care about. For very large rewrites, it is often faster to pause the consumer, finish the migration, and rebuild the derived store from an incremental snapshot. Add a migration review rule that flags statements touching more than a set number of rows.</p>
+</details>
+
+<details>
+<summary>"After a database failover, how do you know CDC did not lose anything?"</summary>
+<p>You check, because the connector cannot tell you. If the slot did not survive failover and the connector created a new one, everything between the old confirmed position and the new slot's start is missing, with no error. Prevent it with failover-safe slots and a connector that refuses to recreate its slot silently. Verify with a reconciliation job that compares counts or checksums per key range and time window between the database and each consumer. After any doubtful failover, run an incremental snapshot of the affected tables; versioned, idempotent consumers make the overlap safe.</p>
+</details>
+
+<details>
+<summary>"What's the outbox's failure story compared with raw CDC?"</summary>
+<p>The outbox row commits in the same transaction as the business change, so the change and the intent to publish always agree: there is no partial write. From there it inherits CDC's properties. A connector outage is lag, not loss; delivery is at-least-once, so consumers dedupe on the event ID; per-aggregate order holds if events are keyed by aggregate ID. The extra risks are small: the outbox table grows unless rows are deleted, which can happen in the same transaction because the WAL already has them, and a schema mistake in the payload is now a contract break you own directly.</p>
+</details>

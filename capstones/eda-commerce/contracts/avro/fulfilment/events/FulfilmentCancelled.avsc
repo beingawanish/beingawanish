@@ -1,0 +1,28 @@
+{
+  "type": "record",
+  "name": "FulfilmentCancelled",
+  "namespace": "com.edacommerce.fulfilment",
+  "doc": "Reply to CancelFulfilment.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "fulfilmentId",
+      "type": "string"
+    },
+    {
+      "name": "cancelledAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "type": "record",
+  "name": "OrderDispatched",
+  "namespace": "com.edacommerce.fulfilment",
+  "doc": "The carrier scanned the parcels out of the warehouse. Triggers payment capture.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "fulfilmentId",
+      "type": "string"
+    },
+    {
+      "name": "shipmentId",
+      "type": "string"
+    },
+    {
+      "name": "dispatchedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

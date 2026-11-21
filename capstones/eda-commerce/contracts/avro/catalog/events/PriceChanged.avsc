@@ -1,0 +1,53 @@
+{
+  "type": "record",
+  "name": "PriceChanged",
+  "namespace": "com.edacommerce.catalog",
+  "doc": "Current price of a SKU in a price list. Snapshot semantics on the compacted topic catalog.price.v1 keyed by sku.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "sku",
+      "type": "string"
+    },
+    {
+      "name": "priceListId",
+      "type": "string",
+      "doc": "Price list, e.g. 'retail-eu'.",
+      "default": "retail-eu"
+    },
+    {
+      "name": "listPrice",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "salePrice",
+      "type": [
+        "null",
+        "com.edacommerce.common.Money"
+      ],
+      "default": null
+    },
+    {
+      "name": "validFrom",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    },
+    {
+      "name": "validUntil",
+      "type": [
+        "null",
+        {
+          "type": "long",
+          "logicalType": "timestamp-millis"
+        }
+      ],
+      "default": null
+    }
+  ]
+}

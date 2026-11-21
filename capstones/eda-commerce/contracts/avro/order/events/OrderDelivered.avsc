@@ -1,0 +1,35 @@
+{
+  "type": "record",
+  "name": "OrderDelivered",
+  "namespace": "com.edacommerce.order",
+  "doc": "The carrier confirmed delivery. Opens the return window.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "shipmentId",
+      "type": "string"
+    },
+    {
+      "name": "deliveredAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    },
+    {
+      "name": "returnWindowEndsAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

@@ -1,0 +1,161 @@
+<h2 id=dd-minicapstone-caching-the-product-catalog-capacity level=2>Deep Dive: The Capacity Plan</h2>
+<p>The capstone ends with a confident number: database reads below 400 queries a second while traffic tripled. A review panel's first job is to check that number. This section rebuilds it from the per-data-type decisions. Doing so turns up one decision that, as written, would blow the budget several times over. Finding that kind of thing is exactly why you do the arithmetic before 8 PM.</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-assumptions level=3>Assumptions</h3>
+<ul>
+<li><strong>Traffic.</strong> A normal evening runs 6,000 page views a second. The sale triples it to 18,000. The bestseller takes 12,000 of those, as in the lessons. The other 6,000 spread over about 30,000 products that get any views in the hour, roughly 0.2 views a second each.</li>
+<li><strong>Catalog.</strong> 100,000 products in total.</li>
+<li><strong>Checkout.</strong> 300 orders a second at peak, half of them for the bestseller.</li>
+<li><strong>Infrastructure.</strong> 60 app instances. A Redis cluster for read caches, a separate small Redis for write-behind counters. A Postgres primary with replicas.</li>
+</ul>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-misses level=3>How many misses does a TTL cause?</h3>
+<p>For a hot key the answer is easy: about one rebuild per TTL. With single flight it can't be more.</p>
+<p>The long tail is where the load hides. A product with <em>r</em> views a second and a TTL of <em>T</em> seconds misses at most once per TTL window, and only if anyone looks at it in that window. Its miss rate is <code>(1 − e^(−rT)) / T</code>. When <em>rT</em> is large, that is just <code>1/T</code>. When <em>rT</em> is small, nearly every view is a miss. Multiply by 30,000 products.</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-db-budget level=3>The database read budget, data type by data type</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Data<th>TTL<th>Views per tail product per TTL (<em>rT</em>)<th>Tail misses / s<th>Notes<tbody>
+<tr><td>Description<td>1 h<td>720<td>8<td>Every active product rebuilds once an hour.
+<tr><td>Display price<td>5 min<td>60<td>100<td>Plus one rebuild per price change.
+<tr><td>Inventory badge (as designed)<td>10 s<td>2<td><strong>2,590</strong><td>86% of 10-second windows see a view, so most views miss.
+<tr><td>Recommendations<td>12 h<td>8,640<td>0.7<td>Few queries, but each is a 400 ms multi-table join.
+<tr><td>View counter<td>none<td>n/a<td>0<td>Reads come from Redis; the database only gets flushes.
+<tr><td><strong>Total, as designed</strong><td><td><td><strong>≈ 2,700</strong><td>Nearly seven times the 400 target.
+</tbody></table></div></div>
+<p>The badge is the problem. Its 10-second TTL is right for the bestseller, which rebuilds once every 10 seconds. It is wrong for 30,000 quiet products, where it acts almost like no cache at all. Nobody notices in a load test that hammers one product page.</p>
+<p>There are two good fixes. Both follow the capstone's own rule that the cost of being wrong sets the correctness mechanism.</p>
+<ul>
+<li><strong>Make the TTL depend on the value.</strong> The badge only shows when stock is 10 or fewer. For a product with 400 in stock, the cached answer is "no badge," and it stays true for a long time. Cache "no badge" for 5 minutes. Cache an actual count for 10 seconds. Have the checkout path delete the key when a decrement crosses the threshold, which happens once per product, not once per sale. If 1,000 of the 30,000 active products are low on stock, the badge costs about 1,000 × 0.086 + 29,000 / 300 ≈ <strong>185 misses a second</strong>.</li>
+<li><strong>Stop reading the database for it at all.</strong> Push stock levels into the cache from <a href="#change-data-capture">change data capture</a> on the inventory table. Every committed decrement becomes a cache write within a second or so. That is 300 cache writes a second at peak and zero database reads. It also makes the badge more accurate than a 10-second TTL. This is the better end state. It is listed in the evolution path because it needs a CDC pipeline first.</li>
+</ul>
+<p>With the first fix, the cache-driven read load is about 8 + 100 + 185 + 1 ≈ <strong>295 queries a second</strong>. That is inside the 400 target, with some headroom for price changes and the occasional rebuild of a recommendations strip.</p>
+<p>Checkout is outside that number, on purpose. 300 orders a second means 300 price reads and 300 conditional decrements against the primary. Count them separately in the capacity plan. They are the reads that must never be cached, and they need their own headroom.</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-redis-plan level=3>Redis: operations, memory and bandwidth</h3>
+<p><strong>Operations.</strong> Each page reads four keys (description, price, badge, recommendations) and runs one counter script. At 18,000 views a second that is 72,000 reads plus 18,000 counter scripts. The reads go to the read-cache cluster. The counter scripts go to the write-behind instance.</p>
+<p><strong>Memory.</strong> Descriptions average about 4 KB each, so 100,000 of them is 400 MB. Recommendation strips at about 2 KB are another 200 MB. Prices and badges are tiny. Add the stampede envelope and Redis's per-key overhead, and plan for about 1 GB of data. That fits one node. The cluster exists for throughput, hot-key isolation and failure blast radius, not for memory. Six primaries, each with one replica, is a sensible start.</p>
+<p><strong>Bandwidth for the hot product.</strong> One bestseller page pulls about 6.5 KB from the cache. At 12,000 views a second, that is 78 MB/s, a little over 600 Mbit/s. A modern network link handles it, but all of it lands on whichever shards own those keys. The next section is about that.</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-write-plan level=3>The write side</h3>
+<p>Writes are small, and that is the point of the design. The view counter's flusher sends the bestseller's count once every 2 seconds. The tail is more interesting. With a 2-second flush, 6,000 tail views a second still produce about 4,950 row updates a second, because quiet keys barely coalesce. Run the tail on a 30-second flush and it drops to about 1,000. Write the second loss sentence: "if we lose 30 seconds of tail views, about six views per product go missing." Put the counters in their own narrow table, so each update rewrites a small row and not the whole product record.</p>
+<p>Then there is the checkout decrement: 150 a second on one inventory row for the bestseller. That one row is a lock queue, just like the view counter in the write-behind incident. The difference is that here, every write matters individually. The failure drills come back to it.</p>
+
+<h2 id=dd-minicapstone-caching-the-product-catalog-topology level=2>Deep Dive: Cache Topology and the Hot Product</h2>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-two-redis level=3>Two Redis roles, two configurations</h3>
+<p>The page uses Redis in two opposite ways, and they want opposite settings.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Setting<th>Read caches (description, price, badge, recommendations)<th>Write-behind counters<tbody>
+<tr><td>What a lost key costs<td>One rebuild from the database<td>Acknowledged views, gone
+<tr><td><code>maxmemory-policy</code><td><code>allkeys-lru</code> or <code>allkeys-lfu</code><td><code>noeviction</code>
+<tr><td>Persistence<td>Optional; replicas keep it warm<td>AOF, <code>appendfsync everysec</code>
+<tr><td>Replicas<td>Yes, for warm failover<td>Yes, plus <code>min-replicas-to-write</code>
+<tr><td>Key TTLs<td>Every key, with jitter<td>None on totals or deltas
+</tbody></table></div></div>
+<p>Putting both on one instance forces a bad choice. LRU will evict unflushed counts during the sale, which is <a href="#writebehind">write-behind</a>'s worst silent failure. <code>noeviction</code> will make every read-cache write fail once memory is full. Two small deployments are cheaper than either outage.</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-colocate level=3>Co-locate a product's keys, or spread them?</h3>
+<p>Redis Cluster places keys by hash slot. A hash tag such as <code>{p8412}</code> in every key name for one product puts all its keys on one shard. Then one <code>MGET</code> fetches the whole page in one round trip.</p>
+<p>The cost is concentration. Every read for the bestseller now hits one shard: 48,000 reads a second, all on one main thread. Spread the keys instead, and four shards share the load at 12,000 each. The page then needs four parallel round trips.</p>
+<p>The way out of the trade-off is an <strong>in-process L1 cache</strong> in front of both. Each app instance keeps the top few hundred products' entries in memory for 1 second. The bestseller's Redis traffic drops from 48,000 reads a second to about 60 instances × 4 keys = 240. With the hot load gone, co-location is cheap and the one-round-trip <code>MGET</code> wins for everyone else.</p>
+<p>The L1 adds up to 1 second of staleness. That fits every staleness budget on the page except the two "zero" rows, and those never touch a cache. Write it into the sentences anyway: "display price may be up to one rebuild plus 1 second old."</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-l1-invalidation level=3>Invalidating 60 local caches</h3>
+<p>An L1 has its own invalidation problem. A price change deletes the Redis key, but 60 processes still hold the old value in memory. Two options:</p>
+<ul>
+<li><strong>Let the L1 TTL do it.</strong> With a 1-second TTL, the worst case is one extra second. For this page that is enough, and it has no moving parts.</li>
+<li><strong>Broadcast invalidations.</strong> Publish the key on a Redis Pub/Sub channel, and every instance drops its local copy. Pub/Sub is fire-and-forget: an instance that is reconnecting misses the message. So the short TTL stays as the backstop. Redis 6 and later also offer client-side caching with server-assisted invalidation (the <code>CLIENT TRACKING</code> feature), which does this bookkeeping for you if your client library supports it.</li>
+</ul>
+<p>Start with the TTL. Add broadcast only if a staleness sentence needs it.</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-page-vs-field level=3>Why not just cache the whole page?</h3>
+<p>Someone in every review asks this. Cache the rendered HTML once and skip four lookups. The answer is in the second column of the final architecture table. A cached page is only as fresh as its freshest part needs to be. The badge needs 10 seconds, so the whole page gets a 10-second TTL, and the description and recommendations rebuild 360 and 4,320 times more often than they need to.</p>
+<p>The pattern that does work is a split by staleness. Cache the page shell, description and recommendations at the edge or in one fragment, with a long TTL and <code>stale-while-revalidate</code>. Fetch the price, badge and counter as a small JSON call with their own short budgets. The <a href="#cdn">CDN</a> then serves most of the bytes, and the app serves only the parts that change.</p>
+
+<h2 id=dd-minicapstone-caching-the-product-catalog-drills level=2>Deep Dive: Failure Drills</h2>
+<p>A review panel will run the design through specific bad evenings. Here are five, each with a timeline, what the design does, and what it still gets wrong.</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-drill-price level=3>Drill 1: the bestseller's price changes at 8:05</h3>
+<p><strong>8:05:00.000.</strong> Merchandising lowers the price in the admin panel. The admin service commits to the database and invalidates <code>price:{p8412}</code>.</p>
+<p><strong>The trap.</strong> If invalidation means <code>DEL</code>, the key vanishes and the stale copy goes with it. 12,000 requests a second meet a 50 ms rebuild: 600 misses. Single flight keeps the database at one query, but 599 requests wait, and the hot shard absorbs a burst of lock attempts and polls. This happens on every price edit, which during a sale may be often.</p>
+<p><strong>The better move.</strong> Soft invalidation: mark the entry stale (set its logical expiry to now) instead of deleting it. The next request serves the old price, triggers one locked refresh, and the new price is live about 50 ms later. Add the L1's 1 second. Checkout reads the database, so no order is placed at the old price.</p>
+<p><strong>What still goes wrong.</strong> The bulk-pricing tool writes straight to the database and skips invalidation. Those prices can be wrong for up to 5 minutes. The capstone accepts that with the TTL, but the panel will ask whether customers can see a price at the product page that differs from checkout for 5 minutes. Answer it before they ask: either show "price confirmed at checkout," or route the bulk tool's writes through CDC invalidation (evolution stage 3).</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-drill-shard level=3>Drill 2: the read-cache shard holding the bestseller dies at 8:10</h3>
+<p><strong>8:10:00.</strong> The primary of one of six read-cache shards stops responding. Failure detection takes a few seconds to tens of seconds, depending on configuration (Sentinel's <code>down-after-milliseconds</code>, Cluster's <code>cluster-node-timeout</code>). Then its replica is promoted.</p>
+<p><strong>During detection.</strong> Every request for a key on that shard gets an error or a timeout. The bestseller is safe: its entries are in 60 L1 caches, which keep serving and simply don't refresh. The tail is not. About a sixth of tail keys live on that shard, so about 1,000 requests a second need data the cache can't give.</p>
+<p><strong>The trap.</strong> A client that treats "cache error" like "cache miss" sends all 1,000 to the database. They are distinct keys, so single flight can't merge them. Database reads jump from 295 to about 1,300 a second, during a sale, for as long as detection takes.</p>
+<p><strong>The better move.</strong> Put a <a href="#circuit-breaker">circuit breaker</a> on each cache shard and a <a href="#bulkhead">bulkhead</a> on database fallback: at most, say, 200 concurrent fallback queries across the fleet, with a short <a href="#timeout">timeout</a> on the cache call itself (a few milliseconds, not the client default). Beyond that, degrade. The recommendations strip disappears, and the description renders from the CDN shell. Price and badge fall back to the database within the bulkhead, because they matter most.</p>
+<p><strong>After failover.</strong> The promoted replica already holds the data, so the hit ratio recovers at once. That is the reason a read cache gets replicas, even though losing it loses no data. A cold replacement would trigger the full cold-start runbook.</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-drill-counter level=3>Drill 3: the counter instance fails over at 8:15</h3>
+<p>The write-behind Redis loses its primary. The promoted replica is missing whatever was not yet replicated, usually milliseconds of increments. The last unflushed deltas on the old primary may also be gone if its AOF had not been fsynced. Worst case is a couple of seconds of views, about 36,000 on the bestseller.</p>
+<p>This is the drill where the loss sentence earns its place. "If we lose 2 seconds of view counts, the numbers are imperceptibly lower." The panel nods and moves on. What they should check is the next part: does the display total on the new primary go backwards? If the totals were replicated too, it dips by the lost amount and nobody can tell. If the totals are rebuilt from the database without adding pending deltas, the bestseller's counter drops by tens of thousands on screen. That is the bug to rule out.</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-drill-soldout level=3>Drill 4: the bestseller sells out at 8:12</h3>
+<p><strong>The display.</strong> The badge says "only 3 left!" From the threshold rule in the capacity plan, it was cached with a 10-second TTL. When the count hits zero, the checkout path invalidates the badge key, and the page shows "sold out" within one rebuild. Without that invalidation, the badge could advertise stock for 10 seconds after there is none. That is annoying, not dangerous, because of the next part.</p>
+<p><strong>The decision.</strong> Each checkout runs, in its own short transaction:</p>
+<pre><code>UPDATE inventory SET qty = qty - 1
+ WHERE sku = $1 AND qty &gt;= 1;
+-- 1 row: reserved.   0 rows: sold out, tell the customer.</code></pre>
+<p>No cache is involved, so overselling is impossible regardless of what the badge said.</p>
+<p><strong>The hot row.</strong> 150 checkouts a second for the bestseller all update the same row. Each one holds that row's lock until its transaction commits. If the transaction is just the decrement and a commit, a couple of milliseconds, the row can handle a few hundred a second. If someone wraps the payment API call in the same transaction, the lock is held for hundreds of milliseconds and throughput collapses to a handful of orders a second. The flash sale then fails at checkout, not at the cache.</p>
+<p>Keep the reservation a separate, tiny transaction. Take payment afterwards. Release the reservation on payment failure or timeout, as a <a href="#saga">saga</a> step. If one row still isn't enough, split stock into several rows (say 10 rows of 100 units each) and decrement a random non-empty one. That is the same trick as splitting a hot counter, applied where every write must be durable.</p>
+
+<h3 id=dd-minicapstone-caching-the-product-catalog-drill-import level=3>Drill 5: a bulk import touches 50,000 descriptions at 8:20</h3>
+<p>The merchandising team, as promised in the brief, runs its bulk tool mid-sale. It rewrites 50,000 product descriptions directly in the database.</p>
+<p><strong>As designed.</strong> No invalidation fires. Descriptions are stale for up to an hour, by the TTL. That is inside the budget. Nothing breaks.</p>
+<p><strong>After you add CDC invalidation (evolution stage 3).</strong> Now each changed row produces an invalidation, so 50,000 arrive within seconds. About 30,000 of those products are active, each viewed every 5 seconds or so. Within about 10 seconds, almost all of them miss and rebuild: a few thousand database reads a second, on distinct keys, which single flight cannot merge. The fix for one problem has created a mass-invalidation stampede.</p>
+<p>Two guards make CDC invalidation safe. First, invalidate only what changed: bulk tools often rewrite rows with identical content, and CDC events carry before and after images, so compare them and drop no-op updates. Second, rate-limit the invalidation consumer, for example to 500 keys a second, and use soft invalidation so each key serves its old copy until it is rebuilt. 50,000 invalidations then spread over 100 seconds, and the database never sees more than the consumer's rate.</p>
+
+<h2 id=dd-minicapstone-caching-the-product-catalog-debates level=2>Deep Dive: The Trade-off Debates</h2>
+<p>These are the arguments a review panel actually has about this design, with the position each side takes and where it usually lands.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Question<th>One side<th>Other side<th>Where it usually lands<tbody>
+<tr><td>Invalidate on write: delete or update the cache?<td>Delete: avoids the write race, simple<td>Update (write-through): no miss after a write<td>Soft invalidation for hot keys, delete for the rest. Write-through only when a single writer owns the key.
+<tr><td>TTL as backstop or as the only mechanism?<td>TTL only: nothing to break<td>Invalidation plus TTL: fresh within milliseconds<td>Both for price and description. TTL only for the badge, where per-sale invalidation would cost more than it saves.
+<tr><td>Who sends invalidations?<td>The writing service, inline<td>CDC from the database log<td>Inline first. CDC once more than one writer (the bulk tool) bypasses it, with a rate limit and no-op filtering.
+<tr><td>Badge freshness source<td>Cache-aside with a value-dependent TTL<td>CDC push of stock levels<td>TTL now, CDC later. Push wins on both accuracy and database load once the pipeline exists.
+<tr><td>Hot-product protection<td>Rely on Redis capacity<td>In-process L1 for top keys<td>L1. It removes the hot shard problem and costs one second of staleness that every budget can absorb.
+<tr><td>Page caching<td>Whole page, one TTL<td>Split shell (long TTL, edge) from live fields (short TTL, API)<td>Split. One TTL for five budgets wastes rebuilds or serves stale prices.
+<tr><td>Counter flush interval<td>2 s everywhere<td>2 s hot, 30 s tail<td>Two intervals. The tail barely coalesces at 2 s, so the short interval buys loss risk and little else.
+</tbody></table></div></div>
+<p>One opinion to defend in the room: <strong>the staleness budget table is the specification, so review it like one.</strong> Every number in the capacity plan above came from a TTL, and every TTL came from a staleness sentence. If product wants the badge accurate to 2 seconds, that is not a tweak. It multiplies the bestseller's badge rebuilds by five and nearly doubles misses on low-stock tail products, and the plan has to be redone. Make that cost visible when the request arrives, not after the sale.</p>
+
+<h2 id=dd-minicapstone-caching-the-product-catalog-observability level=2>Deep Dive: Observability</h2>
+<p>The design makes a different promise for each data type, so measure each one separately. A single cluster-wide hit ratio will hide almost every failure in the drills above.</p>
+<ul>
+<li><strong>Database queries per second by data type.</strong> Tag each query with its source (description, price, badge, recommendations, checkout). This is the number the capacity plan predicted, and the badge row is where it will be wrong first.</li>
+<li><strong>Hit ratio by data type, and by hot versus tail.</strong> The bestseller will be near 100% whatever happens. The tail ratio tells you whether TTLs fit traffic.</li>
+<li><strong>Age of the value served</strong>, as a histogram per data type, against its staleness budget. This is the direct check of the staleness sentences.</li>
+<li><strong>Concurrent rebuilds per key</strong> and waiter timeouts. Either above zero for long means stampede protection is leaking.</li>
+<li><strong>Per-shard CPU and network</strong> on both Redis roles. Averages hide the hot shard.</li>
+<li><strong>Oldest dirty age</strong> on the counter instance, and reconciliation drift between cache totals and the database.</li>
+<li><strong>Invalidation lag</strong>: time from database commit to cache invalidation, once CDC is in place. In multi-region, per region.</li>
+<li><strong>Inventory row lock waits</strong> on the bestseller's SKU during the sale. That is where checkout will fail first.</li>
+</ul>
+
+<h2 id=dd-minicapstone-caching-the-product-catalog-evolution level=2>Deep Dive: The Evolution Path</h2>
+<p>No team builds the final architecture on day one, and they shouldn't. Each stage below is triggered by a measurement, not by ambition.</p>
+<ol>
+<li><strong>Stage 0: cache-aside everywhere, one Redis.</strong> Delete on write, fixed TTLs. Right for a store at a few hundred requests a second. Move on when database CPU tracks page traffic.</li>
+<li><strong>Stage 1: per-type budgets and write-behind counters.</strong> The table from the capstone, plus a separate counter instance. Trigger: a hot row (the view counter) shows up in lock waits.</li>
+<li><strong>Stage 2: stampede protection.</strong> Envelopes with soft and hard expiry, single flight, TTL jitter, the cold-start runbook. Trigger: database spikes aligned with expiries or deploys, or the first planned flash sale.</li>
+<li><strong>Stage 3: L1 caches and CDC-driven invalidation.</strong> Trigger: one Redis shard running hot, or the bulk tool causing stale-data tickets. Bring the rate limit and the no-op filter with it.</li>
+<li><strong>Stage 4: edge split.</strong> Shell and description at the CDN with <code>stale-while-revalidate</code>; live fields through a small API. Trigger: cache bandwidth or app CPU spent rendering identical HTML.</li>
+<li><strong>Stage 5: multi-region.</strong> Each region gets its own Redis. Invalidations, not values, travel between regions over the CDC stream through a durable log (Module 2's <a href="#publishsubscribe">publish/subscribe</a>, typically on Kafka), each carrying the source version. Values are rebuilt locally from each region's replica, so a region can never cache a value newer than its own database copy. The TTL stays as the backstop for a lagging stream, and invalidation lag per region becomes a paged alert. Prices on the order are still read from the primary.</li>
+<li><strong>Stage 6: personalized prices.</strong> Don't cache 500 million results that rarely repeat. Cache the inputs instead: base prices (100,000 keys) and each enterprise customer's contract terms (thousands of keys). Compute the final price at request time, which takes microseconds. When outputs don't repeat, caching them only fills memory with keys read once.</li>
+</ol>
+
+<h2 id=dd-minicapstone-caching-the-product-catalog-review level=2>Deep Dive: Design-Review Questions</h2>
+<ol>
+<li>Show the database read budget per data type at peak, including the long tail. Which row dominates, and what happens to it if traffic doubles?</li>
+<li>Which TTLs were chosen from a staleness sentence, and which were chosen because "five minutes sounds right"?</li>
+<li>Which writers bypass invalidation today (bulk tools, scripts, other services), and what bounds their staleness?</li>
+<li>When the bestseller's price changes mid-sale, what happens in the next 100 ms, in Redis, in the L1 caches and at checkout?</li>
+<li>Are read caches and write-behind state on separate instances, with opposite eviction and persistence settings?</li>
+<li>What does the client do when a cache shard is unreachable? What caps database fallback, and what degrades first?</li>
+<li>How long does the inventory reservation hold its row lock? Is anything slow, such as a payment call, inside that transaction?</li>
+<li>What is the cold-start plan for each Redis role, and how long does a replacement node take to reach its normal hit ratio?</li>
+<li>If CDC invalidation is added, what limits a 50,000-row bulk import from becoming a mass-invalidation stampede?</li>
+<li>Which metrics prove each staleness sentence is true in production, per data type?</li>
+<li>Which numbers on this page could a customer screenshot and hold you to, and which path serves each of them?</li>
+</ol>

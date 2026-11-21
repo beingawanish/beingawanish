@@ -1,0 +1,52 @@
+{
+  "type": "record",
+  "name": "FulfilmentFailed",
+  "namespace": "com.edacommerce.fulfilment",
+  "doc": "The warehouse cannot fulfil the order.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "fulfilmentId",
+      "type": "string"
+    },
+    {
+      "name": "reason",
+      "type": {
+        "type": "enum",
+        "name": "FulfilmentFailureReason",
+        "namespace": "com.edacommerce.fulfilment",
+        "doc": "Why the warehouse gave up. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+        "symbols": [
+          "STOCK_DAMAGED",
+          "STOCK_NOT_FOUND",
+          "ADDRESS_UNSERVICEABLE",
+          "UNKNOWN"
+        ],
+        "default": "UNKNOWN"
+      }
+    },
+    {
+      "name": "detail",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "failedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

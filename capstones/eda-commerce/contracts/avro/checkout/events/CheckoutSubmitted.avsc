@@ -1,0 +1,80 @@
+{
+  "type": "record",
+  "name": "CheckoutSubmitted",
+  "namespace": "com.edacommerce.checkout",
+  "doc": "A customer pressed 'Place order' and the checkout passed validation. Starts the order saga. The orderId is minted here so the HTTP response can return it at once.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "checkoutId",
+      "type": "string"
+    },
+    {
+      "name": "orderId",
+      "type": "string",
+      "doc": "UUIDv7 minted by checkout. Partition key of the whole order flow."
+    },
+    {
+      "name": "cartId",
+      "type": "string"
+    },
+    {
+      "name": "customerId",
+      "type": "string"
+    },
+    {
+      "name": "lines",
+      "type": {
+        "type": "array",
+        "items": "com.edacommerce.common.LineItem"
+      }
+    },
+    {
+      "name": "subtotal",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "shippingFee",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "tax",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "total",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "shippingAddress",
+      "type": "com.edacommerce.common.Address",
+      "pii": true
+    },
+    {
+      "name": "contactEmail",
+      "type": "string",
+      "pii": true
+    },
+    {
+      "name": "shippingMethod",
+      "type": "com.edacommerce.common.ShippingMethod"
+    },
+    {
+      "name": "paymentMethodToken",
+      "type": "string",
+      "doc": "Opaque token from the PSP's client-side tokenisation. Never a card number."
+    },
+    {
+      "name": "priceSnapshotAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      },
+      "doc": "Time of the catalog read model state used to price the cart."
+    }
+  ]
+}

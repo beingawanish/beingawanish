@@ -1,0 +1,34 @@
+{
+  "type": "record",
+  "name": "LineItem",
+  "namespace": "com.edacommerce.common",
+  "doc": "One priced order line, frozen at checkout time.",
+  "fields": [
+    {
+      "name": "lineId",
+      "type": "string",
+      "doc": "Stable identifier of the line within the order."
+    },
+    {
+      "name": "sku",
+      "type": "string"
+    },
+    {
+      "name": "productName",
+      "type": "string",
+      "doc": "Name at time of purchase, for invoices and emails."
+    },
+    {
+      "name": "quantity",
+      "type": "int"
+    },
+    {
+      "name": "unitPrice",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "lineTotal",
+      "type": "com.edacommerce.common.Money"
+    }
+  ]
+}

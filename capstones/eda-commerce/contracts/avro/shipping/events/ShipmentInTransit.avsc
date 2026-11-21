@@ -1,0 +1,44 @@
+{
+  "type": "record",
+  "name": "ShipmentInTransit",
+  "namespace": "com.edacommerce.shipping",
+  "doc": "Carrier scan between pickup and delivery. Duplicates and out-of-order webhooks are filtered by shipping-svc.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "shipmentId",
+      "type": "string"
+    },
+    {
+      "name": "direction",
+      "type": "com.edacommerce.common.ShipmentDirection"
+    },
+    {
+      "name": "location",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "carrierEventId",
+      "type": "string"
+    },
+    {
+      "name": "carrierTimestamp",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

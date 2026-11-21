@@ -1,0 +1,188 @@
+<h2 id=dd-e-hardening-a-payment-flow-capacity level=2>Deep Dive: The Capacity Plan</h2>
+<p>The capstone gives each stage one number. A review panel will want the numbers to fit together. This section rebuilds the final architecture's capacity plan from the brief: 100,000 orders a day, a peak of 300 checkout requests per second, a 2-second promise at p99.9, and a provider whose healthy p99 is 400 ms.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-cap-hang level=3>Checking Stage 1's "about three minutes"</h3>
+<p>The numbers in the incident are consistent, and it is worth seeing why. If 0.4% of calls hang forever, then at 300 requests per second, 1.2 threads per second become permanently stuck. A pool of 200 threads lasts 200 / 1.2 ≈ 167 seconds, just under three minutes. The same arithmetic tells you how fragile the pool was. A provider failure rate of 2% would have frozen checkout in 33 seconds. Any non-zero hang rate, with no timeout, ends in a total outage. Only the delay varies.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-cap-threads level=3>The checkout compartment</h3>
+<p>After Stage 6, the synchronous path is the charge plus the order write. Take a mean charge time of 230 ms and 20 ms for the database, so 250 ms per checkout. At 300 requests per second that is 75 in flight on average. Arrivals are random, so the count wanders by about √75 ≈ 9. A compartment of 75 + 3 x 9 ≈ 100 rarely rejects on a normal peak. That is where Stage 5's 100 comes from, and it is a better reason than "75 plus some headroom".</p>
+<p>Now check the ceiling, which is rate x the longest a call can take. With timeouts and retries, the longest checkout is bounded by the overall request deadline, which the next section sets at 1,800 ms. So the most that checkout can ever hold is 300 x 1.8 = 540 threads. The gap between 100 and 540 is the zone where the circuit breaker must act. If the provider slows enough to push checkout past 100 in flight, rejections start. That is the bulkhead protecting the rest of the service from checkout, which is not what anyone wants. But it is fine for a minute, while the breaker gathers evidence and opens.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-cap-db level=3>Database connections</h3>
+<p>Each checkout holds a connection for about 20 ms, so 300 per second needs only 6 connections on average. The danger is the other compartments. Refund reconciliation at 65 requests per second for 600 ms is 39 in flight, and if each holds a connection the whole time, that is 39 connections. Size per-pod pools from the autoscaler's maximum pod count, and enforce the totals at a pooler such as PgBouncer, with one database user per workload. Otherwise the Stage 5 split holds for threads and leaks at the database. The <a href="#bulkhead">bulkhead</a> deep dive works through that failure.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-cap-queue level=3>Queue, outbox and dead letters</h3>
+<p>The <code>order.paid</code> event volume equals paid orders: 100,000 a day, with peaks near 300 per second in a promotion. Three consumers read it (receipt, warehouse, loyalty), so the broker delivers up to 900 messages per second at peak. At 2 KB a message that is under 2 MB per second, which any mainstream broker handles easily. The design pressure is elsewhere:</p>
+<ul>
+<li><strong>Outbox table growth.</strong> The event is written in the same transaction as the order (the next section explains why). A broker outage of 15 minutes at peak leaves 300 x 900 = 270,000 unpublished rows. The relay must drain them faster than new ones arrive. At a relay rate of 1,000 per second, the backlog clears in about 6.5 minutes.</li>
+<li><strong>DLQ budget.</strong> A healthy month should dead-letter a handful of messages, not hundreds. Alert on the first one for the warehouse consumer, because each one is a paid order that is not shipping.</li>
+<li><strong>Warehouse API pressure.</strong> The warehouse consumer must not forward 300 per second to a partner API rated for 50. Its own concurrency limit and rate limit absorb the burst in the queue, which is the point of making it asynchronous.</li>
+</ul>
+
+<h3 id=dd-e-hardening-a-payment-flow-cap-keys level=3>Idempotency storage</h3>
+<p>One key per logical payment means about 100,000 keys a day. Stored as a column on the pending order with a unique index, that is a few megabytes a day, so this is not a capacity problem. The real question is retention. Provider-side, keys are often kept only for a limited time (Stripe, for example, documents that keys may be removed after 24 hours). So a retry after that window is a new charge. Every retry path, including a customer coming back the next day, must look up the order's state in <em>your</em> database before calling the provider at all.</p>
+
+<h2 id=dd-e-hardening-a-payment-flow-state level=2>Deep Dive: The Payment State Machine</h2>
+<p>The capstone fixes the double charge with an idempotency key. One gap remains between the stages, and review panels go straight for it. What does your own system believe when a charge's outcome is unknown? Stage 6 says "once the charge succeeds and the order commits, the API publishes <code>order.paid</code>". That sentence contains two dual writes, and each one can strand money.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-state-order level=3>Write first, then charge</h3>
+<p>If you charge first and then insert the order, a crash between the two leaves a customer charged with no order. Nothing in your system knows the charge happened. The fix is to reverse the order, and to record intent before acting:</p>
+<ol>
+<li><strong>Create the order</strong> in state <code>PAYMENT_PENDING</code>, with the idempotency key, the amount and the cart snapshot, in one transaction. If this write fails, stop. Never charge without a durable record of why you are charging.</li>
+<li><strong>Call the provider</strong> with the key, passing the order ID as metadata so a charge can always be traced back to its order.</li>
+<li><strong>Record the outcome.</strong> In one transaction, move the order to <code>PAID</code> and insert the <code>order.paid</code> event into an outbox table. A relay publishes from the outbox. That removes the second dual write, between the database and the broker.</li>
+</ol>
+
+<h3 id=dd-e-hardening-a-payment-flow-state-unknown level=3>UNKNOWN is a real state</h3>
+<p>When the last retry times out, the honest answer is "we do not know". Model it:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>State<th>Meaning<th>Left by<tbody>
+<tr><td><code>PAYMENT_PENDING</code><td>Order recorded, charge not yet attempted or in flight<td>Provider answer, or exhausted retries
+<tr><td><code>PAID</code><td>Provider confirmed capture<td>Refund, chargeback
+<tr><td><code>DECLINED</code><td>Provider gave a definite no<td>Customer retries with a new payment method (new key)
+<tr><td><code>PAYMENT_UNKNOWN</code><td>Every attempt was ambiguous (timeouts, lost responses)<td>Reconciliation: webhook, or a status query by key or order ID
+<tr><td><code>DEFERRED</code><td>Stage 7's authorize-later path: accepted, to be captured when the breaker closes<td>Capture job success or failure
+</tbody></table></div></div>
+<p>The user in <code>PAYMENT_UNKNOWN</code> sees "We're confirming your payment" rather than an error, because an error invites a second attempt with a fresh key. That is the one way the design can still double-charge. Behind the screen, two mechanisms resolve the state. The provider's <a href="#webhooks">webhook</a> (for example a "payment succeeded" event) usually arrives within seconds. A reconciliation job also queries the provider for every order that has been unknown for more than a few minutes, by idempotency key or by the order ID in metadata. Whichever answers first moves the order, and the transition is idempotent, so both arriving is harmless.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-state-late level=3>The late success</h3>
+<p>One case needs a written policy. The order went to <code>DECLINED</code> or was abandoned, and then a webhook says the charge succeeded. That happens when a timeout was misread as a failure. The options are to honour the order (mark it paid and fulfil it) or to refund automatically. Either can be right. What is never right is ignoring it, because the customer's statement will show the charge. Reconciliation should report the count of late successes every day. It is one of the best health signals the flow has.</p>
+
+<h2 id=dd-e-hardening-a-payment-flow-compose level=2>Deep Dive: How the Seven Layers Compose</h2>
+<p>Each stage added one wrapper around the provider call. The order of the wrappers, and what each one counts, decides whether they cooperate or fight. Here is the stack from outside in, as it runs on one checkout request:</p>
+<pre><code>def pay(order, deadline):                      # deadline = request start + 1.8 s
+    slot = checkout_bulkhead.try_acquire()     # Stage 5: cap work in progress
+    if slot is None:
+        return busy("Please try again in a moment")
+    try:
+        if breaker.is_open():                  # Stage 4: don't call a failing provider
+            return degrade(order)              # Stage 7: saved cart or deferred capture
+        result = retry(                         # Stage 2: retryable errors only
+            lambda remaining: provider.charge(
+                order.amount,
+                idempotency_key=order.key,     # Stage 3: same key on every attempt
+                timeout=min(1.2, remaining)),  # Stage 1: per-attempt timeout
+            deadline=deadline,
+            should_retry=is_retryable,         # timeouts, resets, 5xx, 429
+            min_remaining=0.45)                # skip a retry that cannot finish
+        breaker.record(result.final_outcome)   # count retry-final outcomes only
+        return result
+    finally:
+        checkout_bulkhead.release(slot)</code></pre>
+
+<h3 id=dd-e-hardening-a-payment-flow-compose-budget level=3>The retries do not fit in the budget</h3>
+<p>Stage 2 allows 3 tries. Stage 1 gives each try 1,200 ms. Three timed-out tries plus backoff is about 3.9 seconds, which Stage 4 confirms ("about 4 seconds failing slowly"). The promise is 2 seconds. So the capstone's retry policy, as written, breaks the latency promise whenever it matters.</p>
+<p>The fix is to make retries <em>deadline-aware</em>. Give the whole request a deadline (say 1,800 ms, leaving 200 ms for the order write and the response). Before each retry, check the remaining time. Retry only if it covers the backoff plus a realistic attempt, about the provider's p99 of 400 ms, so 450 ms in the code above. The effect is clear:</p>
+<ul>
+<li>A <strong>fast failure</strong> (connection reset after 30 ms, a 503 in 50 ms) leaves plenty of budget. You get all three tries. These are most of the transient failures in Stage 2.</li>
+<li>A <strong>timeout</strong> on the first try uses 1,200 ms, leaving 600 ms. One more attempt fits, with its timeout trimmed to the remaining time. A second timeout ends the request as <code>PAYMENT_UNKNOWN</code>.</li>
+</ul>
+<p>Retries now help with the common case and cannot break the promise in the bad case. The deadline also travels: pass it to the provider in a header if it supports one, and to the database as a statement timeout.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-compose-budget-retries level=3>A retry budget on top of the retry policy</h3>
+<p>Per-request limits do not cap the <em>total</em> extra traffic. During a partial brownout, every request may use its three tries, which triples load on a provider that is already struggling. Add a retry budget per process: retries may be at most 10% of first attempts over a rolling window. When the budget is spent, failures return immediately. gRPC's retry throttling and Finagle's retry budgets implement this idea. It caps amplification at 1.1x instead of 3x, and it complements the breaker, which reacts only after the failure rate crosses its threshold.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-compose-breaker level=3>The breaker's window is the wrong shape</h3>
+<p>Stage 4 uses a rolling window of 20 calls. At 300 requests per second, 20 calls is 67 ms of traffic. A burst of 10 failures in 67 ms opens the breaker for 30 seconds, and a 30-second checkout outage is a big price for a 67-millisecond blip. At 3 AM, with one checkout every few seconds, the same 20 calls cover a minute or more. The breaker then reacts slowly to a real outage.</p>
+<p>A time-based window behaves the same at every traffic level. Use the last 10 seconds, with a minimum of, say, 20 calls before the breaker may open. In Resilience4j terms that is <code>slidingWindowType=TIME_BASED</code>, <code>slidingWindowSize=10</code> and <code>minimumNumberOfCalls=20</code>. Its <code>slowCallDurationThreshold</code> and <code>slowCallRateThreshold</code> are also worth setting. They let the breaker count calls slower than, say, 1 second as failures, so it reacts to a brownout before the timeouts pile up.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-compose-counting level=3>Who counts what</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Layer<th>Counts<th>Must not count<tbody>
+<tr><td>Timeout<td>Time per attempt, within the remaining deadline<td>-
+<tr><td>Retry<td>Retryable failures: timeouts, resets, 5xx, 429<td>Declines and validation errors (answers, not failures)
+<tr><td>Circuit breaker<td>Retry-final failures and slow calls<td>Bulkhead rejections, declines, its own open-state rejections
+<tr><td>Bulkhead<td>Work in progress (occupancy)<td>Errors; it does not care whether calls succeed
+<tr><td>DLQ<td>Delivery attempts per message<td>Outage casualties, if the consumer's own breaker is doing its job
+<tr><td>Degradation<td>Breaker state and switches; emits degraded-mode metrics<td>-
+</tbody></table></div></div>
+<p>The two mistakes in that table that cause real incidents are a breaker that counts bulkhead rejections, and retries of declines. The first makes Stage 5's protection trip Stage 4's breaker, so a busy compartment takes payment down entirely. The second retries a card that was declined, which can trip the card network's fraud rules and get the merchant flagged.</p>
+
+<h2 id=dd-e-hardening-a-payment-flow-drills level=2>Deep Dive: Failure Drills</h2>
+<p>A review panel tests a design by walking failures through it. Here are six that the stages do not cover directly. For each, trace what every layer does.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-drill-partial level=3>Drill 1: One provider server in ten hangs</h3>
+<p>10% of payment calls hang until their 1,200 ms timeout. The breaker's failure rate after retries is low, because a retry usually lands on a healthy server: the chance that two tries both hang is 1%. So the breaker stays closed, correctly. The cost lands on the bulkhead. 30 requests per second spend an extra 1.2 seconds each, adding 36 threads to checkout's average of 75. That is 111 in flight against a compartment of 100, so some checkouts are rejected at peak. <strong>Lesson:</strong> a partial hang is what the gap between normal size and ceiling is for. Either size checkout's compartment toward 130, or set a slow-call threshold low enough to shift traffic, or trim the per-attempt timeout to 800 ms (twice p99) for retryable reads. Charges are not reads, so think before shortening their timeout, because a shorter timeout creates more ambiguous outcomes.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-drill-dbfail level=3>Drill 2: The orders database fails over for 30 seconds</h3>
+<p>New checkouts cannot create their <code>PAYMENT_PENDING</code> row, so they stop before the provider is called. That is fail-closed, and it is correct: no charge without a durable record. The page shows the Stage 7 "payments briefly delayed" message and keeps the cart. The harder case is a request that charged successfully and then failed to write <code>PAID</code>. The order is still <code>PAYMENT_PENDING</code>, and the customer has been charged. The request returns "confirming your payment". Within minutes, the provider's webhook or the reconciliation job moves the order to <code>PAID</code> and writes the outbox event. <strong>Lesson:</strong> the state machine, not the request, is what guarantees the outcome.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-drill-broker level=3>Drill 3: The message broker is down for 15 minutes</h3>
+<p>Checkout is unaffected, because it writes to the outbox in the database, not to the broker. Receipts and warehouse notifications are delayed. The outbox grows to around 270,000 rows at peak. When the broker returns, the relay drains them in order. Consumers may see duplicates (the relay is at-least-once) and drop them by event ID. <strong>Lesson:</strong> without the outbox, this drill is 15 minutes of paid orders with no <code>order.paid</code> event, which is the Stage 6 poison incident's quieter cousin. Alert on outbox age (oldest unpublished row), not only on broker health.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-drill-doubleclick level=3>Drill 4: Two tabs, one cart</h3>
+<p>The customer opens checkout in two tabs and clicks Pay in both within a second. If each tab generated its own key, there are two logical payments, and the idempotency layer approves both. So the key must come from the <em>server</em>, tied to the cart and the checkout session, and created when the pending order is created. Both tabs then send the same key. Many providers return a conflict error (Stripe uses <code>409</code>) when a second request with the same key arrives while the first is still in flight. Treat that as "in progress": poll the order state and show the same result in both tabs. <strong>Lesson:</strong> "client-side key" in the debrief means "created before attempt one", not "created by the browser".</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-drill-peak level=3>Drill 5: Black Friday is three times last year's peak</h3>
+<p>900 checkouts per second needs 225 threads in flight at 250 ms. The checkout compartment of 100 per pod is fine only if there are enough pods. That needs capacity planning before the day, not autoscaling during it, because the bulkhead rejects instantly while new pods take minutes to start. The provider is the harder limit. Most payment providers enforce per-account rate limits, and 900 per second may exceed yours. Ask for a raise weeks ahead. On the day, a <code>429</code> is retryable only after its <code>Retry-After</code>, and the retry budget stops the retries from making it worse. Meanwhile, priority shedding at the edge drops recommendations and analytics first, so checkout has the capacity. <strong>Lesson:</strong> the scaling plan is part of the reliability plan.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-drill-deferred level=3>Drill 6: The provider recovers after a 20-minute outage</h3>
+<p>Stage 7 has deferred captures queued for trusted customers. When the breaker closes, the capture job starts. If it captures all of them at once, it creates a load spike on a provider that has just recovered, and the breaker may open again. Drain at a controlled rate, perhaps 20% of the provider's normal rate, rising as success stays high. Some captures will be declined, because the card was cancelled or the limit reached. Those orders were never shipped, since fulfilment waits for <code>PAID</code>, so the only loss is a disappointed customer and an email asking for another card. <strong>Lesson:</strong> the risk in deferred capture is mostly customer experience, not money, as long as goods ship only after capture.</p>
+
+<h2 id=dd-e-hardening-a-payment-flow-debates level=2>Deep Dive: Trade-off Debates a Review Panel Has</h2>
+
+<h3 id=dd-e-hardening-a-payment-flow-debate-authcapture level=3>Authorize and capture together, or separately?</h3>
+<p>The capstone captures at checkout. Card networks also allow a two-step flow: <em>authorize</em> at checkout, which holds the funds, and <em>capture</em> when the order ships. Separating them helps reliability in two ways. A failed capture is retried in the background, away from the user. And an order that cannot ship is released, not refunded, so no money moves. The costs: authorizations expire (often around a week for online card payments, varying by network and provider), so slow shipments need re-authorization, and the code now has two payment calls and more states. For physical goods that ship in days, separating them is usually the better design. For digital goods delivered at once, capture immediately.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-debate-async level=3>Make the charge itself asynchronous?</h3>
+<p>Stage 6 moved everything after the charge off the synchronous path. Some teams go further: accept the order, return "processing", and charge from a queue. That takes the provider out of the latency promise completely. The cost is the user experience of a declined card. The customer has left the page, so the decline comes by email, and recovery rates for "please update your card" emails are much lower than for an inline error. Most consumer checkouts keep the charge synchronous and use the async path only as Stage 7's degraded mode. That is the right default, and the panel should hear the conversion argument behind it.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-debate-retry-layer level=3>Where do retries live?</h3>
+<p>Stage 2 says one layer, the Checkout API. The mobile app has its own instincts, and users have the reload button. The design should make client-side repeats safe rather than forbidden. The app's Pay button submits the server-issued key. A reload shows the order's current state, not a fresh form. The panel will push on this: if the app retries 3 times and the server retries 3 times, the worst case is 9 provider calls. The answer is that the server's retries happen under one key and one deadline, and an app retry with the same key finds the existing order state first.</p>
+
+<h3 id=dd-e-hardening-a-payment-flow-debate-deferred-risk level=3>How much deferred capture risk to accept?</h3>
+<p>Finance owns this number, and engineering should bring the arithmetic. In the 20-minute outage, $40,000 of purchase intent is at stake, say 500 orders at an $80 average. If 40% qualify as trusted repeat customers under the threshold, 200 orders ($16,000) are accepted for deferred capture. With a later decline rate of around 5%, about 10 orders fail capture. Because goods ship only after capture, the loss is 10 unhappy customers, not $800 of shipped goods. Against that sits $16,000 of recovered sales. The panel's job is to check the "ship only after capture" rule is real and enforced, because the whole risk calculation depends on it.</p>
+
+<h2 id=dd-e-hardening-a-payment-flow-evolution level=2>Deep Dive: The Evolution Path</h2>
+<p>The capstone ends at Stage 7. A real payment flow keeps going, usually in this order:</p>
+<ol>
+<li><strong>Reconciliation as a product.</strong> A daily job compares your orders with the provider's settlement report: charges you do not know about, orders the provider never charged, amounts that differ. This catches everything the online path missed. Build it before anything fancier.</li>
+<li><strong>A second provider.</strong> The "Extend It Yourself" question. The rule that keeps this safe: fail over only when the first provider has <em>definitely not</em> charged. That means connection refused, a <code>5xx</code> your provider documents as "not processed", or an open breaker before the call. Never fail over after an ambiguous timeout. Two providers do not share idempotency keys, so a failover after a timeout can charge twice, once at each. Ambiguous outcomes go to <code>PAYMENT_UNKNOWN</code> and reconciliation, whatever the panel's appetite for availability.</li>
+<li><strong>Smart routing.</strong> With two providers, route by cost, approval rate and health per card type and country. The breaker per provider becomes one input to a routing decision, rather than an on/off switch.</li>
+<li><strong>Cells and regions.</strong> Split checkout into independent cells, each with its own database and queue, so one bad deploy or a database failover affects a fraction of customers. The bulkhead becomes physical.</li>
+<li><strong>A ledger.</strong> At platform scale, money movement becomes a double-entry ledger with immutable entries, and orders refer to ledger transactions. That is the subject of <a href="#design-3-the-payment-platform">Design 3: The Payment Platform</a>.</li>
+</ol>
+
+<h2 id=dd-e-hardening-a-payment-flow-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Is the order recorded durably, with its idempotency key, before the provider is called? What happens if that write fails?</li>
+<li>Is the key issued server-side, tied to the cart and session, so two tabs or a reload produce the same key?</li>
+<li>Is there a <code>PAYMENT_UNKNOWN</code> state, what does the user see in it, and what resolves it (webhook, status query, daily reconciliation)?</li>
+<li>Do all timeouts and retries sit inside one request deadline, and are retries skipped when the remaining time cannot fit one?</li>
+<li>Is there a retry budget that caps total amplification, and are declines and validation errors excluded from retries?</li>
+<li>Is the breaker's window time-based, with a minimum call count, and does it ignore bulkhead rejections and declines?</li>
+<li>How were the compartment sizes derived (mean, variance, ceiling), and are database connection limits enforced globally?</li>
+<li>Is the <code>order.paid</code> event written through an outbox in the same transaction as the state change? Is outbox age alerted?</li>
+<li>Does every consumer deduplicate on event or order ID, and does the warehouse DLQ page someone on the first message?</li>
+<li>Which parts of checkout fail closed, which degrade, and did product and finance sign the tiers and the deferred-capture threshold?</li>
+<li>Do goods ship only after capture is confirmed, and is that enforced in code rather than by convention?</li>
+<li>How are late successes (charge succeeded after the order was marked failed) detected and handled, and who sees the daily count?</li>
+</ol>
+
+<h2 id=dd-e-hardening-a-payment-flow-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Your retry policy is three tries at 1.2 seconds each. Your SLO is 2 seconds. Explain."</summary>
+<p>It does not fit, and that is a real flaw. Three timeouts plus backoff is about 3.9 seconds. I'd give the request one deadline, about 1.8 seconds, and make every retry check it: retry only if the remaining time covers the backoff plus a typical attempt. Fast failures still get all their retries. A timed-out attempt gets at most one more, with a trimmed timeout, then the order goes to <code>PAYMENT_UNKNOWN</code> and reconciliation decides.</p>
+</details>
+<details>
+<summary>"The provider timed out on every attempt. Did the customer pay?"</summary>
+<p>Unknown, and the design must say so. The order moves to <code>PAYMENT_UNKNOWN</code>, and the customer sees "confirming your payment", not an error, so they do not try again with a new key. The provider's webhook usually settles it within seconds. If not, a reconciliation job queries the provider by idempotency key or order ID. Whichever answer arrives first moves the order, idempotently.</p>
+</details>
+<details>
+<summary>"Why create the order before charging? Isn't that a lot of abandoned rows?"</summary>
+<p>Yes, and that is cheap. The alternative is a charge with no record, which happens on every crash between charging and writing. That is a customer charged for nothing, found only by a support ticket or a daily reconciliation. Abandoned <code>PAYMENT_PENDING</code> rows are a cleanup job. Missing orders for real charges are refunds, chargebacks and trust. Record intent first, act second.</p>
+</details>
+<details>
+<summary>"Add a second provider. When does checkout switch?"</summary>
+<p>Only when the first provider definitely did not charge: connection refused, a documented "not processed" error, or an open breaker before the call. Never after an ambiguous timeout. The two providers do not share idempotency keys, so switching after a timeout can charge once at each. Ambiguous cases wait for reconciliation. The availability gain from switching after timeouts is not worth double charges.</p>
+</details>
+<details>
+<summary>"Your breaker uses a window of the last 20 calls. Any problem at 300 requests per second?"</summary>
+<p>Twenty calls is 67 ms of traffic at peak. A tiny burst of failures can open the breaker and cost 30 seconds of checkout. At night, the same 20 calls stretch over a minute, so a real outage is slow to trip it. I'd switch to a time-based window, around 10 seconds, with a minimum number of calls, and add a slow-call threshold so a brownout trips the breaker before timeouts pile up.</p>
+</details>
+<details>
+<summary>"Which of the seven patterns would you drop first if you had to ship in a week?"</summary>
+<p>None of the first three: timeouts, retries and idempotency are the minimum for taking money safely. I'd ship those plus a write-first state machine and a reconciliation job, which is the real safety net. The breaker, bulkheads and degradation protect availability, and I'd add them next, in that order, before the first big sales day. The DLQ comes with the move to async post-payment work. The only thing I'd refuse to defer is anything that can charge twice or lose a charge.</p>
+</details>
+<details>
+<summary>"Fulfilment is now asynchronous. A customer pays and the warehouse never hears about it. How do you find out?"</summary>
+<p>Three ways, from fastest to slowest. The warehouse consumer's DLQ alarm fires if the message failed processing. An alert on outbox age fires if the event was never published. And a daily check compares orders in <code>PAID</code> older than an hour against orders the warehouse acknowledged. The last check catches what the first two miss, such as a consumer that acknowledged the message without doing the work.</p>
+</details>

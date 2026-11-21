@@ -1,0 +1,78 @@
+{
+  "type": "record",
+  "name": "OrderPacked",
+  "namespace": "com.edacommerce.fulfilment",
+  "doc": "Parcels are packed. The packing manifest (per-item scans, lot and serial numbers) travels by claim check.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "fulfilmentId",
+      "type": "string"
+    },
+    {
+      "name": "warehouseId",
+      "type": "string"
+    },
+    {
+      "name": "parcels",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "Parcel",
+          "namespace": "com.edacommerce.fulfilment",
+          "fields": [
+            {
+              "name": "parcelId",
+              "type": "string"
+            },
+            {
+              "name": "weightGrams",
+              "type": "int"
+            },
+            {
+              "name": "lengthMm",
+              "type": "int"
+            },
+            {
+              "name": "widthMm",
+              "type": "int"
+            },
+            {
+              "name": "heightMm",
+              "type": "int"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "manifest",
+      "type": "com.edacommerce.common.ClaimCheck"
+    },
+    {
+      "name": "shipTo",
+      "type": "com.edacommerce.common.Address",
+      "pii": true
+    },
+    {
+      "name": "shippingMethod",
+      "type": "com.edacommerce.common.ShippingMethod"
+    },
+    {
+      "name": "packedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "type": "record",
+  "name": "PaymentCaptureFailed",
+  "namespace": "com.edacommerce.payment",
+  "doc": "Reply to CapturePayment when the PSP refused.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "paymentId",
+      "type": "string"
+    },
+    {
+      "name": "reason",
+      "type": {
+        "type": "enum",
+        "name": "CaptureFailureReason",
+        "namespace": "com.edacommerce.payment",
+        "doc": "Why a capture failed. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+        "symbols": [
+          "AUTHORIZATION_EXPIRED",
+          "PSP_ERROR",
+          "UNKNOWN"
+        ],
+        "default": "UNKNOWN"
+      }
+    },
+    {
+      "name": "retryable",
+      "type": "boolean"
+    },
+    {
+      "name": "failedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

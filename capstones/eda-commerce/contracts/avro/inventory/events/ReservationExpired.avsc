@@ -1,0 +1,28 @@
+{
+  "type": "record",
+  "name": "ReservationExpired",
+  "namespace": "com.edacommerce.inventory",
+  "doc": "The TTL passed before CommitReservation arrived. Emitted by the expiry sweeper, and as the reply to a late CommitReservation.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "reservationId",
+      "type": "string"
+    },
+    {
+      "name": "expiredAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

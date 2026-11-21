@@ -1,0 +1,33 @@
+{
+  "type": "record",
+  "name": "ReserveStock",
+  "namespace": "com.edacommerce.inventory",
+  "doc": "Command: hold stock for an order for ttlSeconds.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "reservationId",
+      "type": "string"
+    },
+    {
+      "name": "lines",
+      "type": {
+        "type": "array",
+        "items": "com.edacommerce.common.StockLine"
+      }
+    },
+    {
+      "name": "ttlSeconds",
+      "type": "int",
+      "default": 900
+    }
+  ]
+}

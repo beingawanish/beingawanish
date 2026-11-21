@@ -1,0 +1,264 @@
+<h2 id=dd-llm-gateway-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson lists the gateway's jobs: key custody, budgets, routing, reliability, fallback, streaming, safety. This section follows one request through them in order and shows the state each step keeps. Provider APIs differ in their request shapes, headers and limits, and they change often. So everything here is described in provider-neutral terms. Check each provider's current documentation for the specifics.</p>
+
+<h3 id=dd-llm-gateway-request-path level=3>One request, step by step</h3>
+<ol>
+<li><strong>Authenticate the caller.</strong> The service presents its workload identity: a mesh mTLS certificate, or a short-lived signed token. The gateway maps it to a team, a feature and an environment. No provider key ever leaves the gateway.</li>
+<li><strong>Resolve the logical model.</strong> <code>chat-premium</code> looks up a route: an ordered list of <em>deployments</em>, each one a (provider, model version, region, credential) tuple with a weight and limits.</li>
+<li><strong>Admission checks.</strong> Is the caller inside its rate limit (requests per minute and tokens per minute)? Can its budget cover this request's worst-case cost? Do input guardrails pass?</li>
+<li><strong>Pick a deployment.</strong> Skip any whose circuit breaker is open or whose upstream limit is exhausted. Choose among the rest by weight, latency or cost.</li>
+<li><strong>Translate and call.</strong> An adapter turns the gateway's request format into the provider's, and starts the call with per-phase timeouts.</li>
+<li><strong>Stream back.</strong> Forward each chunk as it arrives, translated into the gateway's response format, while counting tokens.</li>
+<li><strong>Settle.</strong> Record the provider-reported usage, convert it to cost, release the budget reservation, emit the trace and the audit record.</li>
+</ol>
+<p>Steps 3 and 7 are where most of the gateway's interesting state lives. Step 6 is where most of its bugs live.</p>
+
+<h3 id=dd-llm-gateway-route-table level=3>The route table</h3>
+<p>The heart of the gateway is a configuration that maps names to deployments. Products differ in syntax, but the shape is the same. Here it is in a neutral form:</p>
+<pre><code>routes:
+  chat-premium:
+    deployments:
+      - id: provA-large-east     # provider A, large model, pinned version
+        weight: 95
+        limits: {rpm: 3000, tpm: 2000000}
+      - id: provA-large-next     # canary of the next model version
+        weight: 5
+    fallbacks: [provB-large-west, semantic-cache, error-labeled]
+    timeouts: {connect: 2s, first_token: 8s, idle_between_chunks: 20s, total: 120s}
+    retries: {max: 1, on: [connect_error, 5xx_before_first_token], honor_retry_after: true}
+    breaker: {window: 30s, min_requests: 50, error_rate_open: 0.5, half_open_probe: 5}
+  classify-fast:
+    deployments:
+      - {id: provA-small, weight: 100}
+    fallbacks: [selfhosted-7b, keyword-rules]
+budgets:
+  team/growth:              {monthly_usd: 20000, soft_alert: 0.8}
+  feature/agent-experiments: {daily_usd: 500, hard: true}</code></pre>
+<p>Three things in it are worth pausing on. Model versions are pinned, so "the model changed" only ever happens through an edit you can review. The canary is a weight, not a separate code path. And the timeouts come in four kinds, because a single "request timeout" can't describe a stream.</p>
+
+<h3 id=dd-llm-gateway-timeouts level=3>Timeouts for streams</h3>
+<p>A streamed generation that takes 90 seconds may be perfectly healthy. A total timeout of 30 seconds would kill it; a total timeout of 300 seconds would let a hung connection hold a slot for five minutes. Split the timeout into phases instead.</p>
+<ul>
+<li><strong>Connect:</strong> a couple of seconds. Fails fast on network trouble.</li>
+<li><strong>Time to first token:</strong> set from the provider's measured p99 TTFT for this route, with room for long prompts. This is the timeout that catches a brownout.</li>
+<li><strong>Idle between chunks:</strong> the longest gap allowed between two pieces of a stream. It catches a stream that started and then stalled.</li>
+<li><strong>Total:</strong> a ceiling set from <code>max_tokens</code> and normal generation speed. A safety net, not the main control.</li>
+</ul>
+
+<h3 id=dd-llm-gateway-first-byte-rule level=3>The first-byte rule for retries and fallback</h3>
+<p>Before the first chunk reaches the caller, a failed upstream call can be retried or moved to the next deployment, and the caller never knows. After the first chunk has been sent, it cannot. The caller has already shown "The refund policy for" to a user. A second provider will not continue that exact sentence, and starting over would duplicate text on screen.</p>
+<p>So the gateway's reliability logic has two regimes. Before the first byte: retry, fail over, try the next fallback. After the first byte: finish, or end the stream with an explicit error event that the client can show and offer to retry. Some gateways buffer the first few chunks to widen the safe window. That trades TTFT for failover options, and it should be a per-route decision, never a default.</p>
+
+<h3 id=dd-llm-gateway-metering level=3>Metering and budgets, with reservations</h3>
+<p>Token accounting has two sources, and they disagree in useful ways.</p>
+<ul>
+<li><strong>Provider-reported usage.</strong> Most providers return input and output token counts with each response, and in streams usually in the final event. Some require you to ask for it in streaming mode. This is the number you are billed on, so it is the number you record.</li>
+<li><strong>Gateway estimates.</strong> Before the call, the gateway can estimate input tokens with a tokenizer (or roughly, from characters) and knows the requested <code>max_tokens</code>. That gives a worst-case cost before anything is spent.</li>
+</ul>
+<p>A hard budget cap needs both. A check-then-call design reads the remaining budget, sees money left, and calls. But fifty concurrent requests all read the same remaining budget at once, and all pass. The fix is a <strong>reservation</strong>, like a hotel's card hold:</p>
+<ol>
+<li>At admission, atomically subtract the request's worst-case cost (estimated input plus <code>max_tokens</code> output) from the remaining budget. If the result would go below zero, reject.</li>
+<li>At settlement, add back the difference between the reservation and the actual cost.</li>
+<li>If a stream aborts and no usage arrives, settle at an estimate from tokens counted so far, and flag the record for reconciliation.</li>
+</ol>
+<p>The counters live in a fast shared store, such as Redis, using atomic increments or a short script. Budgets are hierarchical: a request draws on the user, the feature, the team and the organization together, and any of them can refuse. The price table that turns tokens into money is itself versioned configuration. Prices change, some providers charge differently for cached input or batch traffic, and a cost report is only as right as the price row that produced it.</p>
+
+<h3 id=dd-llm-gateway-upstream-limits level=3>Living inside upstream limits</h3>
+<p>Providers usually limit each account or key by requests per minute and tokens per minute, and answer excess with HTTP 429. Many also send headers saying how much of the limit remains and when it resets; the header names differ by provider. A gateway that waits for 429s to discover its limits is driving by the sound of the guardrail. Better:</p>
+<ul>
+<li>Keep a local token bucket per deployment, sized a little under the provider's published limit.</li>
+<li>Read the remaining-limit headers when present and adjust the bucket.</li>
+<li>Honor <code>Retry-After</code> on a 429. Do not retry sooner, and add jitter so many callers do not retry together.</li>
+<li>When one deployment's bucket is empty, route to the next deployment in the same route before treating it as a failure.</li>
+</ul>
+<p>When the gateway is the only caller using those keys, its local view is accurate. That is one quiet benefit of key custody: the limits become something you can plan, instead of something fourteen services share without knowing.</p>
+
+<h3 id=dd-llm-gateway-breaker-classes level=3>What counts as a failure</h3>
+<p>A circuit breaker per (provider, model, region) opens when the error rate crosses a threshold. The subtle part is deciding which responses count. Get it wrong and one team's bug can open the breaker for everyone.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Response</th><th>Means</th><th>Counts toward the breaker?</th><th>Retry or fall back?</th></tr></thead><tbody>
+<tr><td>5xx, connection reset, TTFT timeout</td><td>Provider trouble</td><td>Yes</td><td>Yes, before the first byte</td></tr>
+<tr><td>429 rate limited</td><td>You hit a limit</td><td>No; it drains the deployment's bucket instead</td><td>Next deployment, or wait for <code>Retry-After</code></td></tr>
+<tr><td>400 invalid request (context too long, bad schema)</td><td>Caller's bug</td><td>No</td><td>No: return it to the caller</td></tr>
+<tr><td>Refusal or content-policy stop</td><td>The model declined</td><td>No</td><td>Usually no: falling back to shop for a different answer is a policy decision, not a reliability one</td></tr>
+<tr><td>401 / 403</td><td>Credential problem</td><td>Alert at once; separate from the error rate</td><td>No</td></tr>
+</tbody></table></div></div>
+
+<h3 id=dd-llm-gateway-adapters level=3>Adapters and the common format</h3>
+<p>Providers differ in how they represent messages, system prompts, tool calls, streaming events, stop reasons and usage. The gateway picks one internal format (often one modeled on a widely used provider's API) and translates both ways. Translation is where meaning gets lost. A provider-specific feature (a special caching control, a particular tool-call mode, a new content type) either has no slot in the common format or gets a pass-through field. The cleaner the abstraction, the more features it hides. Most gateways end up with a common core plus an escape hatch for provider-specific options, used sparingly and visible in review.</p>
+
+<h3 id=dd-llm-gateway-streaming level=3>Streaming passthrough, concretely</h3>
+<p>Every hop between the provider and the user must forward chunks as they arrive. The usual culprits:</p>
+<ul>
+<li><strong>Reverse-proxy buffering.</strong> nginx buffers upstream responses by default. For SSE routes, turn it off with <code>proxy_buffering off;</code> (or have the upstream send <code>X-Accel-Buffering: no</code>), and use HTTP/1.1 to the upstream with keep-alive.</li>
+<li><strong>Compression.</strong> A gzip middleware waits to fill its window before emitting anything. Exclude <code>text/event-stream</code>.</li>
+<li><strong>Framework response objects</strong> that collect the body before writing. The gateway's handler must write and flush per event.</li>
+<li><strong>Output guardrails.</strong> Scanning output for policy violations needs some text to scan. Hold back a small window (a sentence, or a few dozen tokens), and release text as it clears. That costs a little latency per chunk, but it is far better than scanning the whole response at the end.</li>
+</ul>
+<pre><code>location /v1/stream/ {
+    proxy_pass http://gateway_upstream;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_read_timeout 120s;    # at least the idle-between-chunks timeout
+    gzip off;
+}</code></pre>
+
+<h3 id=dd-llm-gateway-audit level=3>Logging without leaking</h3>
+<p>The gateway sees every prompt and every answer, which makes it the most sensitive log source in the company. Default to metadata: caller, route, deployment, token counts, cost, latency phases, finish reason, trace ID. Store prompt and response content only where a policy says so, with its own retention period, access controls and redaction. The gateway is also the natural place to propagate trace context into provider calls and to attach the trace ID to the audit record. Then "why did this answer cost $4?" is one query.</p>
+
+<h2 id=dd-llm-gateway-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions for this section: 14 services, 200 model calls per second at peak, average prompt 1,500 tokens, average output 300 tokens, average stream duration 8 seconds. Prices and provider limits below are illustrative round numbers, not any provider's actual figures.</p>
+
+<h3 id=dd-llm-gateway-concurrency level=3>Concurrent streams and gateway memory</h3>
+<p>By Little's law, 200 calls per second x 8 seconds = 1,600 streams open at once. Each stream holds two connections: one from the caller and one to the provider. That is 3,200 sockets. An async proxy might keep tens of kilobytes of buffers and state per stream; at 64 KB, that's about 100 MB. CPU is light, since the gateway mostly copies bytes and counts tokens.</p>
+<p>So the gateway is not a capacity problem. It is an availability problem. Its unusual load is long-lived connections. Deploying a new gateway version means draining streams that last seconds to minutes. Set connection draining and grace periods from the longest normal stream, exactly as for the GPU fleet's scale-down. Run at least three instances across zones, so losing one drops a third of streams, not all of them.</p>
+
+<h3 id=dd-llm-gateway-overhead level=3>Overhead</h3>
+<p>The lesson's 3–8 ms per call comes from a few small steps: authentication (cached), a route lookup, one or two calls to a shared counter store, and the extra network hop. Against a TTFT of 500 ms to 2 s, that is under 1%. The one step that can grow is the budget check. If the counter store is in another region, it can add tens of milliseconds. Keep it local, and make admission fail open or closed by an explicit choice, per route, when the counter store is down.</p>
+
+<h3 id=dd-llm-gateway-budget-math level=3>How much a hard cap can overspend</h3>
+<p>Take the weekend agent: about $40K over 60 hours, or roughly $670 an hour. Say each of its calls has a worst case of 20,000 input tokens and 4,000 output tokens. At illustrative prices of $3 per million input and $15 per million output, that is $0.06 + $0.06 = $0.12 per call.</p>
+<ul>
+<li><strong>Check-then-call, no reservation:</strong> overspend is bounded by in-flight calls times worst-case cost. At 20 concurrent calls, that is $2.40 past the cap. Small, but only because <code>max_tokens</code> was set. Without it, the worst case per call is the model's full output length.</li>
+<li><strong>With reservations:</strong> overspend is zero, by construction, except for aborted streams settled on estimates.</li>
+<li><strong>With only an end-of-day batch job comparing spend to budget:</strong> overspend is up to a day of spend, about $16K at that rate. That isn't a cap. It is a report.</li>
+</ul>
+
+<h3 id=dd-llm-gateway-limit-math level=3>Upstream limits and the failover reserve</h3>
+<p>Peak demand: 200 calls per second x 1,800 tokens = 360,000 tokens per second, or 21.6M tokens per minute. Suppose a provider deployment allows 4M tokens per minute. Then the primary route needs six deployments (keys, regions or a higher tier) just to carry normal load.</p>
+<p>Now the failover. The lesson's walkthrough moves 80% of traffic to the secondary provider during a brownout. That is about 17M tokens per minute arriving at a provider that normally carries a small share. If its limits were sized for that small share, it starts returning 429s within seconds, and the failover becomes a second outage. <strong>A fallback is only real if its quota was provisioned for the failover load.</strong> That costs money or negotiation in advance. The alternative is to decide, also in advance, which tiers fail over and which degrade straight to the cache or a labeled error.</p>
+
+<h3 id=dd-llm-gateway-retry-math level=3>Retry amplification</h3>
+<p>Fourteen services, each with its own three retries, calling through a gateway that also retries three times, can turn one failed call into sixteen upstream attempts. During a brownout, that multiplies load on the struggling provider exactly when it can least take it. Put retries in one place, the gateway, and give them a budget: retries may add at most, say, 10% to upstream traffic over a rolling window. Callers then send each request once and trust the gateway to retry. Each retry also costs tokens. A retried 20,000-token prompt is paid twice if the first attempt reached the model before failing.</p>
+
+<h3 id=dd-llm-gateway-log-math level=3>Log volume</h3>
+<p>200 calls per second is about 17M calls a day. Metadata at around 1 KB per call is about 17 GB a day, easy to keep for a year. Full prompts and responses at 8 KB per call add roughly 140 GB a day, and that data is also the most sensitive in the company. That is why content logging is a sampled, policy-driven exception, with short retention, rather than the default.</p>
+
+<h2 id=dd-llm-gateway-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-llm-gateway-fm-buffering level=3>1. The buffering regression</h3>
+<p><strong>Symptom.</strong> After a routine gateway release, users say the assistant "thinks for a long time, then dumps the whole answer." Average total latency is unchanged; TTFT as seen by users has tripled.</p>
+<p><strong>Mechanism.</strong> The release added a response-compression middleware for the gateway's admin API. It applied to every route. The compressor holds output until its window fills, so SSE events now arrive in a few large clumps.</p>
+<p><strong>Detect.</strong> A synthetic probe that measures TTFT through the gateway and directly against the provider, side by side, every minute. Gateway-side metrics alone will not see it, because the gateway thinks it wrote each chunk on time.</p>
+<p><strong>Fix.</strong> Exclude <code>text/event-stream</code> from compression and buffering at every layer. Add a CI test that asserts the first event arrives within a small bound of the upstream's first event. The lesson calls passthrough a standing duty; this test is how you keep it.</p>
+
+<h3 id=dd-llm-gateway-fm-midstream level=3>2. The answer that started twice</h3>
+<p><strong>Symptom.</strong> A few users see answers that begin, break off, and start again with different wording, all in one message.</p>
+<p><strong>Mechanism.</strong> The primary provider dropped the connection 3 seconds into a stream. The gateway's retry logic did not check whether bytes had already gone to the client. It retried on the secondary and kept writing to the same stream.</p>
+<p><strong>Detect.</strong> Count retries and failovers where the first byte had already been sent. The number should be zero.</p>
+<p><strong>Fix.</strong> Enforce the first-byte rule in code. After the first byte, a failure ends the stream with an explicit error event, and the client offers a retry. If a route truly needs mid-stream recovery, the client must handle it, for example by asking the model to continue from the text it already has. The gateway should not do this silently.</p>
+
+<h3 id=dd-llm-gateway-fm-cascade level=3>3. Failover into a wall</h3>
+<p><strong>Symptom.</strong> The primary has a brownout. Within a minute, the secondary returns 429s, the self-hosted fallback is saturated, and the error rate is worse than if the gateway had done nothing.</p>
+<p><strong>Mechanism.</strong> Every route failed over at once, at full volume. The secondary's limits were sized for normal share. The cheap tiers, which could have waited or used rules, competed with premium chat for the same scarce fallback.</p>
+<p><strong>Detect.</strong> Per-deployment 429 rates and bucket levels during failover drills. The drill is the detector. Without one, the outage is the first test.</p>
+<p><strong>Fix.</strong> Provision fallback quota for the load you actually plan to move there. Give routes a failover priority, so premium chat moves first and batch-ish tiers degrade to their own end of chain. Shift traffic gradually, which also lets the half-open probes find recovery on the primary. Run the drill quarterly.</p>
+
+<h3 id=dd-llm-gateway-fm-breaker-poison level=3>4. One team's bug opens everyone's breaker</h3>
+<p><strong>Symptom.</strong> Chat fails over to the secondary provider in the middle of a normal afternoon. The primary provider's status page is green.</p>
+<p><strong>Mechanism.</strong> A new feature began sending prompts over the model's context limit. The provider returned 400s. The breaker counted every non-2xx response as a failure, crossed 50%, and opened the shared (provider, model) circuit for all callers.</p>
+<p><strong>Detect.</strong> Breaker openings broken down by response class and by caller. One caller with one error class is the signature.</p>
+<p><strong>Fix.</strong> Count only provider-side failures toward the breaker: 5xx, timeouts, resets. Return 4xx to the caller. Validate prompt length at admission, with the model's limit in the route table, so a bad request never leaves the gateway.</p>
+
+<h3 id=dd-llm-gateway-fm-meter-drift level=3>5. The meter and the invoice disagree</h3>
+<p><strong>Symptom.</strong> Month-end: the provider invoice is 9% higher than the gateway's metered total. Finance trusts neither.</p>
+<p><strong>Mechanism.</strong> Several causes add up. Aborted streams never received a final usage event, so they were metered at zero. A price changed mid-month, and the price table did not. Retried attempts that reached the model before failing were billed but not metered. Some traffic still used an old key outside the gateway.</p>
+<p><strong>Detect.</strong> Daily reconciliation against the provider's usage reports, per key, where the provider offers them. Count records with estimated or missing usage.</p>
+<p><strong>Fix.</strong> Meter every upstream attempt, not just the successful one. Estimate usage for aborted streams from tokens counted. Version the price table with effective dates. Revoke any key not held by the gateway. Where invoices are recharged to teams, make the metering pipeline exactly-once, as the lesson notes.</p>
+
+<h3 id=dd-llm-gateway-fm-retry-storm level=3>6. The synchronized retry storm</h3>
+<p><strong>Symptom.</strong> A short burst of 429s turns into ten minutes of 429s. Traffic to the provider is higher than before the burst started.</p>
+<p><strong>Mechanism.</strong> Services retried immediately, ignoring <code>Retry-After</code>, and the gateway retried as well. Every retry used the same fixed delay, so the retries arrived together, hit the limit together, and failed together.</p>
+<p><strong>Detect.</strong> Upstream attempts per caller request above about 1.1. The 429 rate that rises after the first 429s, instead of falling.</p>
+<p><strong>Fix.</strong> Retries only at the gateway, with exponential backoff and jitter, honoring <code>Retry-After</code>, under a retry budget. Before retrying on a 429, try another deployment in the same route that still has headroom. See <a href="#retry-with-exponential-backoff">Retry with Exponential Backoff</a>.</p>
+
+<h3 id=dd-llm-gateway-fm-adapter level=3>7. The stop reason nobody mapped</h3>
+<p><strong>Symptom.</strong> After a provider's API update, some summaries end mid-sentence, and the calling service treats them as complete.</p>
+<p><strong>Mechanism.</strong> The provider introduced a new finish reason, or renamed one. The adapter's mapping had a default branch that translated anything unknown to the normal "stop." Truncated outputs now looked finished.</p>
+<p><strong>Detect.</strong> A counter for unmapped values in every adapter field: finish reasons, event types, content types. Contract tests against each provider's live API on a schedule, not only at build time.</p>
+<p><strong>Fix.</strong> Unknown values map to an explicit "unknown," never to a success value, and they trigger an alert. Pin API versions where providers offer it. Keep adapters in a maintained open-source core, so you share this churn with others, as the lesson's buy-first advice says.</p>
+
+<h2 id=dd-llm-gateway-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-llm-gateway-choose-placement level=3>Where the policy runs</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th></th><th>Shared client library</th><th>Sidecar per service</th><th>Central internal gateway</th><th>Hosted third-party gateway</th></tr></thead><tbody>
+<tr><td>Key custody</td><td>Keys in every service</td><td>Keys on every node</td><td>One place</td><td>At the vendor, plus your key to them</td></tr>
+<tr><td>Budgets across services</td><td>Needs a shared counter anyway</td><td>Needs a shared counter anyway</td><td>Native</td><td>Native</td></tr>
+<tr><td>Upstream limit view</td><td>Fragmented</td><td>Fragmented</td><td>Complete</td><td>Complete, possibly shared with other customers' traffic</td></tr>
+<tr><td>Added hop</td><td>None</td><td>Local</td><td>One network hop</td><td>One internet hop</td></tr>
+<tr><td>Rollout of a policy change</td><td>Every service redeploys</td><td>Sidecar rollout</td><td>One deploy or config change</td><td>Vendor config</td></tr>
+<tr><td>Data exposure</td><td>Provider only</td><td>Provider only</td><td>Provider only</td><td>Provider and gateway vendor</td></tr>
+<tr><td>Fits</td><td>One service, one provider</td><td>Large meshes that already run sidecars</td><td>Most companies with several teams</td><td>Small teams wanting many providers fast</td></tr>
+</tbody></table></div></div>
+<p>The central internal gateway is the lesson's design, and for good reason. It is the only option that gives a complete view of keys, budgets and upstream limits without trusting another party with your prompts. A sidecar can work where the mesh is already the policy layer, but budgets and limits still need a central counter, so you end up with most of a gateway anyway.</p>
+
+<h3 id=dd-llm-gateway-choose-routing level=3>How the gateway picks a deployment</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Strategy</th><th>How it chooses</th><th>Good for</th><th>Watch out for</th></tr></thead><tbody>
+<tr><td>Ordered fallback</td><td>First healthy deployment in a list</td><td>Predictable behavior, easy to reason about</td><td>The secondary must be ready for the full load</td></tr>
+<tr><td>Weighted</td><td>Fixed shares across deployments</td><td>Canaries; spreading load over keys and regions</td><td>Weights go stale when limits change</td></tr>
+<tr><td>Least-latency or least-busy</td><td>Recent TTFT or in-flight count</td><td>Several equivalent deployments of one model</td><td>Herding onto whichever just looked fastest</td></tr>
+<tr><td>Cost-based</td><td>Cheapest deployment that meets the tier</td><td>Equivalent models at different prices</td><td>"Equivalent" must be proven by evaluations, and re-proven</td></tr>
+<tr><td>Learned router</td><td>A small model picks a model per request</td><td>Large, mixed traffic where cheap models handle most requests</td><td>A model in the critical path; routing errors are quality bugs</td></tr>
+</tbody></table></div></div>
+<p>Start with ordered fallback plus weights for canaries. Only add latency- or cost-based selection across deployments you have shown to be equivalent by evaluation. A learned router is a product feature, not infrastructure. If you build one, the product team owns its quality, and the gateway only hosts it.</p>
+
+<h3 id=dd-llm-gateway-choose-fail level=3>Fail open or fail closed</h3>
+<p>When a gateway dependency is down (the budget counter store, the guardrail service), each check needs a declared behavior. Budget checks usually fail open for short outages with a tight time limit, since a few minutes of uncounted spend is cheaper than a full AI outage. Safety checks that protect users or data, such as PII redaction on regulated routes, fail closed. Decide per route, write it in the route table, and test it in drills.</p>
+
+<h2 id=dd-llm-gateway-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Are all provider keys held only by the gateway, and is there a way to detect a key used from anywhere else?</li>
+<li>Does every route pin model versions, and does every change go through a canary judged by evaluations?</li>
+<li>Are timeouts split into connect, first token, idle between chunks and total, each set from measured percentiles?</li>
+<li>Is the first-byte rule enforced: no retry or failover after content has been sent?</li>
+<li>Does the breaker count only provider-side failures, per (provider, model, region)?</li>
+<li>Are hard budgets enforced with reservations, and is <code>max_tokens</code> required on every call?</li>
+<li>Is each fallback's quota provisioned for the load the plan sends to it, and when was the failover drill last run?</li>
+<li>Do retries happen in one place, with backoff, jitter, <code>Retry-After</code> and a retry budget?</li>
+<li>Is streaming passthrough tested in CI and probed in production, comparing TTFT through the gateway against direct?</li>
+<li>Is metered usage reconciled against provider usage reports, with the price table versioned?</li>
+<li>What is logged by default, what content is stored, for how long, and who can read it?</li>
+<li>Is there a written rule for what does not belong in the gateway (prompts, templates, product logic), and who enforces it?</li>
+</ol>
+
+<h2 id=dd-llm-gateway-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"The primary provider fails 3 seconds into a stream. What does the gateway do?"</summary>
+<p>It cannot fail over transparently, because the user has already seen part of an answer and a different model will not continue it exactly. Before the first byte, retry or fail over freely. After it, end the stream with an explicit error event, record the partial usage, and let the client offer a retry. If wider failover windows matter for a route, buffer the first few chunks on purpose, and accept the TTFT cost for that route only.</p>
+</details>
+
+<details>
+<summary>"How do you enforce a hard $500 daily cap when 50 requests are in flight?"</summary>
+<p>Reserve before calling. At admission, atomically subtract each request's worst-case cost (estimated input plus <code>max_tokens</code> output at current prices) from the remaining budget, and reject if it would go negative. At settlement, return the difference using the provider-reported usage. Plain check-then-call lets all 50 pass on the same reading. An end-of-day job isn't a cap at all.</p>
+</details>
+
+<details>
+<summary>"Your fallback plan sends traffic to a second provider. What makes that plan fail?"</summary>
+<p>Quota, mostly. If the secondary's limits were sized for its normal share, a full failover hits 429s within seconds and becomes a second outage. Provision for the planned failover load, give routes a failover priority, shift gradually, and let cheaper tiers degrade to their own chain ends instead of competing. Then drill it, because the secondary's model also behaves differently with your prompts, and you want to learn that before the outage.</p>
+</details>
+
+<details>
+<summary>"Should a content-policy refusal open the circuit breaker?"</summary>
+<p>No. The provider worked correctly; the model declined. Counting refusals, or 400s from bad requests, as failures lets one caller's traffic open the circuit for everyone. The breaker counts 5xx, timeouts and resets. Retrying a refusal on another provider is a policy decision about shopping for a different answer, and most organizations should not make it automatically.</p>
+</details>
+
+<details>
+<summary>"Why put retries in the gateway and not in the services?"</summary>
+<p>Because retries multiply across layers. Three in each service times three in the gateway turns one failure into many upstream attempts, exactly when the provider is struggling. In one place, retries can honor <code>Retry-After</code>, try another deployment with headroom first, and stay under a global retry budget. Each retry also costs tokens, which only the gateway can see and meter.</p>
+</details>
+
+<details>
+<summary>"The gateway's metered spend is 9% below the invoice. Where do you look?"</summary>
+<p>Aborted streams with no final usage event, metered as zero. Retried attempts that were billed but not recorded. Stale prices in the price table. Keys still in use outside the gateway. Fix by metering every attempt, estimating usage for aborts, versioning prices, revoking stray keys and reconciling daily against provider usage reports.</p>
+</details>
+
+<details>
+<summary>"Users say the assistant feels slower after a gateway release, but your latency dashboards are flat. What happened?"</summary>
+<p>Probably buffering. Total latency is unchanged, but chunks now arrive in clumps, so TTFT as users feel it has grown. The gateway's own metrics record when it wrote each chunk, not when the client got it. Probe TTFT end to end, through the gateway and direct, and check every layer for buffering or compression on event streams.</p>
+</details>
+
+<details>
+<summary>"A team asks to add a prompt template to the gateway 'just for consistency.' What do you say?"</summary>
+<p>No, and offer the right home. Templates are product behavior; they change with the feature, and their owners must ship them without a platform ticket. They belong in the service or a product-owned prompt registry, versioned there. The gateway keeps identity, keys, metering, budgets, routing, reliability, safety checks and streaming. A useful test: if a rule mentions a product word, it does not belong in the gateway.</p>
+</details>

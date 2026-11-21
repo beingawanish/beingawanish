@@ -1,0 +1,43 @@
+{
+  "type": "record",
+  "name": "FulfilmentAccepted",
+  "namespace": "com.edacommerce.fulfilment",
+  "doc": "The warehouse acknowledged RequestFulfilment.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "fulfilmentId",
+      "type": "string"
+    },
+    {
+      "name": "warehouseId",
+      "type": "string"
+    },
+    {
+      "name": "acceptedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    },
+    {
+      "name": "estimatedDispatchAt",
+      "type": [
+        "null",
+        {
+          "type": "long",
+          "logicalType": "timestamp-millis"
+        }
+      ],
+      "default": null
+    }
+  ]
+}

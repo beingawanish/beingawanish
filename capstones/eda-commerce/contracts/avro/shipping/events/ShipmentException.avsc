@@ -1,0 +1,66 @@
+{
+  "type": "record",
+  "name": "ShipmentException",
+  "namespace": "com.edacommerce.shipping",
+  "doc": "Something went wrong with a shipment: booking failed, parcel lost or damaged, address problem.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "shipmentId",
+      "type": "string"
+    },
+    {
+      "name": "direction",
+      "type": "com.edacommerce.common.ShipmentDirection"
+    },
+    {
+      "name": "code",
+      "type": {
+        "type": "enum",
+        "name": "ShipmentExceptionCode",
+        "namespace": "com.edacommerce.shipping",
+        "doc": "Carrier exception category. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+        "symbols": [
+          "ADDRESS_ISSUE",
+          "DAMAGED",
+          "LOST",
+          "DELAYED",
+          "BOOKING_FAILED",
+          "UNKNOWN"
+        ],
+        "default": "UNKNOWN"
+      }
+    },
+    {
+      "name": "detail",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "carrierEventId",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "raisedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

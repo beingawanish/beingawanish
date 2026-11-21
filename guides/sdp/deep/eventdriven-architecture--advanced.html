@@ -1,0 +1,137 @@
+<h2 id=dd-eventdriven-architecture-adv-orchestration level=2>Deep Dive: Orchestrating Order → Payment → Inventory → Fulfilment → Shipping</h2>
+<p>The first deep dive gave the rule: orchestrate the steps that depend on each other, and choreograph the reactions that don't. This part builds the order workflow that rule points at. One order, five services, every message named and keyed, and every failure branch walked through. The aim is a design you could hand to five teams on Monday.</p>
+<p>The running example is the bookstore again. Customer <code>c_91</code> places order <code>ord_7f3a</code>: three books, $142.00, shipping to Austin.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-commands-events level=3>Commands and events: two kinds of message, two naming rules</h3>
+<p>A workflow needs both kinds of message, and mixing them up is the most common design error in event-driven systems. They differ in who decides.</p>
+<p>A <strong>command</strong> asks one specific service to do something. It is named in the imperative: <code>AuthorizePayment</code>, <code>ReserveStock</code>, <code>CreateShipment</code>. It has exactly one intended handler, the service that owns that capability. And it can be refused. Payment may answer "declined", and that is a normal outcome, not an error.</p>
+<p>An <strong>event</strong> records something that already happened. It is named in the past tense: <code>PaymentAuthorized</code>, <code>StockReserved</code>, <code>ShipmentDispatched</code>. The publisher does not know or care who listens. Nobody can refuse it, because it is already true.</p>
+<p>The naming is not cosmetic. A past-tense name on a message that is really an instruction (<code>SendReceiptRequested</code>, say) hides a dependency. The publisher expects a specific consumer to act, so it is a command dressed as an event. When that consumer is down, the publisher's workflow silently stalls, and nobody owns the timeout.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Property<th>Command<th>Event<tbody>
+<tr><td>Grammar<td>Imperative: <code>ReserveStock</code><td>Past tense: <code>StockReserved</code>
+<tr><td>Handlers<td>Exactly one owner<td>Zero or more subscribers
+<tr><td>Can be refused?<td>Yes, and the refusal is itself an event<td>No, it is a fact
+<tr><td>Who owns the schema<td>The receiver (it defines what it accepts)<td>The publisher (it defines what it states)
+<tr><td>Typical channel<td>A per-service command topic or queue<td>A per-entity event topic
+<tr><td>Coupling<td>Sender knows the receiver<td>Publisher knows nobody
+<tr><td>Retention need<td>Short: until handled<td>Long: replay builds new views
+</table></div></div>
+<p>Notice the schema-ownership row. It decides where a command's schema lives. <code>ReserveStock</code> belongs to inventory, which publishes it in its own contract: "send me this and I will reserve". The orchestrator is a client of that contract, in the same way an HTTP client is a client of an API.</p>
+<p>A good test in review: read each message name aloud and ask "who decided?" If the sender decided what must happen, it's a command. If the sender is reporting what did happen, it's an event.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-who-holds level=3>Who holds the workflow: orchestrator, choreography, and the hybrid</h3>
+<p>The order workflow has every property that pushes toward orchestration. Inventory should not reserve stock for an order whose payment failed. A late failure must undo earlier steps in reverse order. And customer support needs to answer "where is order <code>ord_7f3a</code>?" right now, not by reading five services.</p>
+<p>So something owns the workflow's state. That something is called a <strong>process manager</strong> (the enterprise-integration term) or an <strong>orchestrator</strong>. It holds one record per order: the current step, what has been done, what must be undone if things go wrong, and when the current step is overdue. It reacts to events and sends commands. It contains no business rules about payments or stock. Those stay in the services that own them.</p>
+<p>Pure choreography would wire the same steps as a chain of subscriptions: payment listens for <code>OrderPlaced</code>, inventory listens for <code>PaymentAuthorized</code>, and so on. It works on the happy path and gets awkward fast. Inventory now needs to know that a payment authorization is the trigger for reservation, which is order-workflow knowledge leaking into the stock service. Compensation needs every service to listen for every later failure. And the "where is it?" question needs a separate process monitor, which is an orchestrator that is not allowed to act.</p>
+<p>The shape most companies land on is a hybrid, and it is worth stating precisely:</p>
+<ul>
+<li><strong>The spine is orchestrated.</strong> Payment, inventory, fulfilment and shipping are steps of one saga. The orchestrator sends them commands and listens for their outcome events.</li>
+<li><strong>Every step still publishes domain events.</strong> <code>PaymentAuthorized</code> goes to <code>payment.events</code>, where the orchestrator is just one subscriber.</li>
+<li><strong>Everything else is choreographed.</strong> Email, analytics, loyalty, the fraud model and the search index subscribe to those event topics. The orchestrator never hears of them, and adding a sixth reaction needs no change to the workflow.</li>
+<li><strong>The orchestrator publishes its own events too.</strong> <code>OrderConfirmed</code>, <code>OrderCancelled</code> and <code>OrderShipped</code> are facts about the order as a whole. Most downstream consumers want these, not the step events.</li>
+</ul>
+<p>The line between the two halves is one question: if this consumer did nothing, would the order be wrong? If yes, it is a step and belongs to the orchestrator. If the order would be fine but someone would miss a receipt, it is a reaction and should be choreographed.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-engines level=3>Three ways to build the orchestrator</h3>
+<p>"Use an orchestrator" still leaves the build choice. There are three common answers, and they differ mostly in where the workflow state lives and who writes the timer code.</p>
+<p><strong>A durable workflow engine</strong> such as Temporal (or Cadence, the Uber project it grew out of). You write the workflow as ordinary code: call <code>authorize_payment</code>, then <code>reserve_stock</code>, wrap them in try/except for compensation, and <code>sleep</code> for a deadline. The engine records every step's result in an event history. If the worker crashes, another worker replays that history through the same code and continues from the same point. This is why workflow code must be deterministic: no wall-clock reads, random numbers or direct I/O outside the engine's APIs. Activities (the steps that touch the outside world) are retried by the engine with policies you configure. The engine owns timers, so a seven-day deadline is one line of code.</p>
+<p><strong>A database-backed state machine.</strong> The orchestrator is a normal service with a <code>saga</code> table, an outbox and an inbox. Each incoming event loads the saga row, checks the transition is legal, updates the row, and writes the next command to the outbox, all in one transaction. Timers are a <code>deadline_at</code> column scanned by a small poller. Nothing is magic, so everything is visible in SQL. You also write everything yourself, including the bugs in the timer scanner.</p>
+<p><strong>A managed state-machine service</strong> such as AWS Step Functions or a BPMN engine like Camunda. The workflow is a declared graph (JSON or a diagram) rather than code. These fit well when the steps are mostly calls to other managed services and the team wants the console view for free. Long-running waits on external events need a callback-token style integration, which is more ceremony than a Temporal signal.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Concern<th>Durable workflow engine<th>DB-backed state machine<th>Managed state machine<tbody>
+<tr><td>Where state lives<td>Engine's event history<td>Your <code>saga</code> table<td>The provider's execution record
+<tr><td>Timers and deadlines<td>Built in, durable<td>Your poller over <code>deadline_at</code><td>Built in (wait states)
+<tr><td>Compensation<td>Ordinary code (try/finally)<td>Explicit states and transitions<td>Catch/fallback states in the graph
+<tr><td>Changing a running workflow<td>Versioning APIs; old histories must still replay<td>Migrate rows; easy to reason about<td>New version applies to new executions
+<tr><td>Querying "all orders stuck at payment"<td>Visibility queries, with limits<td>Plain SQL<td>Console and API filters
+<tr><td>New infrastructure<td>Engine cluster plus its database, or a hosted service<td>None beyond what you run<td>None, but vendor lock-in
+<tr><td>Main trap<td>Non-deterministic code breaks replay<td>Hand-written concurrency and timer bugs<td>Payload size and per-transition pricing at volume
+</table></div></div>
+<p>A sensible default: if the company already runs a workflow engine, use it. If not, and there are only one or two sagas, a DB-backed state machine is less to operate and easier for new engineers to read. Move to an engine when the third or fourth long-running workflow arrives, or the first one that needs waits measured in days. The rest of this section uses the DB-backed version, because it shows every moving part. A Temporal workflow does the same things with less code you can see.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-topics-keys level=3>Topic design, keys and ordering</h3>
+<p>The message plan below uses Kafka terms. The same shape works on most log-based brokers.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Topic<th>Kind<th>Written by<th>Read by<th>Key<th>Retention<tbody>
+<tr><td><code>order.events</code><td>Events<td>Checkout, orchestrator<td>Orchestrator, email, analytics, search<td><code>order_id</code><td>Long (30 days or compacted)
+<tr><td><code>payment.commands</code><td>Commands<td>Orchestrator<td>Payment<td><code>order_id</code><td>Short (days)
+<tr><td><code>payment.events</code><td>Events<td>Payment<td>Orchestrator, finance, fraud<td><code>order_id</code><td>Long
+<tr><td><code>inventory.commands</code><td>Commands<td>Orchestrator<td>Inventory<td><code>order_id</code><td>Short
+<tr><td><code>inventory.events</code><td>Events<td>Inventory<td>Orchestrator, replenishment<td><code>order_id</code> (see below)<td>Long
+<tr><td><code>fulfilment.commands</code> / <code>.events</code><td>Both<td>Orchestrator / warehouse adapter<td>Warehouse adapter / orchestrator<td><code>order_id</code><td>Short / long
+<tr><td><code>shipping.commands</code> / <code>.events</code><td>Both<td>Orchestrator / shipping<td>Shipping / orchestrator, email<td><code>order_id</code><td>Short / long
+</table></div></div>
+<p>Four decisions sit inside that table.</p>
+<p><strong>Separate command and event topics per service.</strong> Commands are private traffic between the orchestrator and one service. Events are public. Mixing them on one topic forces every event subscriber to skip commands, and it tempts other teams to send commands they have no business sending. Separate topics also let you give them different retention and access control: only the orchestrator may write <code>payment.commands</code>.</p>
+<p><strong>Key everything in the workflow by <code>order_id</code>.</strong> Kafka orders records only within a partition, and the key picks the partition. Keying every command and event about one order by its ID puts them in one partition per topic. So payment will see <code>AuthorizePayment</code> before <code>VoidAuthorization</code> for the same order, and the orchestrator will see <code>PaymentAuthorized</code> before <code>PaymentCaptured</code>.</p>
+<p>That guarantee is narrower than it sounds. It holds within one topic. Across topics there is no order at all. The orchestrator might read <code>StockReserved</code> (from <code>inventory.events</code>) before an earlier <code>PaymentAuthorized</code> (from <code>payment.events</code>), if the two topics' consumers run at different speeds. A correct orchestrator never relies on cross-topic arrival order. It checks each incoming event against the saga's state, and an event that arrives "early" is either handled or held, never assumed impossible. In the design here the orchestrator sends one command at a time, so a step's reply cannot really overtake the previous step's reply. Parallel steps are where this bites.</p>
+<p><strong>Watch for services whose natural key is something else.</strong> Inventory thinks in SKUs and warehouses. Its own stock-level events (<code>StockLevelChanged</code>) should be keyed by SKU, so that every change to one SKU's count is ordered. Its replies to the order workflow should be keyed by <code>order_id</code>. Those are different facts about different entities, so they go on different topics or at least carry different keys. Forcing one key onto both breaks one of the two orderings.</p>
+<p><strong>Size the partitions for the slowest step.</strong> Ordering per key is bought with parallelism limited by partition count, and per-key serial processing. If the warehouse adapter takes 200 ms per command (it calls an external warehouse system), one consumer thread handles 5 commands per second per partition. At 300 orders per second you need at least 60-way parallelism on <code>fulfilment.commands</code>: more partitions, or a consumer that processes different keys within a partition concurrently while keeping each key serial. The <a href="#partitioned-consumption">Partitioned Consumption</a> lesson covers the second technique.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-ids-saga-table level=3>Correlation, causation, and the saga state table</h3>
+<p>Every message in the workflow carries three identifiers in its envelope, plus its own ID:</p>
+<ul>
+<li><code>message_id</code>: unique per message, assigned once when the message is written to the outbox. This is the dedup key.</li>
+<li><code>correlation_id</code>: the same for every message in this order's workflow. Use the saga ID (here, the order ID with a prefix) so a single search returns the whole story.</li>
+<li><code>causation_id</code>: the <code>message_id</code> of the message that directly caused this one. <code>ReserveStock</code>'s causation ID is the <code>PaymentAuthorized</code> event that triggered it. Following causation links rebuilds the workflow as a tree, including retries and compensations.</li>
+<li><code>traceparent</code>: the W3C trace context, so the hops appear in distributed tracing.</li>
+</ul>
+<p>The correlation ID answers "everything about this order". The causation ID answers "why did this message exist?" You need both. When a refund goes out twice, correlation finds the 40 messages for that order. Causation shows that both <code>RefundPayment</code> commands trace back to the same <code>ShipmentFailed</code> event, which points straight at a non-idempotent compensation handler.</p>
+<p>The orchestrator's state lives in one table:</p>
+<pre><code>CREATE TABLE order_saga (
+  saga_id          text PRIMARY KEY,          -- 'saga_ord_7f3a'
+  order_id         text NOT NULL UNIQUE,
+  state            text NOT NULL,             -- AWAITING_PAYMENT, AWAITING_STOCK, ...
+  version          bigint NOT NULL,           -- optimistic concurrency
+  payment_auth_id  text,                      -- filled as steps complete
+  reservation_id   text,
+  fulfilment_id    text,
+  shipment_id      text,
+  compensations    jsonb NOT NULL DEFAULT '[]',  -- stack of undo actions owed
+  attempt          int NOT NULL DEFAULT 0,    -- retries of the current step
+  step_deadline_at timestamptz,               -- when the current step is overdue
+  saga_deadline_at timestamptz NOT NULL,      -- when the whole order must be resolved
+  last_message_id  text,                      -- causation for the next command
+  created_at       timestamptz NOT NULL,
+  updated_at       timestamptz NOT NULL
+);
+CREATE INDEX order_saga_due ON order_saga (step_deadline_at)
+  WHERE state NOT IN ('COMPLETED', 'CANCELLED', 'FAILED');
+
+CREATE TABLE inbox (                          -- one row per handled message
+  consumer    text NOT NULL,
+  message_id  text NOT NULL,
+  handled_at  timestamptz NOT NULL,
+  PRIMARY KEY (consumer, message_id)
+);</code></pre>
+<p>Handling one event is one database transaction with four parts:</p>
+<ol>
+<li>Insert the message ID into <code>inbox</code>. A primary-key conflict means it was already handled: commit nothing and acknowledge.</li>
+<li>Load the saga row <code>FOR UPDATE</code> (or compare <code>version</code> on update). Check that the event is legal in the current state. <code>StockReserved</code> while in <code>AWAITING_PAYMENT</code> is not, so it is logged and parked for investigation.</li>
+<li>Update the saga row: the new state, the new step deadline, and a push onto the compensation stack if the step created something that must be undone later.</li>
+<li>Insert the next command into the outbox, with <code>causation_id</code> set to the incoming event's ID.</li>
+</ol>
+<p>Commit, then acknowledge the broker offset. A crash anywhere before the commit means the event is redelivered and the whole thing runs again. A crash after the commit but before the ack means it is redelivered and step 1 stops it. That is exactly-once <em>effect</em> on the orchestrator's state, built from at-least-once delivery, without any broker transaction.</p>
+<p>The compensation stack deserves a word. Undo actions are recorded as the steps succeed, not derived at failure time. When payment is authorized, the orchestrator pushes <code>VoidAuthorization(auth_id)</code>. When capture succeeds, it replaces that with <code>RefundPayment(capture_id)</code>. When stock is reserved, it pushes <code>ReleaseStock(reservation_id)</code>. On failure, the orchestrator pops and sends them in reverse order. Recording them up front means the failure path cannot forget a step that the happy path added last month.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-timeouts level=3>Timeouts, deadlines and compensations</h3>
+<p>Every step needs a timeout, and the whole saga needs a deadline. They protect against different things.</p>
+<p>A <strong>step timeout</strong> covers a lost or slow reply: the command went out and nothing came back. For a step that should take milliseconds, like a stock reservation, a timeout of 30 seconds to a few minutes is generous. On expiry the orchestrator does not assume failure. It retries the command (with the <em>same</em> <code>message_id</code> semantics underneath, so the handler's idempotency absorbs it) a bounded number of times with backoff. Only then does it escalate.</p>
+<p>A <strong>saga deadline</strong> covers a workflow that keeps making slow progress, or keeps waiting on something external. "Every order is either shipped or cancelled within 72 hours" is a business rule. It belongs in the saga row as a timestamp, so a scanner can find orders that are about to break it.</p>
+<p>Some deadlines are imposed from outside, and they should drive the design. A card authorization is a hold, and holds expire. Card networks and issuers set how long an authorization stays valid, and it varies by network, card type and merchant category, from a few days to a few weeks. If fulfilment can take longer than that, the workflow needs a branch that re-authorizes before capture, or it must capture earlier. Treat the authorization's expiry as a deadline field, filled from the payment provider's response rather than hard-coded.</p>
+<p>When a step does fail, the decision is between three moves:</p>
+<ul>
+<li><strong>Retry</strong>, when the failure is transient (a timeout, a 503, a broker hiccup) and the step is idempotent.</li>
+<li><strong>Compensate</strong>, when the failure is a business answer (declined, out of stock) or retries are exhausted. Pop the compensation stack and run it backwards.</li>
+<li><strong>Escalate to a human</strong>, when compensation itself fails or the outcome is ambiguous. A refund that the provider keeps rejecting is not something to retry forever. The saga moves to <code>NEEDS_ATTENTION</code>, and a ticket opens with the correlation ID.</li>
+</ul>
+<p>Compensations are commands like any other. They need idempotency, timeouts and retries too. And they are semantic undos, not rollbacks. A refund is a new movement of money that the customer sees on their statement. A void before capture is invisible to most customers. That difference is the reason step order matters, which the next part shows.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-step-order level=3>Choosing the step order: where to put the point of no return</h3>
+<p>The saga literature calls the step after which you can no longer undo cleanly the <strong>pivot</strong>. Steps before it are compensatable. Steps after it must be retried until they succeed. A good order pushes cheap, reversible steps early and the expensive, irreversible ones late.</p>
+<p>In this workflow, the irreversible-ish actions are capturing money (undo means a visible refund) and handing a parcel to a carrier (undo means an interception or a return). So the order below <em>authorizes</em> payment first, which is cheap to void. It reserves stock, which is cheap to release. It lets the warehouse pick and pack. Only then does it capture, and finally it books the shipment.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Order of steps<th>"Out of stock" costs<th>"Payment declined" costs<th>Comment<tbody>
+<tr><td>Capture payment → reserve stock<td>A refund the customer sees<td>Nothing<td>Simple, but every stock-out becomes a refund and a support ticket
+<tr><td>Authorize → reserve → pick → capture → ship<td>A void (usually invisible)<td>Nothing<td>The order used here; needs auth expiry handling for slow fulfilment
+<tr><td>Reserve stock → authorize → pick → capture → ship<td>Nothing<td>Releasing a reservation<td>Fraudulent or failing cards briefly hold scarce stock; reservations need a TTL
+<tr><td>Reserve and authorize in parallel<td>Void or release, whichever succeeded<td>Same<td>Lower latency; the orchestrator must handle replies in either order
+</table></div></div>
+<p>The reader's original sequence put payment before inventory, and that is fine with authorization instead of capture. If your payment provider or market does not support separate authorization and capture, the first row is what you get. Then the out-of-stock branch below becomes a refund, and you should reserve stock first.</p>

@@ -1,0 +1,25 @@
+{
+  "type": "record",
+  "name": "ReleaseReservation",
+  "namespace": "com.edacommerce.inventory",
+  "doc": "Command: give held or allocated stock back to the pool (compensation).",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "reservationId",
+      "type": "string"
+    },
+    {
+      "name": "reason",
+      "type": "string"
+    }
+  ]
+}

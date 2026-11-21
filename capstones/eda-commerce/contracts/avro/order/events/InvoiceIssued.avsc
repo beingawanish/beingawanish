@@ -1,0 +1,41 @@
+{
+  "type": "record",
+  "name": "InvoiceIssued",
+  "namespace": "com.edacommerce.order",
+  "doc": "An invoice PDF was rendered and stored. The event carries a claim check, not the PDF.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "invoiceId",
+      "type": "string"
+    },
+    {
+      "name": "invoiceNumber",
+      "type": "string",
+      "doc": "Gapless, human-readable number, e.g. INV-2026-000123."
+    },
+    {
+      "name": "total",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "document",
+      "type": "com.edacommerce.common.ClaimCheck"
+    },
+    {
+      "name": "issuedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

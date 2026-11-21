@@ -1,0 +1,16 @@
+{
+  "type": "record",
+  "name": "StockLine",
+  "namespace": "com.edacommerce.common",
+  "doc": "A SKU and a quantity, without prices.",
+  "fields": [
+    {
+      "name": "sku",
+      "type": "string"
+    },
+    {
+      "name": "quantity",
+      "type": "int"
+    }
+  ]
+}

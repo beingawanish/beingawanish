@@ -1,0 +1,39 @@
+{
+  "type": "record",
+  "name": "ExpectReturn",
+  "namespace": "com.edacommerce.fulfilment",
+  "doc": "Command: the warehouse should expect a returned parcel and inspect it.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": "string"
+    },
+    {
+      "name": "rmaNumber",
+      "type": "string"
+    },
+    {
+      "name": "lines",
+      "type": {
+        "type": "array",
+        "items": "com.edacommerce.common.ReturnLine"
+      }
+    },
+    {
+      "name": "expectedBy",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

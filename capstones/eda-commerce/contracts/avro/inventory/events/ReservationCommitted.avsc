@@ -1,0 +1,28 @@
+{
+  "type": "record",
+  "name": "ReservationCommitted",
+  "namespace": "com.edacommerce.inventory",
+  "doc": "Reply to CommitReservation.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "reservationId",
+      "type": "string"
+    },
+    {
+      "name": "committedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "type": "record",
+  "name": "ProductUpserted",
+  "namespace": "com.edacommerce.catalog",
+  "doc": "Full snapshot of a product. Published to the compacted topic catalog.product.v1 keyed by sku, so the latest value per key is the current product.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "sku",
+      "type": "string"
+    },
+    {
+      "name": "name",
+      "type": "string"
+    },
+    {
+      "name": "description",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "brand",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "categoryPath",
+      "type": {
+        "type": "array",
+        "items": "string"
+      },
+      "doc": "Root-first category names.",
+      "default": []
+    },
+    {
+      "name": "attributes",
+      "type": {
+        "type": "map",
+        "values": "string"
+      },
+      "doc": "Free-form attributes such as colour or size.",
+      "default": {}
+    },
+    {
+      "name": "status",
+      "type": {
+        "type": "enum",
+        "name": "ProductStatus",
+        "namespace": "com.edacommerce.catalog",
+        "doc": "Lifecycle state of a product. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+        "symbols": [
+          "ACTIVE",
+          "DISCONTINUED",
+          "UNKNOWN"
+        ],
+        "default": "UNKNOWN"
+      }
+    },
+    {
+      "name": "weightGrams",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null
+    },
+    {
+      "name": "imageUrls",
+      "type": {
+        "type": "array",
+        "items": "string"
+      },
+      "default": []
+    }
+  ]
+}

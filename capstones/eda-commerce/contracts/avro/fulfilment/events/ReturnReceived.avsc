@@ -1,0 +1,28 @@
+{
+  "type": "record",
+  "name": "ReturnReceived",
+  "namespace": "com.edacommerce.fulfilment",
+  "doc": "A returned parcel arrived at the warehouse.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": "string"
+    },
+    {
+      "name": "receivedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

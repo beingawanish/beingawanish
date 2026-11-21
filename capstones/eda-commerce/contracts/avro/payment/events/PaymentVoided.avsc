@@ -1,0 +1,28 @@
+{
+  "type": "record",
+  "name": "PaymentVoided",
+  "namespace": "com.edacommerce.payment",
+  "doc": "Reply to VoidPayment.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "paymentId",
+      "type": "string"
+    },
+    {
+      "name": "voidedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

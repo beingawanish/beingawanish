@@ -1,0 +1,44 @@
+{
+  "type": "record",
+  "name": "PaymentAuthorized",
+  "namespace": "com.edacommerce.payment",
+  "doc": "Reply to AuthorizePayment: funds are held.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "paymentId",
+      "type": "string"
+    },
+    {
+      "name": "pspReference",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "authorizedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    },
+    {
+      "name": "authorizationExpiresAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      },
+      "doc": "Card networks release holds after about 7 days. Capture after this fails."
+    }
+  ]
+}

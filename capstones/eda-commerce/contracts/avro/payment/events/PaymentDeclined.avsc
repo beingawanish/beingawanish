@@ -1,0 +1,54 @@
+{
+  "type": "record",
+  "name": "PaymentDeclined",
+  "namespace": "com.edacommerce.payment",
+  "doc": "Reply to AuthorizePayment: no funds are held. Includes PSP timeouts that could not be resolved by reconciliation.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "paymentId",
+      "type": "string"
+    },
+    {
+      "name": "reason",
+      "type": {
+        "type": "enum",
+        "name": "DeclineReason",
+        "namespace": "com.edacommerce.payment",
+        "doc": "Why an authorisation failed. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+        "symbols": [
+          "INSUFFICIENT_FUNDS",
+          "CARD_DECLINED",
+          "FRAUD_SUSPECTED",
+          "PSP_TIMEOUT",
+          "PSP_ERROR",
+          "UNKNOWN"
+        ],
+        "default": "UNKNOWN"
+      }
+    },
+    {
+      "name": "pspReference",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "declinedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}
