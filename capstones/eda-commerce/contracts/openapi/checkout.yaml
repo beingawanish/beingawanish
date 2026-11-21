@@ -1,0 +1,219 @@
+openapi: 3.1.0
+info:
+  title: eda-commerce Checkout API
+  version: 1.0.0
+  description: |
+    Carts and checkout. Served by checkout-svc (port 8102).
+
+    Placing an order is asynchronous. POST /checkouts validates the cart against checkout's local
+    catalog read model, writes the checkout row and a CheckoutSubmitted outbox row in one transaction,
+    and answers 202 with the orderId it minted. The order saga runs after that. Poll
+    GET /orders/{orderId} on the Orders API for the outcome.
+servers:
+  - url: http://localhost:8102
+    description: local
+security:
+  - oidc: [shop]
+tags:
+  - name: carts
+  - name: checkouts
+paths:
+  /carts:
+    post:
+      tags: [carts]
+      operationId: createCart
+      summary: Create an empty cart for the calling customer
+      parameters:
+        - $ref: './common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                currency: {type: string, pattern: '^[A-Z]{3}$', default: EUR}
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: {$ref: './common.yaml#/components/headers/Location'}
+            ETag: {$ref: './common.yaml#/components/headers/ETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Cart'}
+        '400': {$ref: './common.yaml#/components/responses/BadRequest'}
+        '401': {$ref: './common.yaml#/components/responses/Unauthorized'}
+        '409': {$ref: './common.yaml#/components/responses/IdempotencyConflict'}
+        '422': {$ref: './common.yaml#/components/responses/IdempotencyMismatch'}
+  /carts/{cartId}:
+    parameters:
+      - $ref: '#/components/parameters/CartId'
+    get:
+      tags: [carts]
+      operationId: getCart
+      summary: Read a cart, re-priced from the current catalog read model
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag: {$ref: './common.yaml#/components/headers/ETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Cart'}
+        '401': {$ref: './common.yaml#/components/responses/Unauthorized'}
+        '404': {$ref: './common.yaml#/components/responses/NotFound'}
+  /carts/{cartId}/items/{sku}:
+    parameters:
+      - $ref: '#/components/parameters/CartId'
+      - name: sku
+        in: path
+        required: true
+        schema: {type: string, maxLength: 64}
+    put:
+      tags: [carts]
+      operationId: setCartItem
+      summary: Set the quantity of a SKU in the cart (idempotent by nature)
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              properties:
+                quantity: {type: integer, minimum: 1, maximum: 99}
+      responses:
+        '200':
+          description: Updated cart
+          headers:
+            ETag: {$ref: './common.yaml#/components/headers/ETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Cart'}
+        '400': {$ref: './common.yaml#/components/responses/BadRequest'}
+        '404': {$ref: './common.yaml#/components/responses/NotFound'}
+        '412': {$ref: './common.yaml#/components/responses/PreconditionFailed'}
+        '422':
+          description: Unknown or discontinued SKU, or quantity above advisory availability.
+          content:
+            application/problem+json:
+              schema: {$ref: './common.yaml#/components/schemas/Problem'}
+    delete:
+      tags: [carts]
+      operationId: removeCartItem
+      summary: Remove a SKU from the cart
+      responses:
+        '200':
+          description: Updated cart
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Cart'}
+        '404': {$ref: './common.yaml#/components/responses/NotFound'}
+  /checkouts:
+    post:
+      tags: [checkouts]
+      operationId: submitCheckout
+      summary: Place an order from a cart
+      description: |
+        Validates the cart, freezes prices, and emits CheckoutSubmitted. Returns 202 at once; the order
+        saga reserves stock and authorises payment afterwards. A repeated request with the same
+        Idempotency-Key returns the same orderId and never creates a second order.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: './common.yaml#/components/parameters/TraceParent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CheckoutRequest'}
+      responses:
+        '202':
+          description: Accepted. The order saga has started.
+          headers:
+            Location: {$ref: './common.yaml#/components/headers/Location'}
+            Retry-After: {$ref: './common.yaml#/components/headers/RetryAfter'}
+            Idempotent-Replayed: {$ref: './common.yaml#/components/headers/IdempotentReplayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CheckoutAccepted'}
+        '400': {$ref: './common.yaml#/components/responses/BadRequest'}
+        '401': {$ref: './common.yaml#/components/responses/Unauthorized'}
+        '409': {$ref: './common.yaml#/components/responses/IdempotencyConflict'}
+        '422':
+          description: |
+            The cart cannot be checked out: empty, already checked out, price changed since the client
+            last read it (expectedTotal mismatch), or the Idempotency-Key was reused with another body.
+          content:
+            application/problem+json:
+              schema: {$ref: './common.yaml#/components/schemas/Problem'}
+        '429': {$ref: './common.yaml#/components/responses/TooManyRequests'}
+components:
+  parameters:
+    CartId:
+      name: cartId
+      in: path
+      required: true
+      schema: {$ref: './common.yaml#/components/schemas/Uuid'}
+  schemas:
+    CartLine:
+      type: object
+      required: [sku, productName, quantity, unitPrice, lineTotal]
+      properties:
+        sku: {type: string}
+        productName: {type: string}
+        quantity: {type: integer, minimum: 1}
+        unitPrice: {$ref: './common.yaml#/components/schemas/Money'}
+        lineTotal: {$ref: './common.yaml#/components/schemas/Money'}
+        availability:
+          type: string
+          enum: [IN_STOCK, LOW_STOCK, OUT_OF_STOCK, UNKNOWN]
+          description: Advisory, from inventory.stock-level.v1. The reservation is the real check.
+    Cart:
+      type: object
+      required: [cartId, status, lines, subtotal, pricedAt]
+      properties:
+        cartId: {$ref: './common.yaml#/components/schemas/Uuid'}
+        status: {type: string, enum: [OPEN, CHECKED_OUT, ABANDONED]}
+        lines:
+          type: array
+          items: {$ref: '#/components/schemas/CartLine'}
+        subtotal: {$ref: './common.yaml#/components/schemas/Money'}
+        pricedAt:
+          type: string
+          format: date-time
+          description: Freshness of the catalog read model used for prices.
+    CheckoutRequest:
+      type: object
+      required: [cartId, shippingAddress, contactEmail, shippingMethod, paymentMethodToken, expectedTotal]
+      properties:
+        cartId: {$ref: './common.yaml#/components/schemas/Uuid'}
+        shippingAddress: {$ref: './common.yaml#/components/schemas/Address'}
+        contactEmail: {type: string, format: email}
+        shippingMethod: {type: string, enum: [STANDARD, EXPRESS]}
+        paymentMethodToken:
+          type: string
+          description: |
+            Token from the PSP's client-side tokenisation. The fake PSP understands magic tokens:
+            tok_visa_ok, tok_decline, tok_insufficient_funds, tok_timeout, tok_slow, tok_dup_webhook.
+        expectedTotal:
+          $ref: './common.yaml#/components/schemas/Money'
+          description: The total the customer saw. A mismatch returns 422 instead of charging a surprise amount.
+      additionalProperties: false
+    CheckoutAccepted:
+      type: object
+      required: [checkoutId, orderId, status, total]
+      properties:
+        checkoutId: {$ref: './common.yaml#/components/schemas/Uuid'}
+        orderId: {$ref: './common.yaml#/components/schemas/Uuid'}
+        status: {type: string, const: PENDING}
+        total: {$ref: './common.yaml#/components/schemas/Money'}
+        statusUrl: {type: string, format: uri-reference, examples: ['/orders/0190f0a4-7a7e-7c43-9a63-4e0d4f0a1b2c']}
+  securitySchemes:
+    oidc:
+      $ref: './common.yaml#/components/securitySchemes/oidc'
