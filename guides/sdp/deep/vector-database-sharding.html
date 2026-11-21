@@ -137,7 +137,7 @@ def coordinator_p99(n_shards, hedge_ms=None, trials=100_000):
     lat = sorted(max(with_hedge() for _ in range(n_shards)) for _ in range(trials))
     return lat[int(0.99 * trials)]
 
-print(coordinator_p99(12))                # roughly 80+ ms: the tail dominates
+print(coordinator_p99(12))                # roughly 100 ms: the tail dominates
 print(coordinator_p99(12, hedge_ms=12))   # roughly 20-something ms
 </code></pre>
 <p>The exact numbers depend on the distribution you assume. The shape does not: without hedging, the slow tail of any one shard becomes the normal case for the coordinator.</p>

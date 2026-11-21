@@ -3362,6 +3362,154 @@ CREATE TABLE inbox (                          -- one row per handled message
 <tr><td>Reserve and authorize in parallel<td>Void or release, whichever succeeded<td>Same<td>Lower latency; the orchestrator must handle replies in either order
 </table></div></div>
 <p>The reader's original sequence put payment before inventory, and that is fine with authorization instead of capture. If your payment provider or market does not support separate authorization and capture, the first row is what you get. Then the out-of-stock branch below becomes a refund, and you should reserve stock first.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-sequence level=3>The worked sequence, end to end</h3>
+<p>Here is the happy path for <code>ord_7f3a</code>. Solid arrows are commands. Dashed arrows are events. Every arrow is a record written through an outbox and read through an inbox.</p>
+<svg role="img" aria-labelledby="dd-eventdriven-architecture-adv-seq-title dd-eventdriven-architecture-adv-seq-desc" viewBox="0 0 720 470" width="100%" style="max-width:720px;font-family:inherit;font-size:12px">
+<title id="dd-eventdriven-architecture-adv-seq-title">Orchestrated order saga, happy path</title>
+<desc id="dd-eventdriven-architecture-adv-seq-desc">A sequence diagram with six lanes: checkout, orchestrator, payment, inventory, fulfilment and shipping. Checkout publishes order.placed. The orchestrator sends AuthorizePayment and receives PaymentAuthorized, sends ReserveStock and receives StockReserved, sends RequestFulfilment and receives FulfilmentPacked, sends CapturePayment and receives PaymentCaptured, then sends CreateShipment and receives ShipmentDispatched, and finally publishes OrderShipped. Commands are solid arrows and events are dashed.</desc>
+<rect x="0" y="0" width="720" height="470" fill="var(--paper, #ffffff)"/>
+<g stroke="var(--accent, #1f5f99)" fill="var(--bg, #f4f7fa)">
+<rect x="10" y="14" width="100" height="30" rx="5"/><rect x="125" y="14" width="110" height="30" rx="5"/><rect x="250" y="14" width="100" height="30" rx="5"/>
+<rect x="365" y="14" width="100" height="30" rx="5"/><rect x="480" y="14" width="100" height="30" rx="5"/><rect x="600" y="14" width="110" height="30" rx="5"/>
+</g>
+<g fill="var(--ink, #1c2430)" font-weight="bold" text-anchor="middle">
+<text x="60" y="34">Checkout</text><text x="180" y="34">Orchestrator</text><text x="300" y="34">Payment</text>
+<text x="415" y="34">Inventory</text><text x="530" y="34">Fulfilment</text><text x="655" y="34">Shipping</text>
+</g>
+<g stroke="var(--line, #d5dee8)" stroke-width="2">
+<line x1="60" y1="44" x2="60" y2="420"/><line x1="180" y1="44" x2="180" y2="420"/><line x1="300" y1="44" x2="300" y2="420"/>
+<line x1="415" y1="44" x2="415" y2="420"/><line x1="530" y1="44" x2="530" y2="420"/><line x1="655" y1="44" x2="655" y2="420"/>
+</g>
+<g stroke="var(--muted, #5c6b7c)" stroke-width="1.5" stroke-dasharray="5 4" fill="none">
+<line x1="60" y1="75" x2="174" y2="75"/>
+<line x1="300" y1="135" x2="186" y2="135"/>
+<line x1="415" y1="195" x2="186" y2="195"/>
+<line x1="530" y1="255" x2="186" y2="255"/>
+<line x1="300" y1="315" x2="186" y2="315"/>
+<line x1="655" y1="375" x2="186" y2="375"/>
+</g>
+<g stroke="var(--accent, #1f5f99)" stroke-width="2" fill="none">
+<line x1="180" y1="105" x2="294" y2="105"/>
+<line x1="180" y1="165" x2="409" y2="165"/>
+<line x1="180" y1="225" x2="524" y2="225"/>
+<line x1="180" y1="285" x2="294" y2="285"/>
+<line x1="180" y1="345" x2="649" y2="345"/>
+</g>
+<g fill="var(--accent, #1f5f99)">
+<polygon points="294,101 300,105 294,109"/><polygon points="409,161 415,165 409,169"/><polygon points="524,221 530,225 524,229"/>
+<polygon points="294,281 300,285 294,289"/><polygon points="649,341 655,345 649,349"/>
+</g>
+<g fill="var(--muted, #5c6b7c)">
+<polygon points="174,71 180,75 174,79"/><polygon points="186,131 180,135 186,139"/><polygon points="186,191 180,195 186,199"/>
+<polygon points="186,251 180,255 186,259"/><polygon points="186,311 180,315 186,319"/><polygon points="186,371 180,375 186,379"/>
+</g>
+<g fill="var(--ink, #1c2430)">
+<text x="66" y="69">order.placed</text>
+<text x="190" y="99">AuthorizePayment</text>
+<text x="190" y="129">PaymentAuthorized</text>
+<text x="190" y="159">ReserveStock</text>
+<text x="190" y="189">StockReserved</text>
+<text x="190" y="219">RequestFulfilment</text>
+<text x="190" y="249">FulfilmentPacked</text>
+<text x="190" y="279">CapturePayment</text>
+<text x="190" y="309">PaymentCaptured</text>
+<text x="190" y="339">CreateShipment</text>
+<text x="190" y="369">ShipmentDispatched</text>
+<text x="190" y="405">publishes OrderShipped to order.events</text>
+</g>
+<line x1="20" y1="445" x2="60" y2="445" stroke="var(--accent, #1f5f99)" stroke-width="2"/>
+<text x="68" y="449" fill="var(--ink, #1c2430)">command (to one owner, can be refused)</text>
+<line x1="340" y1="445" x2="380" y2="445" stroke="var(--muted, #5c6b7c)" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="388" y="449" fill="var(--ink, #1c2430)">event (a fact; any number of subscribers)</text>
+</svg>
+<p>Checkout publishes the order fact. The saga starts from it rather than from a synchronous call, so checkout's response time never includes payment or inventory.</p>
+<pre><code>// topic: order.events   key: ord_7f3a
+{
+  "message_id": "evt_01J8QF2A",
+  "type": "order.placed.v1",
+  "correlation_id": "saga_ord_7f3a",
+  "causation_id": "req_88c1",            // the HTTP request that created it
+  "occurred_at": "2026-11-20T14:03:11.204Z",
+  "order_version": 1,
+  "data": {
+    "order_id": "ord_7f3a", "customer_id": "c_91",
+    "lines": [ {"sku": "bk_ddia", "qty": 1, "unit_cents": 4800},
+               {"sku": "bk_sre",  "qty": 2, "unit_cents": 4700} ],
+    "total_cents": 14200, "currency": "USD",
+    "payment_method_ref": "pm_tok_3c9",   // a token, never card data
+    "ship_to_ref": "addr_77",             // a reference, see the large-payload section
+    "promise_by": "2026-11-23T23:59:00Z"
+  }
+}</code></pre>
+<p>The orchestrator creates the saga row in state <code>AWAITING_PAYMENT</code>, with a step deadline 2 minutes out and a saga deadline at the delivery promise. In the same transaction it writes the first command:</p>
+<pre><code>// topic: payment.commands   key: ord_7f3a
+{
+  "message_id": "cmd_01J8QF2C",
+  "type": "payment.authorize.v1",
+  "correlation_id": "saga_ord_7f3a",
+  "causation_id": "evt_01J8QF2A",
+  "deadline": "2026-11-20T14:05:11Z",     // after this, don't bother: the saga has moved on
+  "data": {
+    "order_id": "ord_7f3a", "amount_cents": 14200, "currency": "USD",
+    "payment_method_ref": "pm_tok_3c9",
+    "idempotency_key": "saga_ord_7f3a:authorize:1"
+  }
+}</code></pre>
+<p>Two fields carry real weight. The <code>deadline</code> tells payment not to start work that the orchestrator has already given up on. A command that sat in a backlog for 10 minutes should be dropped with a <code>payment.authorize_expired</code> reply, not executed. The <code>idempotency_key</code> is built from the saga, the step and the attempt <em>generation</em>, not from the message ID. A retry of the same step reuses the same key, so the payment provider collapses duplicates. A deliberate re-authorization later (after expiry, say) bumps the generation to <code>:2</code> and gets a new key.</p>
+<p>Payment authorizes with the provider and replies:</p>
+<pre><code>// topic: payment.events   key: ord_7f3a
+{
+  "message_id": "evt_01J8QF3K",
+  "type": "payment.authorized.v1",
+  "correlation_id": "saga_ord_7f3a",
+  "causation_id": "cmd_01J8QF2C",
+  "data": {
+    "order_id": "ord_7f3a", "auth_id": "auth_5521", "amount_cents": 14200,
+    "expires_at": "2026-11-27T14:03:40Z"   // provider-supplied; drives a saga deadline
+  }
+}</code></pre>
+<p>The orchestrator moves to <code>AWAITING_STOCK</code>, pushes <code>VoidAuthorization(auth_5521)</code> onto the compensation stack, and sends <code>ReserveStock</code> with the order lines. Inventory reserves (decrementing available stock, recording a reservation with its own TTL as a safety net) and replies <code>StockReserved</code> with a <code>reservation_id</code>. The orchestrator pushes <code>ReleaseStock</code> and sends <code>RequestFulfilment</code>.</p>
+<p>Fulfilment is the slow step. A warehouse management system works in minutes or hours, not milliseconds. The adapter acknowledges quickly with <code>FulfilmentAccepted</code>, and the orchestrator resets its step deadline to the warehouse's service level, say 8 hours. Later the warehouse reports <code>FulfilmentPacked</code> with parcel weight and dimensions. Now the orchestrator sends <code>CapturePayment</code>. On <code>PaymentCaptured</code> it swaps the stack entry <code>VoidAuthorization</code> for <code>RefundPayment(capture_id)</code>, sends <code>CreateShipment</code>, and on <code>ShipmentDispatched</code> marks the saga <code>COMPLETED</code> and publishes <code>order.shipped.v1</code> to <code>order.events</code>.</p>
+<p>The orchestrator also publishes an <code>order.status_changed</code> event at every state change. That one event feeds the "where is my order?" page, the support console and the stuck-order dashboard. None of them needs to know the saga's internals.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-branches level=3>Failure branches</h3>
+<p>The happy path is the easy 95%. The design is judged on four branches.</p>
+<p><strong>Branch 1: payment declined.</strong> Payment replies with an event, not an error:</p>
+<pre><code>{ "type": "payment.declined.v1", "causation_id": "cmd_01J8QF2C",
+  "data": { "order_id": "ord_7f3a", "reason": "insufficient_funds", "retryable": false } }</code></pre>
+<p>The compensation stack is empty, because nothing succeeded yet. The orchestrator moves to <code>CANCELLED</code> and publishes <code>order.cancelled.v1</code> with <code>reason: payment_declined</code>. Email sends the "please update your card" message by choreography. Two details matter. First, the provider's decline code decides <code>retryable</code>. A soft decline (a provider outage, a "try again" code) should go through bounded retries. A hard decline must not be retried, and repeated attempts on a declined card can attract scheme penalties. Second, some businesses give the customer a window to fix the card. That is a <code>AWAITING_CUSTOMER</code> state with its own deadline, not a retry loop.</p>
+<p><strong>Branch 2: out of stock after payment.</strong> Payment is authorized. Inventory replies <code>StockUnavailable</code> for <code>bk_sre</code>. Perhaps the last two copies sold in the same second, or the stock count was simply wrong. The orchestrator now has a business choice, and it belongs in a product decision, not an engineer's default:</p>
+<ul>
+<li><strong>Cancel the order.</strong> Pop the stack: send <code>VoidAuthorization(auth_5521)</code>, wait for <code>AuthorizationVoided</code>, publish <code>order.cancelled.v1</code> with <code>reason: out_of_stock</code>.</li>
+<li><strong>Partially fulfil.</strong> Reserve what is available, then send <code>AdjustAuthorization</code> (or capture only the smaller amount later). This needs a payment provider that supports partial capture, and a customer-facing policy.</li>
+<li><strong>Backorder.</strong> Move to <code>AWAITING_RESTOCK</code> with a deadline before the authorization expires. Listen for <code>StockReplenished</code> for that SKU. On the deadline, cancel or re-authorize.</li>
+</ul>
+<p>Whatever the choice, the void is idempotent at the provider (keyed by <code>auth_5521</code>), and a void that fails after retries sends the saga to <code>NEEDS_ATTENTION</code>. Money held on a customer's card with no order behind it is a support call waiting to happen, so it gets a page, not a log line. If the payment had been captured already, the same branch would send <code>RefundPayment</code>, which is why the step order put capture late.</p>
+<p><strong>Branch 3: the warehouse times out.</strong> <code>RequestFulfilment</code> went out, <code>FulfilmentAccepted</code> came back, and then nothing for 8 hours. This is the dangerous branch, because the outcome is <em>ambiguous</em>. The warehouse may have lost the request. It may have packed the parcel and failed to tell anyone. Or the event may be sitting in a backlog behind a broken consumer.</p>
+<p>The wrong move is to compensate straight away. Releasing the stock and voiding the payment for a parcel that is already on a truck turns a delay into a loss. The right sequence is:</p>
+<ol>
+<li><strong>Ask before acting.</strong> Send <code>QueryFulfilmentStatus</code>, or call the warehouse adapter's status API directly. Timeouts are where synchronous reads to the owner earn their place.</li>
+<li><strong>If the warehouse says "never heard of it"</strong>, resend <code>RequestFulfilment</code> with the same fulfilment idempotency key. The warehouse adapter must dedupe on that key, so a late original and the resend cannot create two pick lists.</li>
+<li><strong>If it says "in progress"</strong>, extend the step deadline once, record why, and alert if it slips again.</li>
+<li><strong>If it cannot answer at all</strong>, retry the query with backoff until the saga deadline approaches. Then escalate to <code>NEEDS_ATTENTION</code>. A human checking the warehouse floor is cheaper than an automated compensation that might be wrong.</li>
+</ol>
+<p>One more trap: the late reply. Suppose the orchestrator gave up and cancelled, and then <code>FulfilmentPacked</code> arrives. The saga is in <code>CANCELLED</code>, where that event is not a legal transition. The handler must not drop it silently. A packed parcel for a cancelled order needs action: return it to stock and record the reason. So "event in an unexpected state" is a first-class path with its own handling and an alert, never a <code>pass</code>.</p>
+<p><strong>Branch 4: duplicate delivery.</strong> The orchestrator's consumer crashed after committing the saga update for <code>PaymentAuthorized</code> but before committing its Kafka offset. On restart it reads <code>PaymentAuthorized</code> again. Three layers stop the duplicate from doing damage:</p>
+<ol>
+<li>The inbox insert of <code>evt_01J8QF3K</code> conflicts. The handler acknowledges and does nothing.</li>
+<li>Even without the inbox, the saga is now in <code>AWAITING_STOCK</code>, where <code>PaymentAuthorized</code> is not a legal transition. The state check rejects it.</li>
+<li>Even if the orchestrator somehow sent <code>ReserveStock</code> twice, inventory dedupes on its own inbox, and its reservation is keyed by <code>(order_id, line)</code>, so a second reserve for the same order is a no-op returning the same <code>reservation_id</code>.</li>
+</ol>
+<p>Defence in depth is not paranoia here. Each layer catches a different bug. The inbox catches redelivery. The state check catches redelivery after inbox rows were cleaned up, and replays. Downstream idempotency catches bugs in the orchestrator itself. The <a href="#idempotency">Idempotency</a> lesson covers the handler side in general, and the <a href="#saga">Saga</a> lesson covers compensation semantics.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Branch<th>Trigger<th>Orchestrator action<th>Compensations run<th>Customer sees<tbody>
+<tr><td>Payment declined<td><code>payment.declined</code>, non-retryable<td>Cancel<td>None<td>"Update your card" email
+<tr><td>Soft decline / provider down<td>Retryable failure or step timeout<td>Retry with backoff, then cancel<td>None<td>Nothing, or a delay
+<tr><td>Out of stock<td><code>stock.unavailable</code><td>Cancel, partial, or backorder (product decision)<td>Void authorization<td>Cancellation or backorder notice
+<tr><td>Warehouse silent<td>Step deadline expires<td>Query status, resend with same key, escalate<td>Only once outcome is known<td>A delay, ideally with an honest status
+<tr><td>Late reply after cancel<td>Event illegal in current state<td>Handle explicitly, alert<td>Return parcel to stock<td>Nothing
+<tr><td>Duplicate message<td>Redelivery after crash<td>Inbox and state check drop it<td>None<td>Nothing
+</table></div></div>
 <h2 id=h2-12-tldr level=2>12. TL;DR</h2>
 <div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th><tbody><tr><td><strong>Problem</strong><td>Notification-only events send every consumer back to the producer's API for details, so the coupling and the load return asynchronously.<tr><td><strong>Mechanism</strong><td>Put the facts in the event. Each consumer acts from a local view that it can rebuild by replay. Facts have one owner, and views are copies, never the truth.<tr><td><strong>Costs</strong><td>Data copied into every subscriber, views that always lag slightly, personal data that spreads and makes deletion a project, and an even heavier public-schema contract.<tr><td><strong>Skip it when</strong><td>You are inside one service, the read must be exactly current, it is really a synchronous call or a workflow, or the team cannot yet support schema rules, tracing, and alerts.<tr><td><strong>30-second answer</strong><td>The event's contents are the architecture: carry enough state that consumers act from their own replayable local views instead of calling back, send exactly-current reads to the single owning service, keep sensitive fields out of the event, and govern the schema like the public API it is.</table></div></div>
 
@@ -26177,7 +26325,7 @@ def coordinator_p99(n_shards, hedge_ms=None, trials=100_000):
     lat = sorted(max(with_hedge() for _ in range(n_shards)) for _ in range(trials))
     return lat[int(0.99 * trials)]
 
-print(coordinator_p99(12))                # roughly 80+ ms: the tail dominates
+print(coordinator_p99(12))                # roughly 100 ms: the tail dominates
 print(coordinator_p99(12, hedge_ms=12))   # roughly 20-something ms
 </code></pre>
 <p>The exact numbers depend on the distribution you assume. The shape does not: without hedging, the slow tail of any one shard becomes the normal case for the coordinator.</p>
@@ -26806,7 +26954,7 @@ print(rrf([dense, sparse]))   # c17 and c88 lead: both lists agree on them
 <li>Each replica handles about 50 / 8 s ≈ 6 requests per second.</li>
 <li>The bad day's 3× spike: covered in the failure drills below.</li>
 </ul>
-<p>The warm pool rule from the GPU autoscaling lesson is spike rate × boot time. Assume a new GPU replica takes 8 minutes from request to serving: node provisioning, image pull, loading weights, warm-up. A television segment can triple traffic in under 5 minutes. Reactive scaling cannot keep up with that, which is why the capstone pre-warms from marketing's calendar. Queue-depth scaling handles the unplanned remainder, and provider overflow covers the gap while new replicas boot.</p>
+<p>The warm pool rule from the <a href="#gpu-autoscaling">GPU Autoscaling</a> lesson is spike rate × boot time. Assume a new GPU replica takes 8 minutes from request to serving: node provisioning, image pull, loading weights, warm-up. A television segment can triple traffic in under 5 minutes. Reactive scaling cannot keep up with that, which is why the capstone pre-warms from marketing's calendar. Queue-depth scaling handles the unplanned remainder, and provider overflow covers the gap while new replicas boot.</p>
 
 <h3 id=dd-capstone-a-production-rag-chatbot-at-scale-kv level=3>KV cache memory, and what stickiness really buys</h3>
 <p>The KV cache holds attention keys and values for every token in context. For a model with grouped-query attention, the per-token size is layers × KV heads × head dimension × 2 (keys and values) × bytes per value. For a model shaped like many 8-billion-parameter open models (32 layers, 8 KV heads, head dimension 128, 16-bit values), that is 32 × 8 × 128 × 2 × 2 = 131 KB per token. Larger models are several times bigger.</p>
@@ -26895,14 +27043,14 @@ print(rrf([dense, sparse]))   # c17 and c88 lead: both lists agree on them
 
 <h3 id=dd-capstone-a-production-rag-chatbot-at-scale-drill1 level=3>Drill 1: The bad day, with numbers</h3>
 <p><strong>11:00, traffic triples.</strong> Questions go from 40 to 120 per second. Trending questions push the cache hit ratio from 25% to about 35%, so generations rise to about 78 per second, not 90. The calendar had pre-warmed 14 replicas (about 84 requests per second of capacity), so the fleet absorbs it. Queue wait rises from 20 ms to perhaps 150 ms. Queue-depth scaling requests four more replicas, which arrive around 11:08.</p>
-<p><strong>11:04, the primary provider browns out.</strong> Suppose the routing policy sends complex questions (about 25% of generations, roughly 20 per second) to a large provider model. Its latency climbs and errors rise. The breaker needs about 20 seconds of failures to open. During that window, roughly 400 requests hit the failing provider. With a 3-second timeout and one retry to the secondary provider, most of those users see a slow answer rather than an error.</p>
+<p><strong>11:04, the primary provider browns out.</strong> Suppose the routing policy sends complex questions (about 25% of generations, roughly 20 per second) to a large provider model. Its latency climbs and errors rise. The <a href="#circuit-breaker">breaker</a> needs about 20 seconds of failures to open. During that window, roughly 400 requests hit the failing provider. With a 3-second timeout and one retry to the secondary provider, most of those users see a slow answer rather than an error.</p>
 <p><strong>After the breaker opens,</strong> the fallback sequence sends complex questions to the secondary provider. Here is the question a panel will ask: does the secondary provider's rate limit allow 20 extra requests per second, right now? A fallback provider whose quota was never raised is a fallback in name only. The design answer is pre-negotiated quota, tested in a quarterly drill, plus a third rung: the self-hosted model with a "simplified answer" banner when both providers are constrained.</p>
 <p><strong>What the on-call engineer sees:</strong> breaker state change, provider error rate, the fallback share rising on the gateway dashboard, per-tenant spend steady because budgets cap failover costs. No page requires a decision, as the capstone says. A page that does fire should be one with a pre-written action, such as "secondary provider at 90% of quota: enable the self-hosted tier for complex questions".</p>
 
 <h3 id=dd-capstone-a-production-rag-chatbot-at-scale-drill2 level=3>Drill 2: A reconnect storm</h3>
 <p><strong>What happens.</strong> A routine load balancer deploy drops all open SSE connections at once. About 240 streams are mid-answer, and 2,000 clients notice the disconnect. Every client reconnects at the same moment, each sending <code>Last-Event-ID</code>.</p>
 <p><strong>Why it matters.</strong> Each reconnect hits the history store to replay completed messages. The 240 mid-answer streams are more interesting. Their generations may still be running on the fleet, so the reconnect must reattach to the running stream rather than start a new generation. Otherwise 240 duplicate generations start at once, burning GPU capacity and budget, and users see two answers.</p>
-<p><strong>The design that handles it.</strong> Generation runs detached from the connection and writes tokens to a short-lived per-conversation buffer with event IDs. A reconnect replays from the buffer after its <code>Last-Event-ID</code>, then follows the live stream. Clients reconnect with jittered backoff (the server's <code>retry:</code> field can spread this). Load balancers drain connections gradually during deploys instead of cutting them.</p>
+<p><strong>The design that handles it.</strong> Generation runs detached from the connection and writes tokens to a short-lived per-conversation buffer with event IDs. A reconnect replays from the buffer after its <code>Last-Event-ID</code>, then follows the live stream. Clients reconnect with jittered backoff, as in <a href="#serversent-events">Server-Sent Events</a> (the server's <code>retry:</code> field can spread this). Load balancers drain connections gradually during deploys instead of cutting them.</p>
 <p><strong>The signal.</strong> Reconnects per second, and the ratio of generations started to questions asked. That ratio should stay near 1 through a deploy.</p>
 
 <h3 id=dd-capstone-a-production-rag-chatbot-at-scale-drill3 level=3>Drill 3: The embedding upgrade on a giant tenant</h3>
@@ -26946,8 +27094,8 @@ print(rrf([dense, sparse]))   # c17 and c88 lead: both lists agree on them
 <li><strong>Phase 1: make it correct.</strong> CDC-fed ingestion with versioned chunk replacement. Hybrid retrieval and a reranker. Stage-by-stage evals in CI. Citations validated. Tool calls for order status. <em>Move on when</em> spend becomes a line item someone asks about.</li>
 <li><strong>Phase 2: make it cheaper.</strong> Exact and semantic caching with audits. Model routing by question class. Prompt layout for prefix caching. <em>Move on when</em> the first B2B partners sign.</li>
 <li><strong>Phase 3: make it multi-tenant.</strong> Tenant partitions and the directory. Per-tenant cache scopes, budgets and metering. Exactly-once invoices and the usage export. ACL propagation SLO. <em>Move on when</em> steady token volume makes the self-hosting break-even clearly positive.</li>
-<li><strong>Phase 4: make it resilient at scale.</strong> Self-hosted fleet with continuous batching for base load. Calendar pre-warming and queue-depth scaling. Breakers, fallback sequences and tested secondary quota. The bad-day drill run quarterly.</li>
-<li><strong>Phase 5: extend.</strong> Agents with step and token budgets and saga-backed writes. Voice over bidirectional streaming. EU residency, with tenant-keyed indexes and history placed per region and a billing log that aggregates across regions.</li>
+<li><strong>Phase 4: make it resilient at scale.</strong> Self-hosted fleet with continuous batching for base load. Calendar pre-warming and queue-depth scaling. Breakers, fallback sequences and tested secondary quota. The bad-day drill run quarterly, using the <a href="#graceful-degradation">Graceful Degradation</a> tiers.</li>
+<li><strong>Phase 5: extend.</strong> Agents with step and token budgets and <a href="#saga">saga</a>-backed writes. Voice over bidirectional streaming. EU residency, with tenant-keyed indexes and history placed per region and a billing log that aggregates across regions.</li>
 </ol>
 <p>Notice what is absent from phase 0: sharding, self-hosting, exactly-once billing. Each arrives when a measured problem asks for it. That is the same restraint the course recommends everywhere.</p>
 
