@@ -271,7 +271,7 @@ print("2x at 85%:", round(months_of_runway(0.80, 2, 0.85), 1), "months")</code><
 
 <details>
 <summary>"The working set is 300 GB and the biggest box has 256 GB. Now what?"</summary>
-<p>First check whether it really has to be in memory. A 95% hit ratio may be acceptable if the misses go to fast local NVMe. Then cut the working set: archive cold rows, drop unused indexes, use partial indexes, compress. If it still does not fit, move the excess somewhere else: read replicas serving different query types so each caches a different subset, a cache in front, or sharding so each shard's working set fits its own RAM. Look at memory-optimised families too, since general-purpose catalogs top out well below them.</p>
+<p>First check whether it really has to be in memory. A 95% hit ratio may be acceptable if the misses go to fast local NVMe. Then cut the working set: archive cold rows, drop unused indexes, use partial indexes, compress. If it still does not fit, move the excess somewhere else. Read replicas can serve different query types, so each caches a different subset. A cache can sit in front. Or shard, so each shard's working set fits its own RAM. Look at memory-optimised families too, since general-purpose catalogs top out well below them.</p>
 </details>
 
 <details>
@@ -286,7 +286,7 @@ print("2x at 85%:", round(months_of_runway(0.80, 2, 0.85), 1), "months")</code><
 
 <details>
 <summary>"How do you decide that it's time to stop scaling up?"</summary>
-<p>Set the exit condition in advance, in numbers. For example: the next size up buys less than six months at measured growth, or the measured scaling efficiency of the next step is under 60%, or the availability target rises above what one machine can meet. Any one of those triggers the move to horizontal or sharding. The point is to decide the threshold while you have runway, so the migration starts with a year left, not a week.</p>
+<p>Set the exit condition in advance, in numbers. For example: the next size up buys less than six months at measured growth. Or the measured scaling efficiency of the next step is under 60%. Or the availability target rises above what one machine can meet. Any one of those triggers the move to horizontal or sharding. The point is to decide the threshold while you have runway, so the migration starts with a year left, not a week.</p>
 </details>
 
 <details>
