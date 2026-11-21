@@ -1,0 +1,131 @@
+openapi: 3.1.0
+info:
+  title: eda-commerce Catalog API
+  version: 1.0.0
+  description: |
+    Product browse and catalog administration. Served by catalog-svc (port 8101).
+
+    catalog-svc owns products and prices. Every write publishes a full snapshot to a compacted topic
+    (catalog.product.v1, catalog.price.v1) through the outbox. Browse reads come from catalog-svc's own
+    tables joined with its projection of inventory.stock-level.v1.
+servers:
+  - url: http://localhost:8101
+    description: local
+tags:
+  - name: browse
+  - name: catalog-admin
+paths:
+  /products:
+    get:
+      tags: [browse]
+      operationId: listProducts
+      summary: Browse active products
+      security: []
+      parameters:
+        - name: category
+          in: query
+          schema: {type: string}
+        - name: q
+          in: query
+          description: Free text over name and brand.
+          schema: {type: string, maxLength: 100}
+        - name: cursor
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 100, default: 24}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/ProductView'}
+                  nextCursor: {type: [string, 'null']}
+  /products/{sku}:
+    parameters:
+      - $ref: '#/components/parameters/Sku'
+    get:
+      tags: [browse]
+      operationId: getProduct
+      security: []
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag: {$ref: './common.yaml#/components/headers/ETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProductView'}
+        '404': {$ref: './common.yaml#/components/responses/NotFound'}
+  /admin/products/{sku}:
+    parameters:
+      - $ref: '#/components/parameters/Sku'
+    put:
+      tags: [catalog-admin]
+      operationId: upsertProduct
+      summary: Create or replace a product (used by infra/scripts/seed.sh)
+      security:
+        - oidc: [ops]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProductWrite'}
+      responses:
+        '200':
+          description: Stored; ProductUpserted (and PriceChanged if the price changed) written to the outbox.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProductView'}
+        '400': {$ref: './common.yaml#/components/responses/BadRequest'}
+        '403': {$ref: './common.yaml#/components/responses/Forbidden'}
+components:
+  parameters:
+    Sku:
+      name: sku
+      in: path
+      required: true
+      schema: {type: string, maxLength: 64}
+  schemas:
+    ProductWrite:
+      type: object
+      required: [name, status, listPrice]
+      properties:
+        name: {type: string}
+        description: {type: [string, 'null']}
+        brand: {type: [string, 'null']}
+        categoryPath:
+          type: array
+          items: {type: string}
+        attributes:
+          type: object
+          additionalProperties: {type: string}
+        status: {type: string, enum: [ACTIVE, DISCONTINUED]}
+        weightGrams: {type: [integer, 'null']}
+        imageUrls:
+          type: array
+          items: {type: string, format: uri}
+        listPrice: {$ref: './common.yaml#/components/schemas/Money'}
+        salePrice:
+          oneOf:
+            - $ref: './common.yaml#/components/schemas/Money'
+            - type: 'null'
+    ProductView:
+      allOf:
+        - $ref: '#/components/schemas/ProductWrite'
+        - type: object
+          required: [sku, availability, version]
+          properties:
+            sku: {type: string}
+            availability: {type: string, enum: [IN_STOCK, LOW_STOCK, OUT_OF_STOCK, UNKNOWN]}
+            version: {type: integer, format: int64}
+  securitySchemes:
+    oidc:
+      $ref: './common.yaml#/components/securitySchemes/oidc'
