@@ -1,0 +1,80 @@
+# OpenTelemetry Collector (contrib distribution). Every service sends OTLP here (ADR-011).
+# Traces -> Jaeger. Metrics -> Prometheus scrape endpoint on :8889.
+# The spanmetrics connector derives RED metrics from server spans, so HTTP latency dashboards are
+# identical for the Python and the Java builds even though their HTTP instrumentation differs.
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch:
+    send_batch_size: 1024
+    timeout: 2s
+  resource/env:
+    attributes:
+      - key: deployment.environment.name
+        value: local
+        action: upsert
+  # Defence in depth for ADR-013: services must not put personal data in telemetry, and this
+  # processor drops the usual suspects if one does.
+  attributes/pii:
+    actions:
+      - key: http.request.header.authorization
+        action: delete
+      - key: user.email
+        action: delete
+      - key: enduser.id
+        action: hash
+
+connectors:
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+    dimensions:
+      - name: http.request.method
+      - name: http.response.status_code
+      - name: messaging.destination.name
+    exclude_dimensions: [status.message]
+    metrics_flush_interval: 15s
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      enabled: true
+    enable_open_metrics: true   # exemplars: jump from a latency spike to the trace
+  debug:
+    verbosity: basic
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/env, attributes/pii, batch]
+      exporters: [otlp/jaeger, spanmetrics]
+    metrics:
+      receivers: [otlp, spanmetrics]
+      processors: [memory_limiter, resource/env, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/env, attributes/pii, batch]
+      exporters: [debug]
