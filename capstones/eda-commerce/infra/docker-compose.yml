@@ -1,0 +1,354 @@
+# eda-commerce local infrastructure.
+#
+#   make up          core stack (Kafka, Schema Registry, Connect, Postgres, MinIO, observability)
+#   make up-all      core + Temporal (profile "temporal") + Keycloak (profile "auth")
+#
+# Services (the Python or Java builds) are not in this file. They run on the host or from
+# compose.apps.example.yml and reach the infrastructure on the localhost ports below.
+#
+# Every image is pinned. Upgrade one at a time and re-run the Day 1 and Day 2 acceptance checks.
+#
+# Host ports
+#   9092 Kafka (PLAINTEXT_HOST)      8081 Schema Registry     8083 Kafka Connect
+#   5432 Postgres                    9000/9001 MinIO API/UI   8080 Kafka UI
+#   4317/4318 OTLP gRPC/HTTP         16686 Jaeger UI          9090 Prometheus
+#   3000 Grafana                     9308 kafka-exporter
+#   7233 Temporal, 8233 Temporal UI  (profile temporal)
+#   8180 Keycloak                    (profile auth)
+#   8101-8109 application services   (not started here)
+
+name: eda-commerce
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+  # ------------------------------------------------------------------ messaging
+  kafka:
+    image: confluentinc/cp-kafka:7.9.0
+    <<: *restart
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # Single node in combined broker+controller mode (KRaft, no ZooKeeper).
+      CLUSTER_ID: "q1Sh-9_ISia_zwGINzRvyQ"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Topics are created only by infra/scripts/create-topics.sh from the catalogue.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 60000
+      KAFKA_MESSAGE_MAX_BYTES: 1048588        # 1 MiB. Anything bigger goes through the claim check (ADR-009).
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.9.0
+    <<: *restart
+    hostname: schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:29092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: full_transitive   # ADR-004
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/subjects > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  connect:
+    image: quay.io/debezium/connect:3.0.7.Final
+    <<: *restart
+    hostname: connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: eda-connect
+      CONFIG_STORAGE_TOPIC: _connect-configs
+      OFFSET_STORAGE_TOPIC: _connect-offsets
+      STATUS_STORAGE_TOPIC: _connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      # Lets each connector set producer.override.* (acks=all, idempotence) in its own config.
+      CONNECT_CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY: All
+      CONNECT_PRODUCER_ENABLE_IDEMPOTENCE: "true"
+      CONNECT_PRODUCER_ACKS: all
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: 1000
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    <<: *restart
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+      DYNAMIC_CONFIG_ENABLED: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ------------------------------------------------------------------ storage
+  postgres:
+    image: postgres:16.6
+    <<: *restart
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    command:
+      - postgres
+      - -c
+      - wal_level=logical          # required by Debezium (pgoutput)
+      - -c
+      - max_replication_slots=20   # one slot per service connector, plus headroom
+      - -c
+      - max_wal_senders=20
+      - -c
+      - max_slot_wal_keep_size=2GB # a stuck connector cannot fill the disk; it loses its slot instead
+      - -c
+      - max_connections=300
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres && psql -U postgres -tAc \"select 1 from pg_database where datname='returns_db'\" | grep -q 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    <<: *restart
+    hostname: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    entrypoint: ["/bin/sh", "/init.sh"]
+    volumes:
+      - ./minio/init.sh:/init.sh:ro
+    restart: "no"
+
+  # ------------------------------------------------------------------ observability
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.0
+    <<: *restart
+    hostname: otel-collector
+    command: ["--config=/etc/otelcol/collector.yaml"]
+    depends_on:
+      - jaeger
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8889:8889"
+      - "13133:13133"
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol/collector.yaml:ro
+    # The contrib image is distroless (no shell, no curl), so Docker cannot probe it.
+    # Probe from the host instead: curl -fsS localhost:13133 (make health does this).
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.64.0
+    <<: *restart
+    hostname: jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: badger      # survives restarts, unlike the default in-memory store
+      BADGER_EPHEMERAL: "false"
+      BADGER_DIRECTORY_VALUE: /badger/data
+      BADGER_DIRECTORY_KEY: /badger/key
+    user: "0"
+    ports:
+      - "16686:16686"
+    volumes:
+      - jaeger-data:/badger
+    # Health is on :14269; probed from the host by make health (image has no shell tools guaranteed).
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    <<: *restart
+    hostname: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --enable-feature=exemplar-storage
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.8.0
+    <<: *restart
+    command: ["--kafka.server=kafka:29092", "--topic.filter=^[^_].*", "--group.filter=.*"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "9308:9308"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    <<: *restart
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/eda-overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ------------------------------------------------------------------ optional: Temporal (ADR-008 option B)
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    profiles: ["temporal"]
+    <<: *restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: postgres
+      DEFAULT_NAMESPACE: edacommerce
+    ports:
+      - "7233:7233"
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    profiles: ["temporal"]
+    <<: *restart
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:8233
+    ports:
+      - "8233:8080"
+
+  # ------------------------------------------------------------------ optional: OIDC provider (ADR-013)
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0.7
+    profiles: ["auth"]
+    <<: *restart
+    command: ["start-dev", "--import-realm", "--http-port=8080"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_HOSTNAME: http://localhost:8180
+    ports:
+      - "8180:8080"
+    volumes:
+      - ./keycloak/edacommerce-realm.json:/opt/keycloak/data/import/edacommerce-realm.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+volumes:
+  kafka-data:
+  postgres-data:
+  minio-data:
+  jaeger-data:
+  prometheus-data:
+  grafana-data:
