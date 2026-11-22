@@ -1,0 +1,497 @@
+<h2 id="d15-deep-dive">Deep dive: what the logbook really is</h2>
+<p>The mailroom metaphor gets the shape right. A table remembers who sent what, replies get matched against it, and strangers get turned away. What it hides is everything an engineer has to reason about when the table misbehaves. How big is the table? What is the key? When does an entry die? Who decides the public port, and when? Why does one router let a video call through while another forces it onto a relay?</p>
+<p>This deep dive goes under the metaphor. On Linux, the logbook is the connection tracker, conntrack. It is one hash table shared by NAT and the stateful firewall. On macOS and the BSDs, the equivalent is pf's state table. Cloud NAT gateways and Kubernetes nodes run variations of the same idea. Once you can read a conntrack entry and predict its timer, most NAT and firewall mysteries become arithmetic.</p>
+<p>Everything in the "what the kernel actually does" section was captured on a real Linux 6.18 lab built from network namespaces: two NAT routers, a fake internet, a STUN server. The commands and outputs are real. Where a number is a default that varies by OS or vendor, the text says so.</p>
+<h2 id="d15-mental-model">Deep dive: the real mental model</h2>
+<h3 id="d15-one-table-two-tuples-per-flow">One table, two tuples per flow</h3>
+<p>A conntrack entry stores a flow once, as two tuples. The ORIGINAL tuple is the flow as its first packet saw it. The REPLY tuple is what a reply packet will look like on the wire. With no NAT, the reply tuple is just the original turned around. With NAT, the reply tuple is the <em>translated</em> one, and that difference is the translation. There is no separate NAT table. NAT is a conntrack entry whose two tuples do not mirror each other.</p>
+<p>The entry is hashed under both tuples. A packet in either direction does one hash lookup and lands on the same entry. The lookup tells the kernel three things at once: which flow this is, which direction it is travelling, and how to rewrite it.</p>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="d15-ct-title d15-ct-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
+<title id="d15-ct-title">Linux netfilter: where conntrack and NAT act on a forwarded packet</title>
+<desc id="d15-ct-desc">A packet enters from the LAN and passes the prerouting hook (raw, conntrack lookup, destination NAT), the routing decision, the forward hook (filter), and the postrouting hook (source NAT, then confirm). The conntrack table stores each flow once with an original tuple and a reply tuple. Only the first packet of a flow consults the NAT chains; later packets are rewritten from the stored tuples.</desc>
+<defs>
+<marker id="d15-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M 0 1 L 9 5 L 0 9 z" fill="#6b7280"/>
+</marker>
+<marker id="d15-arr-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M 0 1 L 9 5 L 0 9 z" fill="#bf4520"/>
+</marker>
+</defs>
+<text x="24" y="30" font-size="12" fill="#6b7280" letter-spacing="2">ONE FORWARDED PACKET, LAN TO WAN (HOOK PRIORITIES IN SMALL TYPE)</text>
+<rect x="24" y="62" width="96" height="96" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="72" y="104" font-size="14" fill="#2d3142" text-anchor="middle" font-weight="600">in</text>
+<text x="72" y="124" font-size="11" fill="#6b7280" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">brlan</text>
+<rect x="140" y="52" width="200" height="116" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="240" y="72" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">PREROUTING</text>
+<text x="152" y="98" font-size="11.5" fill="#6b7280" font-family="ui-monospace, Menlo, monospace">-300 raw (notrack)</text>
+<text x="152" y="122" font-size="11.5" fill="#bf4520" font-family="ui-monospace, Menlo, monospace">-200 conntrack lookup</text>
+<text x="152" y="146" font-size="11.5" fill="#6b7280" font-family="ui-monospace, Menlo, monospace">-100 dstnat (DNAT)</text>
+<rect x="360" y="80" width="86" height="60" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="403" y="106" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">route</text>
+<text x="403" y="124" font-size="11" fill="#6b7280" text-anchor="middle">lookup</text>
+<rect x="466" y="62" width="110" height="96" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="521" y="84" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">FORWARD</text>
+<text x="478" y="110" font-size="11.5" fill="#6b7280" font-family="ui-monospace, Menlo, monospace">0 filter</text>
+<text x="478" y="132" font-size="11" fill="#6b7280">ct state …</text>
+<rect x="596" y="52" width="140" height="116" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="666" y="72" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">POSTROUTING</text>
+<text x="606" y="98" font-size="11.5" fill="#6b7280" font-family="ui-monospace, Menlo, monospace">100 srcnat</text>
+<text x="606" y="114" font-size="11" fill="#6b7280">(masquerade)</text>
+<text x="606" y="146" font-size="11.5" fill="#bf4520" font-family="ui-monospace, Menlo, monospace">last: confirm</text>
+<line x1="120" y1="110" x2="134" y2="110" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d15-arr)"/>
+<line x1="340" y1="110" x2="354" y2="110" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d15-arr)"/>
+<line x1="446" y1="110" x2="460" y2="110" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d15-arr)"/>
+<line x1="576" y1="110" x2="590" y2="110" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d15-arr)"/>
+<rect x="140" y="236" width="596" height="128" rx="6" fill="none" stroke="#bf4520" stroke-width="2"/>
+<text x="438" y="258" font-size="11" fill="#6b7280" text-anchor="middle" letter-spacing="1.5">CONNTRACK TABLE: ONE ENTRY PER FLOW, HASHED UNDER BOTH TUPLES</text>
+<text xml:space="preserve" style="white-space:pre" x="156" y="286" font-size="11.5" fill="#2d3142" font-family="ui-monospace, Menlo, monospace">ORIGINAL  src=192.168.1.10:51234  dst=203.0.113.50:443</text>
+<text xml:space="preserve" style="white-space:pre" x="156" y="310" font-size="11.5" fill="#2d3142" font-family="ui-monospace, Menlo, monospace">REPLY     src=203.0.113.50:443    dst=203.0.113.7:51234</text>
+<text xml:space="preserve" style="white-space:pre" x="156" y="340" font-size="11.5" fill="#6b7280" font-family="ui-monospace, Menlo, monospace">state ESTABLISHED  [ASSURED]  timeout 432000 s  mark 0</text>
+<line x1="240" y1="174" x2="240" y2="230" stroke="#bf4520" stroke-width="2" marker-end="url(#d15-arr-acc)"/>
+<text x="250" y="206" font-size="11" fill="#bf4520">every packet: hash lookup</text>
+<line x1="640" y1="174" x2="640" y2="230" stroke="#bf4520" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#d15-arr-acc)"/>
+<text x="630" y="196" font-size="11" fill="#bf4520" text-anchor="end">first packet only:</text>
+<text x="630" y="212" font-size="11" fill="#bf4520" text-anchor="end">NAT picks a free REPLY tuple,</text>
+<text x="630" y="228" font-size="11" fill="#bf4520" text-anchor="end">confirm inserts the entry</text>
+<text x="24" y="404" font-size="13" fill="#6b7280">Packet 1: no entry, so it is NEW and unconfirmed. The nat chains run and choose the REPLY tuple.</text>
+<text x="24" y="426" font-size="13" fill="#6b7280">Packet 2 onward: the lookup hits, NAT is applied from the stored tuples, and the nat chains never see it.</text>
+<text x="24" y="448" font-size="13" fill="#6b7280">A reply is recognised because its tuple equals the REPLY tuple, which is how it gets un-NATed.</text>
+<text x="24" y="470" font-size="13" fill="#6b7280">A packet dropped before confirm (by a filter rule) leaves no entry behind.</text>
+</svg>
+
+<h3 id="d15-nat-is-decided-once-per-flow">NAT is decided once per flow</h3>
+<p>This is the single most useful fact in the module. The nat chains (iptables <code>-t nat</code>, or nftables chains of <code>type nat</code>) are consulted only for the first packet of a flow. That packet is NEW and its entry is still <em>unconfirmed</em>. Source NAT at the postrouting hook picks a public address and port, writes them into the REPLY tuple, and the entry is confirmed at the very end of the path. Every later packet hits the entry in prerouting and is rewritten from the stored tuples. The nat chains never see it.</p>
+<p>Three consequences follow. Changing a NAT rule does not affect flows that already exist; you have to delete their entries (<code>conntrack -D</code>) or wait for them to time out. A NAT rule's packet counter counts flows, not packets. And a packet dropped before confirmation, say by a filter rule on the input hook, leaves no entry behind. That last detail turns out to decide whether UDP hole punching works, as the lab below shows.</p>
+<h3 id="d15-choosing-the-public-port">Choosing the public port</h3>
+<p>Linux tries to keep the source port. If <code>192.168.1.10:51234</code> goes out and no other entry already uses <code>203.0.113.7:51234</code> toward the same destination, the reply tuple keeps 51234. Only on a clash does it pick another port from the range. The uniqueness rule is about the <em>whole</em> reply tuple, not the port alone. Two flows may share public port 40002 if they go to different destination addresses or ports. That is why "a NAT has 64k ports" is only half a statement. The real question is: 64k ports <em>per what</em>?</p>
+<p>RFC 4787 (UDP) and RFC 5382 (TCP) give the vocabulary that settles it. They separate two behaviours that the older "cone" names mashed together.</p>
+<ul>
+<li><strong>Mapping behaviour</strong>: when does the NAT reuse the same public <code>IP:port</code> for an internal socket? <em>Endpoint-independent mapping</em> (EIM) reuses it for every destination. <em>Address-dependent</em> and <em>address-and-port-dependent</em> mapping hand out a fresh one per destination address, or per destination address and port.</li>
+<li><strong>Filtering behaviour</strong>: which inbound packets may use an existing mapping? <em>Endpoint-independent filtering</em> accepts anyone. <em>Address-dependent</em> accepts only hosts the inside has sent to. <em>Address-and-port-dependent</em> accepts only the exact <code>IP:port</code> the inside has sent to.</li>
+</ul>
+<p>The old names map roughly like this. Full cone is EIM plus endpoint-independent filtering. Restricted cone is EIM plus address-dependent filtering. Port-restricted cone is EIM plus address-and-port-dependent filtering. "Symmetric" is address-and-port-dependent <em>mapping</em>. RFC 4787 makes EIM a MUST (REQ-1) precisely because peer-to-peer depends on it. Linux masquerade is EIM in practice, because it keeps the source port when it can. Its filtering is address-and-port-dependent, because a reply must match the REPLY tuple exactly. Add the <code>random</code> flag and every new destination gets a random port. You have built a symmetric NAT.</p>
+<h3 id="d15-stun-turn-and-ice-mechanically">STUN, TURN and ICE, mechanically</h3>
+<p><strong>STUN</strong> (RFC 8489) is a mirror. The client sends a 20-byte Binding request over UDP, usually to port 3478. It carries a type, a length, the fixed magic cookie <code>0x2112A442</code>, and a 96-bit transaction ID. The server answers with the source address it observed, in an XOR-MAPPED-ADDRESS attribute. The port is XORed with the top 16 bits of the cookie and the IPv4 address with the whole cookie. That XOR exists for a reason you met in the module: some ALGs scanned payloads for anything that looked like the private address and "helpfully" rewrote it. Obfuscating the address hides it from them.</p>
+<p>The answer is the client's <em>server-reflexive</em> address: its NAT mapping as seen from outside. It is only useful to a peer if the NAT does endpoint-independent mapping, because the peer is a different destination. Behind a symmetric NAT, the mapping toward the peer is not the one STUN reported.</p>
+<p><strong>Hole punching</strong> is then a timing trick. Each peer learns the other's server-reflexive address through some signalling channel. Both send UDP to each other at roughly the same time. Peer A's outbound packet creates a mapping and a conntrack entry on NAT A whose REPLY tuple is exactly B's public address and port. When B's packet arrives, it matches that REPLY tuple and is let in as a reply. The first packet in each direction usually dies at the far NAT, because the far side's hole is not open yet. It still did its job: it opened the near side's hole.</p>
+<p><strong>TURN</strong> (RFC 8656) is the fallback when no direct path exists. The client sends an Allocate request and receives a <em>relayed</em> transport address on the TURN server. It then installs a permission for each peer address with CreatePermission; a permission lasts 300 seconds unless refreshed. Data travels either inside Send/Data indications, at 36 bytes of overhead per IPv4 datagram, or over a bound channel with a 4-byte ChannelData header. Every relayed byte costs the operator bandwidth, which is why relays are the last resort.</p>
+<p><strong>ICE</strong> (RFC 8445) is the procedure that tries everything in order. Each side gathers candidates (host, server-reflexive, relayed) and ranks them with a formula. Priority equals 2^24 × type preference + 2^8 × local preference + (256 − component ID). The recommended type preferences are 126 for host, 110 for peer-reflexive, 100 for server-reflexive and 0 for relayed. Both sides pair candidates up, run STUN connectivity checks on each pair in priority order, and the controlling side nominates the best pair that works.</p>
+<h3 id="d15-the-filters-mental-model-verdicts-hooks-and-order">The filter's mental model: verdicts, hooks and order</h3>
+<p>The module said rules are evaluated top to bottom and the first match wins. That is true inside one Cisco ACL or one iptables chain. It is not the whole story on Linux or on macOS.</p>
+<p><strong>nftables.</strong> You create <em>base chains</em> and attach each to a hook (prerouting, input, forward, output, postrouting) at a priority. Several base chains can sit on the same hook, from different tables, and they run in priority order. Inside one chain, rules run top to bottom until a verdict. The asymmetry is what catches people. <code>drop</code> is final: the packet is gone. <code>accept</code> only ends <em>this</em> base chain. The packet then continues to the next base chain on the same hook, and to the later hooks. So a table you own can say <code>accept</code>, and a table Docker, firewalld or kube-proxy installed at a later priority can still drop the packet. The chain's <code>policy</code> is the verdict when no rule decides. Sets and verdict maps (<code>ip saddr @blocklist drop</code>, <code>tcp dport vmap { 22 : jump ssh, 443 : accept }</code>) are hash or interval lookups. That is the scaling difference from classic iptables, which walks rules linearly.</p>
+<p><strong>pf (macOS, BSD).</strong> pf checks the state table first. A packet that matches an existing state passes without any ruleset evaluation. A packet with no state is evaluated against the filter rules, and here the default is the opposite of nftables: <em>the last matching rule wins</em>. A rule marked <code>quick</code> ends evaluation the moment it matches. On current OpenBSD and on the pf in macOS, <code>pass</code> rules keep state by default; confirm on your system with <code>pfctl -s rules</code>, which prints the implied <code>keep state</code>. Translation rules (<code>nat</code>, <code>rdr</code>) are the exception: they are first-match.</p>
+<p>So "first match wins" is a property of a particular rule language, not of firewalls in general. A senior engineer asks which language before reading the rules.</p>
+<h3 id="d15-stateful-versus-stateless-one-level-down">Stateful versus stateless, one level down</h3>
+<p>A stateful filter does more than remember 5-tuples. For TCP, Linux conntrack also tracks sequence-number windows in both directions. A segment far outside the window is classified INVALID, and so is a lone ACK for a flow the tracker never saw. That is why asymmetric routing breaks stateful firewalls. If the SYN goes through firewall A and the SYN-ACK comes back through firewall B, then B sees a SYN-ACK with no SYN. It marks the packet INVALID, and a sane rule set drops INVALID.</p>
+<p>Two Linux knobs bend this. <code>nf_conntrack_tcp_loose</code> (default 1) lets the tracker pick up an established TCP flow mid-stream. That is what makes a firewall reboot or failover survivable for existing connections. <code>nf_conntrack_tcp_be_liberal</code> (default 0) stops it marking out-of-window segments INVALID. And a <code>notrack</code> rule in a raw-priority chain exempts traffic from tracking entirely. High-volume DNS servers and load balancers use it so their busiest flows never touch the table.</p>
+<h2 id="d15-on-the-wire">Deep dive: what the kernel actually does</h2>
+<h3 id="d15-the-lab">The lab</h3>
+<p>The lab is plain Linux network namespaces joined by veth pairs. Router <code>r1</code> has LAN <code>192.168.1.0/24</code> behind it and WAN address <code>203.0.113.7</code>. Router <code>r2</code> has <code>10.0.0.0/24</code> behind it and WAN address <code>203.0.113.9</code>. A server at <code>203.0.113.50</code> runs a TCP service on port 443 and a STUN server on UDP 3478. Each router runs this nftables rule set, which is a typical home router in miniature. These are Linux-only; macOS has no network namespaces.</p>
+<pre class="text"><code>table ip nat {
+    chain post {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname &quot;wan&quot; counter masquerade
+    }
+}
+table ip filter {
+    chain input_policy {
+        type filter hook input priority filter; policy drop;
+        ct state established,related accept
+        iifname != &quot;wan&quot; accept
+    }
+    chain forward_policy {
+        type filter hook forward priority filter; policy drop;
+        ct state established,related counter accept
+        ct state invalid counter drop
+        iifname != &quot;wan&quot; oifname &quot;wan&quot; counter accept
+    }
+}</code></pre>
+<h3 id="d15-one-tcp-flow-captured-on-both-sides-of-the-nat">One TCP flow, captured on both sides of the NAT</h3>
+<p>Laptop A (<code>192.168.1.10</code>) connects from source port 51234 to <code>203.0.113.50:443</code>. Laptop A2 (<code>192.168.1.11</code>) does the same thing 0.3 seconds later, also from source port 51234. Here are the two SYNs, captured with <code>tcpdump -nn -v</code> on the router's LAN side and then on its WAN side:</p>
+<pre class="text"><code># r1, LAN side (brlan)
+21:34:29.566227 IP (tos 0x0, ttl 64, id 6061, offset 0, flags [DF], proto TCP (6), length 60)
+    192.168.1.10.51234 &gt; 203.0.113.50.443: Flags [S], cksum 0xfe13 (incorrect -&gt; 0x4cff), seq 3290283300, win 64240, options [mss 1460,sackOK,TS val 2788364500 ecr 0,nop,wscale 10], length 0
+21:34:29.864555 IP (tos 0x0, ttl 64, id 38525, offset 0, flags [DF], proto TCP (6), length 60)
+    192.168.1.11.51234 &gt; 203.0.113.50.443: Flags [S], cksum 0xfe14 (incorrect -&gt; 0x17cc), seq 1344199659, win 64240, options [mss 1460,sackOK,TS val 898698209 ecr 0,nop,wscale 10], length 0
+
+# r1, WAN side (wan)
+21:34:29.566563 IP (tos 0x0, ttl 63, id 6061, offset 0, flags [DF], proto TCP (6), length 60)
+    203.0.113.7.51234 &gt; 203.0.113.50.443: Flags [S], cksum 0x7869 (incorrect -&gt; 0xd2a9), seq 3290283300, win 64240, options [mss 1460,sackOK,TS val 2788364500 ecr 0,nop,wscale 10], length 0
+21:34:29.864996 IP (tos 0x0, ttl 63, id 38525, offset 0, flags [DF], proto TCP (6), length 60)
+    203.0.113.7.60182 &gt; 203.0.113.50.443: Flags [S], cksum 0x7869 (incorrect -&gt; 0x7a83), seq 1344199659, win 64240, options [mss 1460,sackOK,TS val 898698209 ecr 0,nop,wscale 10], length 0</code></pre>
+<p>Read it field by field. The source address changed from private to <code>203.0.113.7</code>. The TTL dropped from 64 to 63, because the router forwarded the packet. The IP ID (6061), the sequence number, the window and every TCP option crossed unchanged; NAT does not touch them. The checksums were recomputed. The "incorrect" note appears because tcpdump captured the packets before checksum offload filled them in. It is an artefact of capturing on the sending host, not a bug.</p>
+<p>The interesting line is the last one. A's flow kept port 51234 on the outside, because nothing else was using it. A2 asked for the same port toward the same destination. That would have produced an identical REPLY tuple, so the kernel picked 60182 instead. That is the real behaviour behind the module's diagram, where the router handed out 50000 and 50001 in order. Linux keeps the source port when it can and moves only on a clash.</p>
+<h3 id="d15-the-entrys-life-as-conntrack-events">The entry's life, as conntrack events</h3>
+<p><code>conntrack -E</code> prints table events as they happen. This is A's flow from SYN to close:</p>
+<pre class="text"><code>    [NEW] tcp      6 120 SYN_SENT src=192.168.1.10 dst=203.0.113.50 sport=51234 dport=443 [UNREPLIED] src=203.0.113.50 dst=203.0.113.7 sport=443 dport=51234
+ [UPDATE] tcp      6 60 SYN_RECV src=192.168.1.10 dst=203.0.113.50 sport=51234 dport=443 src=203.0.113.50 dst=203.0.113.7 sport=443 dport=51234
+ [UPDATE] tcp      6 432000 ESTABLISHED src=192.168.1.10 dst=203.0.113.50 sport=51234 dport=443 src=203.0.113.50 dst=203.0.113.7 sport=443 dport=51234 [ASSURED]
+ [UPDATE] tcp      6 120 FIN_WAIT src=192.168.1.10 dst=203.0.113.50 sport=51234 dport=443 src=203.0.113.50 dst=203.0.113.7 sport=443 dport=51234 [ASSURED]
+ [UPDATE] tcp      6 60 CLOSE_WAIT src=192.168.1.10 dst=203.0.113.50 sport=51234 dport=443 src=203.0.113.50 dst=203.0.113.7 sport=443 dport=51234 [ASSURED]
+ [UPDATE] tcp      6 30 LAST_ACK src=192.168.1.10 dst=203.0.113.50 sport=51234 dport=443 src=203.0.113.50 dst=203.0.113.7 sport=443 dport=51234 [ASSURED]
+ [UPDATE] tcp      6 120 TIME_WAIT src=192.168.1.10 dst=203.0.113.50 sport=51234 dport=443 src=203.0.113.50 dst=203.0.113.7 sport=443 dport=51234 [ASSURED]</code></pre>
+<p>Each line is protocol name and number (<code>tcp 6</code>), seconds left on the timer, tracker state, the ORIGINAL tuple, then the REPLY tuple. The timer is reset on each state change to that state's timeout. <code>[UNREPLIED]</code> means no packet has matched the REPLY tuple yet. <code>[ASSURED]</code> means traffic has flowed both ways; assured entries are the last to be evicted when the table fills. Notice the 432000 on ESTABLISHED. That is five days, and it is the kernel default. The flow also lingers in TIME_WAIT for 120 seconds after it closes, still holding its public port.</p>
+<p>The tracker's TCP state machine is a model inferred from the packets it sees. It is not either endpoint's TCP state. Here the server closed first, so the tracker's names describe the flow's overall progress, not either socket.</p>
+<p>The rule counters, read after both flows had finished, prove the "NAT is decided once" point:</p>
+<pre class="text"><code>        oifname &quot;wan&quot; counter packets 2 bytes 120 masquerade
+        ct state established,related counter packets 16 bytes 874 accept
+        iifname != &quot;wan&quot; oifname &quot;wan&quot; counter packets 2 bytes 120 accept</code></pre>
+<p>Two flows, about twenty packets in total. The masquerade rule matched two packets, one SYN per flow. The "new outbound" filter rule also matched two. Everything else rode on the ESTABLISHED rule.</p>
+<h3 id="d15-udp-has-no-handshake-so-the-timer-does-the-work">UDP has no handshake, so the timer does the work</h3>
+<p>UDP entries change timers based on what the tracker has seen. On kernel 6.18, one request and one reply leave a 30-second entry. More traffic a few seconds later promotes it to ASSURED with the 120-second "stream" timeout. A datagram nobody answers stays UNREPLIED at 30 seconds.</p>
+<pre class="text"><code># after one request/reply
+udp      17 29 src=192.168.1.10 dst=203.0.113.50 sport=41000 dport=5353 src=203.0.113.50 dst=203.0.113.7 sport=5353 dport=41000 mark=0 use=1
+# after a second exchange 3 s later
+udp      17 119 src=192.168.1.10 dst=203.0.113.50 sport=41000 dport=5353 src=203.0.113.50 dst=203.0.113.7 sport=5353 dport=41000 [ASSURED] mark=0 use=1
+# a datagram nobody answered
+udp      17 29 src=192.168.1.10 dst=203.0.113.50 sport=41001 dport=9999 [UNREPLIED] src=203.0.113.50 dst=203.0.113.7 sport=9999 dport=41001 mark=0 use=1</code></pre>
+<p>Thirty seconds is short. RFC 4787 (REQ-5) says a UDP mapping MUST NOT expire in less than two minutes, and recommends five. A plain Linux router is stricter than the RFC for flows with a single exchange. This is why every UDP protocol that must survive NAT sends keepalives, and why those keepalives tend to come every 15 to 25 seconds.</p>
+<h3 id="d15-port-exhaustion-reproduced-with-a-four-port-pool">Port exhaustion, reproduced with a four-port pool</h3>
+<p>To make exhaustion visible, the lab shrinks r1's pool to four ports: <code>meta l4proto tcp masquerade to :40000-40003</code>. Laptop A then opens five connections to <code>:443</code> and holds them, followed by two to <code>:8443</code> on the same server:</p>
+<pre class="text"><code>to :443   ok    client port 40972
+to :443   ok    client port 40984
+to :443   ok    client port 40992
+to :443   ok    client port 41000
+to :443   FAIL  timed out
+to :8443  ok    client port 58888
+to :8443  ok    client port 58894</code></pre>
+<p>The fifth connection to <code>:443</code> failed: four ports, four flows to that exact destination, no free REPLY tuple. The very next connections to <code>:8443</code> succeeded. The table shows why. They reused public ports 40002 and 40003, which were already busy toward <code>:443</code>:</p>
+<pre class="text"><code>tcp      6 59 CLOSE_WAIT src=192.168.1.10 dst=203.0.113.50 sport=40992 dport=443 src=203.0.113.50 dst=203.0.113.7 sport=443 dport=40002 [ASSURED] mark=0 use=1
+tcp      6 60 CLOSE_WAIT src=192.168.1.10 dst=203.0.113.50 sport=58888 dport=8443 src=203.0.113.50 dst=203.0.113.7 sport=8443 dport=40002 [ASSURED] mark=0 use=1</code></pre>
+<p>The failure shows up in the per-CPU statistics. Each attempt (the SYN and one retransmission) counts as an insert failure and a drop:</p>
+<pre class="text"><code>$ conntrack -S
+cpu=0       found=0 invalid=0 insert=0 insert_failed=2 drop=2 early_drop=0 error=0 search_restart=0 clash_resolve=0 chaintoolong=0</code></pre>
+<p>Nothing is logged and nothing is sent back to the client. The SYN just vanishes, and the application sees a connect timeout. That is exactly the "looks like the internet is down" symptom from the module's load-test story.</p>
+<h3 id="d15-hole-punching-three-ways">Hole punching, three ways</h3>
+<p><code>stun_punch.py</code> (below) is a minimal STUN server and client plus a punch test. Each peer binds UDP port 40000, asks the STUN server for its public address, and posts it to a shared directory that stands in for the signalling server. It then fires six probes, 300 ms apart, at the address the other peer posted. The lab ran it in three configurations.</p>
+<p><strong>Run 1: masquerade, input policy drop.</strong> This is the realistic home-router setup.</p>
+<pre class="text"><code># excerpt; &quot;...&quot; marks omitted probe lines
+binding request from 203.0.113.7:40000
+binding request from 203.0.113.9:40000
+[alice] local 0.0.0.0:40000  STUN says I am 203.0.113.7:40000
+[alice] got &#39;bob probe 1&#39; from 203.0.113.9:40000
+...
+[alice] got &#39;bob probe 5&#39; from 203.0.113.9:40000
+[alice] DIRECT PATH OPEN
+[bob] local 0.0.0.0:40000  STUN says I am 203.0.113.9:40000
+[bob] got &#39;alice probe 0&#39; from 203.0.113.7:40000
+...
+[bob] DIRECT PATH OPEN</code></pre>
+<p>Alice never saw Bob's probe 0. It reached r1 before Alice's own first probe had opened the hole, and r1's input policy dropped it. Because the drop happened before confirmation, it left no conntrack entry. Alice's next outbound probe created a normal entry with port 40000 intact. From then on the two flows matched each other's REPLY tuples.</p>
+<p><strong>Run 2: masquerade with <code>random</code>.</strong> Now each destination gets a random public port. The NAT has become symmetric.</p>
+<pre class="text"><code>binding request from 203.0.113.7:38713
+binding request from 203.0.113.9:42729
+[alice] local 0.0.0.0:40000  STUN says I am 203.0.113.7:38713
+[alice] no packets from peer: hole punch failed
+[bob] local 0.0.0.0:40000  STUN says I am 203.0.113.9:42729
+[bob] no packets from peer: hole punch failed
+--- r1 conntrack
+udp      17 29 src=192.168.1.10 dst=203.0.113.9 sport=40000 dport=42729 [UNREPLIED] src=203.0.113.9 dst=203.0.113.7 sport=42729 dport=20447 mark=0 use=1</code></pre>
+<p>STUN told Alice she was <code>203.0.113.7:38713</code>. But her flow toward Bob went out from port 20447. Bob was dutifully sending to 38713, which belongs to a different mapping whose REPLY tuple names the STUN server. Address-and-port-dependent mapping makes the server-reflexive candidate a lie for every other destination. This pairing needs TURN.</p>
+<p><strong>Run 3: masquerade, but the router's input chain accepts.</strong> This is the surprising one.</p>
+<pre class="text"><code>[alice] local 0.0.0.0:40000  STUN says I am 203.0.113.7:40000
+[alice] no packets from peer: hole punch failed
+[bob] local 0.0.0.0:40000  STUN says I am 203.0.113.9:40000
+[bob] no packets from peer: hole punch failed
+--- r1 conntrack
+udp      17 29 src=203.0.113.9 dst=203.0.113.7 sport=40000 dport=40000 [UNREPLIED] src=203.0.113.7 dst=203.0.113.9 sport=40000 dport=40000 mark=0 use=1
+udp      17 29 src=192.168.1.10 dst=203.0.113.9 sport=40000 dport=40000 [UNREPLIED] src=203.0.113.9 dst=203.0.113.7 sport=40000 dport=43447 mark=0 use=1</code></pre>
+<p>Bob's early probe arrived at r1 addressed to the router itself. With an accepting input chain, the packet was delivered locally, so its conntrack entry was <em>confirmed</em>. That entry now owned the tuple <code>203.0.113.9:40000 ↔︎ 203.0.113.7:40000</code>. When Alice's outbound probe came along, its natural REPLY tuple clashed with it, so masquerade moved her to port 43447. Her mapping was no longer the one STUN reported. Same NAT, same forwarding rules. The only difference was whether a stray inbound packet got to leave a trace in the table.</p>
+<h3 id="d15-the-code">The code</h3>
+<p><code>stun_punch.py</code> runs anywhere with Python 3.13. On your Mac you can run the server and client against localhost; the punch mode needs two NATs, which is what the namespaces provided.</p>
+<div class="sourceCode" id="d15-cb12"><pre class="sourceCode python"><code class="sourceCode python"><span id="d15-cb12-1"><a href="#d15-cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Minimal STUN (RFC 8489) Binding server/client plus a UDP hole-punch test.</span></span>
+<span id="d15-cb12-2"><a href="#d15-cb12-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-3"><a href="#d15-cb12-3" aria-hidden="true" tabindex="-1"></a><span class="co">  python3 stun_punch.py server 0.0.0.0 3478</span></span>
+<span id="d15-cb12-4"><a href="#d15-cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co">  python3 stun_punch.py client 127.0.0.1 3478</span></span>
+<span id="d15-cb12-5"><a href="#d15-cb12-5" aria-hidden="true" tabindex="-1"></a><span class="co">  python3 stun_punch.py punch NAME STUN_HOST RENDEZVOUS_DIR</span></span>
+<span id="d15-cb12-6"><a href="#d15-cb12-6" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d15-cb12-7"><a href="#d15-cb12-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os, pathlib, socket, struct, sys, time</span>
+<span id="d15-cb12-8"><a href="#d15-cb12-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-9"><a href="#d15-cb12-9" aria-hidden="true" tabindex="-1"></a>MAGIC <span class="op">=</span> <span class="bn">0x2112A442</span></span>
+<span id="d15-cb12-10"><a href="#d15-cb12-10" aria-hidden="true" tabindex="-1"></a>BINDING_REQ, BINDING_OK <span class="op">=</span> <span class="bn">0x0001</span>, <span class="bn">0x0101</span></span>
+<span id="d15-cb12-11"><a href="#d15-cb12-11" aria-hidden="true" tabindex="-1"></a>XOR_MAPPED <span class="op">=</span> <span class="bn">0x0020</span></span>
+<span id="d15-cb12-12"><a href="#d15-cb12-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-13"><a href="#d15-cb12-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-14"><a href="#d15-cb12-14" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> build_request() <span class="op">-&gt;</span> <span class="bu">tuple</span>[<span class="bu">bytes</span>, <span class="bu">bytes</span>]:</span>
+<span id="d15-cb12-15"><a href="#d15-cb12-15" aria-hidden="true" tabindex="-1"></a>    txid <span class="op">=</span> os.urandom(<span class="dv">12</span>)</span>
+<span id="d15-cb12-16"><a href="#d15-cb12-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> struct.pack(<span class="st">&quot;!HHI12s&quot;</span>, BINDING_REQ, <span class="dv">0</span>, MAGIC, txid), txid</span>
+<span id="d15-cb12-17"><a href="#d15-cb12-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-18"><a href="#d15-cb12-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-19"><a href="#d15-cb12-19" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> build_response(txid: <span class="bu">bytes</span>, ip: <span class="bu">str</span>, port: <span class="bu">int</span>) <span class="op">-&gt;</span> <span class="bu">bytes</span>:</span>
+<span id="d15-cb12-20"><a href="#d15-cb12-20" aria-hidden="true" tabindex="-1"></a>    xport <span class="op">=</span> port <span class="op">^</span> (MAGIC <span class="op">&gt;&gt;</span> <span class="dv">16</span>)</span>
+<span id="d15-cb12-21"><a href="#d15-cb12-21" aria-hidden="true" tabindex="-1"></a>    xaddr <span class="op">=</span> struct.unpack(<span class="st">&quot;!I&quot;</span>, socket.inet_aton(ip))[<span class="dv">0</span>] <span class="op">^</span> MAGIC</span>
+<span id="d15-cb12-22"><a href="#d15-cb12-22" aria-hidden="true" tabindex="-1"></a>    attr <span class="op">=</span> struct.pack(<span class="st">&quot;!HHBBHI&quot;</span>, XOR_MAPPED, <span class="dv">8</span>, <span class="dv">0</span>, <span class="bn">0x01</span>, xport, xaddr)</span>
+<span id="d15-cb12-23"><a href="#d15-cb12-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> struct.pack(<span class="st">&quot;!HHI12s&quot;</span>, BINDING_OK, <span class="bu">len</span>(attr), MAGIC, txid) <span class="op">+</span> attr</span>
+<span id="d15-cb12-24"><a href="#d15-cb12-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-25"><a href="#d15-cb12-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-26"><a href="#d15-cb12-26" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> parse_response(data: <span class="bu">bytes</span>, txid: <span class="bu">bytes</span>) <span class="op">-&gt;</span> <span class="bu">tuple</span>[<span class="bu">str</span>, <span class="bu">int</span>]:</span>
+<span id="d15-cb12-27"><a href="#d15-cb12-27" aria-hidden="true" tabindex="-1"></a>    mtype, length, cookie, rtx <span class="op">=</span> struct.unpack(<span class="st">&quot;!HHI12s&quot;</span>, data[:<span class="dv">20</span>])</span>
+<span id="d15-cb12-28"><a href="#d15-cb12-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">assert</span> mtype <span class="op">==</span> BINDING_OK <span class="kw">and</span> cookie <span class="op">==</span> MAGIC <span class="kw">and</span> rtx <span class="op">==</span> txid, <span class="st">&quot;not our answer&quot;</span></span>
+<span id="d15-cb12-29"><a href="#d15-cb12-29" aria-hidden="true" tabindex="-1"></a>    pos <span class="op">=</span> <span class="dv">20</span></span>
+<span id="d15-cb12-30"><a href="#d15-cb12-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> pos <span class="op">&lt;</span> <span class="dv">20</span> <span class="op">+</span> length:</span>
+<span id="d15-cb12-31"><a href="#d15-cb12-31" aria-hidden="true" tabindex="-1"></a>        atype, alen <span class="op">=</span> struct.unpack(<span class="st">&quot;!HH&quot;</span>, data[pos:pos <span class="op">+</span> <span class="dv">4</span>])</span>
+<span id="d15-cb12-32"><a href="#d15-cb12-32" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> atype <span class="op">==</span> XOR_MAPPED:</span>
+<span id="d15-cb12-33"><a href="#d15-cb12-33" aria-hidden="true" tabindex="-1"></a>            _, fam, xport, xaddr <span class="op">=</span> struct.unpack(<span class="st">&quot;!BBHI&quot;</span>, data[pos <span class="op">+</span> <span class="dv">4</span>:pos <span class="op">+</span> <span class="dv">12</span>])</span>
+<span id="d15-cb12-34"><a href="#d15-cb12-34" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> socket.inet_ntoa(struct.pack(<span class="st">&quot;!I&quot;</span>, xaddr <span class="op">^</span> MAGIC)), xport <span class="op">^</span> (MAGIC <span class="op">&gt;&gt;</span> <span class="dv">16</span>)</span>
+<span id="d15-cb12-35"><a href="#d15-cb12-35" aria-hidden="true" tabindex="-1"></a>        pos <span class="op">+=</span> <span class="dv">4</span> <span class="op">+</span> alen <span class="op">+</span> (<span class="op">-</span>alen <span class="op">%</span> <span class="dv">4</span>)          <span class="co"># attributes are padded to 4 bytes</span></span>
+<span id="d15-cb12-36"><a href="#d15-cb12-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">raise</span> <span class="pp">ValueError</span>(<span class="st">&quot;no XOR-MAPPED-ADDRESS&quot;</span>)</span>
+<span id="d15-cb12-37"><a href="#d15-cb12-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-38"><a href="#d15-cb12-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-39"><a href="#d15-cb12-39" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> server(host: <span class="bu">str</span>, port: <span class="bu">int</span>) <span class="op">-&gt;</span> <span class="va">None</span>:</span>
+<span id="d15-cb12-40"><a href="#d15-cb12-40" aria-hidden="true" tabindex="-1"></a>    s <span class="op">=</span> socket.socket(socket.AF_INET, socket.SOCK_DGRAM)</span>
+<span id="d15-cb12-41"><a href="#d15-cb12-41" aria-hidden="true" tabindex="-1"></a>    s.bind((host, port))</span>
+<span id="d15-cb12-42"><a href="#d15-cb12-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="va">True</span>:</span>
+<span id="d15-cb12-43"><a href="#d15-cb12-43" aria-hidden="true" tabindex="-1"></a>        data, (ip, sport) <span class="op">=</span> s.recvfrom(<span class="dv">2048</span>)</span>
+<span id="d15-cb12-44"><a href="#d15-cb12-44" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="bu">len</span>(data) <span class="op">&gt;=</span> <span class="dv">20</span> <span class="kw">and</span> struct.unpack(<span class="st">&quot;!HHI&quot;</span>, data[:<span class="dv">8</span>]) <span class="op">==</span> (BINDING_REQ, <span class="dv">0</span>, MAGIC):</span>
+<span id="d15-cb12-45"><a href="#d15-cb12-45" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;binding request from </span><span class="sc">{</span>ip<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>sport<span class="sc">}</span><span class="ss">&quot;</span>, flush<span class="op">=</span><span class="va">True</span>)</span>
+<span id="d15-cb12-46"><a href="#d15-cb12-46" aria-hidden="true" tabindex="-1"></a>            s.sendto(build_response(data[<span class="dv">8</span>:<span class="dv">20</span>], ip, sport), (ip, sport))</span>
+<span id="d15-cb12-47"><a href="#d15-cb12-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-48"><a href="#d15-cb12-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-49"><a href="#d15-cb12-49" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> query(sock: socket.socket, host: <span class="bu">str</span>, port: <span class="bu">int</span>) <span class="op">-&gt;</span> <span class="bu">tuple</span>[<span class="bu">str</span>, <span class="bu">int</span>]:</span>
+<span id="d15-cb12-50"><a href="#d15-cb12-50" aria-hidden="true" tabindex="-1"></a>    req, txid <span class="op">=</span> build_request()</span>
+<span id="d15-cb12-51"><a href="#d15-cb12-51" aria-hidden="true" tabindex="-1"></a>    sock.sendto(req, (host, port))</span>
+<span id="d15-cb12-52"><a href="#d15-cb12-52" aria-hidden="true" tabindex="-1"></a>    data, _ <span class="op">=</span> sock.recvfrom(<span class="dv">2048</span>)</span>
+<span id="d15-cb12-53"><a href="#d15-cb12-53" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> parse_response(data, txid)</span>
+<span id="d15-cb12-54"><a href="#d15-cb12-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-55"><a href="#d15-cb12-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-56"><a href="#d15-cb12-56" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> punch(name: <span class="bu">str</span>, stun_host: <span class="bu">str</span>, rdv: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="va">None</span>:</span>
+<span id="d15-cb12-57"><a href="#d15-cb12-57" aria-hidden="true" tabindex="-1"></a>    sock <span class="op">=</span> socket.socket(socket.AF_INET, socket.SOCK_DGRAM)</span>
+<span id="d15-cb12-58"><a href="#d15-cb12-58" aria-hidden="true" tabindex="-1"></a>    sock.bind((<span class="st">&quot;0.0.0.0&quot;</span>, <span class="dv">40000</span>))</span>
+<span id="d15-cb12-59"><a href="#d15-cb12-59" aria-hidden="true" tabindex="-1"></a>    sock.settimeout(<span class="dv">2</span>)</span>
+<span id="d15-cb12-60"><a href="#d15-cb12-60" aria-hidden="true" tabindex="-1"></a>    me <span class="op">=</span> query(sock, stun_host, <span class="dv">3478</span>)</span>
+<span id="d15-cb12-61"><a href="#d15-cb12-61" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;[</span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">] local </span><span class="sc">{</span>sock<span class="sc">.</span>getsockname()[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">:40000  STUN says I am </span><span class="sc">{</span>me[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>me[<span class="dv">1</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d15-cb12-62"><a href="#d15-cb12-62" aria-hidden="true" tabindex="-1"></a>    d <span class="op">=</span> pathlib.Path(rdv)</span>
+<span id="d15-cb12-63"><a href="#d15-cb12-63" aria-hidden="true" tabindex="-1"></a>    (d <span class="op">/</span> <span class="ss">f&quot;.</span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">&quot;</span>).write_text(<span class="ss">f&quot;</span><span class="sc">{</span>me[<span class="dv">0</span>]<span class="sc">}</span><span class="ss"> </span><span class="sc">{</span>me[<span class="dv">1</span>]<span class="sc">}</span><span class="ss">&quot;</span>)     <span class="co"># the &quot;signalling server&quot;:</span></span>
+<span id="d15-cb12-64"><a href="#d15-cb12-64" aria-hidden="true" tabindex="-1"></a>    (d <span class="op">/</span> <span class="ss">f&quot;.</span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">&quot;</span>).rename(d <span class="op">/</span> name)                   <span class="co"># publish atomically</span></span>
+<span id="d15-cb12-65"><a href="#d15-cb12-65" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="kw">not</span> (others <span class="op">:=</span> [p <span class="cf">for</span> p <span class="kw">in</span> d.iterdir() <span class="cf">if</span> p.name <span class="kw">not</span> <span class="kw">in</span> (name, <span class="ss">f&quot;.</span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">&quot;</span>) <span class="kw">and</span> <span class="kw">not</span> p.name.startswith(<span class="st">&quot;.&quot;</span>)]):</span>
+<span id="d15-cb12-66"><a href="#d15-cb12-66" aria-hidden="true" tabindex="-1"></a>        time.sleep(<span class="fl">0.1</span>)                                 <span class="co"># wait for the peer to post</span></span>
+<span id="d15-cb12-67"><a href="#d15-cb12-67" aria-hidden="true" tabindex="-1"></a>    peer_file <span class="op">=</span> others[<span class="dv">0</span>]</span>
+<span id="d15-cb12-68"><a href="#d15-cb12-68" aria-hidden="true" tabindex="-1"></a>    ip, port <span class="op">=</span> peer_file.read_text().split()</span>
+<span id="d15-cb12-69"><a href="#d15-cb12-69" aria-hidden="true" tabindex="-1"></a>    peer <span class="op">=</span> (ip, <span class="bu">int</span>(port))</span>
+<span id="d15-cb12-70"><a href="#d15-cb12-70" aria-hidden="true" tabindex="-1"></a>    sock.settimeout(<span class="fl">0.3</span>)</span>
+<span id="d15-cb12-71"><a href="#d15-cb12-71" aria-hidden="true" tabindex="-1"></a>    got <span class="op">=</span> <span class="dv">0</span></span>
+<span id="d15-cb12-72"><a href="#d15-cb12-72" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">6</span>):                                  <span class="co"># 6 probes, 300 ms apart</span></span>
+<span id="d15-cb12-73"><a href="#d15-cb12-73" aria-hidden="true" tabindex="-1"></a>        sock.sendto(<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">}</span><span class="ss"> probe </span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span>.encode(), peer)</span>
+<span id="d15-cb12-74"><a href="#d15-cb12-74" aria-hidden="true" tabindex="-1"></a>        <span class="cf">try</span>:</span>
+<span id="d15-cb12-75"><a href="#d15-cb12-75" aria-hidden="true" tabindex="-1"></a>            data, src <span class="op">=</span> sock.recvfrom(<span class="dv">2048</span>)</span>
+<span id="d15-cb12-76"><a href="#d15-cb12-76" aria-hidden="true" tabindex="-1"></a>            got <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d15-cb12-77"><a href="#d15-cb12-77" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;[</span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">] got </span><span class="sc">{</span>data<span class="sc">.</span>decode()<span class="sc">!r}</span><span class="ss"> from </span><span class="sc">{</span>src[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>src[<span class="dv">1</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d15-cb12-78"><a href="#d15-cb12-78" aria-hidden="true" tabindex="-1"></a>        <span class="cf">except</span> socket.timeout:</span>
+<span id="d15-cb12-79"><a href="#d15-cb12-79" aria-hidden="true" tabindex="-1"></a>            <span class="cf">pass</span></span>
+<span id="d15-cb12-80"><a href="#d15-cb12-80" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;[</span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">] </span><span class="sc">{</span><span class="st">&#39;DIRECT PATH OPEN&#39;</span> <span class="cf">if</span> got <span class="cf">else</span> <span class="st">&#39;no packets from peer: hole punch failed&#39;</span><span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d15-cb12-81"><a href="#d15-cb12-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-82"><a href="#d15-cb12-82" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb12-83"><a href="#d15-cb12-83" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="d15-cb12-84"><a href="#d15-cb12-84" aria-hidden="true" tabindex="-1"></a>    cmd <span class="op">=</span> sys.argv[<span class="dv">1</span>]</span>
+<span id="d15-cb12-85"><a href="#d15-cb12-85" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> cmd <span class="op">==</span> <span class="st">&quot;server&quot;</span>:</span>
+<span id="d15-cb12-86"><a href="#d15-cb12-86" aria-hidden="true" tabindex="-1"></a>        server(sys.argv[<span class="dv">2</span>], <span class="bu">int</span>(sys.argv[<span class="dv">3</span>]))</span>
+<span id="d15-cb12-87"><a href="#d15-cb12-87" aria-hidden="true" tabindex="-1"></a>    <span class="cf">elif</span> cmd <span class="op">==</span> <span class="st">&quot;client&quot;</span>:</span>
+<span id="d15-cb12-88"><a href="#d15-cb12-88" aria-hidden="true" tabindex="-1"></a>        s <span class="op">=</span> socket.socket(socket.AF_INET, socket.SOCK_DGRAM)</span>
+<span id="d15-cb12-89"><a href="#d15-cb12-89" aria-hidden="true" tabindex="-1"></a>        s.settimeout(<span class="dv">2</span>)</span>
+<span id="d15-cb12-90"><a href="#d15-cb12-90" aria-hidden="true" tabindex="-1"></a>        ip, port <span class="op">=</span> query(s, sys.argv[<span class="dv">2</span>], <span class="bu">int</span>(sys.argv[<span class="dv">3</span>]))</span>
+<span id="d15-cb12-91"><a href="#d15-cb12-91" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;local socket   </span><span class="sc">{</span>s<span class="sc">.</span>getsockname()[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>s<span class="sc">.</span>getsockname()[<span class="dv">1</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d15-cb12-92"><a href="#d15-cb12-92" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;server saw me  </span><span class="sc">{</span>ip<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>port<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d15-cb12-93"><a href="#d15-cb12-93" aria-hidden="true" tabindex="-1"></a>    <span class="cf">elif</span> cmd <span class="op">==</span> <span class="st">&quot;punch&quot;</span>:</span>
+<span id="d15-cb12-94"><a href="#d15-cb12-94" aria-hidden="true" tabindex="-1"></a>        punch(sys.argv[<span class="dv">2</span>], sys.argv[<span class="dv">3</span>], sys.argv[<span class="dv">4</span>])</span></code></pre></div>
+<p>Run against localhost, with no NAT in the way, the mirror shows exactly what you sent from:</p>
+<pre class="text"><code>binding request from 127.0.0.1:48355
+local socket   0.0.0.0:48355
+server saw me  127.0.0.1:48355</code></pre>
+<h3 id="d15-accept-is-not-the-end-two-nftables-chains-on-one-hook">accept is not the end: two nftables chains on one hook</h3>
+<p>On the server namespace, two tables each attach a base chain to the input hook. One sits at priority −10 and accepts pings. The other sits at +10 and drops them:</p>
+<pre class="text"><code>$ ping -c2 -W1 203.0.113.50
+2 packets transmitted, 0 received, 100% packet loss, time 1001ms
+
+$ nft list ruleset
+table inet early {
+    chain in {
+        type filter hook input priority filter - 10; policy accept;
+        icmp type echo-request counter packets 2 bytes 168 accept comment &quot;accept here...&quot;
+    }
+}
+table inet late {
+    chain in {
+        type filter hook input priority filter + 10; policy accept;
+        icmp type echo-request counter packets 2 bytes 168 drop comment &quot;...is not the end&quot;
+    }
+}</code></pre>
+<p>Both counters read 2. The packets were accepted, then dropped. This is the shape of a whole class of "my rule says accept, why is it blocked?" tickets on hosts where Docker, firewalld or kube-proxy also own a table.</p>
+<h3 id="d15-on-your-mac">On your Mac</h3>
+<p>macOS has no conntrack, but pf keeps a state table you can read. These are read-only.</p>
+<div class="sourceCode" id="d15-cb15"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d15-cb15-1"><a href="#d15-cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># run on your Mac — your output will differ</span></span>
+<span id="d15-cb15-2"><a href="#d15-cb15-2" aria-hidden="true" tabindex="-1"></a><span class="co"># State-table size, searches, inserts and removals since pf was enabled</span></span>
+<span id="d15-cb15-3"><a href="#d15-cb15-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> pfctl <span class="at">-s</span> info</span>
+<span id="d15-cb15-4"><a href="#d15-cb15-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb15-5"><a href="#d15-cb15-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Current states (empty if pf has no rules loaded, the macOS default)</span></span>
+<span id="d15-cb15-6"><a href="#d15-cb15-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> pfctl <span class="at">-s</span> state <span class="kw">|</span> <span class="fu">head</span></span>
+<span id="d15-cb15-7"><a href="#d15-cb15-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb15-8"><a href="#d15-cb15-8" aria-hidden="true" tabindex="-1"></a><span class="co"># pf&#39;s timers and limits: compare with the Linux numbers in the next section</span></span>
+<span id="d15-cb15-9"><a href="#d15-cb15-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> pfctl <span class="at">-s</span> timeouts</span>
+<span id="d15-cb15-10"><a href="#d15-cb15-10" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> pfctl <span class="at">-s</span> memory</span>
+<span id="d15-cb15-11"><a href="#d15-cb15-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d15-cb15-12"><a href="#d15-cb15-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Your local ephemeral port range (the pool your own sockets draw from)</span></span>
+<span id="d15-cb15-13"><a href="#d15-cb15-13" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> net.inet.ip.portrange.first net.inet.ip.portrange.last</span></code></pre></div>
+<p>On Linux, the equivalents:</p>
+<div class="sourceCode" id="d15-cb16"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d15-cb16-1"><a href="#d15-cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Linux</span></span>
+<span id="d15-cb16-2"><a href="#d15-cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> conntrack <span class="at">-L</span> <span class="kw">|</span> <span class="fu">head</span>                  <span class="co"># entries (package: conntrack / conntrack-tools)</span></span>
+<span id="d15-cb16-3"><a href="#d15-cb16-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> conntrack <span class="at">-C</span>                         <span class="co"># entry count</span></span>
+<span id="d15-cb16-4"><a href="#d15-cb16-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> conntrack <span class="at">-S</span>                         <span class="co"># per-CPU insert_failed, drop, early_drop, clash_resolve</span></span>
+<span id="d15-cb16-5"><a href="#d15-cb16-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> conntrack <span class="at">-E</span>                         <span class="co"># live events</span></span>
+<span id="d15-cb16-6"><a href="#d15-cb16-6" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_buckets</span>
+<span id="d15-cb16-7"><a href="#d15-cb16-7" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-a</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;nf_conntrack_(tcp|udp|icmp|generic)_timeout&#39;</span></span>
+<span id="d15-cb16-8"><a href="#d15-cb16-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nft list ruleset                     <span class="co"># every table, chain, priority and counter</span></span></code></pre></div>
+<h2 id="d15-numbers">Deep dive: by the numbers</h2>
+<h3 id="d15-timers">Timers</h3>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Flow state</th>
+<th>Linux conntrack default (s)</th>
+<th>pf default (s)</th>
+<th>RFC floor (s)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>TCP, first packet / SYN sent</td>
+<td>120 (<code>syn_sent</code>)</td>
+<td>120 (<code>tcp.first</code>)</td>
+<td>—</td>
+</tr>
+<tr class="even">
+<td>TCP established, idle</td>
+<td>432000 (5 days)</td>
+<td>86400 (1 day)</td>
+<td>7440 (2 h 4 min, RFC 5382 REQ-5)</td>
+</tr>
+<tr class="odd">
+<td>TCP closing</td>
+<td>120 (<code>fin_wait</code>), 30 (<code>last_ack</code>)</td>
+<td>45 (<code>tcp.finwait</code>), 900 (<code>tcp.closing</code>)</td>
+<td>240 (4 min for transitory, RFC 5382)</td>
+</tr>
+<tr class="even">
+<td>TCP TIME_WAIT / closed</td>
+<td>120 / 10</td>
+<td>90 (<code>tcp.closed</code>)</td>
+<td>—</td>
+</tr>
+<tr class="odd">
+<td>UDP, one exchange</td>
+<td>30</td>
+<td>60 (<code>udp.first</code>), 30 (<code>udp.single</code>)</td>
+<td>120 (RFC 4787 REQ-5; 300 recommended)</td>
+</tr>
+<tr class="even">
+<td>UDP, bidirectional "stream"</td>
+<td>120 (180 on older kernels)</td>
+<td>60 (<code>udp.multiple</code>)</td>
+<td>120</td>
+</tr>
+<tr class="odd">
+<td>ICMP</td>
+<td>30</td>
+<td>20 (<code>icmp.first</code>)</td>
+<td>—</td>
+</tr>
+<tr class="even">
+<td>Anything else</td>
+<td>600 (<code>generic</code>)</td>
+<td>60 (<code>other.first</code>)</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>The Linux column is what <code>sysctl</code> printed on the 6.18 lab kernel. The pf column is the OpenBSD-lineage default; check yours with <code>pfctl -s timeouts</code>. Consumer routers and cloud gateways set their own values, which are often much shorter. The RFC column is a requirement on NATs, and it is widely violated for UDP.</p>
+<p>Now compare the endpoints. Linux and macOS both start TCP keepalive probes only after 7200 seconds of idleness (<code>net.ipv4.tcp_keepalive_time</code>, <code>net.inet.tcp.keepidle</code>), and only on sockets that ask for keepalive. Any middlebox with an idle timeout under two hours will silently forget a quiet connection long before the endpoints notice.</p>
+<h3 id="d15-how-many-flows-fit-through-one-public-address">How many flows fit through one public address</h3>
+<p>The unit that must be unique on the outside is the REPLY tuple: destination IP, destination port, public IP, public port, protocol. For one public IP, the ports usually available are 1024–65535, which is 64,512. That gives:</p>
+<ul>
+<li><strong>Per destination</strong> (<code>IP:port:protocol</code>): at most 64,512 concurrent flows per public IP. One busy upstream, such as a single API endpoint or one database, hits this ceiling first.</li>
+<li><strong>Across many destinations</strong>: far more, as the four-port lab showed, <em>unless</em> the NAT insists on endpoint-independent mapping for every flow. Then a public port is pinned to one internal socket for all destinations, and the pool really is 64,512 internal sockets per protocol per IP.</li>
+</ul>
+<p>Closed flows still hold their tuple. With a 120-second TIME_WAIT hold, the sustainable rate of <em>new</em> connections to a single destination from one public IP is 64,512 ÷ 120 ≈ 537 per second. A service that opens a fresh HTTPS connection per request, without keepalive or pooling, can hit that wall at modest traffic.</p>
+<p>Cloud NAT gateways publish their own versions of these limits. Treat these as published figures to re-check, not constants:</p>
+<ul>
+<li><strong>AWS NAT Gateway</strong>: up to 55,000 simultaneous connections to each unique destination per assigned IP, and up to 8 IPs per gateway, so 440,000 to one destination. Idle flows time out after 350 seconds. Exhaustion shows in the <code>ErrorPortAllocation</code> CloudWatch metric.</li>
+<li><strong>Google Cloud NAT</strong>: 64,512 ports per NAT IP per protocol, carved into per-VM blocks (64 ports per VM by default with static allocation, so about 1,008 VMs per IP), or allocated dynamically. Drops are reported as <code>OUT_OF_RESOURCES</code>.</li>
+<li><strong>Azure NAT Gateway</strong>: 64,512 SNAT ports per public IP, up to 16 IPs.</li>
+</ul>
+<h3 id="d15-sizing-the-conntrack-table">Sizing the conntrack table</h3>
+<p>The lab kernel, on a 16 GB VM, defaulted to <code>nf_conntrack_max = 262144</code> and <code>nf_conntrack_buckets = 262144</code>. The defaults are derived from RAM, and the formula has changed across kernel versions, so read yours rather than assume. Each entry costs a few hundred bytes of kernel memory, more with extensions such as NAT and labels. A quarter-million entries is therefore tens of megabytes, which is cheap. The table is rarely too big. It is far more often too small for a busy NAT, or full of five-day ESTABLISHED entries for flows whose endpoints vanished without a FIN.</p>
+<p>Do the occupancy math with Little's law: entries ≈ new flows per second × average entry lifetime. A node accepting 2,000 short HTTP connections per second holds about 2,000 × (connection time + 120 s TIME_WAIT) ≈ 240,000 entries. That is right at the lab default.</p>
+<h3 id="d15-ice-priorities-you-will-see-in-real-sdp">ICE priorities you will see in real SDP</h3>
+<p>Plug the RFC 8445 recommendations (local preference 65535, component 1) into the formula and you get numbers that appear verbatim in WebRTC session descriptions:</p>
+<pre class="text"><code>host   126·2^24 + 65535·2^8 + 255 = 2130706431
+prflx  110·2^24 + 65535·2^8 + 255 = 1862270975
+srflx  100·2^24 + 65535·2^8 + 255 = 1694498815
+relay    0·2^24 + 65535·2^8 + 255 =   16777215
+
+a=candidate:1 1 udp 2130706431 192.168.1.10 40000 typ host
+a=candidate:2 1 udp 1694498815 203.0.113.7 40000 typ srflx raddr 192.168.1.10 rport 40000</code></pre>
+<p>Browsers vary the local preference, so the exact values differ. The ordering does not: host beats reflexive, and relay comes last.</p>
+<h2 id="d15-failure-modes">Deep dive: production failure modes</h2>
+<h3 id="d15-the-conntrack-table-fills">The conntrack table fills</h3>
+<p><strong>Symptom.</strong> New connections through a Linux NAT box, Kubernetes node or firewall fail at random. Existing ones carry on. The kernel log says <code>nf_conntrack: table full, dropping packet</code>.</p>
+<p><strong>Mechanism.</strong> Entries are created faster than they expire. The usual culprits are a flood (SYN floods create NEW entries), a burst of short connections each holding 120 seconds of TIME_WAIT, or UDP scanning. When the table is full, the kernel tries <code>early_drop</code>: it evicts a non-ASSURED entry found in nearby hash buckets. If it cannot, the new packet is dropped.</p>
+<p><strong>Prove it.</strong> Compare <code>conntrack -C</code> with <code>sysctl net.netfilter.nf_conntrack_max</code>. Then run <code>conntrack -S</code> and watch <code>drop</code> and <code>early_drop</code> climb. <code>conntrack -L | awk '{print $4}' | sort | uniq -c</code> shows which states dominate.</p>
+<p><strong>Fix.</strong> Raise <code>nf_conntrack_max</code> and the hash size with it (<code>nf_conntrack_buckets</code>, or the module's <code>hashsize</code> parameter on older kernels) so chains stay short. Cut <code>nf_conntrack_tcp_timeout_established</code> from five days to something like an hour if long idle flows are not expected. Exempt traffic that needs no state with <code>notrack</code>.</p>
+<h3 id="d15-the-cloud-nat-gateway-runs-out-of-ports">The cloud NAT gateway runs out of ports</h3>
+<p><strong>Symptom.</strong> Outbound calls from private subnets to one popular dependency time out, while calls elsewhere work. It happens at peak, and often only from the busiest service.</p>
+<p><strong>Mechanism.</strong> The per-destination limit from the numbers section. A fleet of pods calls one third-party API on a single IP and port, all through one NAT IP. Every request opens a new connection, and closed ones still hold their port for the timeout.</p>
+<p><strong>Prove it.</strong> The provider's port-allocation metric or log (<code>ErrorPortAllocation</code> on AWS, <code>OUT_OF_RESOURCES</code> on Google Cloud). On a Linux NAT, compare <code>conntrack -L -d &lt;dest-ip&gt; | wc -l</code> with the pool size.</p>
+<p><strong>Fix.</strong> In order of leverage: reuse connections (HTTP keepalive, connection pools), add NAT IPs, and keep cloud-service traffic off the NAT (VPC endpoints or Private Service Connect for object storage and APIs).</p>
+<h3 id="d15-the-five-second-dns-delay-in-kubernetes">The five-second DNS delay in Kubernetes</h3>
+<p><strong>Symptom.</strong> A small fraction of DNS lookups from pods take exactly five seconds, or a little over.</p>
+<p><strong>Mechanism.</strong> glibc sends the A and AAAA queries in parallel from the same UDP socket, so both packets share one 5-tuple. The ClusterIP DNAT means both need a conntrack entry. If the two packets are processed on different CPUs at the same moment, both create an unconfirmed entry, and one loses the race at confirm time. That packet is dropped. The resolver waits for its five-second timeout and retries.</p>
+<p><strong>Prove it.</strong> <code>conntrack -S</code> on the node shows <code>insert_failed</code> climbing. Newer kernels resolve many of these races and count them in <code>clash_resolve</code> instead.</p>
+<p><strong>Fix.</strong> Kernel clash-resolution work reduced it. The robust fixes are <code>options single-request-reopen</code> (or <code>use-vc</code>) in the pod's <code>resolv.conf</code>, or NodeLocal DNSCache, which answers on the node and removes the DNAT step.</p>
+<h3 id="d15-idle-connections-die-behind-a-middlebox">Idle connections die behind a middlebox</h3>
+<p><strong>Symptom.</strong> A database or gRPC connection that sat idle for several minutes fails on next use with a reset, or hangs and then times out. Busy connections never fail.</p>
+<p><strong>Mechanism.</strong> A NAT or firewall timed out the entry: 350 seconds on an AWS NAT Gateway, often less on consumer kit and corporate firewalls. The next packet from the client matches nothing. A NAT drops it, or, as the AWS gateway does, answers with a reset. Neither endpoint ever saw a FIN.</p>
+<p><strong>Prove it.</strong> The failure correlates with idle time, not with load. Capture on the client: the first packet after the gap gets no reply, or an immediate RST.</p>
+<p><strong>Fix.</strong> Turn on TCP keepalive with an idle time below the shortest middlebox timeout (for example <code>TCP_KEEPIDLE</code> of 60 seconds), or set the pool's maximum idle time below it. Do not rely on the two-hour OS default.</p>
+<h3 id="d15-asymmetric-paths-through-stateful-firewalls">Asymmetric paths through stateful firewalls</h3>
+<p><strong>Symptom.</strong> After a routing change, a failover or ECMP, some connections hang during the handshake and others work.</p>
+<p><strong>Mechanism.</strong> The SYN went through one stateful device and the SYN-ACK came back through another. The second device has no entry, sees an unsolicited SYN-ACK, classifies it INVALID and drops it.</p>
+<p><strong>Prove it.</strong> Capture on both devices. Look for <code>ct state invalid</code> counters rising on one of them.</p>
+<p><strong>Fix.</strong> Make return traffic symmetric (source NAT at the firewall, or consistent hashing), synchronise state between the pair (<code>conntrackd</code> on Linux, pfsync on the BSDs), or keep that path stateless.</p>
+<h3 id="d15-the-hole-punch-that-should-work-but-doesnt">The hole punch that should work but doesn't</h3>
+<p><strong>Symptom.</strong> Two peers behind ordinary home routers fall back to TURN, even though STUN reports endpoint-independent mappings on both.</p>
+<p><strong>Mechanism.</strong> Either one NAT has address-and-port-dependent mapping (lab run 2), or a router with an accepting input chain confirmed an early inbound probe and forced a port change (lab run 3). Two peers behind the same carrier-grade NAT add a third cause. Their server-reflexive candidates share one public IP, so the path needs the CGN to <em>hairpin</em>: accept a packet from inside addressed to its own outside, and send it back in. RFC 4787 REQ-9 requires hairpinning. Not every CGN does it.</p>
+<p><strong>Prove it.</strong> Query two different STUN servers from the same local port. Different reported ports mean the mapping is destination-dependent. On a Linux router, <code>conntrack -L -p udp</code> shows the remapped port.</p>
+<p><strong>Fix.</strong> Keep a TURN relay available; ICE will use it. On routers you control, drop unsolicited input rather than accepting it, and do not turn on <code>random</code> port mapping without a reason.</p>
+<h3 id="d15-my-accept-rule-is-not-working">My accept rule is not working</h3>
+<p><strong>Symptom.</strong> You add an <code>accept</code> in your nftables table. The packets are still dropped.</p>
+<p><strong>Mechanism.</strong> Another base chain on the same hook, often in a table you did not write, drops them afterwards. Accept ends only the current base chain.</p>
+<p><strong>Prove it.</strong> <code>nft list ruleset</code> shows every chain with its hook and priority. Add counters, or trace: <code>nft insert rule inet early in meta nftrace set 1</code> (insert puts it first), then <code>nft monitor trace</code>.</p>
+<p><strong>Fix.</strong> Put your policy where the final say lives, or use the other tool's supported hook (Docker's <code>DOCKER-USER</code> chain, for example). Do not race it with priorities.</p>
+<h2 id="d15-context-2026">Deep dive: 2026 context</h2>
+<p><strong>Kubernetes moved off iptables.</strong> kube-proxy's nftables mode went GA in Kubernetes 1.33. It uses verdict maps instead of long linear chains, so service lookup cost stops growing with the number of Services. eBPF data planes such as Cilium replace kube-proxy and keep their own connection-tracking maps in BPF (<code>cilium bpf ct list global</code>), with their own sizes and timeouts. The concepts carry over exactly: a flow table, NAT decided once per flow, timers, exhaustion. Only the commands change.</p>
+<p><strong>IPv6 removes NAT but not state.</strong> An IPv6-only or dual-stack VPC gives every workload a global address. The stateful filter remains. AWS's egress-only internet gateway, for instance, is stateful outbound-only filtering with no translation. IPv6-only clusters reach the IPv4 internet through NAT64 (RFC 6146) with DNS64 (RFC 6147), and mobile networks run 464XLAT (RFC 6877). The port-exhaustion math moves to the NAT64 gateway. It does not disappear.</p>
+<p><strong>QUIC was designed around NAT.</strong> QUIC identifies connections by connection IDs rather than the 4-tuple. When a NAT rebinds a client to a new public port after an idle timeout, the server can recognise the connection and validate the new path. The 30-second UDP timers in the table above are why QUIC stacks send PINGs on idle connections they want to keep. They are also why some networks still treat UDP 443 as second-class, pushing browsers back to TCP.</p>
+<p><strong>Zero-trust connectors are hole punching in production.</strong> Mesh VPNs such as Tailscale, and connector-based access products, run agents behind arbitrary NATs that dial <em>outbound</em> to a coordination service. They then try STUN-style direct paths and fall back to relays over HTTPS when the NAT is symmetric or UDP is blocked. Inbound ports stay closed. The NAT-type taxonomy above decides whether you get a direct path or a relay.</p>
+<p><strong>Cloud NAT is a metered product.</strong> Per-GB processing charges and per-destination port limits make "how many connections, to where" a cost and capacity question, not only a design one. Private endpoints for cloud APIs are the standard way to keep bulk traffic off the NAT.</p>
+<h2 id="d15-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: You change a SNAT rule on a Linux gateway to use a new public IP. Some traffic moves to the new IP, and some stays on the old one for days. Why?</strong></p>
+<p>NAT is decided on the first packet of a flow and stored in the conntrack entry's REPLY tuple. Existing flows keep their translation until their entries die, and established TCP entries default to a five-day timeout. Flush the affected entries with <code>conntrack -D</code> (which breaks those flows), or wait them out.</p>
+<p><strong>Q2: What is the difference between a NAT's mapping behaviour and its filtering behaviour, and which one breaks hole punching?</strong></p>
+<p>Mapping decides whether one internal socket gets the same public <code>IP:port</code> for all destinations (endpoint-independent) or a new one per destination. Filtering decides which outside hosts may send in through an existing mapping. Hole punching tolerates strict filtering, because each side's outbound packet opens the filter for the other's exact address. It does not tolerate destination-dependent mapping, because the address learned from STUN is not the one the peer must send to. That is the "symmetric NAT" case, and it needs a relay.</p>
+<p><strong>Q3: A NAT gateway has one public IP. How many concurrent TCP connections can it carry?</strong></p>
+<p>It depends on the destinations. The unique key on the outside is the full 5-tuple, so it is about 64,512 per destination <code>IP:port</code>, per public IP. Across many destinations it can be millions, unless the NAT enforces endpoint-independent mapping for every flow; then it is about 64,512 internal sockets per protocol. Closed connections also hold their port through a TIME_WAIT-like hold, which caps the new-connection rate to one destination at roughly 64,512 ÷ 120 ≈ 537 per second per IP. Then quote the provider's published limit.</p>
+<p><strong>Q4: Why does a stateful firewall break under asymmetric routing, while a stateless ACL does not?</strong></p>
+<p>The stateful device validates each packet against an entry built from the flow's earlier packets, including TCP window tracking. A device that sees only the return half has no entry and classifies the packets INVALID. A stateless ACL judges each packet against static rules, so it does not care which path the other direction took. That is also why stateless ACLs need explicit return rules sized to the clients' ephemeral ranges (Linux 32768–60999; macOS and Windows 49152–65535).</p>
+<p><strong>Q5: In nftables, two tables hook input. One accepts SSH, the other drops everything. What happens to SSH, and how would pf differ?</strong></p>
+<p>SSH is accepted by the first base chain and then dropped by the second, because accept ends only the current base chain while drop is final. Priority order decides which runs first, but here it does not matter: any later drop wins. In pf, an existing state short-circuits all rules. For a new packet, the <em>last</em> matching rule wins unless an earlier <code>quick</code> rule matched. Rule order means opposite things in the two languages.</p>
+<p><strong>Q6: <code>nf_conntrack: table full</code> appears on a busy node. You double <code>nf_conntrack_max</code> and it comes back next week. What did you miss?</strong></p>
+<p>Why the table is full. Look at the state distribution. Thousands of ESTABLISHED entries for dead peers point at the five-day timeout. Masses of TIME_WAIT point at connection churn that pooling would fix. UNREPLIED entries point at scans or floods. Check that the hash buckets grew with the maximum, and consider <code>notrack</code> for traffic that needs no state at all, such as a DNS server's port 53.</p>
+<p><strong>Q7: Why does STUN XOR the address it reports?</strong></p>
+<p>Because NAT ALGs used to find anything in a payload that looked like the client's address and rewrite it, corrupting the very answer STUN was trying to deliver. XOR with the magic cookie (and the transaction ID for IPv6) makes the address unrecognisable to those middleboxes. It is not security, just protection against helpful meddling.</p>
+<p><strong>Q8: A UDP protocol survives 30 seconds of silence and fails after 60. Where do you look?</strong></p>
+<p>At the UDP mapping timeouts of every NAT and stateful firewall on the path. Linux uses 30 seconds for a flow with a single exchange, and many consumer routers are similar, far below RFC 4787's two-minute floor. Fix it in the protocol with keepalives every 15 to 25 seconds, as QUIC, WireGuard's <code>PersistentKeepalive</code> and WebRTC's consent checks do. Do not hope for longer timers on networks you do not control.</p>

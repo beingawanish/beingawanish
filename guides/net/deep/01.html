@@ -1,0 +1,525 @@
+<h2 id="d01-deep-dive">Deep dive: a host is a stack of queues and tables</h2>
+<p>The five-layer diagram is a map of <em>responsibilities</em>. It tells you who answers which question. It does not tell you what the machine is made of, and that is what you need at 2 AM.</p>
+<p>On a real host every layer is built from two kinds of state. <strong>Tables</strong> answer a question for each packet: which next hop, which MAC address, which socket, is this flow already known. <strong>Queues</strong> sit wherever one side can produce faster than the other side can consume: your process versus TCP, TCP versus the NIC, the NIC versus the CPU, the kernel versus your process again. A packet's life is a walk through about a dozen of these structures. Each one has a size, a default, a counter that ticks when it overflows, and a command that shows it.</p>
+<p>That is the senior engineer's version of "think in layers." When checkout fails for some customers, they don't ask "is the network down?" They ask "which queue is full, or which table is wrong?" Then they read the counter that answers it. The rest of this deep dive builds that picture. It uses Linux, because that is what your servers, containers and cloud VMs run, and it gives the macOS equivalent where one exists.</p>
+<h2 id="d01-real-mental-model">Deep dive: the real mental model — tables answer, queues wait</h2>
+<p>Start with the distinction, because it predicts how each part fails.</p>
+<p>A <strong>table</strong> is looked up once per packet (or once per flow). It fails in three ways. It can be <em>wrong</em>: a stale route, or an old MAC address after a failover. It can be <em>missing an entry</em>, so the packet waits while the kernel goes to find one, as with ARP. Or it can be <em>full</em>: when the conntrack or neighbour table hits its limit, new flows get dropped while old ones work fine.</p>
+<p>A <strong>queue</strong> absorbs a rate mismatch. It fails in two ways, and the second is the sneaky one. It can <em>overflow</em>, and then something is dropped and a counter goes up. Or it can <em>stay full</em>. A full queue drops nothing, but every packet now waits behind it. That is latency with no loss, and no error log will ever mention it.</p>
+<p>Here is the whole machine on one page.</p>
+<div style="overflow-x:auto">
+<svg width="100%" viewBox="0 0 760 704" role="img" aria-labelledby="d01-host-title d01-host-desc" style="min-width:760px; background:#f5f5f5; border:1px solid #d8d4cc; border-radius:6px;">
+<title id="d01-host-title">One host, two paths: the queues and tables a packet passes</title>
+<desc id="d01-host-desc">The transmit path runs down the left: socket send buffer, route lookup, conntrack, neighbour lookup, qdisc, driver TX ring, NIC. The receive path runs up the right: NIC RX ring, NAPI and GRO with the per-CPU backlog, conntrack, local route check, socket lookup, SYN and accept queues, socket receive buffer. Four shared tables sit in the middle: routing table, socket hash tables, conntrack table and neighbour table. Queues are drawn in orange, tables in dark outline.</desc>
+<text x="380" y="32" text-anchor="middle" font-family="Georgia, serif" font-size="21" fill="#2d3142">One host, two paths: the queues and tables a packet passes</text>
+<text x="144" y="64" text-anchor="middle" font-family="monospace" font-size="12" fill="#6b6f7e">TRANSMIT (TOP → DOWN)</text>
+<text x="380" y="64" text-anchor="middle" font-family="monospace" font-size="12" fill="#6b6f7e">SHARED TABLES</text>
+<text x="616" y="64" text-anchor="middle" font-family="monospace" font-size="12" fill="#6b6f7e">RECEIVE (BOTTOM → UP)</text>
+<line x1="264" y1="223" x2="300" y2="140" stroke="#2d3142" stroke-width="1" stroke-dasharray="3 3"/>
+<line x1="264" y1="281" x2="300" y2="308" stroke="#2d3142" stroke-width="1" stroke-dasharray="3 3"/>
+<line x1="264" y1="339" x2="300" y2="392" stroke="#2d3142" stroke-width="1" stroke-dasharray="3 3"/>
+<line x1="496" y1="339" x2="460" y2="140" stroke="#2d3142" stroke-width="1" stroke-dasharray="3 3"/>
+<line x1="496" y1="281" x2="460" y2="224" stroke="#2d3142" stroke-width="1" stroke-dasharray="3 3"/>
+<line x1="496" y1="397" x2="460" y2="308" stroke="#2d3142" stroke-width="1" stroke-dasharray="3 3"/>
+<rect x="24" y="84" width="240" height="46" rx="6" fill="#f5f5f5" stroke="#6b6f7e" stroke-width="1.2" stroke-dasharray="4 3"/>
+<text x="36" y="103" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">write() / send()</text>
+<text x="36" y="121" font-family="monospace" font-size="11" fill="#6b6f7e">your process, user space</text>
+<rect x="24" y="142" width="240" height="46" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2"/>
+<line x1="250" y1="152" x2="250" y2="178" stroke="#bf4520" stroke-width="2"/>
+<line x1="244" y1="152" x2="244" y2="178" stroke="#bf4520" stroke-width="2"/>
+<line x1="238" y1="152" x2="238" y2="178" stroke="#bf4520" stroke-width="2"/>
+<line x1="232" y1="152" x2="232" y2="178" stroke="#bf4520" stroke-width="2"/>
+<text x="36" y="161" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Socket send buffer</text>
+<text x="36" y="179" font-family="monospace" font-size="11" fill="#6b6f7e">tcp_wmem · ss Send-Q</text>
+<rect x="24" y="200" width="240" height="46" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="36" y="219" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Route lookup</text>
+<text x="36" y="237" font-family="monospace" font-size="11" fill="#6b6f7e">which next hop, which device?</text>
+<rect x="24" y="258" width="240" height="46" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="36" y="277" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Conntrack (OUTPUT)</text>
+<text x="36" y="295" font-family="monospace" font-size="11" fill="#6b6f7e">new flow or known flow?</text>
+<rect x="24" y="316" width="240" height="46" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="36" y="335" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Neighbour lookup</text>
+<text x="36" y="353" font-family="monospace" font-size="11" fill="#6b6f7e">next-hop IP → MAC (ARP/ND)</text>
+<rect x="24" y="374" width="240" height="46" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2"/>
+<line x1="250" y1="384" x2="250" y2="410" stroke="#bf4520" stroke-width="2"/>
+<line x1="244" y1="384" x2="244" y2="410" stroke="#bf4520" stroke-width="2"/>
+<line x1="238" y1="384" x2="238" y2="410" stroke="#bf4520" stroke-width="2"/>
+<line x1="232" y1="384" x2="232" y2="410" stroke="#bf4520" stroke-width="2"/>
+<text x="36" y="393" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Qdisc</text>
+<text x="36" y="411" font-family="monospace" font-size="11" fill="#6b6f7e">fq_codel · txqueuelen 1000</text>
+<rect x="24" y="432" width="240" height="46" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2"/>
+<line x1="250" y1="442" x2="250" y2="468" stroke="#bf4520" stroke-width="2"/>
+<line x1="244" y1="442" x2="244" y2="468" stroke="#bf4520" stroke-width="2"/>
+<line x1="238" y1="442" x2="238" y2="468" stroke="#bf4520" stroke-width="2"/>
+<line x1="232" y1="442" x2="232" y2="468" stroke="#bf4520" stroke-width="2"/>
+<text x="36" y="451" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Driver TX ring</text>
+<text x="36" y="469" font-family="monospace" font-size="11" fill="#6b6f7e">256–4096 descriptors · BQL</text>
+<rect x="24" y="490" width="240" height="46" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="36" y="509" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">NIC transmit</text>
+<text x="36" y="527" font-family="monospace" font-size="11" fill="#6b6f7e">DMA · checksum · TSO</text>
+<rect x="496" y="84" width="240" height="46" rx="6" fill="#f5f5f5" stroke="#6b6f7e" stroke-width="1.2" stroke-dasharray="4 3"/>
+<text x="508" y="103" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">read() / recv()</text>
+<text x="508" y="121" font-family="monospace" font-size="11" fill="#6b6f7e">your process, user space</text>
+<rect x="496" y="142" width="240" height="46" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2"/>
+<line x1="722" y1="152" x2="722" y2="178" stroke="#bf4520" stroke-width="2"/>
+<line x1="716" y1="152" x2="716" y2="178" stroke="#bf4520" stroke-width="2"/>
+<line x1="710" y1="152" x2="710" y2="178" stroke="#bf4520" stroke-width="2"/>
+<line x1="704" y1="152" x2="704" y2="178" stroke="#bf4520" stroke-width="2"/>
+<text x="508" y="161" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Socket receive buffer</text>
+<text x="508" y="179" font-family="monospace" font-size="11" fill="#6b6f7e">tcp_rmem · ss Recv-Q</text>
+<rect x="496" y="200" width="240" height="46" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2"/>
+<line x1="722" y1="210" x2="722" y2="236" stroke="#bf4520" stroke-width="2"/>
+<line x1="716" y1="210" x2="716" y2="236" stroke="#bf4520" stroke-width="2"/>
+<line x1="710" y1="210" x2="710" y2="236" stroke="#bf4520" stroke-width="2"/>
+<line x1="704" y1="210" x2="704" y2="236" stroke="#bf4520" stroke-width="2"/>
+<text x="508" y="219" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">SYN and accept queues</text>
+<text x="508" y="237" font-family="monospace" font-size="11" fill="#6b6f7e">listen backlog · somaxconn</text>
+<rect x="496" y="258" width="240" height="46" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="508" y="277" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Socket lookup</text>
+<text x="508" y="295" font-family="monospace" font-size="11" fill="#6b6f7e">4-tuple hash, then listener</text>
+<rect x="496" y="316" width="240" height="46" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="508" y="335" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Route: is it for me?</text>
+<text x="508" y="353" font-family="monospace" font-size="11" fill="#6b6f7e">local table → deliver up</text>
+<rect x="496" y="374" width="240" height="46" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="508" y="393" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Conntrack (PREROUTING)</text>
+<text x="508" y="411" font-family="monospace" font-size="11" fill="#6b6f7e">match or create an entry</text>
+<rect x="496" y="432" width="240" height="46" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2"/>
+<line x1="722" y1="442" x2="722" y2="468" stroke="#bf4520" stroke-width="2"/>
+<line x1="716" y1="442" x2="716" y2="468" stroke="#bf4520" stroke-width="2"/>
+<line x1="710" y1="442" x2="710" y2="468" stroke="#bf4520" stroke-width="2"/>
+<line x1="704" y1="442" x2="704" y2="468" stroke="#bf4520" stroke-width="2"/>
+<text x="508" y="451" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">NAPI poll · GRO · backlog</text>
+<text x="508" y="469" font-family="monospace" font-size="11" fill="#6b6f7e">budget 300 · backlog 1000</text>
+<rect x="496" y="490" width="240" height="46" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2"/>
+<line x1="722" y1="500" x2="722" y2="526" stroke="#bf4520" stroke-width="2"/>
+<line x1="716" y1="500" x2="716" y2="526" stroke="#bf4520" stroke-width="2"/>
+<line x1="710" y1="500" x2="710" y2="526" stroke="#bf4520" stroke-width="2"/>
+<line x1="704" y1="500" x2="704" y2="526" stroke="#bf4520" stroke-width="2"/>
+<text x="508" y="509" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">NIC RX ring</text>
+<text x="508" y="527" font-family="monospace" font-size="11" fill="#6b6f7e">DMA into ring · rx_missed</text>
+<line x1="144" y1="130" x2="144" y2="136" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="144,142 139,134 149,134" fill="#6b6f7e"/>
+<line x1="616" y1="142" x2="616" y2="136" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="616,130 611,138 621,138" fill="#6b6f7e"/>
+<line x1="144" y1="188" x2="144" y2="194" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="144,200 139,192 149,192" fill="#6b6f7e"/>
+<line x1="616" y1="200" x2="616" y2="194" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="616,188 611,196 621,196" fill="#6b6f7e"/>
+<line x1="144" y1="246" x2="144" y2="252" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="144,258 139,250 149,250" fill="#6b6f7e"/>
+<line x1="616" y1="258" x2="616" y2="252" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="616,246 611,254 621,254" fill="#6b6f7e"/>
+<line x1="144" y1="304" x2="144" y2="310" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="144,316 139,308 149,308" fill="#6b6f7e"/>
+<line x1="616" y1="316" x2="616" y2="310" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="616,304 611,312 621,312" fill="#6b6f7e"/>
+<line x1="144" y1="362" x2="144" y2="368" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="144,374 139,366 149,366" fill="#6b6f7e"/>
+<line x1="616" y1="374" x2="616" y2="368" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="616,362 611,370 621,370" fill="#6b6f7e"/>
+<line x1="144" y1="420" x2="144" y2="426" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="144,432 139,424 149,424" fill="#6b6f7e"/>
+<line x1="616" y1="432" x2="616" y2="426" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="616,420 611,428 621,428" fill="#6b6f7e"/>
+<line x1="144" y1="478" x2="144" y2="484" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="144,490 139,482 149,482" fill="#6b6f7e"/>
+<line x1="616" y1="490" x2="616" y2="484" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="616,478 611,486 621,486" fill="#6b6f7e"/>
+<rect x="300" y="112" width="160" height="56" rx="4" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<line x1="300" y1="136" x2="460" y2="136" stroke="#d8d4cc"/>
+<line x1="300" y1="152" x2="460" y2="152" stroke="#d8d4cc"/>
+<text x="380" y="129" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">Routing table (FIB)</text>
+<text x="380" y="148" text-anchor="middle" font-family="monospace" font-size="11" fill="#6b6f7e">ip route</text>
+<rect x="300" y="196" width="160" height="56" rx="4" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<line x1="300" y1="220" x2="460" y2="220" stroke="#d8d4cc"/>
+<line x1="300" y1="236" x2="460" y2="236" stroke="#d8d4cc"/>
+<text x="380" y="213" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">Socket hash tables</text>
+<text x="380" y="232" text-anchor="middle" font-family="monospace" font-size="11" fill="#6b6f7e">ss -tan</text>
+<rect x="300" y="280" width="160" height="56" rx="4" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<line x1="300" y1="304" x2="460" y2="304" stroke="#d8d4cc"/>
+<line x1="300" y1="320" x2="460" y2="320" stroke="#d8d4cc"/>
+<text x="380" y="297" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">Conntrack table</text>
+<text x="380" y="316" text-anchor="middle" font-family="monospace" font-size="11" fill="#6b6f7e">conntrack -L</text>
+<rect x="300" y="364" width="160" height="56" rx="4" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<line x1="300" y1="388" x2="460" y2="388" stroke="#d8d4cc"/>
+<line x1="300" y1="404" x2="460" y2="404" stroke="#d8d4cc"/>
+<text x="380" y="381" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">Neighbour table</text>
+<text x="380" y="400" text-anchor="middle" font-family="monospace" font-size="11" fill="#6b6f7e">ip neigh</text>
+<line x1="60" y1="572" x2="700" y2="572" stroke="#2d3142" stroke-width="3"/>
+<line x1="144" y1="536" x2="144" y2="564" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="144,570 139,562 149,562" fill="#6b6f7e"/>
+<line x1="616" y1="572" x2="616" y2="544" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="616,538 611,546 621,546" fill="#6b6f7e"/>
+<text x="380" y="592" text-anchor="middle" font-family="monospace" font-size="12" fill="#6b6f7e">THE WIRE</text>
+<rect x="60" y="612" width="26" height="18" rx="3" fill="#fff7f0" stroke="#bf4520" stroke-width="2"/>
+<text x="96" y="626" font-family="sans-serif" font-size="13" fill="#2d3142">Queue: absorbs a rate mismatch. Fails by overflowing (drops) or staying full (delay).</text>
+<rect x="60" y="640" width="26" height="18" rx="3" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="96" y="654" font-family="sans-serif" font-size="13" fill="#2d3142">Table: answers a question per packet. Fails by being wrong, stale, or full.</text>
+<text x="380" y="686" text-anchor="middle" font-family="Georgia, serif" font-style="italic" font-size="14" fill="#bf4520">Most “the network is slow” tickets end in one of these boxes. Each has a size and a counter.</text>
+</svg>
+</div>
+<h3 id="d01-the-transmit-path-step-by-step">The transmit path, step by step</h3>
+<p>Follow one <code>send()</code> of 10 KB on an established TCP connection.</p>
+<ol type="1">
+<li><strong>Socket send buffer.</strong> <code>send()</code> copies your bytes into the socket's send buffer and returns. It does <em>not</em> mean anything was transmitted. TCP keeps these bytes until they are acknowledged, because it may need to retransmit them. So the send buffer is both the outgoing queue and the retransmit queue. If it is full, a blocking <code>send()</code> sleeps and a non-blocking one returns <code>EAGAIN</code>.</li>
+<li><strong>TCP decides how much may leave now.</strong> The congestion window (<code>cwnd</code>) and the peer's advertised receive window cap the bytes in flight. Anything beyond that cap waits in the send buffer. On Linux, TCP Small Queues also limits how many bytes one socket may have parked in the layers below, so a single bulk flow cannot fill the device queue.</li>
+<li><strong>Route lookup.</strong> IP looks up the destination in the FIB (Linux stores it as a compressed trie). The answer is a next hop, an output device and a source address. <code>ip route get</code> runs exactly this lookup for you. The result also carries per-destination exceptions, such as a learned path MTU (Module 2's deep dive uses that).</li>
+<li><strong>Conntrack.</strong> If netfilter connection tracking is loaded (it is on any host running Docker, kube-proxy in iptables mode, or a stateful firewall), the packet is matched against the conntrack table. A new flow gets an entry. NAT decisions are stored here too.</li>
+<li><strong>Neighbour lookup.</strong> The next hop's IP must become a MAC address. The neighbour table (ARP for IPv4, ND for IPv6) holds that mapping with a state. If the entry is missing, the kernel sends an ARP request and <em>parks the packet</em> in a small per-entry queue until the reply arrives. If the reply never comes, the parked packets are dropped and you get <code>EHOSTUNREACH</code>.</li>
+<li><strong>Qdisc.</strong> The packet joins the device's queueing discipline. This is the queue you can configure: <code>fq_codel</code> (the default on most current distros, set by systemd), <code>fq</code> (common on servers using pacing), or the old kernel default <code>pfifo_fast</code>. Its length limit is <code>txqueuelen</code>, 1000 packets by default.</li>
+<li><strong>Driver TX ring.</strong> The driver moves packets from the qdisc into a ring of descriptors that the NIC reads by DMA. Typical rings hold 256 to 4096 descriptors. Byte Queue Limits (BQL) cap how many <em>bytes</em> sit in the ring, so the backlog stays in the qdisc, where a smart scheduler can manage it.</li>
+<li><strong>NIC.</strong> The NIC fetches the bytes, can fill in checksums, can cut one large TCP send into MSS-sized segments (TSO, Module 2's deep dive), and puts bits on the wire.</li>
+</ol>
+<h3 id="d01-the-receive-path-step-by-step">The receive path, step by step</h3>
+<ol type="1">
+<li><strong>RX ring.</strong> The NIC writes arriving frames by DMA into pre-allocated buffers on a receive ring. If the CPU does not refill the ring fast enough, the NIC has nowhere to put the next frame and drops it. That shows up as <code>rx_missed</code> or a similar driver-specific counter.</li>
+<li><strong>NAPI poll, GRO, backlog.</strong> An interrupt wakes a softirq. The softirq then <em>polls</em> the ring, up to <code>netdev_budget</code> packets (300) or <code>netdev_budget_usecs</code> (2 ms) per round, instead of taking one interrupt per packet. GRO merges consecutive segments of the same flow into one large buffer. If Receive Packet Steering hands packets to another CPU, they wait in that CPU's backlog queue (<code>netdev_max_backlog</code>, 1000).</li>
+<li><strong>Conntrack (PREROUTING).</strong> Same table as before. Replies match the entry created on the way out. That match is what makes a stateful firewall "stateful."</li>
+<li><strong>Route: is it for me?</strong> The routing lookup runs again, this time against the <code>local</code> table. If the destination is one of the host's addresses, the packet goes up. If not, it is forwarded (if forwarding is on) or dropped.</li>
+<li><strong>Socket lookup.</strong> TCP hashes the 4-tuple into the established-connections table. If nothing matches and the segment is a SYN, it tries the listening sockets.</li>
+<li><strong>SYN queue and accept queue.</strong> A SYN creates a small request entry (the SYN queue). When the handshake's final ACK arrives, the connection moves to the listener's <strong>accept queue</strong>. It waits there until your process calls <code>accept()</code>. Its size is the smaller of the <code>listen()</code> backlog and <code>net.core.somaxconn</code>.</li>
+<li><strong>Socket receive buffer.</strong> Data for an established connection lands here, in order, and the kernel ACKs it. The advertised window tells the sender how much room is left. If your process stops reading, the buffer fills, the window drops toward zero, and the sender stalls.</li>
+<li><strong><code>read()</code>.</strong> Your process copies the bytes out. Only now has the application "received" anything.</li>
+</ol>
+<p>Notice what this does to the phrase "the server got my request." The server's <em>kernel</em> may have ACKed it, and the bytes may sit in a receive buffer or an accept queue for seconds. Meanwhile the application has seen nothing. Half of all "but the network says it was delivered" arguments end right here.</p>
+<h3 id="d01-the-same-structures-as-a-checklist">The same structures as a checklist</h3>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Structure</th>
+<th>Kind</th>
+<th>Typical Linux default</th>
+<th>See it</th>
+<th>Counter when it fails</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Socket send buffer</td>
+<td>Queue</td>
+<td><code>tcp_wmem</code> 4 KiB / 16 KiB / 4 MiB (min/initial/max, autotuned)</td>
+<td><code>ss -tm</code> (<code>Send-Q</code>, <code>skmem</code>)</td>
+<td>none; <code>send()</code> blocks or returns <code>EAGAIN</code></td>
+</tr>
+<tr class="even">
+<td>Routing table (FIB)</td>
+<td>Table</td>
+<td>—</td>
+<td><code>ip route</code>, <code>ip route get</code></td>
+<td><code>IpOutNoRoutes</code> in <code>nstat</code></td>
+</tr>
+<tr class="odd">
+<td>Conntrack table</td>
+<td>Table</td>
+<td><code>nf_conntrack_max</code>, scaled to RAM</td>
+<td><code>conntrack -C</code>, <code>/proc/sys/net/netfilter/nf_conntrack_count</code></td>
+<td><code>nf_conntrack: table full, dropping packet</code> in <code>dmesg</code></td>
+</tr>
+<tr class="even">
+<td>Neighbour table</td>
+<td>Table</td>
+<td><code>gc_thresh3</code> = 1024 entries</td>
+<td><code>ip neigh</code></td>
+<td><code>neighbor table overflow!</code> in <code>dmesg</code></td>
+</tr>
+<tr class="odd">
+<td>Unresolved-neighbour queue</td>
+<td>Queue</td>
+<td><code>unres_qlen_bytes</code> = 212,992 bytes</td>
+<td>—</td>
+<td><code>unresolved_discards</code> in <code>/proc/net/stat/arp_cache</code></td>
+</tr>
+<tr class="even">
+<td>Qdisc</td>
+<td>Queue</td>
+<td><code>txqueuelen</code> 1000 packets</td>
+<td><code>tc -s qdisc</code></td>
+<td><code>dropped</code>, <code>backlog</code></td>
+</tr>
+<tr class="odd">
+<td>Driver TX / RX rings</td>
+<td>Queue</td>
+<td>256–4096 descriptors</td>
+<td><code>ethtool -g</code></td>
+<td><code>ethtool -S</code> (driver-specific names)</td>
+</tr>
+<tr class="even">
+<td>Per-CPU backlog</td>
+<td>Queue</td>
+<td><code>netdev_max_backlog</code> 1000</td>
+<td><code>/proc/net/softnet_stat</code></td>
+<td>column 2 (dropped), column 3 (time squeeze)</td>
+</tr>
+<tr class="odd">
+<td>SYN queue</td>
+<td>Queue</td>
+<td><code>tcp_max_syn_backlog</code>, 128+ scaled to RAM</td>
+<td><code>ss -tn state syn-recv</code></td>
+<td><code>TcpExtTCPReqQFullDrop</code></td>
+</tr>
+<tr class="even">
+<td>Accept queue</td>
+<td>Queue</td>
+<td>min(backlog, <code>somaxconn</code>); <code>somaxconn</code> = 4096 since kernel 5.4</td>
+<td><code>ss -ltn</code> (<code>Recv-Q</code> vs <code>Send-Q</code>)</td>
+<td><code>TcpExtListenOverflows</code>, <code>TcpExtListenDrops</code></td>
+</tr>
+<tr class="odd">
+<td>Socket receive buffer</td>
+<td>Queue</td>
+<td><code>tcp_rmem</code> 4 KiB / 128 KiB / 6 MiB (distro-dependent)</td>
+<td><code>ss -tm</code> (<code>Recv-Q</code>, <code>rb</code>)</td>
+<td><code>TcpExtTCPRcvQDrop</code>, zero windows on the wire</td>
+</tr>
+</tbody>
+</table>
+<p>All of these defaults are tunable, and distributions, cloud images and Kubernetes node images often change them. Read your own with <code>sysctl</code> before you reason from the table.</p>
+<h2 id="d01-kernel-view">Deep dive: what the kernel actually shows you</h2>
+<p>The outputs below are real. They come from a small lab of Linux network namespaces: a client at 192.168.1.50, a router at 192.168.1.1, and a server at 203.0.113.10, joined by virtual Ethernet (veth) pairs. Kernel 6.18, iproute2 6.1. Your output will differ in details, not in shape.</p>
+<h3 id="d01-the-route-lookup-done-for-you">The route lookup, done for you</h3>
+<pre class="text"><code>$ ip route get 203.0.113.10
+203.0.113.10 via 192.168.1.1 dev d02c0 src 192.168.1.50 uid 0
+    cache</code></pre>
+<p>That one line is step 3 of the transmit path, run on demand. The destination is off-link, so the next hop is the gateway 192.168.1.1, leaving through device <code>d02c0</code> with source address 192.168.1.50. The <code>cache</code> line is where per-destination exceptions appear. After a path-MTU event it reads <code>cache expires 596sec mtu 1400</code>, as Module 2's deep dive shows.</p>
+<h3 id="d01-the-neighbour-table-with-state">The neighbour table, with state</h3>
+<pre class="text"><code>$ ip -s neigh show
+192.168.1.1 dev d02c0 lladdr 02:00:00:00:01:01  ref 1 used 2/1/2 probes 4 REACHABLE</code></pre>
+<p><code>REACHABLE</code> means the kernel has recent proof that the gateway is alive. That proof can be an ARP reply or, more often, TCP progress: forward progress on a connection counts as confirmation. Entries age out of <code>REACHABLE</code> after a randomised 15–45 s (half to one and a half times <code>base_reachable_time_ms</code>, default 30,000). They then go <code>STALE</code>, but stay usable. The next packet sent through a <code>STALE</code> entry moves it to <code>DELAY</code> (5 s), then <code>PROBE</code> (unicast ARP, 3 tries), and finally <code>FAILED</code>. The <code>used 2/1/2</code> field gives seconds since last use, last confirmation and last update.</p>
+<p>This state machine is why a failover that moves an IP to a new MAC address can take seconds to be noticed. A host keeps using the old MAC until the entry goes stale and a probe fails. That is, unless the new owner sends a gratuitous ARP, which overwrites the entry at once.</p>
+<h3 id="d01-a-full-receive-buffer-caught-in-the-act">A full receive buffer, caught in the act</h3>
+<p>This is the most useful <code>ss</code> output you will ever read. The client is downloading a 1 MiB file with <code>curl --limit-rate 100k</code>, so the application reads slowly on purpose.</p>
+<pre class="text"><code>$ ss -tmin                                   # on the client
+State      Recv-Q Send-Q Local Address:Port  Peer Address:Port
+CLOSE-WAIT 820301 0       192.168.1.50:47170 203.0.113.10:443
+     skmem:(r926764,rb3068538,t0,tb69120,f3028,w0,o0,bl0,d2) bbr wscale:10,10
+     rto:204 rtt:0.064/0.06 ato:40 mss:1448 pmtu:1500 rcvmss:1448 advmss:1448
+     cwnd:13 bytes_sent:701 bytes_acked:702 bytes_received:1051479 ...
+
+$ ss -tmin                                   # on the server, same instant
+State      Recv-Q Send-Q Local Address:Port Peer Address:Port
+FIN-WAIT-2 0      0       203.0.113.10:443  192.168.1.50:47170</code></pre>
+<p>Read it slowly. The server has sent everything, received the ACKs, and closed its side. As far as the server is concerned, the response is <em>delivered</em>. It is in <code>FIN-WAIT-2</code> with nothing queued. Yet the client's kernel still holds <strong>820,301 bytes</strong> in the receive queue (<code>Recv-Q</code>) that curl has not read. <code>r926764</code> is the memory those bytes occupy, including per-packet overhead. <code>rb3068538</code> is the buffer limit that receive autotuning grew to, about 3 MB.</p>
+<p>Two lessons sit in this output. First, "delivered" in TCP means "in the peer's kernel," never "processed." Second, <code>CLOSE-WAIT</code> with a large <code>Recv-Q</code> is the fingerprint of an application that is not reading. That is a bug in the app, and no network change will fix it.</p>
+<p>(This lab runs <code>bbr</code> as its congestion control. Most distributions default to <code>cubic</code>.)</p>
+<h3 id="d01-device-queues-and-the-softirq-counters">Device queues and the softirq counters</h3>
+<pre class="text"><code>$ ethtool -g eth0                      # a cloud VM with a virtio NIC
+Ring parameters for eth0:
+Pre-set maximums:
+RX:         256
+TX:         256
+Current hardware settings:
+RX:         256
+TX:         256
+
+$ tc -s qdisc show dev eth0
+qdisc pfifo_fast 0: root refcnt 2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+ Sent 23069657 bytes 31459 pkt (dropped 0, overlimits 0 requeues 4)
+ backlog 0b 0p requeues 4
+
+$ head -3 /proc/net/softnet_stat       # one row per CPU, hex
+000052b1 00000000 00000001 00000000 ...
+000008e5 00000000 00000000 00000000 ...
+00000d97 00000000 00000000 00000000 ...</code></pre>
+<p>The ring here is small (256) and cannot grow; the hypervisor fixes the maximum. The qdisc has dropped nothing and holds no backlog right now, which is what an idle link looks like. In <code>softnet_stat</code>, column 1 is packets processed per CPU (0x52b1 = 21,169 on CPU 0). Column 2 counts drops because that CPU's backlog was full. Column 3 is "time squeeze": the softirq ran out of budget with work still waiting. A rising column 3 is the earliest sign that a host can't keep up with its receive rate.</p>
+<h3 id="d01-the-accept-queue-overflowed-on-purpose">The accept queue, overflowed on purpose</h3>
+<p>This Python 3.13 script (stdlib only) fills two queues from user space. First it calls <code>listen(2)</code> and never calls <code>accept()</code>. Then it writes into a connection whose receiver never reads.</p>
+<p><code>code/d01/host_queues.py</code>:</p>
+<div class="sourceCode" id="d01-cb5"><pre class="sourceCode python"><code class="sourceCode python"><span id="d01-cb5-1"><a href="#d01-cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Two kernel queues you can fill from Python: the accept queue and the socket buffers.</span></span>
+<span id="d01-cb5-2"><a href="#d01-cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d01-cb5-3"><a href="#d01-cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co">    python3.13 host_queues.py</span></span>
+<span id="d01-cb5-4"><a href="#d01-cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co">Runs on localhost only. Numbers depend on OS and kernel settings.</span></span>
+<span id="d01-cb5-5"><a href="#d01-cb5-5" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d01-cb5-6"><a href="#d01-cb5-6" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> socket</span>
+<span id="d01-cb5-7"><a href="#d01-cb5-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="d01-cb5-8"><a href="#d01-cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d01-cb5-9"><a href="#d01-cb5-9" aria-hidden="true" tabindex="-1"></a><span class="co"># --- 1. The accept queue: finished handshakes waiting for accept() ---------</span></span>
+<span id="d01-cb5-10"><a href="#d01-cb5-10" aria-hidden="true" tabindex="-1"></a>srv <span class="op">=</span> socket.socket()</span>
+<span id="d01-cb5-11"><a href="#d01-cb5-11" aria-hidden="true" tabindex="-1"></a>srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, <span class="dv">1</span>)</span>
+<span id="d01-cb5-12"><a href="#d01-cb5-12" aria-hidden="true" tabindex="-1"></a>srv.bind((<span class="st">&quot;127.0.0.1&quot;</span>, <span class="dv">0</span>))</span>
+<span id="d01-cb5-13"><a href="#d01-cb5-13" aria-hidden="true" tabindex="-1"></a>srv.listen(<span class="dv">2</span>)                      <span class="co"># backlog 2, and we never call accept()</span></span>
+<span id="d01-cb5-14"><a href="#d01-cb5-14" aria-hidden="true" tabindex="-1"></a>port <span class="op">=</span> srv.getsockname()[<span class="dv">1</span>]</span>
+<span id="d01-cb5-15"><a href="#d01-cb5-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d01-cb5-16"><a href="#d01-cb5-16" aria-hidden="true" tabindex="-1"></a>clients, done <span class="op">=</span> [], <span class="dv">0</span></span>
+<span id="d01-cb5-17"><a href="#d01-cb5-17" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">6</span>):</span>
+<span id="d01-cb5-18"><a href="#d01-cb5-18" aria-hidden="true" tabindex="-1"></a>    c <span class="op">=</span> socket.socket()</span>
+<span id="d01-cb5-19"><a href="#d01-cb5-19" aria-hidden="true" tabindex="-1"></a>    c.settimeout(<span class="fl">0.5</span>)</span>
+<span id="d01-cb5-20"><a href="#d01-cb5-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="d01-cb5-21"><a href="#d01-cb5-21" aria-hidden="true" tabindex="-1"></a>        c.<span class="ex">connect</span>((<span class="st">&quot;127.0.0.1&quot;</span>, port))</span>
+<span id="d01-cb5-22"><a href="#d01-cb5-22" aria-hidden="true" tabindex="-1"></a>        done <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d01-cb5-23"><a href="#d01-cb5-23" aria-hidden="true" tabindex="-1"></a>        result <span class="op">=</span> <span class="st">&quot;connected (handshake finished, sits in accept queue)&quot;</span></span>
+<span id="d01-cb5-24"><a href="#d01-cb5-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">except</span> (<span class="pp">TimeoutError</span>, socket.timeout):</span>
+<span id="d01-cb5-25"><a href="#d01-cb5-25" aria-hidden="true" tabindex="-1"></a>        result <span class="op">=</span> <span class="st">&quot;timed out (server dropped the SYN: queue full)&quot;</span></span>
+<span id="d01-cb5-26"><a href="#d01-cb5-26" aria-hidden="true" tabindex="-1"></a>    clients.append(c)</span>
+<span id="d01-cb5-27"><a href="#d01-cb5-27" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;client </span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">: </span><span class="sc">{</span>result<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d01-cb5-28"><a href="#d01-cb5-28" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;listen(2) held </span><span class="sc">{</span>done<span class="sc">}</span><span class="ss"> finished connections before it started dropping</span><span class="ch">\n</span><span class="ss">&quot;</span>)</span>
+<span id="d01-cb5-29"><a href="#d01-cb5-29" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> c <span class="kw">in</span> clients:</span>
+<span id="d01-cb5-30"><a href="#d01-cb5-30" aria-hidden="true" tabindex="-1"></a>    c.close()</span>
+<span id="d01-cb5-31"><a href="#d01-cb5-31" aria-hidden="true" tabindex="-1"></a>srv.close()</span>
+<span id="d01-cb5-32"><a href="#d01-cb5-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d01-cb5-33"><a href="#d01-cb5-33" aria-hidden="true" tabindex="-1"></a><span class="co"># --- 2. Socket buffers: how much a sender can write before blocking --------</span></span>
+<span id="d01-cb5-34"><a href="#d01-cb5-34" aria-hidden="true" tabindex="-1"></a>lst <span class="op">=</span> socket.create_server((<span class="st">&quot;127.0.0.1&quot;</span>, <span class="dv">0</span>))</span>
+<span id="d01-cb5-35"><a href="#d01-cb5-35" aria-hidden="true" tabindex="-1"></a>snd <span class="op">=</span> socket.create_connection(lst.getsockname())</span>
+<span id="d01-cb5-36"><a href="#d01-cb5-36" aria-hidden="true" tabindex="-1"></a>rcv, _ <span class="op">=</span> lst.accept()</span>
+<span id="d01-cb5-37"><a href="#d01-cb5-37" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;SO_SNDBUF (sender)  :&quot;</span>, snd.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF))</span>
+<span id="d01-cb5-38"><a href="#d01-cb5-38" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;SO_RCVBUF (receiver):&quot;</span>, rcv.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))</span>
+<span id="d01-cb5-39"><a href="#d01-cb5-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d01-cb5-40"><a href="#d01-cb5-40" aria-hidden="true" tabindex="-1"></a>snd.setblocking(<span class="va">False</span>)</span>
+<span id="d01-cb5-41"><a href="#d01-cb5-41" aria-hidden="true" tabindex="-1"></a>chunk, written <span class="op">=</span> <span class="st">b&quot;x&quot;</span> <span class="op">*</span> <span class="dv">65536</span>, <span class="dv">0</span></span>
+<span id="d01-cb5-42"><a href="#d01-cb5-42" aria-hidden="true" tabindex="-1"></a>deadline <span class="op">=</span> time.monotonic() <span class="op">+</span> <span class="dv">2</span></span>
+<span id="d01-cb5-43"><a href="#d01-cb5-43" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> time.monotonic() <span class="op">&lt;</span> deadline:</span>
+<span id="d01-cb5-44"><a href="#d01-cb5-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="d01-cb5-45"><a href="#d01-cb5-45" aria-hidden="true" tabindex="-1"></a>        written <span class="op">+=</span> snd.send(chunk)</span>
+<span id="d01-cb5-46"><a href="#d01-cb5-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">except</span> <span class="pp">BlockingIOError</span>:      <span class="co"># EAGAIN: send buffer full, peer not reading</span></span>
+<span id="d01-cb5-47"><a href="#d01-cb5-47" aria-hidden="true" tabindex="-1"></a>        time.sleep(<span class="fl">0.05</span>)         <span class="co"># give the receiver&#39;s autotuning a moment</span></span>
+<span id="d01-cb5-48"><a href="#d01-cb5-48" aria-hidden="true" tabindex="-1"></a>        <span class="cf">try</span>:</span>
+<span id="d01-cb5-49"><a href="#d01-cb5-49" aria-hidden="true" tabindex="-1"></a>            written <span class="op">+=</span> snd.send(chunk)</span>
+<span id="d01-cb5-50"><a href="#d01-cb5-50" aria-hidden="true" tabindex="-1"></a>        <span class="cf">except</span> <span class="pp">BlockingIOError</span>:</span>
+<span id="d01-cb5-51"><a href="#d01-cb5-51" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span></span>
+<span id="d01-cb5-52"><a href="#d01-cb5-52" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;send() accepted </span><span class="sc">{</span>written<span class="sc">:,}</span><span class="ss"> bytes with the receiver never calling recv()&quot;</span>)</span>
+<span id="d01-cb5-53"><a href="#d01-cb5-53" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;those bytes now live in two kernel queues: the receiver&#39;s receive buffer&quot;</span>)</span>
+<span id="d01-cb5-54"><a href="#d01-cb5-54" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;and the sender&#39;s send buffer. The application on each side sees none of it.&quot;</span>)</span></code></pre></div>
+<p>Real output on Linux 6.18:</p>
+<pre class="text"><code>client 0: connected (handshake finished, sits in accept queue)
+client 1: connected (handshake finished, sits in accept queue)
+client 2: connected (handshake finished, sits in accept queue)
+client 3: timed out (server dropped the SYN: queue full)
+client 4: timed out (server dropped the SYN: queue full)
+client 5: timed out (server dropped the SYN: queue full)
+listen(2) held 3 finished connections before it started dropping
+
+SO_SNDBUF (sender)  : 3939840
+SO_RCVBUF (receiver): 131072
+send() accepted 4,243,968 bytes with the receiver never calling recv()
+those bytes now live in two kernel queues: the receiver&#39;s receive buffer
+and the sender&#39;s send buffer. The application on each side sees none of it.</code></pre>
+<p>And the kernel's own record of the first half:</p>
+<pre class="text"><code>$ nstat | grep -i listen
+TcpExtListenOverflows           4                  0.0
+TcpExtListenDrops               4                  0.0</code></pre>
+<p>Three details are worth a second look. Linux accepts <em>backlog + 1</em> connections, so <code>listen(2)</code> held 3. When the queue is full, Linux silently drops the incoming SYN; it does not send a RST. So the client sees a <em>timeout</em>, not "connection refused." And four overflows were counted for three failed clients. The counter records every dropped handshake packet, retries included, so read it as a rate of drops rather than a count of victims. On macOS the same script runs, but the counts and buffer sizes differ.</p>
+<h3 id="d01-the-macos-equivalents">The macOS equivalents</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Question</th>
+<th>Linux</th>
+<th>macOS</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Which route will this destination use?</td>
+<td><code>ip route get 1.1.1.1</code></td>
+<td><code>route -n get 1.1.1.1</code></td>
+</tr>
+<tr class="even">
+<td>Neighbour cache</td>
+<td><code>ip neigh</code></td>
+<td><code>arp -an</code>, <code>ndp -an</code></td>
+</tr>
+<tr class="odd">
+<td>Per-socket queues</td>
+<td><code>ss -tmi</code></td>
+<td><code>netstat -an -p tcp</code> (<code>Recv-Q</code>/<code>Send-Q</code> columns)</td>
+</tr>
+<tr class="even">
+<td>Listen queue depth</td>
+<td><code>ss -ltn</code></td>
+<td><code>netstat -Lan</code> (<code>qlen/incqlen/maxqlen</code>)</td>
+</tr>
+<tr class="odd">
+<td>Protocol counters</td>
+<td><code>nstat -az</code></td>
+<td><code>netstat -s -p tcp</code></td>
+</tr>
+<tr class="even">
+<td>Accept-queue cap</td>
+<td><code>sysctl net.core.somaxconn</code></td>
+<td><code>sysctl kern.ipc.somaxconn</code> (128 by default)</td>
+</tr>
+<tr class="odd">
+<td>Socket buffer defaults</td>
+<td><code>sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem</code></td>
+<td><code>sysctl net.inet.tcp.recvspace net.inet.tcp.sendspace</code></td>
+</tr>
+</tbody>
+</table>
+<p>macOS has no <code>tc</code>. Its driver rings and interface queues are mostly hidden, and <code>nettop</code> gives a live per-flow view instead.</p>
+<h2 id="d01-numbers">Deep dive: by the numbers</h2>
+<p><strong>A queue's delay is its depth divided by its drain rate.</strong> This is Little's law applied to bytes, and it is the single most useful formula on this page. A <code>txqueuelen</code> of 1000 full-size frames is 1000 × 1514 = 1.51 MB. Draining at 10 Gbit/s, that is 1.2 ms of delay. Draining into a 20 Mbit/s home uplink, the same 1000 packets are <strong>606 ms</strong>. The queue did not change. The drain rate did. That is bufferbloat, and it is why <code>fq_codel</code> and <code>cake</code> exist. Both watch how long packets <em>sit</em> (CoDel targets 5 ms) rather than how many there are.</p>
+<p><strong>The per-packet time budget shrinks with link speed.</strong> A full-size frame occupies 1538 byte-times on the cable (1514 + 4 FCS + 8 preamble + 12 inter-frame gap). At 10 Gbit/s that is 812,744 frames per second, or <strong>1.23 µs per frame</strong>. At 100 Gbit/s it is 8.1 million per second, or <strong>123 ns</strong> — about the cost of one cache miss to DRAM. No CPU core handles a separate interrupt, lookup chain and socket wake-up per frame at that rate. That is why the receive path batches (NAPI), merges (GRO), and spreads work over cores (RSS: one RX ring per queue, hashed by 4-tuple).</p>
+<p><strong>A socket buffer must hold one bandwidth-delay product.</strong> To keep a path full, the receive window has to cover bandwidth × RTT. For 1 Gbit/s and 80 ms that is 125,000,000 × 0.08 = <strong>10 MB</strong>. A common distro <code>tcp_rmem</code> maximum is 6 MiB, and only part of the buffer becomes window, since some pays for packet overhead. So a single flow on that path tops out at roughly 6 MiB × (window share) / 0.08 s, often a few hundred Mbit/s, while the link and the far end are idle. "We have a 1 Gbit link and get 400 Mbit/s to the other region" is very often this, not the network.</p>
+<p><strong>Accept-queue math.</strong> A server that accepts 2,000 connections per second, with the queue capped at 128 (the pre-5.4 Linux default, and still macOS's default), has 64 ms of slack. A 100 ms garbage-collection pause or a slow <code>accept()</code> loop overflows it. With <code>somaxconn</code> = 4096 the slack is about 2 s. Remember that the effective cap is the <em>smaller</em> of <code>somaxconn</code> and the backlog your server passes to <code>listen()</code>. Many frameworks still pass 128 or 511.</p>
+<p><strong>Retransmission timing tells you which queue dropped.</strong> A dropped SYN is retried after 1 s, then 2 s, 4 s and so on (Linux's initial RTO is 1 s, per RFC 6298). So a client that sees connects take <em>just over 1 s</em> or <em>just over 3 s</em> is almost certainly losing SYNs. Usually that is an accept queue or SYN queue overflow, or a firewall. Data-segment loss on an established connection retransmits after roughly RTT + 4 × RTT variance, with a 200 ms minimum on Linux. So a request that "sometimes takes an extra 200 ms" points at a loss after the handshake.</p>
+<p><strong>Neighbour and conntrack limits are smaller than people think.</strong> <code>gc_thresh3</code> = 1024 means a host cannot keep more than 1024 neighbour entries. A Kubernetes node with hundreds of pods on a flat network, or a router on a large /16, can hit that. Conntrack's default maximum scales with RAM and is often 65,536 to 262,144 entries. An established TCP entry lives for 5 days by default (<code>nf_conntrack_tcp_timeout_established</code> = 432,000 s). A busy NAT gateway or kube-proxy node can fill the table with entries for connections that ended long ago.</p>
+<h2 id="d01-failures">Deep dive: production failure modes</h2>
+<p>Each entry runs symptom → mechanism → proof → fix.</p>
+<h3 id="d01-1-connects-take-one-second-sometimes-three">1. Connects take one second, sometimes three</h3>
+<p><strong>Symptom.</strong> Latency graphs show a cluster at ~1,000 ms and ~3,000 ms for new connections only. Established connections are fine. CPU looks normal on average.</p>
+<p><strong>Mechanism.</strong> The accept queue overflows during bursts, because the app calls <code>accept()</code> too slowly or the backlog is small. Linux drops the SYN (or the final ACK), and the client retransmits on its 1 s timer.</p>
+<p><strong>Prove it.</strong></p>
+<div class="sourceCode" id="d01-cb8"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d01-cb8-1"><a href="#d01-cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-ltn</span> <span class="st">&#39;sport = :443&#39;</span>          <span class="co"># Recv-Q = queued now, Send-Q = the cap</span></span>
+<span id="d01-cb8-2"><a href="#d01-cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nstat</span> <span class="at">-az</span> TcpExtListenOverflows TcpExtListenDrops</span>
+<span id="d01-cb8-3"><a href="#d01-cb8-3" aria-hidden="true" tabindex="-1"></a><span class="co"># macOS: netstat -Lan | grep 443</span></span></code></pre></div>
+<p><code>Recv-Q</code> near <code>Send-Q</code> on a listening socket, plus a rising <code>ListenOverflows</code>, is a confession.</p>
+<p><strong>Fix.</strong> Make <code>accept()</code> faster (more acceptor threads, or <code>SO_REUSEPORT</code> to spread one port over several listeners). Then raise <em>both</em> <code>net.core.somaxconn</code> and the application's <code>listen()</code> backlog. Raising only one does nothing, because the effective cap is the smaller of the two.</p>
+<h3 id="d01-2-new-connections-fail-at-random-existing-ones-are-fine">2. New connections fail at random; existing ones are fine</h3>
+<p><strong>Symptom.</strong> A NAT gateway, Docker host or kube-proxy node drops a fraction of <em>new</em> flows. Retries usually succeed. <code>dmesg</code> shows <code>nf_conntrack: table full, dropping packet</code>.</p>
+<p><strong>Mechanism.</strong> The conntrack table is full. Every new flow needs an entry, so new flows die while tracked flows keep working.</p>
+<p><strong>Prove it.</strong></p>
+<div class="sourceCode" id="d01-cb9"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d01-cb9-1"><a href="#d01-cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/sys/net/netfilter/nf_conntrack_count /proc/sys/net/netfilter/nf_conntrack_max</span>
+<span id="d01-cb9-2"><a href="#d01-cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">conntrack</span> <span class="at">-S</span> <span class="kw">|</span> <span class="fu">head</span>            <span class="co"># per-CPU insert_failed / drop counters</span></span></code></pre></div>
+<p><strong>Fix.</strong> Raise <code>nf_conntrack_max</code> (and the hash size with it). Shorten timeouts for short-lived traffic. Exempt high-volume flows that need no state, such as DNS to a local cache, with a <code>notrack</code> rule.</p>
+<h3 id="d01-3-neighbor-table-overflow-on-a-big-flat-network">3. "Neighbor table overflow" on a big flat network</h3>
+<p><strong>Symptom.</strong> Intermittent unreachability to <em>some</em> hosts on the same subnet. <code>dmesg</code> prints <code>neighbour: arp_cache: neighbor table overflow!</code>.</p>
+<p><strong>Mechanism.</strong> More live neighbours than <code>gc_thresh3</code> (1024 by default). The kernel can't create entries for new next hops, so packets to them are dropped while it tries to free some.</p>
+<p><strong>Prove it.</strong> <code>ip -4 neigh | wc -l</code> near 1024, and the message in <code>dmesg</code>.</p>
+<p><strong>Fix.</strong> Raise <code>net.ipv4.neigh.default.gc_thresh1/2/3</code> (and the <code>ipv6</code> equivalents) together. Or make the L2 domain smaller, which is usually the better design answer.</p>
+<h3 id="d01-4-latency-spikes-whenever-someone-uploads">4. Latency spikes whenever someone uploads</h3>
+<p><strong>Symptom.</strong> Video calls stutter and SSH lags while a backup or large upload runs. No packet loss is reported.</p>
+<p><strong>Mechanism.</strong> Bufferbloat. A deep FIFO sits at the bottleneck, usually the uplink of a home router or a VPN concentrator. It is full and stays full. From the numbers section: 1000 packets at 20 Mbit/s is 606 ms of standing queue.</p>
+<p><strong>Prove it.</strong> Run <code>ping</code> to the gateway's next hop before and during the upload. RTT jumping from 10 ms to hundreds of ms with no loss is the signature. On a Linux box you control, <code>tc -s qdisc</code> shows a large, persistent <code>backlog</code>.</p>
+<p><strong>Fix.</strong> Put an AQM qdisc (<code>fq_codel</code> or <code>cake</code>) at the bottleneck. If the bottleneck sits in a device you can't configure, shape your own egress slightly below the link rate, so the queue forms where <em>you</em> manage it.</p>
+<h3 id="d01-5-throughput-collapses-the-network-graphs-are-clean">5. Throughput collapses, the network graphs are clean</h3>
+<p><strong>Symptom.</strong> A consumer falls behind. The producer's sends start blocking. Captures show <code>win 0</code> from the receiver.</p>
+<p><strong>Mechanism.</strong> The receiving application isn't reading. Its receive buffer fills, the window closes, and TCP flow control stops the sender. This is TCP working exactly as designed.</p>
+<p><strong>Prove it.</strong> On the receiver, <code>ss -tmi</code> shows a large <code>Recv-Q</code> (as in the <code>CLOSE-WAIT</code> example above). <code>tcpdump</code> shows zero-window advertisements and the sender's zero-window probes.</p>
+<p><strong>Fix.</strong> It's the application: a blocked event loop, a slow downstream, a missing <code>read()</code>. Profiling the consumer will find it. Packet tuning won't.</p>
+<h3 id="d01-6-drops-at-high-packet-rates-with-cpu-to-spare">6. Drops at high packet rates, with CPU to spare</h3>
+<p><strong>Symptom.</strong> Under load, a receiver loses packets even though total CPU looks moderate. One core sits at 100% in softirq.</p>
+<p><strong>Mechanism.</strong> All receive work lands on one CPU: one RX queue, or one flow hashed to one queue. That CPU's ring or backlog overflows.</p>
+<p><strong>Prove it.</strong> <code>softnet_stat</code> columns 2 and 3 rising on one row. <code>ethtool -S eth0 | grep -iE 'drop|miss|fifo'</code>. <code>mpstat -P ALL 1</code> showing one core high in <code>%soft</code>.</p>
+<p><strong>Fix.</strong> Use more RX queues with RSS (<code>ethtool -L</code>) or RPS in software, spread IRQ affinity, and enlarge the ring (<code>ethtool -G</code>) where the hardware allows it.</p>
+<h2 id="d01-context-2026">Deep dive: 2026 context</h2>
+<p><strong>Kubernetes multiplies every table.</strong> Each pod is a network namespace with its <em>own</em> routing table, neighbour table, sockets and qdiscs, joined to the node by a veth pair. The node, meanwhile, holds the shared conntrack table that kube-proxy's iptables or IPVS rules depend on. So a node with 100 pods has 101 copies of most of the structures in the diagram, and one conntrack table under all of them. eBPF data planes such as Cilium replace kube-proxy's iptables rules with BPF hash maps, and often keep their own connection-tracking map. The lesson carries over directly: find that map's size limit and its "map full" counter before an incident does.</p>
+<p><strong>In the cloud, some queues belong to someone else.</strong> A VM's virtio, ENA or gVNIC rings are the queues you can see. Behind them sit hypervisor and SmartNIC queues and per-instance policers that you can't see. AWS's ENA driver exposes some of these as counters, with names like <code>bw_in_allowance_exceeded</code>, <code>pps_allowance_exceeded</code> and <code>conntrack_allowance_exceeded</code> in <code>ethtool -S</code>. When those rise, the drops happened outside your kernel, and no <code>sysctl</code> will help.</p>
+<p><strong>QUIC moves transport state into your process.</strong> With HTTP/3, the congestion window, the retransmit queue and the per-stream buffers live in the application's QUIC library, not in the kernel. <code>ss</code> shows one UDP socket with a receive queue and nothing else. The tables and queues are still there; you just debug them with the library's own stats or with qlog files instead of kernel counters.</p>
+<p><strong>eBPF lets you observe every box.</strong> Tools in the bcc and bpftrace collections hook the drop points directly. For example, <code>tcpdrop</code>, or a bpftrace probe on the <code>skb:kfree_skb</code> tracepoint, which since kernel 5.17 carries a <em>drop reason</em>. That is the modern answer to "which queue dropped it": ask the kernel to tell you at the moment of the drop.</p>
+<p><strong>Zero trust adds tables to every host.</strong> When a mesh sidecar or a per-host agent enforces policy, every connection passes through an extra user-space proxy. That adds one more accept queue, one more pair of socket buffers, and one more connection table per hop. Count them when a "simple" service call is slow.</p>
+<h2 id="d01-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: <code>send()</code> returned success. What do you actually know?</strong></p>
+<p>Only that the kernel copied your bytes into the socket's send buffer. Nothing may have left the host yet: the congestion window, the peer's receive window, or a full qdisc can all hold it back. Even after the peer ACKs the bytes, they are only in the peer's <em>kernel</em> receive buffer, not in its application. If you need to know the application processed something, the application has to say so. That is the end-to-end argument from Module 1, applied to one system call.</p>
+<p><strong>Q2: Clients report connects taking about one second under load, never 200 ms. Where do you look?</strong></p>
+<p>One second is the initial SYN retransmission timeout. So a SYN, or the handshake's final ACK, is being dropped. On the server, check <code>ss -ltn</code> for the listener's <code>Recv-Q</code> against its cap, and <code>nstat</code> for <code>ListenOverflows</code>/<code>ListenDrops</code> and <code>TCPReqQFullDrop</code>. If those are clean, look at conntrack (<code>table full</code> in <code>dmesg</code>) and any firewall or load balancer in the path. A loss after the handshake would show up as roughly 200 ms+ retransmissions instead, which is how you tell the two apart.</p>
+<p><strong>Q3: A listening socket shows <code>Recv-Q 0</code> and <code>Send-Q 4096</code>. What do those mean? They don't mean what they mean on a connected socket.</strong></p>
+<p>On a listening socket, <code>Recv-Q</code> is the number of fully established connections waiting for <code>accept()</code>, and <code>Send-Q</code> is the accept queue's maximum. On an established socket they are bytes: unread received data and unacknowledged sent data. Mixing the two up is a common way to misread <code>ss</code>.</p>
+<p><strong>Q4: Where does latency come from on a link with zero packet loss?</strong></p>
+<p>From queues that are full but not overflowing. Each packet waits behind the queue's depth divided by the drain rate. A 1000-packet FIFO in front of a 20 Mbit/s uplink adds about 600 ms with no drops at all. Loss-based congestion control makes it worse, because it keeps filling the buffer until it overflows. The fixes are AQM (<code>fq_codel</code>, <code>cake</code>), delay-based or model-based congestion control, and putting the queue where you control it.</p>
+<p><strong>Q5: Why does Linux poll the NIC instead of taking one interrupt per packet?</strong></p>
+<p>At high rates, interrupt overhead alone would consume the CPU. At 10 Gbit/s with full-size frames you have about 1.2 µs per frame, and an interrupt plus context switch eats a large slice of that. NAPI takes one interrupt, disables further interrupts for that queue, and polls up to a budget (300 packets) per round. It re-enables interrupts once the ring is empty. Under load it behaves like polling; when idle, like interrupts. GRO then cuts per-packet work further by merging segments before the stack sees them.</p>
+<p><strong>Q6: After a database failover the VIP moved, but some app servers keep timing out for about a minute. Explain.</strong></p>
+<p>Those servers still have the old MAC address for the VIP in their neighbour tables. Normal traffic keeps confirming the entry as long as TCP makes progress. Once it stops, the entry still has to age to <code>STALE</code>, then pass through <code>DELAY</code> and <code>PROBE</code> before it fails and is re-resolved. That can take tens of seconds. The standard fix is for the new owner to send gratuitous ARP (or an unsolicited IPv6 Neighbor Advertisement) at takeover, which overwrites the entry everywhere on the segment at once. Cloud VPCs don't run real ARP this way; there, the equivalent is the provider's API remapping the address, and it has its own propagation delay.</p>
+<p><strong>Q7: Name a table whose overflow breaks only <em>new</em> connections, and explain why old ones survive.</strong></p>
+<p>The conntrack table (also the neighbour table for new next hops, and the accept queue for new connections to one listener). Packets of an existing flow match an entry that already exists, so they need no new allocation. Only the first packet of a new flow needs a free slot. That asymmetry — "existing users fine, new users fail" — should send you straight to tables with a fixed maximum.</p>

@@ -1,0 +1,451 @@
+<h2 id="d03-deep-dive">Deep dive: inside the switch</h2>
+<p>The module gave you a switch as a learning table and a rule: learn the source, look up the destination, flood if unknown. That is correct, and it is the right place to start. But it hides the machine.</p>
+<p>A real switch is a pipeline etched into silicon. A frame passes through a fixed series of stages, each with a few nanoseconds to do its job. The MAC table is a hash table with buckets that can fill up early. Frames wait in a packet buffer that every port shares, and that buffer is small — tens of microseconds of traffic, not seconds. When several ports talk to one port at once, the buffer fills in microseconds and the switch drops frames while your monitoring graph says the link is nearly idle. And when two cables are bundled into one logical link, a hash function decides which cable each flow uses, forever.</p>
+<p>Those four things — the table, the timers, the buffer and the hash — are where switching problems in production actually live. This deep dive goes through each of them.</p>
+<h2 id="d03-mental-model">Deep dive: the real mental model — a pipeline with a shared buffer</h2>
+<div style="overflow-x:auto">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 520" role="img" aria-labelledby="d03-pipe-title d03-pipe-desc" style="max-width:100%;height:auto;min-width:760px;background:#f5f5f5;border:1px solid #d8d4cc;border-radius:6px;">
+<title id="d03-pipe-title">One frame through a switch ASIC: pipeline stages, MAC table and shared buffer</title>
+<desc id="d03-pipe-desc">Six pipeline stages left to right: ingress MAC and PHY with the FCS check, parser with a fixed window, L2 lookup keyed by VLAN and MAC, ACL in TCAM, the traffic manager, and egress. Below the L2 lookup, the MAC table learns source addresses with an age per entry and returns a flood list on a miss. Below the traffic manager, one shared packet buffer feeds per-port queues; one port's queue fills during an incast burst and hits its dynamic threshold. Cut-through forwarding can start once the parser has the header; store-and-forward waits for the FCS at the end of the frame. A LAG member is chosen by hashing the flow's fields.</desc>
+<text x="24" y="38" font-family="Georgia,serif" font-size="22" fill="#2d3142">One frame through a switch ASIC</text>
+<text x="24" y="60" font-family="system-ui,sans-serif" font-size="13" fill="#6b6f7e">a fixed pipeline of stages · one table learned from sources · one buffer shared by every port</text>
+<g font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">
+<rect x="24" y="100" width="110" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="79" y="126">Ingress</text><text x="79" y="144">MAC / PHY</text>
+<rect x="154" y="100" width="110" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="209" y="126">Parser</text><text x="209" y="144" font-weight="400" font-size="11">fixed byte window</text>
+<rect x="284" y="100" width="110" height="64" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2.5"/>
+<text x="339" y="126">L2 lookup</text><text x="339" y="144" font-weight="400" font-size="11">key = (VLAN, MAC)</text>
+<rect x="414" y="100" width="110" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="469" y="126">ACL</text><text x="469" y="144" font-weight="400" font-size="11">TCAM, masks</text>
+<rect x="544" y="100" width="110" height="64" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2.5"/>
+<text x="599" y="126">Traffic</text><text x="599" y="144">manager</text>
+<rect x="674" y="100" width="122" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="735" y="126">Egress</text><text x="735" y="144" font-weight="400" font-size="11">tags, FCS, LAG pick</text>
+</g>
+<g stroke="#2d3142" stroke-width="1.5" fill="#2d3142">
+<line x1="134" y1="132" x2="150" y2="132"/><polygon points="154,132 146,128 146,136"/>
+<line x1="264" y1="132" x2="280" y2="132"/><polygon points="284,132 276,128 276,136"/>
+<line x1="394" y1="132" x2="410" y2="132"/><polygon points="414,132 406,128 406,136"/>
+<line x1="524" y1="132" x2="540" y2="132"/><polygon points="544,132 536,128 536,136"/>
+<line x1="654" y1="132" x2="670" y2="132"/><polygon points="674,132 666,128 666,136"/>
+</g>
+<!-- cut-through vs store-and-forward markers -->
+<g font-family="ui-monospace,Menlo,monospace" font-size="10">
+<line x1="209" y1="78" x2="209" y2="98" stroke="#bf4520" stroke-width="1.5" stroke-dasharray="4,3"/>
+<text x="214" y="86" fill="#bf4520">CUT-THROUGH CAN START HERE</text>
+<line x1="79" y1="166" x2="79" y2="190" stroke="#6b6f7e" stroke-width="1.5" stroke-dasharray="4,3"/>
+<text x="24" y="204" fill="#6b6f7e">STORE-AND-FORWARD WAITS</text>
+<text x="24" y="217" fill="#6b6f7e">FOR THE FCS (LAST 4 B)</text>
+</g>
+<!-- MAC table -->
+<rect x="190" y="250" width="300" height="150" rx="6" fill="#ffffff" stroke="#d8d4cc" stroke-width="1"/>
+<text x="340" y="272" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="11" fill="#2d3142">MAC TABLE (HASHED SRAM, BUCKETS)</text>
+<g font-family="ui-monospace,Menlo,monospace" font-size="11" fill="#2d3142">
+<text x="204" y="296" fill="#6b6f7e">VLAN</text><text x="244" y="296" fill="#6b6f7e">MAC</text><text x="388" y="296" fill="#6b6f7e">PORT</text><text x="436" y="296" fill="#6b6f7e">AGE</text>
+<text x="204" y="316">10</text><text x="244" y="316">02:00:00:00:00:01</text><text x="388" y="316">1</text><text x="436" y="316">4 s</text>
+<text x="204" y="336">10</text><text x="244" y="336">02:00:00:00:00:02</text><text x="388" y="336">2</text><text x="436" y="336">4 s</text>
+<text x="204" y="356" fill="#bf4520">miss → flood list: every VLAN 10 port</text>
+<text x="244" y="372" fill="#bf4520">except the ingress port</text>
+<text x="204" y="392" fill="#6b6f7e">idle &gt; 300 s (default) → deleted</text>
+</g>
+<g stroke="#2d3142" stroke-width="1.5" fill="#2d3142" font-family="system-ui,sans-serif" font-size="11">
+<line x1="320" y1="164" x2="320" y2="246"/><polygon points="320,250 316,242 324,242"/>
+<text x="250" y="214" stroke="none">learn: src</text><text x="250" y="228" stroke="none">→ in-port</text>
+<line x1="360" y1="250" x2="360" y2="168"/><polygon points="360,164 356,172 364,172"/>
+<text x="366" y="214" stroke="none">forward: dst</text><text x="366" y="228" stroke="none">→ out-port</text>
+</g>
+<!-- shared buffer -->
+<rect x="520" y="250" width="276" height="200" rx="6" fill="#ffffff" stroke="#d8d4cc" stroke-width="1"/>
+<text x="658" y="272" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="11" fill="#2d3142">ONE SHARED BUFFER, QUEUE PER PORT</text>
+<line x1="599" y1="164" x2="599" y2="246" stroke="#2d3142" stroke-width="1.5"/><polygon points="599,250 595,242 603,242" fill="#2d3142"/>
+<g font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e" text-anchor="middle">
+<line x1="540" y1="420" x2="776" y2="420" stroke="#6b6f7e" stroke-width="1"/>
+<rect x="552" y="404" width="34" height="16" fill="#e8e4da" stroke="#2d3142" stroke-width="1"/><text x="569" y="436">p1</text>
+<rect x="604" y="410" width="34" height="10" fill="#e8e4da" stroke="#2d3142" stroke-width="1"/><text x="621" y="436">p2</text>
+<rect x="656" y="300" width="34" height="120" fill="#fdf0e8" stroke="#bf4520" stroke-width="2"/><text x="673" y="436" fill="#bf4520">p3</text>
+<rect x="708" y="412" width="34" height="8" fill="#e8e4da" stroke="#2d3142" stroke-width="1"/><text x="725" y="436">p4</text>
+<line x1="640" y1="300" x2="700" y2="300" stroke="#bf4520" stroke-width="1.5" stroke-dasharray="4,3"/>
+</g>
+<text x="548" y="296" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#bf4520">LIMIT = α × FREE</text>
+<text x="548" y="310" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#bf4520">8 → 1 INCAST:</text>
+<text x="548" y="324" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#bf4520">FULL IN ~48 µs</text>
+<text x="24" y="482" font-family="Georgia,serif" font-style="italic" font-size="14" fill="#2d3142">The table decides where a frame goes; the buffer decides whether it survives the wait.</text>
+<text x="24" y="504" font-family="Georgia,serif" font-style="italic" font-size="14" fill="#6b6f7e">Egress to a LAG picks one member per flow: member = hash(MACs, IPs, ports) mod N.</text>
+</svg>
+</div>
+<p>Follow one frame through the diagram.</p>
+<p><strong>Ingress MAC and PHY.</strong> The port turns symbols on the wire back into bytes, strips the preamble and SFD, and runs the CRC-32 over the frame as it streams in. The CRC result is only known once the last byte has arrived. Keep that fact in mind; it decides the store-and-forward versus cut-through question below.</p>
+<p><strong>Parser.</strong> The parser pulls fields out of the first bytes of the frame: destination and source MAC, any 802.1Q tag, the EtherType, and — on most modern switches — the IP and TCP/UDP headers too, because ACLs and hashing need them. The parser reads a fixed window of bytes. Anything beyond that window is invisible to the rest of the pipeline. Module 04's deep dive shows how IPv6 extension headers fall foul of exactly this limit.</p>
+<p><strong>L2 lookup and learning.</strong> Two lookups happen against the same table, keyed by <em>(VLAN, MAC)</em>, not by MAC alone. The key includes the VLAN because the same MAC may legitimately appear in two VLANs on two different ports.</p>
+<ul>
+<li>The <strong>source lookup</strong> is the learning step. A miss means a new address: insert <em>(VLAN, src MAC) → ingress port</em>. A hit on a <em>different</em> port means the station moved, or something is wrong: update the port. A hit on the same port just refreshes the entry's age.</li>
+<li>The <strong>destination lookup</strong> is the forwarding step. A hit gives one egress port. A miss gives the VLAN's flood list: every port in that VLAN except the one the frame came in on.</li>
+</ul>
+<p><strong>ACL / TCAM.</strong> Policies that match on masks — "drop TCP to port 23 from this /24" — live in TCAM, a ternary memory that compares the key against every entry in parallel. TCAM is fast, power-hungry and small, so it holds thousands of entries, not millions. The big exact-match MAC table is usually <em>not</em> TCAM. Despite the name "CAM table", most switch ASICs store MACs in hashed SRAM, with a small true CAM or overflow area for collisions.</p>
+<p><strong>Traffic manager.</strong> This is where the frame waits. The switch writes the frame into a <strong>shared packet buffer</strong> and puts a pointer to it on a queue for the chosen egress port (one queue per traffic class, usually eight). A scheduler drains each port's queues at that port's line rate. If the destination is a flood, the frame is written once and the pointer is queued on many ports.</p>
+<p><strong>Egress.</strong> On the way out, the egress pipeline adds or strips VLAN tags, applies egress ACLs and recomputes the FCS if the frame changed. Then the MAC serialises it onto the wire.</p>
+<h3 id="d03-hash-table">The MAC table is a hash table, and it behaves like one</h3>
+<p>A switch vendor's datasheet might promise "64K MAC addresses". What the chip has is a hash table: the hash of <em>(VLAN, MAC)</em> picks a bucket, and each bucket holds a few entries (often four or eight; it varies by chip). When every slot in a bucket is full, a new address that hashes there cannot be learned, even if the table as a whole is half empty. Designs use tricks — several hash functions, cuckoo-style moves — to push usable capacity close to the nominal number, but the exact behaviour varies by chip and is rarely documented in detail.</p>
+<p>What happens to a frame from an address the switch failed to learn? It is still forwarded. But replies <em>to</em> that address become unknown unicast and get flooded. One unlearnable MAC turns into a steady trickle of flooded traffic. That is the same end state as the CAM overflow attack in the module, reached by accident.</p>
+<h3 id="d03-ageing">Ageing is a timer per entry, and it disagrees with ARP</h3>
+<p>Every entry carries a timestamp of when the switch last saw that MAC as a <em>source</em>. A background sweep deletes entries older than the ageing time. IEEE 802.1Q's default is <strong>300 seconds</strong>, with an allowed range of 10 to 1,000,000 seconds. Most vendors and the Linux bridge use 300 s by default.</p>
+<p>Notice what refreshes an entry: frames <em>from</em> the station. Frames <em>to</em> the station do not count. A host that only receives — a syslog collector, a backup target receiving a UDP stream, a server behind an asymmetric path — will age out of the table while traffic is still flowing to it. From then on, every frame sent to it is flooded. The lab output below shows this happening.</p>
+<p>Topology changes shorten ageing on purpose. Under classic STP, a topology change notification makes switches use the forward delay (15 s by default) as their ageing time for a while, so stale entries vanish quickly. RSTP goes further and flushes entries learned on affected ports immediately. Both trade a burst of flooding for faster recovery.</p>
+<h3 id="d03-cut-through">Store-and-forward versus cut-through</h3>
+<p>A <strong>store-and-forward</strong> switch receives the whole frame, checks the FCS, and only then starts sending it out. Corrupt frames die at the first switch. The cost is that every hop adds one full frame's serialisation time before the first bit leaves.</p>
+<p>A <strong>cut-through</strong> switch starts transmitting once it has read enough header to decide the egress port. The destination MAC is in the first 6 bytes, but in practice the switch waits for the L3/L4 headers too, so ACLs and hashing work. It can begin sending before the tail of the frame has even arrived.</p>
+<p>That saves real time. Serialising a 1,518-byte frame takes 12.1 µs at 1 Gb/s, 1.2 µs at 10 Gb/s and 0.12 µs at 100 Gb/s. A 9,018-byte jumbo frame takes 7.2 µs at 10 Gb/s. Cut-through switches commonly forward in a few hundred nanoseconds whatever the frame size (exact figures are vendor-specific).</p>
+<p>Three catches make cut-through less magic than the marketing:</p>
+<ol type="1">
+<li><strong>It cannot drop a bad frame.</strong> By the time the CRC check fails, the head of the frame is already on the next link. The switch can only end the frame with a deliberately wrong FCS — usually called <em>CRC stomping</em> — so the next store-and-forward device drops it. The error counter then increments on a link that is perfectly healthy. You have to trace the error back to the hop where it first appeared.</li>
+<li><strong>It only works when the egress port is idle.</strong> If anything is queued for that port, the frame waits in the buffer like any other. Under load, a cut-through switch is a store-and-forward switch.</li>
+<li><strong>It cannot go from slow to fast.</strong> A frame arriving at 10 Gb/s cannot be streamed out at 100 Gb/s; the egress would run out of bytes mid-frame. Switches fall back to store-and-forward for slow-to-fast speed changes.</li>
+</ol>
+<p>At 100 Gb/s and above, the serialisation saving is tens of nanoseconds per hop, so the choice matters less than it did at 1 and 10 Gb/s. It still matters for trading networks and some HPC fabrics.</p>
+<h3 id="d03-buffers">The buffer is shared, small, and policed by a formula</h3>
+<p>A frame waits in the buffer only while its egress port is busy. The buffer exists to absorb short collisions in time, when two inputs want the same output at once.</p>
+<p>The sizes are smaller than most engineers guess. Data-centre switches built on merchant silicon typically carry a few tens of megabytes of on-chip buffer, shared by every port on a chip that moves terabits per second. Take 32 MB on a 12.8 Tb/s switch: that is 32 × 8 / 12,800,000 seconds, or <strong>20 µs</strong> of the switch's full throughput. Spread evenly over 128 ports of 100 Gb/s, each port gets 250 KB, again about 20 µs of its own line rate. "Deep-buffer" routers exist, with gigabytes of external memory, and they cost and consume accordingly.</p>
+<p>Because the buffer is shared, the switch needs a rule for how much one queue may take. The common answer is a <strong>dynamic threshold</strong>: a queue may grow up to α × (free buffer), where α is a configurable factor such as 1 or 2. When the buffer is mostly empty, one congested port can borrow a large share. As the buffer fills, every queue's limit shrinks together. It stops one hot port from starving all the others. It also means a queue's real limit depends on what every other port is doing at that microsecond.</p>
+<h3 id="d03-microbursts">Microbursts: congestion that your graphs cannot see</h3>
+<p>Put the pieces together. Eight servers reply to one request at the same moment (a scatter-gather query, a distributed cache read, a storage stripe). Each sends 256 KB at 25 Gb/s toward one 25 Gb/s port. The port can drain 25 Gb/s; 200 Gb/s is arriving. The queue grows at the difference, 175 Gb/s, which is about 21.9 KB every microsecond. With a 1 MB share of the buffer, the queue is full in about 48 µs. Everything after that is dropped.</p>
+<p>The simulation below runs that scenario in 1-µs steps:</p>
+<div class="sourceCode" id="d03-cb1"><pre class="sourceCode python"><code class="sourceCode python"><span id="d03-cb1-1"><a href="#d03-cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Microburst on one 25 Gb/s egress port: 8 senders answer one request at once.</span></span>
+<span id="d03-cb1-2"><a href="#d03-cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb1-3"><a href="#d03-cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">Time advances in 1-microsecond steps. Each sender bursts 256 KB at line rate.</span></span>
+<span id="d03-cb1-4"><a href="#d03-cb1-4" aria-hidden="true" tabindex="-1"></a><span class="co">The egress queue drains at 25 Gb/s and may hold at most BUFFER bytes.</span></span>
+<span id="d03-cb1-5"><a href="#d03-cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d03-cb1-6"><a href="#d03-cb1-6" aria-hidden="true" tabindex="-1"></a>LINE <span class="op">=</span> <span class="fl">25e9</span> <span class="op">/</span> <span class="dv">8</span>          <span class="co"># bytes per second on every port</span></span>
+<span id="d03-cb1-7"><a href="#d03-cb1-7" aria-hidden="true" tabindex="-1"></a>STEP <span class="op">=</span> <span class="fl">1e-6</span>              <span class="co"># 1 microsecond</span></span>
+<span id="d03-cb1-8"><a href="#d03-cb1-8" aria-hidden="true" tabindex="-1"></a>SENDERS <span class="op">=</span> <span class="dv">8</span></span>
+<span id="d03-cb1-9"><a href="#d03-cb1-9" aria-hidden="true" tabindex="-1"></a>BURST <span class="op">=</span> <span class="dv">256</span> <span class="op">*</span> <span class="dv">1024</span>       <span class="co"># bytes each sender sends</span></span>
+<span id="d03-cb1-10"><a href="#d03-cb1-10" aria-hidden="true" tabindex="-1"></a>BUFFER <span class="op">=</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span>     <span class="co"># bytes this queue may use (its shared-buffer share)</span></span>
+<span id="d03-cb1-11"><a href="#d03-cb1-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb1-12"><a href="#d03-cb1-12" aria-hidden="true" tabindex="-1"></a>per_step <span class="op">=</span> LINE <span class="op">*</span> STEP   <span class="co"># 3125 bytes per port per microsecond</span></span>
+<span id="d03-cb1-13"><a href="#d03-cb1-13" aria-hidden="true" tabindex="-1"></a>left <span class="op">=</span> [BURST] <span class="op">*</span> SENDERS</span>
+<span id="d03-cb1-14"><a href="#d03-cb1-14" aria-hidden="true" tabindex="-1"></a>queue <span class="op">=</span> dropped <span class="op">=</span> sent <span class="op">=</span> <span class="fl">0.0</span></span>
+<span id="d03-cb1-15"><a href="#d03-cb1-15" aria-hidden="true" tabindex="-1"></a>peak <span class="op">=</span> <span class="fl">0.0</span></span>
+<span id="d03-cb1-16"><a href="#d03-cb1-16" aria-hidden="true" tabindex="-1"></a>t <span class="op">=</span> <span class="dv">0</span></span>
+<span id="d03-cb1-17"><a href="#d03-cb1-17" aria-hidden="true" tabindex="-1"></a>first_drop <span class="op">=</span> <span class="va">None</span></span>
+<span id="d03-cb1-18"><a href="#d03-cb1-18" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="bu">any</span>(left) <span class="kw">or</span> queue <span class="op">&gt;</span> <span class="dv">0</span>:</span>
+<span id="d03-cb1-19"><a href="#d03-cb1-19" aria-hidden="true" tabindex="-1"></a>    arriving <span class="op">=</span> <span class="fl">0.0</span></span>
+<span id="d03-cb1-20"><a href="#d03-cb1-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(SENDERS):</span>
+<span id="d03-cb1-21"><a href="#d03-cb1-21" aria-hidden="true" tabindex="-1"></a>        chunk <span class="op">=</span> <span class="bu">min</span>(left[i], per_step)</span>
+<span id="d03-cb1-22"><a href="#d03-cb1-22" aria-hidden="true" tabindex="-1"></a>        left[i] <span class="op">-=</span> chunk</span>
+<span id="d03-cb1-23"><a href="#d03-cb1-23" aria-hidden="true" tabindex="-1"></a>        arriving <span class="op">+=</span> chunk</span>
+<span id="d03-cb1-24"><a href="#d03-cb1-24" aria-hidden="true" tabindex="-1"></a>    room <span class="op">=</span> BUFFER <span class="op">-</span> queue</span>
+<span id="d03-cb1-25"><a href="#d03-cb1-25" aria-hidden="true" tabindex="-1"></a>    accepted <span class="op">=</span> <span class="bu">min</span>(arriving, room)</span>
+<span id="d03-cb1-26"><a href="#d03-cb1-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> arriving <span class="op">&gt;</span> room <span class="kw">and</span> first_drop <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="d03-cb1-27"><a href="#d03-cb1-27" aria-hidden="true" tabindex="-1"></a>        first_drop <span class="op">=</span> t</span>
+<span id="d03-cb1-28"><a href="#d03-cb1-28" aria-hidden="true" tabindex="-1"></a>    dropped <span class="op">+=</span> arriving <span class="op">-</span> accepted</span>
+<span id="d03-cb1-29"><a href="#d03-cb1-29" aria-hidden="true" tabindex="-1"></a>    queue <span class="op">+=</span> accepted</span>
+<span id="d03-cb1-30"><a href="#d03-cb1-30" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> <span class="bu">min</span>(queue, per_step)</span>
+<span id="d03-cb1-31"><a href="#d03-cb1-31" aria-hidden="true" tabindex="-1"></a>    queue <span class="op">-=</span> out</span>
+<span id="d03-cb1-32"><a href="#d03-cb1-32" aria-hidden="true" tabindex="-1"></a>    sent <span class="op">+=</span> out</span>
+<span id="d03-cb1-33"><a href="#d03-cb1-33" aria-hidden="true" tabindex="-1"></a>    peak <span class="op">=</span> <span class="bu">max</span>(peak, queue)</span>
+<span id="d03-cb1-34"><a href="#d03-cb1-34" aria-hidden="true" tabindex="-1"></a>    t <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d03-cb1-35"><a href="#d03-cb1-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb1-36"><a href="#d03-cb1-36" aria-hidden="true" tabindex="-1"></a>total <span class="op">=</span> SENDERS <span class="op">*</span> BURST</span>
+<span id="d03-cb1-37"><a href="#d03-cb1-37" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;offered          : </span><span class="sc">{</span>SENDERS<span class="sc">}</span><span class="ss"> x </span><span class="sc">{</span>BURST<span class="op">//</span><span class="dv">1024</span><span class="sc">}</span><span class="ss"> KB = </span><span class="sc">{</span>total<span class="op">/</span><span class="fl">1e6</span><span class="sc">:.2f}</span><span class="ss"> MB&quot;</span>)</span>
+<span id="d03-cb1-38"><a href="#d03-cb1-38" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;burst duration   : </span><span class="sc">{</span>BURST<span class="op">/</span>per_step<span class="sc">:.0f}</span><span class="ss"> us at line rate per sender&quot;</span>)</span>
+<span id="d03-cb1-39"><a href="#d03-cb1-39" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;queue fill rate  : </span><span class="sc">{</span>(SENDERS<span class="op">-</span><span class="dv">1</span>)<span class="op">*</span>per_step<span class="sc">:.0f}</span><span class="ss"> B/us (</span><span class="sc">{</span>(SENDERS<span class="op">-</span><span class="dv">1</span>)<span class="op">*</span><span class="dv">25</span><span class="sc">}</span><span class="ss"> Gb/s excess)&quot;</span>)</span>
+<span id="d03-cb1-40"><a href="#d03-cb1-40" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;first drop at    : </span><span class="sc">{</span>first_drop<span class="sc">}</span><span class="ss"> us&quot;</span>)</span>
+<span id="d03-cb1-41"><a href="#d03-cb1-41" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;peak queue       : </span><span class="sc">{</span>peak<span class="op">/</span><span class="fl">1e6</span><span class="sc">:.2f}</span><span class="ss"> MB&quot;</span>)</span>
+<span id="d03-cb1-42"><a href="#d03-cb1-42" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;dropped          : </span><span class="sc">{</span>dropped<span class="op">/</span><span class="fl">1e6</span><span class="sc">:.2f}</span><span class="ss"> MB (</span><span class="sc">{</span><span class="dv">100</span><span class="op">*</span>dropped<span class="op">/</span>total<span class="sc">:.1f}</span><span class="ss">% of offered)&quot;</span>)</span>
+<span id="d03-cb1-43"><a href="#d03-cb1-43" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;drained after    : </span><span class="sc">{</span>t<span class="sc">}</span><span class="ss"> us&quot;</span>)</span>
+<span id="d03-cb1-44"><a href="#d03-cb1-44" aria-hidden="true" tabindex="-1"></a>busy <span class="op">=</span> sent <span class="op">/</span> LINE                       <span class="co"># seconds the port was busy</span></span>
+<span id="d03-cb1-45"><a href="#d03-cb1-45" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;1-second average : </span><span class="sc">{</span><span class="dv">100</span><span class="op">*</span>busy<span class="sc">:.3f}</span><span class="ss">% utilisation  &lt;- what a 1 s counter shows&quot;</span>)</span>
+<span id="d03-cb1-46"><a href="#d03-cb1-46" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;1-ms window peak : </span><span class="sc">{</span><span class="dv">100</span><span class="op">*</span><span class="bu">min</span>(<span class="fl">1.0</span>, sent<span class="op">/</span>(LINE<span class="op">*</span><span class="fl">1e-3</span>))<span class="sc">:.0f}</span><span class="ss">% utilisation&quot;</span>)</span></code></pre></div>
+<p>Output from a real run (Python 3.13):</p>
+<pre class="text"><code>offered          : 8 x 256 KB = 2.10 MB
+burst duration   : 84 us at line rate per sender
+queue fill rate  : 21875 B/us (175 Gb/s excess)
+first drop at    : 47 us
+peak queue       : 1.05 MB
+dropped          : 0.79 MB (37.6% of offered)
+drained after    : 419 us
+1-second average : 0.042% utilisation  &lt;- what a 1 s counter shows
+1-ms window peak : 42% utilisation</code></pre>
+<p>Read the last two lines twice. More than a third of the burst was dropped. The port's one-second average utilisation was 0.04 %. Even a one-millisecond window shows only 42 %. A monitoring system polling interface counters every 30 or 60 seconds will never see this. It will see drop counters creeping up on a link that looks empty.</p>
+<p>The cost lands on TCP. A dropped segment at the tail of a burst often has no later segments behind it to trigger fast retransmit, so it waits for a retransmission timeout. Linux's minimum RTO is 200 ms. In a data centre with a 100 µs round trip, one lost segment can make a request 2,000 times slower than its RTT. This is the <strong>TCP incast</strong> problem. It is why data-centre operators care about ECN marking thresholds, buffer tuning and congestion control (DCTCP and its descendants) far more than about link speed.</p>
+<h3 id="d03-lag">Link aggregation: a hash decides, per flow, forever</h3>
+<p>A LAG (IEEE 802.1AX, which used to be 802.3ad) bundles several physical links into one logical port. LACP keeps the bundle honest. Each side sends LACPDUs to the slow-protocols multicast address <code>01:80:c2:00:00:02</code> (EtherType <code>0x8809</code>), every 30 s in slow mode or every 1 s in fast mode, and declares a partner dead after three missed intervals (90 s or 3 s).</p>
+<p>The part people misunderstand is how frames are spread. The switch does <strong>not</strong> round-robin frames across members. Doing so would reorder frames within a TCP flow, and TCP reads reordering as loss. Instead it hashes fields that are constant for a flow — MACs, IPs, protocol, ports — and uses the hash to pick a member. Every frame of a flow takes the same member. Different flows usually take different ones.</p>
+<p>The consequences follow directly:</p>
+<ul>
+<li><strong>One flow never exceeds one member's speed.</strong> A 4 × 25 Gb/s LAG is not a 100 Gb/s pipe for a single TCP connection. It is four 25 Gb/s pipes.</li>
+<li><strong>Balance is statistical.</strong> Thousands of small flows spread nearly evenly. A handful of large flows can land on the same member by chance.</li>
+<li><strong>Changing the member count moves flows.</strong> With "hash modulo N", going from 4 to 5 members changes the member for most flows, which briefly reorders their in-flight packets. <em>Resilient hashing</em> uses a fixed table of buckets and reassigns only the buckets the new member takes over.</li>
+<li><strong>Same hash, same answer.</strong> If two tiers of switches use the same hash function on the same fields, the second tier sees only flows that already share a hash property, and sends them all one way. This is <strong>hash polarisation</strong>.</li>
+</ul>
+<p>The script below shows all four effects using CRC-32 (a hash many switch ASICs offer):</p>
+<div class="sourceCode" id="d03-cb3"><pre class="sourceCode python"><code class="sourceCode python"><span id="d03-cb3-1"><a href="#d03-cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;How a LAG (or ECMP group) spreads flows: hash the 5-tuple, pick a member.</span></span>
+<span id="d03-cb3-2"><a href="#d03-cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb3-3"><a href="#d03-cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">Uses CRC-32 from zlib as the hash, as many switch ASICs offer CRC-based hashes.</span></span>
+<span id="d03-cb3-4"><a href="#d03-cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d03-cb3-5"><a href="#d03-cb3-5" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> random</span>
+<span id="d03-cb3-6"><a href="#d03-cb3-6" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> struct</span>
+<span id="d03-cb3-7"><a href="#d03-cb3-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> zlib</span>
+<span id="d03-cb3-8"><a href="#d03-cb3-8" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> collections <span class="im">import</span> Counter</span>
+<span id="d03-cb3-9"><a href="#d03-cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb3-10"><a href="#d03-cb3-10" aria-hidden="true" tabindex="-1"></a>random.seed(<span class="dv">7</span>)</span>
+<span id="d03-cb3-11"><a href="#d03-cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb3-12"><a href="#d03-cb3-12" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> five_tuple(i):</span>
+<span id="d03-cb3-13"><a href="#d03-cb3-13" aria-hidden="true" tabindex="-1"></a>    src <span class="op">=</span> <span class="ss">f&quot;10.0.</span><span class="sc">{</span>i <span class="op">//</span> <span class="dv">250</span><span class="sc">}</span><span class="ss">.</span><span class="sc">{</span>i <span class="op">%</span> <span class="dv">250</span> <span class="op">+</span> <span class="dv">1</span><span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="d03-cb3-14"><a href="#d03-cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> (src, <span class="st">&quot;10.9.0.10&quot;</span>, <span class="dv">6</span>, random.randint(<span class="dv">32768</span>, <span class="dv">60999</span>), <span class="dv">443</span>)</span>
+<span id="d03-cb3-15"><a href="#d03-cb3-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb3-16"><a href="#d03-cb3-16" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> flow_hash(t, seed<span class="op">=</span><span class="dv">0</span>):</span>
+<span id="d03-cb3-17"><a href="#d03-cb3-17" aria-hidden="true" tabindex="-1"></a>    src, dst, proto, sport, dport <span class="op">=</span> t</span>
+<span id="d03-cb3-18"><a href="#d03-cb3-18" aria-hidden="true" tabindex="-1"></a>    key <span class="op">=</span> (<span class="bu">bytes</span>(<span class="bu">map</span>(<span class="bu">int</span>, src.split(<span class="st">&quot;.&quot;</span>))) <span class="op">+</span> <span class="bu">bytes</span>(<span class="bu">map</span>(<span class="bu">int</span>, dst.split(<span class="st">&quot;.&quot;</span>)))</span>
+<span id="d03-cb3-19"><a href="#d03-cb3-19" aria-hidden="true" tabindex="-1"></a>           <span class="op">+</span> struct.pack(<span class="st">&quot;!BHH&quot;</span>, proto, sport, dport))</span>
+<span id="d03-cb3-20"><a href="#d03-cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> zlib.crc32(key, seed)</span>
+<span id="d03-cb3-21"><a href="#d03-cb3-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb3-22"><a href="#d03-cb3-22" aria-hidden="true" tabindex="-1"></a>flows <span class="op">=</span> [five_tuple(i) <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">10_000</span>)]</span>
+<span id="d03-cb3-23"><a href="#d03-cb3-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb3-24"><a href="#d03-cb3-24" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;1) 10,000 small flows over 4 members (flow counts):&quot;</span>)</span>
+<span id="d03-cb3-25"><a href="#d03-cb3-25" aria-hidden="true" tabindex="-1"></a>c <span class="op">=</span> Counter(flow_hash(f) <span class="op">%</span> <span class="dv">4</span> <span class="cf">for</span> f <span class="kw">in</span> flows)</span>
+<span id="d03-cb3-26"><a href="#d03-cb3-26" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;   &quot;</span>, [c[m] <span class="cf">for</span> m <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">4</span>)])</span>
+<span id="d03-cb3-27"><a href="#d03-cb3-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb3-28"><a href="#d03-cb3-28" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;2) 6 elephant flows of 10 Gb/s over 4 x 25 Gb/s members (Gb/s per member):&quot;</span>)</span>
+<span id="d03-cb3-29"><a href="#d03-cb3-29" aria-hidden="true" tabindex="-1"></a>eleph <span class="op">=</span> flows[:<span class="dv">6</span>]</span>
+<span id="d03-cb3-30"><a href="#d03-cb3-30" aria-hidden="true" tabindex="-1"></a>load <span class="op">=</span> Counter()</span>
+<span id="d03-cb3-31"><a href="#d03-cb3-31" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> f <span class="kw">in</span> eleph:</span>
+<span id="d03-cb3-32"><a href="#d03-cb3-32" aria-hidden="true" tabindex="-1"></a>    load[flow_hash(f) <span class="op">%</span> <span class="dv">4</span>] <span class="op">+=</span> <span class="dv">10</span></span>
+<span id="d03-cb3-33"><a href="#d03-cb3-33" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;   &quot;</span>, [load[m] <span class="cf">for</span> m <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">4</span>)], <span class="st">&quot;-&gt; busiest member&quot;</span>, <span class="bu">max</span>(load.values()), <span class="st">&quot;Gb/s&quot;</span>)</span>
+<span id="d03-cb3-34"><a href="#d03-cb3-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb3-35"><a href="#d03-cb3-35" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;3) Add a 5th member. Fraction of flows that change member:&quot;</span>)</span>
+<span id="d03-cb3-36"><a href="#d03-cb3-36" aria-hidden="true" tabindex="-1"></a>moved <span class="op">=</span> <span class="bu">sum</span>(flow_hash(f) <span class="op">%</span> <span class="dv">4</span> <span class="op">!=</span> flow_hash(f) <span class="op">%</span> <span class="dv">5</span> <span class="cf">for</span> f <span class="kw">in</span> flows)</span>
+<span id="d03-cb3-37"><a href="#d03-cb3-37" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;    modulo hashing          : </span><span class="sc">{</span><span class="dv">100</span> <span class="op">*</span> moved <span class="op">/</span> <span class="bu">len</span>(flows)<span class="sc">:.1f}</span><span class="ss">%&quot;</span>)</span>
+<span id="d03-cb3-38"><a href="#d03-cb3-38" aria-hidden="true" tabindex="-1"></a><span class="co"># Resilient hashing: a fixed table of buckets; a new member takes over only</span></span>
+<span id="d03-cb3-39"><a href="#d03-cb3-39" aria-hidden="true" tabindex="-1"></a><span class="co"># a fair share of buckets, everything else stays where it was.</span></span>
+<span id="d03-cb3-40"><a href="#d03-cb3-40" aria-hidden="true" tabindex="-1"></a>BUCKETS <span class="op">=</span> <span class="dv">256</span></span>
+<span id="d03-cb3-41"><a href="#d03-cb3-41" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> [b <span class="op">%</span> <span class="dv">4</span> <span class="cf">for</span> b <span class="kw">in</span> <span class="bu">range</span>(BUCKETS)]</span>
+<span id="d03-cb3-42"><a href="#d03-cb3-42" aria-hidden="true" tabindex="-1"></a>new <span class="op">=</span> table[:]</span>
+<span id="d03-cb3-43"><a href="#d03-cb3-43" aria-hidden="true" tabindex="-1"></a>per_member <span class="op">=</span> BUCKETS <span class="op">//</span> <span class="dv">5</span></span>
+<span id="d03-cb3-44"><a href="#d03-cb3-44" aria-hidden="true" tabindex="-1"></a>taken <span class="op">=</span> <span class="dv">0</span></span>
+<span id="d03-cb3-45"><a href="#d03-cb3-45" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> b <span class="kw">in</span> <span class="bu">range</span>(BUCKETS):</span>
+<span id="d03-cb3-46"><a href="#d03-cb3-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> taken <span class="op">&lt;</span> per_member <span class="kw">and</span> Counter(new)[new[b]] <span class="op">&gt;</span> per_member:</span>
+<span id="d03-cb3-47"><a href="#d03-cb3-47" aria-hidden="true" tabindex="-1"></a>        new[b] <span class="op">=</span> <span class="dv">4</span></span>
+<span id="d03-cb3-48"><a href="#d03-cb3-48" aria-hidden="true" tabindex="-1"></a>        taken <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d03-cb3-49"><a href="#d03-cb3-49" aria-hidden="true" tabindex="-1"></a>moved <span class="op">=</span> <span class="bu">sum</span>(table[flow_hash(f) <span class="op">%</span> BUCKETS] <span class="op">!=</span> new[flow_hash(f) <span class="op">%</span> BUCKETS] <span class="cf">for</span> f <span class="kw">in</span> flows)</span>
+<span id="d03-cb3-50"><a href="#d03-cb3-50" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;    resilient bucket table  : </span><span class="sc">{</span><span class="dv">100</span> <span class="op">*</span> moved <span class="op">/</span> <span class="bu">len</span>(flows)<span class="sc">:.1f}</span><span class="ss">%&quot;</span>)</span>
+<span id="d03-cb3-51"><a href="#d03-cb3-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb3-52"><a href="#d03-cb3-52" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;4) Polarisation: two tiers, same hash function and seed, 2 links each:&quot;</span>)</span>
+<span id="d03-cb3-53"><a href="#d03-cb3-53" aria-hidden="true" tabindex="-1"></a>tier1 <span class="op">=</span> Counter()</span>
+<span id="d03-cb3-54"><a href="#d03-cb3-54" aria-hidden="true" tabindex="-1"></a>tier2 <span class="op">=</span> Counter()</span>
+<span id="d03-cb3-55"><a href="#d03-cb3-55" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> f <span class="kw">in</span> flows:</span>
+<span id="d03-cb3-56"><a href="#d03-cb3-56" aria-hidden="true" tabindex="-1"></a>    a <span class="op">=</span> flow_hash(f) <span class="op">%</span> <span class="dv">2</span></span>
+<span id="d03-cb3-57"><a href="#d03-cb3-57" aria-hidden="true" tabindex="-1"></a>    tier1[a] <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d03-cb3-58"><a href="#d03-cb3-58" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> a <span class="op">==</span> <span class="dv">0</span>:                      <span class="co"># flows that went to spine 0</span></span>
+<span id="d03-cb3-59"><a href="#d03-cb3-59" aria-hidden="true" tabindex="-1"></a>        tier2[flow_hash(f) <span class="op">%</span> <span class="dv">2</span>] <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d03-cb3-60"><a href="#d03-cb3-60" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;    tier 1 split     :&quot;</span>, [tier1[<span class="dv">0</span>], tier1[<span class="dv">1</span>]])</span>
+<span id="d03-cb3-61"><a href="#d03-cb3-61" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;    tier 2 (spine 0) :&quot;</span>, [tier2[<span class="dv">0</span>], tier2[<span class="dv">1</span>]], <span class="st">&quot; &lt;- one link idle&quot;</span>)</span>
+<span id="d03-cb3-62"><a href="#d03-cb3-62" aria-hidden="true" tabindex="-1"></a>tier2 <span class="op">=</span> Counter(flow_hash(f, seed<span class="op">=</span><span class="bn">0x5EED</span>) <span class="op">%</span> <span class="dv">2</span> <span class="cf">for</span> f <span class="kw">in</span> flows <span class="cf">if</span> flow_hash(f) <span class="op">%</span> <span class="dv">2</span> <span class="op">==</span> <span class="dv">0</span>)</span>
+<span id="d03-cb3-63"><a href="#d03-cb3-63" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;    tier 2, new seed :&quot;</span>, [tier2[<span class="dv">0</span>], tier2[<span class="dv">1</span>]], <span class="st">&quot; &lt;- CRC is linear: a seed only flips bits&quot;</span>)</span>
+<span id="d03-cb3-64"><a href="#d03-cb3-64" aria-hidden="true" tabindex="-1"></a>tier2 <span class="op">=</span> Counter((flow_hash(f) <span class="op">&gt;&gt;</span> <span class="dv">16</span>) <span class="op">%</span> <span class="dv">2</span> <span class="cf">for</span> f <span class="kw">in</span> flows <span class="cf">if</span> flow_hash(f) <span class="op">%</span> <span class="dv">2</span> <span class="op">==</span> <span class="dv">0</span>)</span>
+<span id="d03-cb3-65"><a href="#d03-cb3-65" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;    tier 2, bit 16   :&quot;</span>, [tier2[<span class="dv">0</span>], tier2[<span class="dv">1</span>]], <span class="st">&quot; &lt;- different hash bits fix it&quot;</span>)</span></code></pre></div>
+<p>Output from a real run:</p>
+<pre class="text"><code>1) 10,000 small flows over 4 members (flow counts):
+    [2471, 2610, 2436, 2483]
+2) 6 elephant flows of 10 Gb/s over 4 x 25 Gb/s members (Gb/s per member):
+    [20, 0, 10, 30] -&gt; busiest member 30 Gb/s
+3) Add a 5th member. Fraction of flows that change member:
+    modulo hashing          : 79.5%
+    resilient bucket table  : 19.1%
+4) Polarisation: two tiers, same hash function and seed, 2 links each:
+    tier 1 split     : [4907, 5093]
+    tier 2 (spine 0) : [4907, 0]  &lt;- one link idle
+    tier 2, new seed : [0, 4907]  &lt;- CRC is linear: a seed only flips bits
+    tier 2, bit 16   : [2441, 2466]  &lt;- different hash bits fix it</code></pre>
+<p>Case 2 is the one that bites in production. Six 10 Gb/s flows is only 60 % of the bundle's 100 Gb/s, yet one member is asked for 30 Gb/s and drops, while another sits idle.</p>
+<p>Case 4 has a lesson of its own. With a CRC, changing the seed does not decorrelate the tiers. A CRC is linear, so a different seed only XORs every hash with the same constant: the tier-2 split flipped from "all on link 0" to "all on link 1". Real fixes use different hash functions or different output bits per tier, which is what vendors' "hash seed / hash offset" knobs do under the hood.</p>
+<p>The same mechanism, with a different name, spreads traffic across equal-cost IP routes (ECMP). Everything above applies to a leaf-spine fabric as much as to a two-cable LAG.</p>
+<h2 id="d03-wire">Deep dive: what the bridge actually does — a Linux lab</h2>
+<p>You can watch learning, ageing and flooding with nothing but a Linux machine. The Linux bridge is a software switch with the same learning algorithm, and it is the switch under Docker's <code>docker0</code> and many Kubernetes CNI plugins. The lab below builds a bridge with three hosts, each in its own network namespace. It needs root on Linux (a Linux VM on your Mac works). It does not run on macOS directly.</p>
+<div class="sourceCode" id="d03-cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d03-cb5-1"><a href="#d03-cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="d03-cb5-2"><a href="#d03-cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Linux only, needs root. Bridge d03br with hosts d03A d03B d03C.</span></span>
+<span id="d03-cb5-3"><a href="#d03-cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cleanup()</span><span class="kw">{</span> <span class="cf">for</span> n <span class="kw">in</span> d03A d03B d03C<span class="kw">;</span> <span class="cf">do</span> <span class="ex">ip</span> netns del <span class="va">$n</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null<span class="kw">;</span> <span class="cf">done</span><span class="kw">;</span> <span class="ex">ip</span> link del d03br <span class="dv">2</span><span class="op">&gt;</span>/dev/null<span class="kw">;</span> <span class="kw">}</span></span>
+<span id="d03-cb5-4"><a href="#d03-cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">cleanup</span></span>
+<span id="d03-cb5-5"><a href="#d03-cb5-5" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> n <span class="kw">in</span> d03A d03B d03C<span class="kw">;</span> <span class="cf">do</span> <span class="ex">ip</span> netns add <span class="va">$n</span><span class="kw">;</span> <span class="cf">done</span></span>
+<span id="d03-cb5-6"><a href="#d03-cb5-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link add d03br type bridge ageing_time 1000   <span class="co"># 10 s for the demo (centiseconds)</span></span>
+<span id="d03-cb5-7"><a href="#d03-cb5-7" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set d03br up</span>
+<span id="d03-cb5-8"><a href="#d03-cb5-8" aria-hidden="true" tabindex="-1"></a><span class="va">i</span><span class="op">=</span>1</span>
+<span id="d03-cb5-9"><a href="#d03-cb5-9" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> n <span class="kw">in</span> A B C<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="d03-cb5-10"><a href="#d03-cb5-10" aria-hidden="true" tabindex="-1"></a>  <span class="ex">ip</span> link add v03<span class="va">$n</span> type veth peer name eth0 netns d03<span class="va">$n</span></span>
+<span id="d03-cb5-11"><a href="#d03-cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="ex">ip</span> link set v03<span class="va">$n</span> master d03br up</span>
+<span id="d03-cb5-12"><a href="#d03-cb5-12" aria-hidden="true" tabindex="-1"></a>  <span class="ex">ip</span> <span class="at">-n</span> d03<span class="va">$n</span> link set eth0 address 02:00:00:00:00:0<span class="va">$i</span></span>
+<span id="d03-cb5-13"><a href="#d03-cb5-13" aria-hidden="true" tabindex="-1"></a>  <span class="ex">ip</span> <span class="at">-n</span> d03<span class="va">$n</span> addr add 10.0.0.<span class="va">$i</span>/24 dev eth0</span>
+<span id="d03-cb5-14"><a href="#d03-cb5-14" aria-hidden="true" tabindex="-1"></a>  <span class="ex">ip</span> <span class="at">-n</span> d03<span class="va">$n</span> link set eth0 up</span>
+<span id="d03-cb5-15"><a href="#d03-cb5-15" aria-hidden="true" tabindex="-1"></a>  <span class="va">i</span><span class="op">=</span><span class="va">$((i</span><span class="op">+</span><span class="dv">1</span><span class="va">))</span></span>
+<span id="d03-cb5-16"><a href="#d03-cb5-16" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="d03-cb5-17"><a href="#d03-cb5-17" aria-hidden="true" tabindex="-1"></a><span class="co"># Static ARP entries, so ARP broadcasts do not refresh the table behind our back</span></span>
+<span id="d03-cb5-18"><a href="#d03-cb5-18" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-n</span> d03A neigh replace 10.0.0.2 lladdr 02:00:00:00:00:02 dev eth0 nud permanent</span>
+<span id="d03-cb5-19"><a href="#d03-cb5-19" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-n</span> d03B neigh replace 10.0.0.1 lladdr 02:00:00:00:00:01 dev eth0 nud permanent</span>
+<span id="d03-cb5-20"><a href="#d03-cb5-20" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> netns exec d03A ping <span class="at">-c1</span> <span class="at">-W1</span> 10.0.0.2 <span class="op">&gt;</span>/dev/null</span>
+<span id="d03-cb5-21"><a href="#d03-cb5-21" aria-hidden="true" tabindex="-1"></a><span class="ex">bridge</span> <span class="at">-s</span> fdb show br d03br <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-v</span> permanent          <span class="co"># learned entries + timers</span></span>
+<span id="d03-cb5-22"><a href="#d03-cb5-22" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 4<span class="kw">;</span>  <span class="ex">bridge</span> <span class="at">-s</span> fdb show br d03br <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-v</span> permanent</span>
+<span id="d03-cb5-23"><a href="#d03-cb5-23" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 8<span class="kw">;</span>  <span class="ex">bridge</span> <span class="at">-s</span> fdb show br d03br <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-v</span> permanent <span class="co"># aged out by now</span></span>
+<span id="d03-cb5-24"><a href="#d03-cb5-24" aria-hidden="true" tabindex="-1"></a><span class="co"># Silent receiver: B listens on UDP 5000 but never sends; A streams to it; C captures</span></span>
+<span id="d03-cb5-25"><a href="#d03-cb5-25" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> netns exec d03B timeout 4 python3 <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="d03-cb5-26"><a href="#d03-cb5-26" aria-hidden="true" tabindex="-1"></a><span class="st">import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind((&#39;10.0.0.2&#39;,5000))</span></span>
+<span id="d03-cb5-27"><a href="#d03-cb5-27" aria-hidden="true" tabindex="-1"></a><span class="st">while True: s.recv(2000)&quot;</span> <span class="kw">&amp;</span></span>
+<span id="d03-cb5-28"><a href="#d03-cb5-28" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> netns exec d03C timeout 3 tcpdump <span class="at">-e</span> <span class="at">-nn</span> <span class="at">-i</span> eth0 <span class="at">-c</span> 4 udp <span class="kw">&amp;</span></span>
+<span id="d03-cb5-29"><a href="#d03-cb5-29" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 1</span>
+<span id="d03-cb5-30"><a href="#d03-cb5-30" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> netns exec d03A python3 <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="d03-cb5-31"><a href="#d03-cb5-31" aria-hidden="true" tabindex="-1"></a><span class="st">import socket,time</span></span>
+<span id="d03-cb5-32"><a href="#d03-cb5-32" aria-hidden="true" tabindex="-1"></a><span class="st">s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)</span></span>
+<span id="d03-cb5-33"><a href="#d03-cb5-33" aria-hidden="true" tabindex="-1"></a><span class="st">for i in range(4): s.sendto(b&#39;x&#39;*100,(&#39;10.0.0.2&#39;,5000)); time.sleep(0.25)&quot;</span></span>
+<span id="d03-cb5-34"><a href="#d03-cb5-34" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 2.5<span class="kw">;</span> <span class="ex">bridge</span> <span class="at">-s</span> fdb show br d03br <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-v</span> permanent</span>
+<span id="d03-cb5-35"><a href="#d03-cb5-35" aria-hidden="true" tabindex="-1"></a><span class="ex">cleanup</span></span></code></pre></div>
+<p>The script ran on a Linux 6.18 kernel; the outputs below are pasted from that run, with annotations added after <code>&lt;-</code>. First, the default ageing time of a freshly created bridge, before the demo shortened it:</p>
+<pre class="text"><code>$ ip -d link show br9 | grep -o &#39;ageing_time [0-9]*&#39;
+ageing_time 30000                      &lt;- centiseconds: 300 s, the 802.1Q default</code></pre>
+<p>Learning and ageing, with the ageing time set to 10 s:</p>
+<pre class="text"><code>### fdb before
+                                               &lt;- empty: nothing has spoken yet
+### fdb after one ping
+02:00:00:00:00:01 dev v03A used 0/0 master d03br    &lt;- learned from A&#39;s echo request
+02:00:00:00:00:02 dev v03B used 0/0 master d03br    &lt;- learned from B&#39;s echo reply
+### 4 s later
+02:00:00:00:00:01 dev v03A used 4/4 master d03br    &lt;- &quot;used/updated&quot;: seconds since the
+02:00:00:00:00:02 dev v03B used 4/4 master d03br       entry was last used / refreshed
+### 12 s later (aged)
+                                               &lt;- both gone: idle longer than ageing_time</code></pre>
+<p>Now the silent receiver. Host A streams UDP to B. B has a listener, so it never answers — no ICMP port unreachable, nothing. We capture on C, which should see none of this traffic:</p>
+<pre class="text"><code>### silent receiver: A streams UDP to B, B never transmits; capture on C
+listening on eth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+21:33:31.636052 02:00:00:00:00:01 &gt; 02:00:00:00:00:02, ethertype IPv4 (0x0800), length 142: 10.0.0.1.41807 &gt; 10.0.0.2.5000: UDP, length 100
+21:33:31.886395 02:00:00:00:00:01 &gt; 02:00:00:00:00:02, ethertype IPv4 (0x0800), length 142: 10.0.0.1.41807 &gt; 10.0.0.2.5000: UDP, length 100
+21:33:32.136672 02:00:00:00:00:01 &gt; 02:00:00:00:00:02, ethertype IPv4 (0x0800), length 142: 10.0.0.1.41807 &gt; 10.0.0.2.5000: UDP, length 100
+21:33:32.387065 02:00:00:00:00:01 &gt; 02:00:00:00:00:02, ethertype IPv4 (0x0800), length 142: 10.0.0.1.41807 &gt; 10.0.0.2.5000: UDP, length 100
+4 packets captured
+### fdb after stream
+02:00:00:00:00:01 dev v03A used 3/2 master d03br    &lt;- A is known; B is not</code></pre>
+<p>Every one of A's datagrams reached C, even though the destination MAC is B's. That is unknown-unicast flooding, captured on a bystander. The table at the end explains it: the bridge learned A (A transmits) but never relearned B (B is silent). As long as B stays quiet, every frame to B goes to every port. The <code>length 142</code> is the frame without its 4-byte FCS: 14 Ethernet + 20 IP + 8 UDP + 100 data.</p>
+<p>An earlier version of this lab made a revealing mistake. Without the listener on B, B's kernel answered each datagram with ICMP port unreachable. That single reply taught the bridge where B was, and the flooding stopped after the first frame. One flooded frame is normal: it is how learning starts. A steady stream of them is a symptom.</p>
+<p>The filter for finding this on any host is simple: capture frames that are neither to you nor broadcast/multicast. If you see any, something upstream is flooding.</p>
+<div class="sourceCode" id="d03-cb9"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d03-cb9-1"><a href="#d03-cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Linux: frames on this NIC that are not for us (needs root)</span></span>
+<span id="d03-cb9-2"><a href="#d03-cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tcpdump <span class="at">-e</span> <span class="at">-nn</span> <span class="at">-i</span> eth0 <span class="st">&#39;not ether host &#39;&quot;</span><span class="va">$(</span><span class="fu">cat</span> /sys/class/net/eth0/address<span class="va">)</span><span class="st">&quot;&#39; and not broadcast and not multicast&#39;</span></span>
+<span id="d03-cb9-3"><a href="#d03-cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d03-cb9-4"><a href="#d03-cb9-4" aria-hidden="true" tabindex="-1"></a><span class="co"># run on your Mac — your output will differ (en0 is often Wi-Fi; flooding is a wired-LAN symptom)</span></span>
+<span id="d03-cb9-5"><a href="#d03-cb9-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tcpdump <span class="at">-e</span> <span class="at">-nn</span> <span class="at">-i</span> en0 <span class="st">&quot;not ether host </span><span class="va">$(</span><span class="ex">ifconfig</span> en0 <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;/ether/{print $2}&#39;</span><span class="va">)</span><span class="st"> and not broadcast and not multicast&quot;</span></span></code></pre></div>
+<h2 id="d03-numbers">Deep dive: by the numbers</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Value</th>
+<th>Note</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>MAC ageing time</td>
+<td>300 s default; 802.1Q range 10–1,000,000 s</td>
+<td>Linux bridge shows it as <code>ageing_time 30000</code> (centiseconds)</td>
+</tr>
+<tr class="even">
+<td>ARP cache timeout on many routers</td>
+<td>often far longer than 300 s (4 hours on Cisco IOS)</td>
+<td>Vendor default; hosts keep ARP entries for minutes at most</td>
+</tr>
+<tr class="odd">
+<td>STP topology-change ageing</td>
+<td>forward delay, 15 s default</td>
+<td>RSTP flushes affected ports instead</td>
+</tr>
+<tr class="even">
+<td>Minimum frame on the wire</td>
+<td>64 B + 8 B preamble/SFD + 12 B inter-frame gap = 84 B slot</td>
+<td>Why line rate in packets/s is lower than you think</td>
+</tr>
+<tr class="odd">
+<td>Line rate, 64-byte frames</td>
+<td>1.488 Mpps at 1 G, 14.88 Mpps at 10 G, 148.8 Mpps at 100 G</td>
+<td>10⁹ / (84 × 8) per Gb/s</td>
+</tr>
+<tr class="even">
+<td>Serialisation, 1,518 B</td>
+<td>12.1 µs at 1 G, 1.21 µs at 10 G, 0.12 µs at 100 G</td>
+<td>Store-and-forward adds this per hop</td>
+</tr>
+<tr class="odd">
+<td>Serialisation, 9,018 B jumbo</td>
+<td>72 µs at 1 G, 7.2 µs at 10 G</td>
+<td>Jumbo frames help CPUs, hurt per-hop latency</td>
+</tr>
+<tr class="even">
+<td>On-chip buffer, DC merchant silicon</td>
+<td>tens of MB shared by all ports</td>
+<td>Varies by chip; 32 MB at 12.8 Tb/s ≈ 20 µs of full throughput</td>
+</tr>
+<tr class="odd">
+<td>Linux TCP minimum RTO</td>
+<td>200 ms</td>
+<td>Versus ~100 µs data-centre RTT: one timeout ≈ 2,000 RTTs</td>
+</tr>
+<tr class="even">
+<td>LACP timers</td>
+<td>1 s fast / 30 s slow; timeout 3 s / 90 s</td>
+<td>Use fast rate when you want sub-5 s failure detection</td>
+</tr>
+<tr class="odd">
+<td>Flows moved, modulo 4→5</td>
+<td>~80 % (simulated above)</td>
+<td>Resilient hashing: ~20 %</td>
+</tr>
+</tbody>
+</table>
+<p>A worked check on the packet-rate row. A 64-byte frame occupies 64 + 8 + 12 = 84 bytes of wire time, or 672 bits. At 10 Gb/s, 10¹⁰ / 672 = 14,880,952 frames per second. A switch advertised as "line rate at 64 bytes" must make one forwarding decision every 67 ns per 10 G port. On a 128-port 100 G switch, the pipeline handles about 19 billion decisions per second. That is why the work is done in fixed-function silicon and not in software.</p>
+<h2 id="d03-failures">Deep dive: production failure modes</h2>
+<h3 id="d03-fail-flood">Unicast flooding from asymmetric routing</h3>
+<p><strong>Symptom.</strong> Hosts on a VLAN see traffic that is not theirs. Uplinks show elevated utilisation that no application accounts for. Sometimes a server's NIC drops packets because it is processing other servers' traffic.</p>
+<p><strong>Mechanism.</strong> Return traffic for a server enters the VLAN through router R1, but the server sends its outbound traffic through router R2. That asymmetry is common with two first-hop routers and load sharing. R1 holds an ARP entry for the server for hours, because router ARP timeouts are long. The switch near R1 never sees the server's MAC as a source, because the server talks to R2. After 300 s the MAC ages out on that switch. R1 keeps sending to a MAC the switch does not know, and every frame floods the VLAN.</p>
+<p><strong>Prove it.</strong> On a bystander host, run the "not for me" capture above. The flooded frames will have the router's MAC as source and the server's MAC as destination. On the switch facing R1, look up the server's MAC; it will be missing while traffic is flowing (<code>show mac address-table address &lt;mac&gt;</code> on most vendor CLIs; <code>bridge fdb show | grep &lt;mac&gt;</code> on Linux).</p>
+<p><strong>Fix.</strong> Make the timers agree. Set the router's ARP timeout below the switch's MAC ageing time, so the router re-ARPs and the server's reply refreshes the table. Or raise MAC ageing above the ARP timeout. Or remove the asymmetry.</p>
+<h3 id="d03-fail-flap">MAC flapping: a loop, a duplicate, or a misbehaving host</h3>
+<p><strong>Symptom.</strong> Intermittent loss for one or a few hosts. Switch logs complain that a MAC is "moving" or "flapping" between two ports (the exact message is vendor-specific).</p>
+<p><strong>Mechanism.</strong> Learning trusts the source address. If frames with the same source MAC arrive on two ports, the entry flips between them, and frames destined for that MAC follow whichever port won last. The causes, roughly in order of how often they turn up: a Layer 2 loop (the same broadcast arrives on two ports); two VMs or containers cloned with the same MAC; a server bonding mode that sends the same MAC out of two switch ports without the switch knowing they form a bundle; and plain spoofing.</p>
+<p><strong>Prove it.</strong> Watch the table entry over a few seconds; on Linux, <code>watch -n 0.5 'bridge fdb show | grep &lt;mac&gt;'</code>. Check broadcast counters on the two ports. A loop shows a broadcast rate climbing fast. A duplicate MAC does not.</p>
+<p><strong>Fix.</strong> For loops, STP/RSTP or physically removing the loop; storm control limits the damage meanwhile. For duplicates, fix the MAC assignment. For bonding, match the server's mode to the switch config: LACP on both sides, or active-backup with no LAG on the switch.</p>
+<h3 id="d03-fail-microburst">Microburst drops on an "idle" link</h3>
+<p><strong>Symptom.</strong> Application p99 latency spikes, often in clean multiples of 200 ms. Interface graphs show 5–20 % utilisation. Drop counters on one egress port rise slowly.</p>
+<p><strong>Mechanism.</strong> The incast arithmetic above. Short bursts overflow the port's share of the shared buffer, and TCP recovers through retransmission timeouts.</p>
+<p><strong>Prove it.</strong> Correlate three numbers. First, egress discard counters on that port's queues (on Linux hosts, <code>ip -s link show dev eth0</code> and <code>ethtool -S eth0 | grep -i drop</code>; on switches, the per-queue drop counters). Second, retransmission counters on the senders: <code>nstat -az TcpRetransSegs TcpExtTCPTimeouts</code> on Linux, <code>netstat -s -p tcp | grep -i retrans</code> on macOS. Third, buffer high-water marks or microburst telemetry if the switch has it; many recent switches can export queue depth at sub-millisecond granularity. Utilisation graphs will not help, as the simulation showed.</p>
+<p><strong>Fix.</strong> In rough order of preference: let the switch mark ECN instead of dropping, and use a congestion control that reacts to it (DCTCP-style); spread the fan-in (stagger requests, limit concurrency); raise the queue's dynamic-threshold factor or give the traffic class its own buffer pool; move to a switch with more buffer per port. Faster links help less than you would expect, because the fan-in ratio stays the same.</p>
+<h3 id="d03-fail-lag">One LAG member hot, the others cold</h3>
+<p><strong>Symptom.</strong> A 4 × 25 G LAG at 40 % total load drops packets. One member shows 100 % utilisation.</p>
+<p><strong>Mechanism.</strong> A few large flows hashed onto the same member (case 2 above). Or the hash uses only MAC addresses. Linux bonding's default <code>xmit_hash_policy</code> is <code>layer2</code>, and between a host and its single router every frame has the same pair of MACs, so every flow lands on one member.</p>
+<p><strong>Prove it.</strong> Per-member counters (<code>cat /proc/net/bonding/bond0</code>, and <code>ip -s link show</code> on each member, on Linux; the per-interface counters of the port-channel members on a switch). Check the configured hash policy on <em>both</em> ends; each side hashes only its own transmit direction.</p>
+<p><strong>Fix.</strong> Hash on L3+L4 fields (<code>xmit_hash_policy=layer3+4</code> on Linux bonding; the equivalent load-balance setting on the switch). If the traffic really is a few elephants, a LAG cannot fix it. Use faster single links, split the work into more flows, or use a fabric that sprays packets and reorders at the receiver.</p>
+<h3 id="d03-fail-crc">CRC errors on a link that tests clean</h3>
+<p><strong>Symptom.</strong> A port shows rising FCS/CRC errors. You replace the optic and cable; the errors continue.</p>
+<p><strong>Mechanism.</strong> In a cut-through path, a frame corrupted on an upstream link is forwarded with a stomped CRC. The error appears on the first store-and-forward hop (or end host) downstream, not on the link that caused it.</p>
+<p><strong>Prove it.</strong> Follow the errors upstream. The true source is the port with <em>input</em> errors that are not stomped. Some platforms count stomped frames separately, which makes this quick; on others you walk the path port by port.</p>
+<p><strong>Fix.</strong> Replace the optic or cable on the link where the errors originate.</p>
+<h2 id="d03-2026">Deep dive: 2026 context</h2>
+<p><strong>Cloud VPCs do not switch.</strong> AWS, Google Cloud and Azure virtual networks do not run flood-and-learn at all. The hypervisor or smart NIC knows every VM's MAC and IP from the control plane. It answers ARP on the VM's behalf and delivers frames directly. Broadcast and multicast are not supported in a standard VPC (AWS offers multicast only through a Transit Gateway feature). Everything in this deep dive about MAC ageing and unknown-unicast flooding simply does not happen inside a VPC. That also means old L2 tricks — gratuitous ARP failover, a floating IP moved by sending ARP — do not work there. You move the IP through the cloud API instead.</p>
+<p><strong>Kubernetes and containers do switch, in software.</strong> A node using a bridge-based CNI has a Linux bridge (<code>cni0</code>, <code>docker0</code>) with the same learning table and the same 300 s ageing you saw in the lab. Overlay CNIs that use VXLAN (Flannel, Calico in VXLAN mode, others) usually avoid flood-and-learn across nodes. The agent programs static forwarding entries, visible with <code>bridge fdb show dev flannel.1</code>, each mapping a remote MAC to a remote node's IP. Learning by flooding across an IP fabric would be too expensive.</p>
+<p><strong>Data-centre fabrics replaced flooding with a control plane.</strong> Large fabrics run VXLAN with an EVPN control plane (RFC 7432, RFC 8365). Switches advertise the MACs they learn locally in BGP, so remote switches install them without ever flooding. LAG's multi-switch cousin — one server dual-homed to two switches — is done with EVPN multihoming instead of vendor-specific MLAG in newer designs.</p>
+<p><strong>AI training clusters made buffers and hashing first-class problems.</strong> GPU-to-GPU traffic is a few huge, synchronised flows: the worst case for both microbursts and per-flow hashing. RoCEv2 fabrics traditionally rely on Priority Flow Control (IEEE 802.1Qbb) to avoid drops. That brings its own failure mode: pause frames that spread congestion backwards and, in bad cases, deadlock. The newer approach — in hyperscaler fabrics and in the Ultra Ethernet Consortium's specification released in 2025 — sprays a flow's packets across all paths and lets the receiver reorder. It abandons the "one flow, one path" rule this section explained. When you hear "packet spraying" or "adaptive routing", this is the problem it solves.</p>
+<p><strong>Speeds keep rising; the buffer per port does not.</strong> Each switch generation roughly doubles throughput. On-chip buffer grows more slowly, so the microseconds of buffering per port tend to shrink. Microburst behaviour gets harder, not easier, as links get faster.</p>
+<h2 id="d03-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: A switch's MAC table is half full, yet it is flooding traffic to a host that is actively receiving. Give two independent explanations.</strong></p>
+<p>First, the host may be silent. Ageing refreshes on <em>source</em> addresses only, so a host that only receives ages out after 300 s and every frame to it is flooded, however busy the stream. Second, the table is a hash table with fixed-size buckets. If the host's <em>(VLAN, MAC)</em> hashes into a full bucket, the switch cannot learn it, even with half the table free. You tell them apart by checking whether the host ever transmits on that port, and whether the switch reports learning failures or hash collisions.</p>
+<p><strong>Q2: Why can a cut-through switch not drop a frame with a bad FCS, and what does that do to troubleshooting?</strong></p>
+<p>The FCS is the last 4 bytes of the frame. A cut-through switch has started transmitting long before those bytes arrive. When the check fails, the frame is already half-sent, so the switch can only end it with a deliberately bad CRC. The next store-and-forward device drops it and counts an error. The counter therefore increments one or more hops away from the faulty link, and swapping optics on the reporting port does nothing.</p>
+<p><strong>Q3: Interface utilisation is 10 %, yet the switch is dropping packets on that port. How is that possible, and how would you prove it?</strong></p>
+<p>Utilisation is an average over seconds or minutes, and drops happen over microseconds. When several ports send to one port at once, the queue grows at the excess rate, and a buffer share of around a megabyte fills in tens of microseconds. Proof comes from correlation, not averages: egress discard counters on that queue, TCP retransmission-timeout counters on the senders, and sub-millisecond buffer telemetry if the switch has it. Latency outliers in multiples of the minimum RTO (200 ms on Linux) are a strong hint.</p>
+<p><strong>Q4: You add a fifth member to a busy four-member LAG. What happens to the traffic, and how would you avoid it?</strong></p>
+<p>With modulo-N hashing, around four out of five flows change member. Packets already queued on the old member and new ones on the new member can arrive out of order, and TCP may treat that as loss. Resilient (consistent) hashing keeps a fixed bucket table and moves only the buckets the new member takes, around a fifth of the flows. Doing the change in a quiet period also helps.</p>
+<p><strong>Q5: Why does a single <code>iperf3</code> stream over a 4 × 10 G LAG top out near 10 Gb/s, and what changes with <code>-P 8</code>?</strong></p>
+<p>The LAG hashes per flow so it never reorders packets within a flow. One TCP stream is one flow, so it uses one 10 G member. With eight parallel streams there are eight different source ports. They hash to different members with reasonable probability, but the spread is not guaranteed to be even. Eight flows over four members often leaves one member with three flows and another with one.</p>
+<p><strong>Q6: Two tiers of switches both hash with CRC-32 over the same fields. You change the seed on the second tier, and nothing improves. Why?</strong></p>
+<p>CRC is linear over GF(2). For fixed-length input, changing the initial value XORs every output with the same constant. If tier 1 sent all flows with hash bit 0 equal to 0 to one spine, those flows still share bit 0 at tier 2, just possibly inverted. They all go one way. You need a different function, or different output bits, at each tier — not a different seed of the same CRC.</p>
+<p><strong>Q7: You run a VM cluster that fails over by moving a virtual IP and sending gratuitous ARP. It works on-premises and fails in the cloud. Why?</strong></p>
+<p>On-premises, the gratuitous ARP is a broadcast that floods the VLAN, so it refreshes every host's ARP cache and every switch's MAC table. In a cloud VPC there is no flooding and no learning. The virtual network's control plane decides which VM owns an IP, and it answers ARP itself, so a guest's gratuitous ARP changes nothing. The failover must call the cloud API to move the IP (or update a route), or use a load balancer.</p>
