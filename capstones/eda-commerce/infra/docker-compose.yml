@@ -191,7 +191,10 @@ services:
       retries: 10
 
   minio-init:
+    # One-shot. Kept out of `up --wait` (a container that exits is not "healthy");
+    # make up runs it explicitly with `compose run --rm minio-init`.
     image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    profiles: ["init"]
     depends_on:
       minio:
         condition: service_healthy
