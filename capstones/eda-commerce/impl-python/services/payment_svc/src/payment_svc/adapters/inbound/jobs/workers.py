@@ -8,6 +8,7 @@ from collections.abc import Callable
 from edacommon.db import Database, UnitOfWork
 from edacommon.ids import Clock
 from edacommon.logging import get_logger
+
 from payment_svc.adapters.outbound.persistence.repositories import WebhookStore
 from payment_svc.adapters.outbound.psp.acl import outcome_from_notification
 from payment_svc.application.payments import Payments
@@ -19,8 +20,9 @@ class WebhookProcessor:
     """Applies rows of ``psp_webhook`` that the endpoint stored (store-then-ack). ``wake()`` is
     called after each stored webhook so latency stays low; the poll interval is the safety net."""
 
-    def __init__(self, db: Database, payments_for: Callable[[UnitOfWork], Payments], clock: Clock,
-                 interval_s: float = 1.0) -> None:
+    def __init__(
+        self, db: Database, payments_for: Callable[[UnitOfWork], Payments], clock: Clock, interval_s: float = 1.0
+    ) -> None:
         self._db = db
         self._payments_for = payments_for
         self._clock = clock

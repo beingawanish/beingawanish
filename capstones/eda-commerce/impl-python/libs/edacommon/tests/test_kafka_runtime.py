@@ -15,12 +15,10 @@ import time
 import uuid
 from typing import Any
 
+import contracts_py
 import pytest
 from confluent_kafka import Consumer, Producer, TopicPartition
 from confluent_kafka.schema_registry import Schema
-from sqlalchemy import text
-
-import contracts_py
 from contracts_py.records import ReserveStock
 from contracts_py.topics import retry_topics
 from edacommon.config import ServiceSettings
@@ -37,6 +35,7 @@ from edacommon.outbox import OutboxWriter, PollingRelay
 from edacommon.serde import AvroSerde
 from edacommon.testing.fakes import counter_value
 from edacommon.testing.infra import create_topics
+from sqlalchemy import text
 
 from .conftest import example
 
@@ -77,17 +76,37 @@ class Env:
                 time.sleep(self.handler_delay)
             if self.failures:
                 raise self.failures.pop(0)
-            uow.session.execute(text("INSERT INTO effect (id, n) VALUES (:id, 1) ON CONFLICT (id) DO UPDATE "
-                                     "SET n = effect.n + 1"), {"id": cmd.reservation_id})
-            OutboxWriter(self.serde, self.group, SystemClock()).append(uow.session, OutgoingMessage(
-                topic=reply_topic, record_type=REPLY, key=cmd.order_id, aggregate_type="Reservation",
-                aggregate_id=cmd.reservation_id,
-                body={"orderId": cmd.order_id, "reservationId": cmd.reservation_id, "reason": "ok",
-                      "releasedAt": SystemClock().now()}))
+            uow.session.execute(
+                text("INSERT INTO effect (id, n) VALUES (:id, 1) ON CONFLICT (id) DO UPDATE SET n = effect.n + 1"),
+                {"id": cmd.reservation_id},
+            )
+            OutboxWriter(self.serde, self.group, SystemClock()).append(
+                uow.session,
+                OutgoingMessage(
+                    topic=reply_topic,
+                    record_type=REPLY,
+                    key=cmd.order_id,
+                    aggregate_type="Reservation",
+                    aggregate_id=cmd.reservation_id,
+                    body={
+                        "orderId": cmd.order_id,
+                        "reservationId": cmd.reservation_id,
+                        "reason": "ok",
+                        "releasedAt": SystemClock().now(),
+                    },
+                ),
+            )
             uow.after_commit(self.handled.set)
 
-        self.processor = MessageProcessor(group=self.group, registry=self.registry, db=db, serde=self.serde,
-                                          forwarder=Forwarder(self.producer, self.group), metrics=metrics, clock=clock)
+        self.processor = MessageProcessor(
+            group=self.group,
+            registry=self.registry,
+            db=db,
+            serde=self.serde,
+            forwarder=Forwarder(self.producer, self.group),
+            metrics=metrics,
+            clock=clock,
+        )
 
     def send_command(self, order_id: str | None = None) -> str:
         """Write a ReserveStock to an outbox and relay it, exactly as a producing service would."""
@@ -96,9 +115,17 @@ class Env:
         value["orderId"] = order_id
         body = {k: v for k, v in value.items() if k != "envelope"}
         with self.db.unit_of_work() as uow:
-            appended = self.writer.append(uow.session, OutgoingMessage(
-                topic=self.cmd_topic, record_type=TYPE, key=order_id, body=body, aggregate_type="Reservation",
-                aggregate_id=value["reservationId"]))
+            appended = self.writer.append(
+                uow.session,
+                OutgoingMessage(
+                    topic=self.cmd_topic,
+                    record_type=TYPE,
+                    key=order_id,
+                    body=body,
+                    aggregate_type="Reservation",
+                    aggregate_id=value["reservationId"],
+                ),
+            )
         PollingRelay(self.db, self.producer, self.metrics).publish_once()
         return appended.event_id
 
@@ -107,16 +134,21 @@ class Env:
         conf = consumer_config(self.settings, g)
         conf["session.timeout.ms"] = 6000
         topics = list(retry_topics(self.group)) if retry else [self.cmd_topic]
-        return cls(consumer_conf=conf, topics=topics, processor=self.processor, clock=self.clock, retry_mode=retry,
-                   name=g)
+        return cls(consumer_conf=conf, topics=topics, processor=self.processor, clock=self.clock, retry_mode=retry, name=g)
 
     def effects(self) -> int:
         with self.db.unit_of_work() as uow:
             return int(uow.session.execute(text("SELECT coalesce(sum(n),0) FROM effect")).scalar_one())
 
     def read(self, topic: str, n: int, timeout: float = 20.0) -> list[Any]:
-        c = Consumer({"bootstrap.servers": self.settings.kafka_bootstrap_servers, "group.id": f"reader-{uuid.uuid4().hex}",
-                      "auto.offset.reset": "earliest", "enable.auto.commit": False})
+        c = Consumer(
+            {
+                "bootstrap.servers": self.settings.kafka_bootstrap_servers,
+                "group.id": f"reader-{uuid.uuid4().hex}",
+                "auto.offset.reset": "earliest",
+                "enable.auto.commit": False,
+            }
+        )
         c.subscribe([topic])
         out: list[Any] = []
         deadline = time.monotonic() + timeout
@@ -154,11 +186,21 @@ def test_command_in_reply_out_with_debezium_headers_and_murmur2(env: Env) -> Non
     (cmd,) = env.read(env.cmd_topic, 1)
     assert cmd.partition() == java_partition(order_id, 12), "polling relay must partition like Java (murmur2)"
     names = [k for k, _ in cmd.headers()]
-    assert names == ["id", "ce_id", "ce_type", "ce_source", "ce_time", "correlation_id", "causation_id",
-                     "traceparent", "tracestate", "ce_specversion"]
+    assert names == [
+        "id",
+        "ce_id",
+        "ce_type",
+        "ce_source",
+        "ce_time",
+        "correlation_id",
+        "causation_id",
+        "traceparent",
+        "tracestate",
+        "ce_specversion",
+    ]
     loop = env.loop()
     t = run_in_thread(loop)
-    wait_for(lambda: env.handled.is_set())
+    wait_for(env.handled.is_set)
     PollingRelay(env.db, env.producer, env.metrics).publish_once()
     (reply,) = env.read(env.reply_topic, 1)
     h = {k: (v.decode() if v else None) for k, v in reply.headers()}
@@ -198,8 +240,7 @@ def test_dlq_peek_and_replay_processes_once(env: Env) -> None:
     main, retry = env.loop(), env.loop(retry=True)
     threads = [run_in_thread(main), run_in_thread(retry)]
     env.read(f"{env.group}.dlq", 1)
-    ops = DlqOps(consumer_conf=consumer_config(env.settings, "x"), producer=env.producer, group=env.group,
-                 clock=env.clock)
+    ops = DlqOps(consumer_conf=consumer_config(env.settings, "x"), producer=env.producer, group=env.group, clock=env.clock)
     (entry,) = ops.peek(10)
     assert entry.eventId == event_id and entry.eventType == TYPE and entry.errorClass == "NonRetryable"
     assert entry.originalTopic == env.cmd_topic and entry.errorMessage == "unknown reservation"
@@ -226,7 +267,7 @@ def test_crash_after_db_commit_before_offset_commit_is_a_duplicate(env: Env, met
     env.send_command()
     crashing = env.loop(cls=CrashingLoop)
     t = run_in_thread(crashing)
-    wait_for(lambda: env.handled.is_set())
+    wait_for(env.handled.is_set)
     crashing.stop()
     t.join(15)
     assert env.effects() == 1
@@ -243,7 +284,7 @@ def test_graceful_shutdown_finishes_record_and_commits(env: Env) -> None:
     env.send_command()
     loop = env.loop()
     t = run_in_thread(loop)
-    wait_for(lambda: env.in_handler.is_set())
+    wait_for(env.in_handler.is_set)
     started = time.monotonic()
     loop.stop()  # what SIGTERM does
     t.join(20)

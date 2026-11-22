@@ -132,15 +132,15 @@ class SagaData:
     capture_attempt: int = 0
     cancel_reason: str | None = None
     cancel_detail: str | None = None
-    pending: tuple[str, ...] = ()            # outstanding compensations (Compensation values)
-    early: tuple[dict[str, Any], ...] = ()   # triggers that arrived before their state
-    resume_state: str | None = None          # where an operator retry goes from NEEDS_ATTENTION
+    pending: tuple[str, ...] = ()  # outstanding compensations (Compensation values)
+    early: tuple[dict[str, Any], ...] = ()  # triggers that arrived before their state
+    resume_state: str | None = None  # where an operator retry goes from NEEDS_ATTENTION
     attention_issue: str | None = None
-    decided: bool = False                    # reached confirmed-or-cancelled (DECISION metric)
+    decided: bool = False  # reached confirmed-or-cancelled (DECISION metric)
     order_shipped_emitted: bool = False
     invoice_issued: bool = False
     compensation_alerted: bool = False
-    notes: tuple[str, ...] = ()              # late/irrelevant replies recorded for the ops view
+    notes: tuple[str, ...] = ()  # late/irrelevant replies recorded for the ops view
 
     def to_json(self) -> dict[str, Any]:
         d = asdict(self)
@@ -152,7 +152,7 @@ class SagaData:
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> SagaData:
-        known = {f for f in cls.__dataclass_fields__}  # tolerate bookkeeping keys (e.g. the kit's)
+        known = set(cls.__dataclass_fields__)  # tolerate bookkeeping keys (e.g. the kit's)
         v = {k: x for k, x in d.items() if k in known}
         v["lines"] = tuple(Line(**x) for x in v.get("lines", ()))
         v["pending"] = tuple(v.get("pending", ()))
@@ -316,9 +316,7 @@ class OperatorRetry(Trigger):
     kind: ClassVar[str] = "OPERATOR"
 
 
-_DEFERRABLE: dict[str, type[Trigger]] = {
-    t.kind: t for t in (OrderPacked, OrderDispatched, ShipmentDelivered, ShipmentException)
-}
+_DEFERRABLE: dict[str, type[Trigger]] = {t.kind: t for t in (OrderPacked, OrderDispatched, ShipmentDelivered, ShipmentException)}
 
 
 def _store(t: Trigger) -> dict[str, Any]:
@@ -333,14 +331,14 @@ def _load(d: dict[str, Any]) -> Trigger:
 # ------------------------------------------------------------------------------------- decisions
 @dataclass(frozen=True, slots=True)
 class Command:
-    name: str                  # ReserveStock, AuthorizePayment, ...
+    name: str  # ReserveStock, AuthorizePayment, ...
     business_id: str
     params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class Event:
-    name: str                  # OrderPlaced, OrderConfirmed, ...
+    name: str  # OrderPlaced, OrderConfirmed, ...
     params: dict[str, Any] = field(default_factory=dict)
 
 
@@ -351,9 +349,9 @@ class Decision:
     attempts: int
     deadline: datetime | None
     commands: tuple[Command, ...] = ()
-    events: tuple[Event, ...] = ()        # in emission order; IssueInvoice is an event placeholder
+    events: tuple[Event, ...] = ()  # in emission order; IssueInvoice is an event placeholder
     ignored: bool = False
-    outcome: str | None = None            # DELIVERED | CANCELLED | MANUAL_REVIEW
+    outcome: str | None = None  # DELIVERED | CANCELLED | MANUAL_REVIEW
     decision_reached: bool = False
 
     @property
@@ -367,15 +365,30 @@ Mint = Callable[[], str]
 # ---------------------------------------------------------------------------------- the machine
 def start(t: CheckoutSubmitted, now: datetime, cfg: Timeouts, mint: Mint) -> Decision:
     """CheckoutSubmitted / emit OrderPlaced, send ReserveStock."""
-    data = SagaData(order_id=t.order_id, customer_id=t.customer_id, currency=t.currency, total_minor=t.total_minor,
-                    lines=t.lines, ship_to=t.ship_to, shipping_method=t.shipping_method, payment_token=t.payment_token,
-                    reservation_id=mint())
-    return Decision(State.RESERVING_STOCK, data, 0, now + cfg.stock,
-                    commands=(_reserve(data),), events=(Event("OrderPlaced"),))
+    data = SagaData(
+        order_id=t.order_id,
+        customer_id=t.customer_id,
+        currency=t.currency,
+        total_minor=t.total_minor,
+        lines=t.lines,
+        ship_to=t.ship_to,
+        shipping_method=t.shipping_method,
+        payment_token=t.payment_token,
+        reservation_id=mint(),
+    )
+    return Decision(State.RESERVING_STOCK, data, 0, now + cfg.stock, commands=(_reserve(data),), events=(Event("OrderPlaced"),))
 
 
-def transition(state: State, data: SagaData, attempts: int, t: Trigger, now: datetime, cfg: Timeouts,
-               mint: Mint, deadline: datetime | None = None) -> Decision:
+def transition(
+    state: State,
+    data: SagaData,
+    attempts: int,
+    t: Trigger,
+    now: datetime,
+    cfg: Timeouts,
+    mint: Mint,
+    deadline: datetime | None = None,
+) -> Decision:
     """``deadline`` is the stored deadline; decisions that only record a fact keep it."""
     d = _step(state, data, attempts, t, now, cfg, mint, deadline)
     # Rule 4: after any real move, apply early events that the new state expects.
@@ -388,7 +401,7 @@ def transition(state: State, data: SagaData, attempts: int, t: Trigger, now: dat
 def _drain(d: Decision, now: datetime, cfg: Timeouts, mint: Mint) -> Decision:
     for i, raw in enumerate(d.data.early):
         trig = _load(raw)
-        rest = d.data.early[:i] + d.data.early[i + 1:]
+        rest = d.data.early[:i] + d.data.early[i + 1 :]
         candidate = _step(d.state, replace(d.data, early=rest), d.attempts, trig, now, cfg, mint, d.deadline)
         if not candidate.ignored and candidate.data.early != (*rest, raw):
             return _merge(d, candidate)
@@ -396,13 +409,16 @@ def _drain(d: Decision, now: datetime, cfg: Timeouts, mint: Mint) -> Decision:
 
 
 def _merge(first: Decision, second: Decision) -> Decision:
-    return replace(second, commands=first.commands + second.commands, events=first.events + second.events,
-                   outcome=second.outcome or first.outcome,
-                   decision_reached=first.decision_reached or second.decision_reached)
+    return replace(
+        second,
+        commands=first.commands + second.commands,
+        events=first.events + second.events,
+        outcome=second.outcome or first.outcome,
+        decision_reached=first.decision_reached or second.decision_reached,
+    )
 
 
-def _ignore(state: State, data: SagaData, attempts: int, deadline: datetime | None = None,
-            why: str | None = None) -> Decision:
+def _ignore(state: State, data: SagaData, attempts: int, deadline: datetime | None = None, why: str | None = None) -> Decision:
     return Decision(state, data, attempts, deadline, ignored=True)
 
 
@@ -412,8 +428,9 @@ def _defer(state: State, data: SagaData, attempts: int, t: Trigger, deadline: da
     return Decision(state, replace(data, early=(*data.early, _store(t))), attempts, deadline)
 
 
-def _step(s: State, d: SagaData, attempts: int, t: Trigger, now: datetime, cfg: Timeouts, mint: Mint,
-          keep: datetime | None) -> Decision:
+def _step(
+    s: State, d: SagaData, attempts: int, t: Trigger, now: datetime, cfg: Timeouts, mint: Mint, keep: datetime | None
+) -> Decision:
     # ---- terminal states: only safety-net compensations ---------------------------------------
     if s in TERMINAL:
         return _after_terminal(s, d, attempts, t)
@@ -442,14 +459,16 @@ def _step(s: State, d: SagaData, attempts: int, t: Trigger, now: datetime, cfg: 
             return Decision(State.AUTHORIZING_PAYMENT, d2, 0, now + cfg.payment, commands=(_authorize(d2),))
         if isinstance(t, StockReservationRejected) and t.reservation_id == d.reservation_id:
             d2 = replace(d, cancel_reason=CancelReason.OUT_OF_STOCK, cancel_detail=t.detail or None, decided=True)
-            return Decision(State.CANCELLED, d2, 0, None, events=(Event("OrderCancelled"),), outcome="CANCELLED",
-                            decision_reached=True)
+            return Decision(
+                State.CANCELLED, d2, 0, None, events=(Event("OrderCancelled"),), outcome="CANCELLED", decision_reached=True
+            )
         if isinstance(t, Deadline):
             if attempts < STOCK_MAX_RESENDS:
                 return Decision(s, d, attempts + 1, now + cfg.stock, commands=(_reserve(d),))
             # "cancel and send ReleaseReservation in case the reply was lost"
-            return _begin_cancel(replace(d, reservation_held=True), CancelReason.SAGA_TIMEOUT,
-                                 "no stock reply after 2 resends", now, cfg)
+            return _begin_cancel(
+                replace(d, reservation_held=True), CancelReason.SAGA_TIMEOUT, "no stock reply after 2 resends", now, cfg
+            )
         return _late_or_ignored(s, d, attempts, t, keep, now, cfg)
 
     # ---- AUTHORIZING_PAYMENT -----------------------------------------------------------------
@@ -475,12 +494,24 @@ def _step(s: State, d: SagaData, attempts: int, t: Trigger, now: datetime, cfg: 
     # ---- COMMITTING_STOCK --------------------------------------------------------------------
     if s is State.COMMITTING_STOCK:
         if isinstance(t, ReservationCommitted) and t.reservation_id == d.reservation_id:
-            d2 = replace(d, reservation_held=False, reservation_committed=True, fulfilment_id=d.fulfilment_id or mint(),
-                         fulfilment_requested=True,
-                         fulfilment_attempt=1, decided=True)
-            return Decision(State.AWAITING_FULFILMENT_ACK, d2, 0, now + cfg.fulfilment_ack,
-                            commands=(_request_fulfilment(d2),), events=(Event("OrderConfirmed"),),
-                            decision_reached=not d.decided)
+            d2 = replace(
+                d,
+                reservation_held=False,
+                reservation_committed=True,
+                fulfilment_id=d.fulfilment_id or mint(),
+                fulfilment_requested=True,
+                fulfilment_attempt=1,
+                decided=True,
+            )
+            return Decision(
+                State.AWAITING_FULFILMENT_ACK,
+                d2,
+                0,
+                now + cfg.fulfilment_ack,
+                commands=(_request_fulfilment(d2),),
+                events=(Event("OrderConfirmed"),),
+                decision_reached=not d.decided,
+            )
         if isinstance(t, ReservationExpired) and t.reservation_id == d.reservation_id:
             d2 = replace(d, reservation_expired=True, reservation_held=False)
             return _begin_cancel(d2, CancelReason.RESERVATION_EXPIRED, "reservation expired before commit", now, cfg)
@@ -556,8 +587,9 @@ def _step(s: State, d: SagaData, attempts: int, t: Trigger, now: datetime, cfg: 
 
 
 # ---------------------------------------------------------------------------------- helpers
-def _late_or_ignored(s: State, d: SagaData, attempts: int, t: Trigger, keep: datetime | None,
-                     now: datetime, cfg: Timeouts) -> Decision:
+def _late_or_ignored(
+    s: State, d: SagaData, attempts: int, t: Trigger, keep: datetime | None, now: datetime, cfg: Timeouts
+) -> Decision:
     """Pre-pivot early arrivals of shipping events are stored; everything else is late or foreign."""
     if isinstance(t, (ShipmentDelivered, ShipmentException)) and t.outbound and s not in PAST_PIVOT:
         return _defer(s, d, attempts, t, keep)
@@ -581,14 +613,13 @@ def _begin_cancel(d: SagaData, reason: CancelReason, detail: str | None, now: da
     first_decision = not d.decided
     d2 = replace(d, cancel_reason=reason.value, cancel_detail=detail, pending=tuple(pending), decided=True)
     if not pending:
-        return Decision(State.CANCELLED, d2, 0, None, events=(Event("OrderCancelled"),), outcome="CANCELLED",
-                        decision_reached=first_decision)
-    return Decision(State.CANCELLING, d2, 0, now + cfg.compensation, commands=tuple(commands),
-                    decision_reached=first_decision)
+        return Decision(
+            State.CANCELLED, d2, 0, None, events=(Event("OrderCancelled"),), outcome="CANCELLED", decision_reached=first_decision
+        )
+    return Decision(State.CANCELLING, d2, 0, now + cfg.compensation, commands=tuple(commands), decision_reached=first_decision)
 
 
-def _cancelling(d: SagaData, attempts: int, t: Trigger, now: datetime, cfg: Timeouts,
-                keep: datetime | None) -> Decision:
+def _cancelling(d: SagaData, attempts: int, t: Trigger, now: datetime, cfg: Timeouts, keep: datetime | None) -> Decision:
     pending = list(d.pending)
     d2 = d
     extra: list[Command] = []
@@ -618,8 +649,11 @@ def _cancelling(d: SagaData, attempts: int, t: Trigger, now: datetime, cfg: Time
             extra.append(Command("VoidPayment", d.payment_id, {"reason": d.cancel_reason or "CANCELLED"}))
         else:
             return _ignore(State.CANCELLING, d2, attempts)
-    elif isinstance(t, StockReserved) and t.reservation_id == d.reservation_id and not (
-            d.reservation_expired or d.reservation_released):
+    elif (
+        isinstance(t, StockReserved)
+        and t.reservation_id == d.reservation_id
+        and not (d.reservation_expired or d.reservation_released)
+    ):
         # A stale duplicate after expiry/release is ignored: inventory never re-holds that id.
         d2 = replace(d, reservation_held=True)
         if Compensation.RELEASE_RESERVATION not in pending:
@@ -634,16 +668,24 @@ def _cancelling(d: SagaData, attempts: int, t: Trigger, now: datetime, cfg: Time
         backoff = cfg.compensation * min(2 ** min(n, 4), 16)
         events: tuple[Event, ...] = ()
         if n >= COMPENSATION_ALERT_AFTER and not d.compensation_alerted:
-            events = (Event("OrderRequiresAttention", {"issue": f"compensations unconfirmed after {n} attempts: "
-                                                                f"{', '.join(pending)}", "state": State.CANCELLING.value}),)
+            events = (
+                Event(
+                    "OrderRequiresAttention",
+                    {
+                        "issue": f"compensations unconfirmed after {n} attempts: {', '.join(pending)}",
+                        "state": State.CANCELLING.value,
+                    },
+                ),
+            )
             d = replace(d, compensation_alerted=True)
         return Decision(State.CANCELLING, d, n, now + backoff, commands=cmds, events=events)
     else:
         return _ignore(State.CANCELLING, d, attempts)
     d3 = replace(d2, pending=tuple(pending))
     if not pending:
-        return Decision(State.CANCELLED, d3, 0, None, commands=tuple(extra), events=(Event("OrderCancelled"),),
-                        outcome="CANCELLED")
+        return Decision(
+            State.CANCELLED, d3, 0, None, commands=tuple(extra), events=(Event("OrderCancelled"),), outcome="CANCELLED"
+        )
     return Decision(State.CANCELLING, d3, attempts, now + cfg.compensation if extra else keep, commands=tuple(extra))
 
 
@@ -667,13 +709,26 @@ def _after_terminal(s: State, d: SagaData, attempts: int, t: Trigger) -> Decisio
     """Terminal states ignore everything, except that something still held gets compensated."""
     if s is State.CANCELLED:
         if isinstance(t, PaymentAuthorized) and t.payment_id == d.payment_id and not d.payment_voided:
-            return Decision(s, replace(d, payment_authorized=True).note("late PaymentAuthorized after cancel: voided"),
-                            attempts, None, commands=(Command("VoidPayment", t.payment_id, {"reason": "LATE_AUTHORIZATION"}),))
-        if (isinstance(t, StockReserved) and t.reservation_id == d.reservation_id and not d.reservation_held
-                and not (d.reservation_expired or d.reservation_released)):
-            return Decision(s, replace(d, reservation_held=True).note("late StockReserved after cancel: released"),
-                            attempts, None,
-                            commands=(Command("ReleaseReservation", t.reservation_id, {"reason": "LATE_RESERVATION"}),))
+            return Decision(
+                s,
+                replace(d, payment_authorized=True).note("late PaymentAuthorized after cancel: voided"),
+                attempts,
+                None,
+                commands=(Command("VoidPayment", t.payment_id, {"reason": "LATE_AUTHORIZATION"}),),
+            )
+        if (
+            isinstance(t, StockReserved)
+            and t.reservation_id == d.reservation_id
+            and not d.reservation_held
+            and not (d.reservation_expired or d.reservation_released)
+        ):
+            return Decision(
+                s,
+                replace(d, reservation_held=True).note("late StockReserved after cancel: released"),
+                attempts,
+                None,
+                commands=(Command("ReleaseReservation", t.reservation_id, {"reason": "LATE_RESERVATION"}),),
+            )
         if isinstance(t, PaymentVoided) and t.payment_id == d.payment_id and not d.payment_voided:
             return Decision(s, replace(d, payment_voided=True), attempts, None)
         if isinstance(t, ReservationReleased) and t.reservation_id == d.reservation_id and d.reservation_held:
@@ -683,9 +738,14 @@ def _after_terminal(s: State, d: SagaData, attempts: int, t: Trigger) -> Decisio
 
 def _attention_now(d: SagaData, s: State, issue: str, resume: State | None) -> Decision:
     d2 = replace(d, attention_issue=issue, resume_state=resume.value if resume else None)
-    return Decision(State.NEEDS_ATTENTION, d2, 0, None,
-                    events=(Event("OrderRequiresAttention", {"issue": issue, "state": s.value}),),
-                    outcome="MANUAL_REVIEW")
+    return Decision(
+        State.NEEDS_ATTENTION,
+        d2,
+        0,
+        None,
+        events=(Event("OrderRequiresAttention", {"issue": issue, "state": s.value}),),
+        outcome="MANUAL_REVIEW",
+    )
 
 
 def _attention(d: SagaData, attempts: int, t: Trigger, now: datetime, cfg: Timeouts, mint: Mint) -> Decision:
@@ -731,8 +791,9 @@ def _shipped(d: SagaData, now: datetime) -> Decision:
 
 def _delivered(d: SagaData, t: ShipmentDelivered) -> Decision:
     d2 = replace(d, shipment_id=d.shipment_id or t.shipment_id)
-    return Decision(State.DELIVERED, d2, 0, None,
-                    events=(Event("OrderDelivered", {"deliveredAt": t.delivered_at}),), outcome="DELIVERED")
+    return Decision(
+        State.DELIVERED, d2, 0, None, events=(Event("OrderDelivered", {"deliveredAt": t.delivered_at}),), outcome="DELIVERED"
+    )
 
 
 def _reserve(d: SagaData) -> Command:

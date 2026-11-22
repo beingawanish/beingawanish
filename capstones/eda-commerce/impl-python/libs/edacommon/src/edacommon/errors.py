@@ -54,7 +54,11 @@ _TRANSIENT_SQLSTATES = {
     "57P02",  # crash_shutdown
     "57P03",  # cannot_connect_now
     "53300",  # too_many_connections
-    "08000", "08003", "08006", "08001", "08004",  # connection exceptions
+    "08000",
+    "08003",
+    "08006",
+    "08001",
+    "08004",  # connection exceptions
 }
 
 

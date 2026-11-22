@@ -35,8 +35,12 @@ import org.springframework.transaction.support.TransactionTemplate;
 public class ConsumerRuntimeConfiguration {
 
   @Bean
-  HandlerRegistry edaHandlerRegistry(List<MessageHandler<?>> handlers) {
-    return new HandlerRegistry(handlers);
+  HandlerRegistry edaHandlerRegistry(
+      org.springframework.beans.factory.ObjectProvider<MessageHandler<?>> handlers,
+      org.springframework.beans.factory.ObjectProvider<com.edacommerce.edacommon.consumer.MessageHandlerGroup> groups) {
+    return new HandlerRegistry(
+        com.edacommerce.edacommon.consumer.MessageHandlerGroup.collect(
+            handlers.orderedStream().toList(), groups.orderedStream().toList()));
   }
 
   @Bean

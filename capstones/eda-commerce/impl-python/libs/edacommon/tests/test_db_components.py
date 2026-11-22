@@ -8,8 +8,6 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import create_engine, select, text
-
 from edacommon.db import Database, outbox_table
 from edacommon.envelope import Causation, OutgoingMessage
 from edacommon.errors import DomainError
@@ -22,14 +20,20 @@ from edacommon.serde import AvroSerde
 from edacommon.testing.fakes import collect, counter_value
 from edacommon.testing.infra import contract_sql_path, fresh_database, information_schema_columns
 from edacommon.webhooks import WebhookReceiver, sign
+from sqlalchemy import create_engine, select, text
 
 pytestmark = pytest.mark.integration
 
 
 def released(order_id: str, rid: str, now: Any) -> OutgoingMessage:
-    return OutgoingMessage(topic="inventory.events.v1", record_type="com.edacommerce.inventory.ReservationReleased",
-                           key=order_id, aggregate_type="Reservation", aggregate_id=rid,
-                           body={"orderId": order_id, "reservationId": rid, "reason": "x", "releasedAt": now})
+    return OutgoingMessage(
+        topic="inventory.events.v1",
+        record_type="com.edacommerce.inventory.ReservationReleased",
+        key=order_id,
+        aggregate_type="Reservation",
+        aggregate_id=rid,
+        body={"orderId": order_id, "reservationId": rid, "reason": "x", "releasedAt": now},
+    )
 
 
 # ------------------------------------------------------------------------------------------ outbox
@@ -50,16 +54,25 @@ def test_outbox_row_columns_and_rollback(db: Database, serde: AvroSerde, clock: 
     assert r["published_at"] is None
 
 
-def test_polling_relay_publishes_in_order_with_headers(db: Database, serde: AvroSerde, clock: Any,
-                                                        fake_producer: Any, metrics_reader: Any) -> None:
+def test_polling_relay_publishes_in_order_with_headers(
+    db: Database, serde: AvroSerde, clock: Any, fake_producer: Any, metrics_reader: Any
+) -> None:
     w = OutboxWriter(serde, "inventory-svc", clock)
     with db.unit_of_work() as uow:
         ids = [w.append(uow.session, released("o-1", f"r-{i}", clock.now())).event_id for i in range(5)]
     with db.unit_of_work() as uow:
-        w.append(uow.session, OutgoingMessage(
-            topic="inventory.events.v1", record_type="com.edacommerce.inventory.ReservationReleased", key="o-2",
-            aggregate_type="Reservation", aggregate_id="r-9", causation=Causation("o-2", "cause-1"),
-            body={"orderId": "o-2", "reservationId": "r-9", "reason": "x", "releasedAt": clock.now()}))
+        w.append(
+            uow.session,
+            OutgoingMessage(
+                topic="inventory.events.v1",
+                record_type="com.edacommerce.inventory.ReservationReleased",
+                key="o-2",
+                aggregate_type="Reservation",
+                aggregate_id="r-9",
+                causation=Causation("o-2", "cause-1"),
+                body={"orderId": "o-2", "reservationId": "r-9", "reason": "x", "releasedAt": clock.now()},
+            ),
+        )
     metrics, reader = metrics_reader
     relay = PollingRelay(db, fake_producer, metrics)
     assert relay.publish_once() == 6
@@ -68,16 +81,27 @@ def test_polling_relay_publishes_in_order_with_headers(db: Database, serde: Avro
     assert [r.header_map["ce_id"] for r in recs[:5]] == ids
     last = recs[-1].header_map
     assert last["causation_id"] == "cause-1" and last["correlation_id"] == "o-2" and recs[-1].key == b"o-2"
-    assert set(last) == {"id", "ce_id", "ce_type", "ce_source", "ce_time", "correlation_id", "causation_id",
-                         "traceparent", "tracestate", "ce_specversion"}
+    assert set(last) == {
+        "id",
+        "ce_id",
+        "ce_type",
+        "ce_source",
+        "ce_time",
+        "correlation_id",
+        "causation_id",
+        "traceparent",
+        "tracestate",
+        "ce_specversion",
+    }
     assert last["ce_specversion"] == "1.0" and last["ce_source"] == "inventory-svc"
     assert collect(reader)["eda.outbox.pending"][-1].value == 0
     with db.unit_of_work() as uow:
         assert uow.session.execute(text("SELECT count(*) FROM outbox WHERE published_at IS NULL")).scalar_one() == 0
 
 
-def test_relay_does_not_mark_rows_when_broker_refuses(db: Database, serde: AvroSerde, clock: Any,
-                                                       fake_producer: Any, metrics_reader: Any) -> None:
+def test_relay_does_not_mark_rows_when_broker_refuses(
+    db: Database, serde: AvroSerde, clock: Any, fake_producer: Any, metrics_reader: Any
+) -> None:
     w = OutboxWriter(serde, "inventory-svc", clock)
     with db.unit_of_work() as uow:
         w.append(uow.session, released("o-1", "r-1", clock.now()))
@@ -104,6 +128,7 @@ def _ok(n: list[int]) -> Any:
         n.append(1)
         uow.session.execute(text("INSERT INTO effect (id, n) VALUES (:i, 1)"), {"i": f"e{len(n)}"})
         return StoredResponse(202, b'{"orderId":"o-1"}', {"content-type": "application/json", "Location": "/orders/o-1"})
+
     return action
 
 
@@ -128,8 +153,11 @@ def test_idempotency_replay_mismatch_and_conflict(db: Database, clock: Any) -> N
         release.wait(5)
         return StoredResponse(202, b"{}")
 
-    t = threading.Thread(target=store.execute, args=(db,), kwargs=dict(
-        caller="c", key="k2", method="POST", path="/checkouts", body=b"{}", action=slow))
+    t = threading.Thread(
+        target=store.execute,
+        args=(db,),
+        kwargs={"caller": "c", "key": "k2", "method": "POST", "path": "/checkouts", "body": b"{}", "action": slow},
+    )
     t.start()
     started.wait(5)
     with pytest.raises(IdempotencyConflict):
@@ -152,36 +180,68 @@ def test_domain_error_rolls_back_the_key(db: Database, clock: Any) -> None:
 
 
 # -------------------------------------------------------------------------------------------- saga
-def test_saga_engine_versions_transitions_and_metrics(db: Database, serde: AvroSerde, clock: Any,
-                                                       metrics_reader: Any) -> None:
+def test_saga_engine_versions_transitions_and_metrics(db: Database, serde: AvroSerde, clock: Any, metrics_reader: Any) -> None:
     metrics, reader = metrics_reader
     engine = SagaEngine(saga_type="ORDER", outbox=OutboxWriter(serde, "order-svc", clock), metrics=metrics, clock=clock)
 
     def ev(n: int) -> PendingMessage:
-        return PendingMessage(topic="order.events.v1", record_type="com.edacommerce.order.OrderRequiresAttention",
-                              key="o-1", aggregate_type="Order", is_event=True,
-                              body={"orderId": "o-1", "sagaState": "X", "issue": f"i{n}", "raisedAt": clock.now()})
+        return PendingMessage(
+            topic="order.events.v1",
+            record_type="com.edacommerce.order.OrderRequiresAttention",
+            key="o-1",
+            aggregate_type="Order",
+            is_event=True,
+            body={"orderId": "o-1", "sagaState": "X", "issue": f"i{n}", "raisedAt": clock.now()},
+        )
 
     with db.unit_of_work() as uow:
-        r = engine.handle(uow, saga_id="o-1", trigger_type="com.x.Start", trigger_id="e1", correlation_id="o-1",
-                          decide=lambda row, now: SagaStep(state="A", data={"k": 1}, deadline_at=now + timedelta(seconds=30),
-                                                           step_attempts=0, messages=[ev(1)]))
+        r = engine.handle(
+            uow,
+            saga_id="o-1",
+            trigger_type="com.x.Start",
+            trigger_id="e1",
+            correlation_id="o-1",
+            decide=lambda row, now: SagaStep(
+                state="A", data={"k": 1}, deadline_at=now + timedelta(seconds=30), step_attempts=0, messages=[ev(1)]
+            ),
+        )
     assert r.applied and r.row and r.row.version == 1
     clock.advance(2)
     with db.unit_of_work() as uow:
-        r = engine.handle(uow, saga_id="o-1", trigger_type="com.x.Next", trigger_id="e2",
-                          decide=lambda row, now: SagaStep(state="B", data=row.data, deadline_at=None, step_attempts=0,
-                                                           messages=[ev(2), ev(3)], terminal=True, outcome="DELIVERED",
-                                                           decision_reached=True))
+        r = engine.handle(
+            uow,
+            saga_id="o-1",
+            trigger_type="com.x.Next",
+            trigger_id="e2",
+            decide=lambda row, now: SagaStep(
+                state="B",
+                data=row.data,
+                deadline_at=None,
+                step_attempts=0,
+                messages=[ev(2), ev(3)],
+                terminal=True,
+                outcome="DELIVERED",
+                decision_reached=True,
+            ),
+        )
     assert r.row and r.row.version == 3, "two events move the version by two"
     with db.unit_of_work() as uow:
-        ignored = engine.handle(uow, saga_id="o-1", trigger_type="com.x.Late", trigger_id="e3",
-                                decide=lambda row, now: SagaStep.ignore(row))
+        ignored = engine.handle(
+            uow, saga_id="o-1", trigger_type="com.x.Late", trigger_id="e3", decide=lambda row, now: SagaStep.ignore(row)
+        )
         assert not ignored.applied
         hist = SagaRepository(uow.session).history("o-1")
-        payloads = [bytes(p) for p in uow.session.execute(select(outbox_table.c.payload).order_by(outbox_table.c.created_at, outbox_table.c.id)).scalars()]
+        payloads = [
+            bytes(p)
+            for p in uow.session.execute(
+                select(outbox_table.c.payload).order_by(outbox_table.c.created_at, outbox_table.c.id)
+            ).scalars()
+        ]
     assert [(h.seq, h.from_state, h.to_state) for h in hist] == [(1, "NEW", "A"), (3, "A", "B")]
-    versions = [serde.deserialize("order.events.v1", "com.edacommerce.order.OrderRequiresAttention", p)["envelope"]["aggregateVersion"] for p in payloads]
+    versions = [
+        serde.deserialize("order.events.v1", "com.edacommerce.order.OrderRequiresAttention", p)["envelope"]["aggregateVersion"]
+        for p in payloads
+    ]
     assert versions == [1, 2, 3], "aggregateVersion strictly increasing per order"
     assert counter_value(reader, "eda.saga.outcomes", saga_type="ORDER", outcome="DELIVERED") == 1
     steps = {p.attributes["step"]: p for p in collect(reader)["eda.saga.step.duration"]}
@@ -189,8 +249,8 @@ def test_saga_engine_versions_transitions_and_metrics(db: Database, serde: AvroS
 
 
 def test_optimistic_lock_detects_concurrent_update(db: Database) -> None:
-    from edacommon.saga import ConcurrentSagaUpdate, SagaRow
     from edacommon.ids import SystemClock
+    from edacommon.saga import ConcurrentSagaUpdate, SagaRow
 
     now = SystemClock().now()
     with db.unit_of_work() as uow:
@@ -199,8 +259,7 @@ def test_optimistic_lock_detects_concurrent_update(db: Database) -> None:
         SagaRepository(uow.session).save(SagaRow("s", "ORDER", "B", {}, 2, None, 0, "s"), expected_version=0, now=now)
 
 
-def test_sweeper_fires_deadlines_once_across_replicas(db: Database, serde: AvroSerde, clock: Any,
-                                                       metrics_reader: Any) -> None:
+def test_sweeper_fires_deadlines_once_across_replicas(db: Database, serde: AvroSerde, clock: Any, metrics_reader: Any) -> None:
     from edacommon.ids import SystemClock
 
     real = SystemClock()
@@ -208,17 +267,27 @@ def test_sweeper_fires_deadlines_once_across_replicas(db: Database, serde: AvroS
     engine = SagaEngine(saga_type="ORDER", outbox=OutboxWriter(serde, "order-svc", real), metrics=metrics, clock=real)
     with db.unit_of_work() as uow:
         for i in range(20):
-            engine.handle(uow, saga_id=f"s{i}", trigger_type="start", trigger_id=None,
-                          decide=lambda row, now: SagaStep(state="WAIT", data={}, deadline_at=now - timedelta(seconds=1),
-                                                           step_attempts=0))
+            engine.handle(
+                uow,
+                saga_id=f"s{i}",
+                trigger_type="start",
+                trigger_id=None,
+                decide=lambda row, now: SagaStep(state="WAIT", data={}, deadline_at=now - timedelta(seconds=1), step_attempts=0),
+            )
     fired: list[str] = []
     lock = threading.Lock()
 
     def on_deadline(uow: Any, row: Any) -> None:
         with lock:
             fired.append(row.saga_id)
-        engine.handle(uow, saga_id=row.saga_id, trigger_type="DEADLINE", trigger_id=None, locked_row=row,
-                      decide=lambda r, now: SagaStep(state="DONE", data=r.data, deadline_at=None, step_attempts=0, terminal=True))
+        engine.handle(
+            uow,
+            saga_id=row.saga_id,
+            trigger_type="DEADLINE",
+            trigger_id=None,
+            locked_row=row,
+            decide=lambda r, now: SagaStep(state="DONE", data=r.data, deadline_at=None, step_attempts=0, terminal=True),
+        )
 
     sweepers = [DeadlineSweeper(db=db, saga_type="ORDER", on_deadline=on_deadline, clock=real, metrics=metrics) for _ in range(3)]
     threads = [threading.Thread(target=s.run_once) for s in sweepers]
@@ -237,9 +306,16 @@ def test_webhook_receiver_dedupes_and_rejects(db: Database, metrics_reader: Any)
 
     metrics, reader = metrics_reader
     stored: list[str] = []
-    rx = WebhookReceiver(db=db, source="psp", consumer="psp-webhook", secret="s", metrics=metrics,
-                         event_id_of=lambda p: p["pspEventId"], event_type_of=lambda p: p["eventType"],
-                         store=lambda session, payload, raw: stored.append(payload["pspEventId"]))
+    rx = WebhookReceiver(
+        db=db,
+        source="psp",
+        consumer="psp-webhook",
+        secret="s",
+        metrics=metrics,
+        event_id_of=lambda p: p["pspEventId"],
+        event_type_of=lambda p: p["eventType"],
+        store=lambda session, payload, raw: stored.append(payload["pspEventId"]),
+    )
     now = SystemClock().now()
     body = b'{"pspEventId":"e9","eventType":"authorization.succeeded"}'
     ts = str(int(now.timestamp()))
@@ -274,7 +350,11 @@ def test_shared_tables_match_contract_ddl() -> None:
             with e.connect() as c:
                 idx = c.execute(text("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname='public' ORDER BY 1")).all()
                 pub = c.execute(text("SELECT pubname, tablename FROM pg_publication_tables")).all()
-                chk = c.execute(text("SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE connamespace='public'::regnamespace ORDER BY 1")).all()
+                chk = c.execute(
+                    text(
+                        "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE connamespace='public'::regnamespace ORDER BY 1"
+                    )
+                ).all()
             e.dispose()
             return idx, pub, chk
 
@@ -283,4 +363,6 @@ def test_shared_tables_match_contract_ddl() -> None:
 
 def test_java_partition_helper_is_stable() -> None:
     # Same orderId -> same partition number on every 12-partition topic, whichever language produced it.
-    assert java_partition("6ed9d0ed-127a-524b-b079-a06e34f3ec73", 12) == java_partition("6ed9d0ed-127a-524b-b079-a06e34f3ec73", 12)
+    assert java_partition("6ed9d0ed-127a-524b-b079-a06e34f3ec73", 12) == java_partition(
+        "6ed9d0ed-127a-524b-b079-a06e34f3ec73", 12
+    )

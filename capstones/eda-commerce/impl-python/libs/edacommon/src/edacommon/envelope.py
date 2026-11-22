@@ -70,9 +70,7 @@ class Causation:
     causation_id: str | None = None
 
 
-_current_causation: contextvars.ContextVar[Causation | None] = contextvars.ContextVar(
-    "eda_causation", default=None
-)
+_current_causation: contextvars.ContextVar[Causation | None] = contextvars.ContextVar("eda_causation", default=None)
 
 
 def current_causation() -> Causation | None:

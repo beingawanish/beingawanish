@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from inventory_svc.domain.model import (
     CommitDecision,
     ReleaseDecision,
@@ -42,12 +41,15 @@ def test_ttl_is_capped_by_service_setting() -> None:
     assert hold_until(NOW, 30, timedelta(seconds=900)) == NOW + timedelta(seconds=30)
 
 
-@pytest.mark.parametrize(("status", "expected"), [
-    (ReservationStatus.COMMITTED, CommitDecision.ANSWER_COMMITTED),
-    (ReservationStatus.EXPIRED, CommitDecision.ANSWER_EXPIRED),
-    (ReservationStatus.RELEASED, CommitDecision.ANSWER_RELEASED),
-    (ReservationStatus.REJECTED, CommitDecision.ANSWER_REJECTED),
-])
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (ReservationStatus.COMMITTED, CommitDecision.ANSWER_COMMITTED),
+        (ReservationStatus.EXPIRED, CommitDecision.ANSWER_EXPIRED),
+        (ReservationStatus.RELEASED, CommitDecision.ANSWER_RELEASED),
+        (ReservationStatus.REJECTED, CommitDecision.ANSWER_REJECTED),
+    ],
+)
 def test_commit_resends_answer_with_original_outcome(status: ReservationStatus, expected: CommitDecision) -> None:
     assert decide_commit(res(status), NOW) is expected
 
@@ -59,13 +61,16 @@ def test_commit_held_valid_vs_expired() -> None:
     assert decide_commit(None, NOW) is CommitDecision.UNKNOWN
 
 
-@pytest.mark.parametrize(("status", "expected"), [
-    (ReservationStatus.HELD, ReleaseDecision.RELEASE_HELD),
-    (ReservationStatus.COMMITTED, ReleaseDecision.RETURN_ALLOCATED),
-    (ReservationStatus.RELEASED, ReleaseDecision.ANSWER_RELEASED),
-    (ReservationStatus.EXPIRED, ReleaseDecision.ANSWER_RELEASED),
-    (ReservationStatus.REJECTED, ReleaseDecision.ANSWER_RELEASED),
-])
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (ReservationStatus.HELD, ReleaseDecision.RELEASE_HELD),
+        (ReservationStatus.COMMITTED, ReleaseDecision.RETURN_ALLOCATED),
+        (ReservationStatus.RELEASED, ReleaseDecision.ANSWER_RELEASED),
+        (ReservationStatus.EXPIRED, ReleaseDecision.ANSWER_RELEASED),
+        (ReservationStatus.REJECTED, ReleaseDecision.ANSWER_RELEASED),
+    ],
+)
 def test_release_is_idempotent_compensation(status: ReservationStatus, expected: ReleaseDecision) -> None:
     assert decide_release(res(status)) is expected
 

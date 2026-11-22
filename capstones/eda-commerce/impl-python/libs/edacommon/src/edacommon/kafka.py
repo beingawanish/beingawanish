@@ -18,11 +18,13 @@ from edacommon.config import ServiceSettings
 def _security(settings: ServiceSettings) -> dict[str, Any]:
     conf: dict[str, Any] = {"security.protocol": settings.kafka_security_protocol}
     if settings.kafka_security_protocol == "SSL":
-        conf.update({
-            "ssl.ca.location": settings.kafka_ssl_ca_location,
-            "ssl.certificate.location": settings.kafka_ssl_cert_location,
-            "ssl.key.location": settings.kafka_ssl_key_location,
-        })
+        conf.update(
+            {
+                "ssl.ca.location": settings.kafka_ssl_ca_location,
+                "ssl.certificate.location": settings.kafka_ssl_cert_location,
+                "ssl.key.location": settings.kafka_ssl_key_location,
+            }
+        )
     return {k: v for k, v in conf.items() if v is not None}
 
 
@@ -31,9 +33,9 @@ def consumer_config(settings: ServiceSettings, group_id: str, *, client_suffix: 
         "bootstrap.servers": settings.kafka_bootstrap_servers,
         "group.id": group_id,
         "client.id": f"{settings.service_name}{client_suffix}",
-        "enable.auto.commit": False,               # commit after the DB transaction (§4.1)
+        "enable.auto.commit": False,  # commit after the DB transaction (§4.1)
         "enable.auto.offset.store": False,
-        "auto.offset.reset": "earliest",           # new groups and rebuilt projections see everything
+        "auto.offset.reset": "earliest",  # new groups and rebuilt projections see everything
         "isolation.level": "read_committed",
         "partition.assignment.strategy": "cooperative-sticky",
         "session.timeout.ms": 45000,
@@ -53,7 +55,7 @@ def producer_config(settings: ServiceSettings, *, client_suffix: str = "-produce
         "acks": "all",
         "enable.idempotence": True,
         "compression.type": "zstd",
-        "partitioner": "murmur2_random",           # guide §5 rule 1: same partition as Java/Connect
+        "partitioner": "murmur2_random",  # guide §5 rule 1: same partition as Java/Connect
         "linger.ms": 5,
         **_security(settings),
     }
@@ -71,7 +73,7 @@ def murmur2(data: bytes) -> int:
     length = len(data)
     h = (seed ^ length) & 0xFFFFFFFF
     for i in range(0, length - length % 4, 4):
-        k = int.from_bytes(data[i:i + 4], "little")
+        k = int.from_bytes(data[i : i + 4], "little")
         k = (k * m) & 0xFFFFFFFF
         k ^= k >> r
         k = (k * m) & 0xFFFFFFFF

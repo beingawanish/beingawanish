@@ -22,7 +22,8 @@ class ContractsCodegenHook(BuildHookInterface):  # type: ignore[type-arg]
     def initialize(self, version: str, build_data: dict[str, Any]) -> None:
         path = Path(self.root) / "contracts_codegen.py"
         spec = importlib.util.spec_from_file_location("contracts_codegen", path)
-        assert spec and spec.loader
+        assert spec
+        assert spec.loader
         module = importlib.util.module_from_spec(spec)
         sys.modules["contracts_codegen"] = module  # dataclasses need the module registered
         spec.loader.exec_module(module)

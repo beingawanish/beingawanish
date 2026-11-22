@@ -22,6 +22,7 @@ import threading
 from functools import cache
 from typing import Any
 
+import contracts_py
 import fastavro
 from confluent_kafka.schema_registry import (
     Schema,
@@ -32,7 +33,6 @@ from confluent_kafka.schema_registry.avro import AvroDeserializer, AvroSerialize
 from confluent_kafka.schema_registry.error import SchemaRegistryError
 from confluent_kafka.serialization import MessageField, SerializationContext, SerializationError
 
-import contracts_py
 from edacommon.errors import NonRetryable, Transient
 
 MAGIC_BYTE = 0
@@ -74,13 +74,16 @@ def encode_raw(record_type: str, value: dict[str, Any]) -> bytes:
 def decode_raw(record_type: str, data: bytes, writer_type: str | None = None) -> dict[str, Any]:
     writer = parsed_schema(writer_type or record_type)
     reader = parsed_schema(record_type)
-    out: dict[str, Any] = fastavro.schemaless_reader(io.BytesIO(data), writer, reader)
+    out = fastavro.schemaless_reader(io.BytesIO(data), writer, reader)
+    if not isinstance(out, dict):
+        raise NonRetryable(f"{record_type} decoded to {type(out).__name__}")
     return out
 
 
 def validate(record_type: str, value: dict[str, Any]) -> None:
     """Raise NonRetryable if ``value`` does not conform to the bundled schema."""
-    from fastavro.validation import ValidationError, validate as fa_validate
+    from fastavro.validation import ValidationError
+    from fastavro.validation import validate as fa_validate
 
     try:
         fa_validate(value, parsed_schema(record_type), raise_errors=True)
@@ -160,13 +163,16 @@ class AvroSerde:
         """Look up (and cache) the registered id; used to warm the cache for readiness."""
         try:
             reg = self._client.lookup_schema(
-                subject_for(topic, record_type), Schema(contracts_py.schema_str(record_type), "AVRO"),
+                subject_for(topic, record_type),
+                Schema(contracts_py.schema_str(record_type), "AVRO"),
                 normalize_schemas=True,
             )
         except SchemaRegistryError as exc:
             raise _classify_sr(exc, subject_for(topic, record_type)) from exc
         except Exception as exc:
             raise Transient(f"schema registry unreachable: {exc}") from exc
+        if reg.schema_id is None:
+            raise NonRetryable(f"registry returned no id for {subject_for(topic, record_type)}")
         return int(reg.schema_id)
 
     def warm(self, pairs: list[tuple[str, str]]) -> None:

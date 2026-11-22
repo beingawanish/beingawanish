@@ -35,9 +35,15 @@ class ClaimCheck:
     store: str = "s3"
 
     def to_avro(self) -> dict[str, Any]:
-        return {"store": self.store, "bucket": self.bucket, "objectKey": self.object_key,
-                "contentType": self.content_type, "sizeBytes": self.size_bytes, "sha256": self.sha256,
-                "expiresAt": self.expires_at}
+        return {
+            "store": self.store,
+            "bucket": self.bucket,
+            "objectKey": self.object_key,
+            "contentType": self.content_type,
+            "sizeBytes": self.size_bytes,
+            "sha256": self.sha256,
+            "expiresAt": self.expires_at,
+        }
 
     @classmethod
     def from_avro(cls, d: dict[str, Any]) -> ClaimCheck:
@@ -46,8 +52,15 @@ class ClaimCheck:
             from edacommon.ids import from_millis
 
             exp = from_millis(exp)
-        return cls(bucket=d["bucket"], object_key=d["objectKey"], content_type=d["contentType"],
-                   size_bytes=int(d["sizeBytes"]), sha256=d["sha256"], expires_at=exp, store=d.get("store", "s3"))
+        return cls(
+            bucket=d["bucket"],
+            object_key=d["objectKey"],
+            content_type=d["contentType"],
+            size_bytes=int(d["sizeBytes"]),
+            sha256=d["sha256"],
+            expires_at=exp,
+            store=d.get("store", "s3"),
+        )
 
     def expires_at_millis(self) -> int | None:
         return to_millis(self.expires_at) if self.expires_at else None
@@ -59,30 +72,38 @@ class ClaimCheckStore:
         self._metrics = metrics
 
     @classmethod
-    def from_settings(cls, *, endpoint: str, region: str, access_key: str, secret_key: str,
-                      metrics: EdaMetrics) -> ClaimCheckStore:
+    def from_settings(
+        cls, *, endpoint: str, region: str, access_key: str, secret_key: str, metrics: EdaMetrics
+    ) -> ClaimCheckStore:
         import boto3
         from botocore.config import Config
 
         client = boto3.client(
-            "s3", endpoint_url=endpoint, region_name=region, aws_access_key_id=access_key,
+            "s3",
+            endpoint_url=endpoint,
+            region_name=region,
+            aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
-            config=Config(s3={"addressing_style": "path"}, signature_version="s3v4", connect_timeout=3, read_timeout=10,
-                          retries={"max_attempts": 2, "mode": "standard"}),
+            config=Config(
+                s3={"addressing_style": "path"},
+                signature_version="s3v4",
+                connect_timeout=3,
+                read_timeout=10,
+                retries={"max_attempts": 2, "mode": "standard"},
+            ),
         )
         return cls(client, metrics)
 
-    def put(self, bucket: str, key: str, data: bytes, content_type: str, *,
-            expires_at: datetime | None = None) -> ClaimCheck:
+    def put(self, bucket: str, key: str, data: bytes, content_type: str, *, expires_at: datetime | None = None) -> ClaimCheck:
         digest = hashlib.sha256(data).hexdigest()
         try:
-            self._s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type,
-                                Metadata={"sha256": digest})
+            self._s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type, Metadata={"sha256": digest})
         except Exception as exc:
             raise _classify(exc, f"put s3://{bucket}/{key}") from exc
         self._metrics.claimcheck_size(bucket=bucket, direction="put", size=len(data))
-        return ClaimCheck(bucket=bucket, object_key=key, content_type=content_type, size_bytes=len(data),
-                          sha256=digest, expires_at=expires_at)
+        return ClaimCheck(
+            bucket=bucket, object_key=key, content_type=content_type, size_bytes=len(data), sha256=digest, expires_at=expires_at
+        )
 
     def get(self, cc: ClaimCheck) -> bytes:
         try:
@@ -97,7 +118,8 @@ class ClaimCheckStore:
 
     def presign(self, cc: ClaimCheck, ttl: timedelta = timedelta(minutes=5)) -> str:
         url: str = self._s3.generate_presigned_url(
-            "get_object", Params={"Bucket": cc.bucket, "Key": cc.object_key}, ExpiresIn=int(ttl.total_seconds()))
+            "get_object", Params={"Bucket": cc.bucket, "Key": cc.object_key}, ExpiresIn=int(ttl.total_seconds())
+        )
         return url
 
 
@@ -111,7 +133,11 @@ def _classify(exc: Exception, what: str) -> Exception:
         status = None
     if code in ("NoSuchKey", "404", "NotFound", "NoSuchBucket"):
         return RetryLater(f"{what}: object not found (yet)")
-    if status is not None and int(status) >= 500 or type(exc).__name__ in (
-        "EndpointConnectionError", "ConnectTimeoutError", "ReadTimeoutError", "ConnectionClosedError"):
+    if (status is not None and int(status) >= 500) or type(exc).__name__ in (
+        "EndpointConnectionError",
+        "ConnectTimeoutError",
+        "ReadTimeoutError",
+        "ConnectionClosedError",
+    ):
         return Transient(f"{what}: object store unavailable: {exc}")
     return RetryLater(f"{what}: {exc}")

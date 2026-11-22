@@ -63,7 +63,7 @@ filterwarnings = ["ignore::DeprecationWarning:testcontainers.*"]
 
 # --------------------------------------------------------------------------------------------- ruff
 [tool.ruff]
-line-length = 110
+line-length = 130
 target-version = "py313"
 extend-exclude = ["libs/contracts_py/src/contracts_py/_generated"]
 
@@ -74,10 +74,17 @@ ignore = [
     "S101",                                                 # asserts are fine in tests and invariants
     "S608",                                                 # SQL is built from constants, never user input
     "RUF012",
+    "PLC0415",                                              # lazy imports keep optional deps (boto3, uvicorn) off hot paths
+    "PLR0917",
+    "N818",                                                 # DomainError subclasses read better as NotFound, IdempotencyConflict
+    "N812",                                                 # `from contracts_py import records as R`
+    "PLW0603",                                              # uuid7 monotonic state; test container singletons
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"**/tests/**" = ["S", "PLR", "N802", "DTZ"]
+"**/tests/**" = ["S", "PLR", "N802", "DTZ", "PT018", "E501", "PT012", "RUF059"]
+"**/config.py" = ["S105"]
+"**/psp/fake/*.py" = ["S105"]                                # magic test tokens, not secrets                                   # local-only defaults of guide §7 (dev-psp-secret...)
 
 # --------------------------------------------------------------------------------------------- mypy
 [tool.mypy]
@@ -97,7 +104,8 @@ explicit_package_bases = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["confluent_kafka.*", "fastavro.*", "boto3.*", "botocore.*", "fpdf.*", "testcontainers.*", "moto.*"]
+module = ["confluent_kafka.*", "fastavro.*", "boto3.*", "botocore.*", "fpdf.*", "testcontainers.*", "moto.*", "yaml", "jsonschema",
+          "docker", "opentelemetry.exporter.otlp.proto.http.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------------- import-linter

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from payment_svc.adapters.outbound.psp.acl import outcome_from_notification
 from payment_svc.adapters.outbound.psp.fake.psp import FakePsp, FakePspConfig, WebhookSender
 from payment_svc.application.ports import PspTimeout
@@ -29,14 +28,17 @@ def psp(**cfg: object) -> tuple[FakePsp, WebhookSender, Collect]:
     return FakePsp(FakePspConfig().merged(base), sender, seed=1), sender, c
 
 
-@pytest.mark.parametrize(("token", "event", "code"), [
-    ("tok_visa_ok", "authorization.succeeded", None),
-    ("tok_decline", "authorization.failed", "card_declined"),
-    ("tok_insufficient_funds", "authorization.failed", "insufficient_funds"),
-    ("tok_fraud", "authorization.failed", "fraud_suspected"),
-    ("tok_slow", "authorization.succeeded", None),
-    ("tok_capture_fails", "authorization.succeeded", None),
-])
+@pytest.mark.parametrize(
+    ("token", "event", "code"),
+    [
+        ("tok_visa_ok", "authorization.succeeded", None),
+        ("tok_decline", "authorization.failed", "card_declined"),
+        ("tok_insufficient_funds", "authorization.failed", "insufficient_funds"),
+        ("tok_fraud", "authorization.failed", "fraud_suspected"),
+        ("tok_slow", "authorization.succeeded", None),
+        ("tok_capture_fails", "authorization.succeeded", None),
+    ],
+)
 def test_magic_tokens(token: str, event: str, code: str | None) -> None:
     p, sender, c = psp()
     assert p.authorize(payment_id="p1", amount_minor=100, currency="EUR", token=token).kind is OutcomeKind.PENDING
@@ -91,7 +93,12 @@ def test_capture_fails_token() -> None:
 
 def test_acl_mapping() -> None:
     base = {"merchantReference": "p1", "pspPaymentId": "psp1", "occurredAt": "2026-11-18T10:00:00.000Z"}
-    assert outcome_from_notification({**base, "eventType": "authorization.failed", "failureCode": "fraud_suspected"})[1].decline_reason is DeclineReason.FRAUD_SUSPECTED
+    assert (
+        outcome_from_notification({**base, "eventType": "authorization.failed", "failureCode": "fraud_suspected"})[
+            1
+        ].decline_reason
+        is DeclineReason.FRAUD_SUSPECTED
+    )
     assert outcome_from_notification({**base, "eventType": "capture.failed", "failureCode": "processing_error"})[1].retryable
     with pytest.raises(ValueError, match="unknown PSP event"):
         outcome_from_notification({**base, "eventType": "chargeback.opened"})

@@ -19,9 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 import contracts_py
+import pytest
 from contracts_py.records import MESSAGE_TYPES
 from contracts_py.topics import MESSAGE_TOPIC
 from edacommon.serde import AvroSerde, decode_raw, encode_raw, validate
@@ -57,7 +56,7 @@ def test_bin_decodes_to_json(name: str) -> None:
 def test_typed_round_trip_is_byte_identical(name: str) -> None:
     raw = (EXAMPLES / f"{name}.bin").read_bytes()
     record = MESSAGE_TYPES[name].from_avro(decode_raw(name, raw))
-    assert record.AVRO_NAME == name
+    assert name == record.AVRO_NAME
     assert encode_raw(name, record.to_avro()) == raw
 
 

@@ -20,7 +20,7 @@ from typing import Any, Protocol
 from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.orm import Session
 
-from edacommon.db import Database, inbox_table, outbox_table, idempotency_table
+from edacommon.db import Database, idempotency_table, inbox_table, outbox_table
 from edacommon.envelope import (
     Causation,
     OutboxRow,
@@ -64,28 +64,53 @@ class OutboxWriter:
         occurred_at = truncate_ms(self._clock.now())
         traceparent, tracestate = current_trace_headers()
         envelope = build_envelope(
-            event_id=event_id, record_type=msg.record_type, topic=msg.topic, producer=self._producer,
-            key=msg.key, aggregate_type=msg.aggregate_type, aggregate_id=msg.aggregate_id,
-            aggregate_version=msg.aggregate_version, correlation_id=causation.correlation_id,
-            causation_id=causation.causation_id, occurred_at=occurred_at, traceparent=traceparent,
-            tracestate=tracestate, expires_at=msg.expires_at,
+            event_id=event_id,
+            record_type=msg.record_type,
+            topic=msg.topic,
+            producer=self._producer,
+            key=msg.key,
+            aggregate_type=msg.aggregate_type,
+            aggregate_id=msg.aggregate_id,
+            aggregate_version=msg.aggregate_version,
+            correlation_id=causation.correlation_id,
+            causation_id=causation.causation_id,
+            occurred_at=occurred_at,
+            traceparent=traceparent,
+            tracestate=tracestate,
+            expires_at=msg.expires_at,
         )
         value = {"envelope": envelope, **msg.body}
         payload = self._serde.serialize(msg.topic, msg.record_type, value)
-        session.execute(insert(outbox_table).values(
-            id=event_id, aggregate_type=msg.aggregate_type, aggregate_id=msg.key,
-            event_type=msg.record_type, topic=msg.topic, payload=payload, occurred_at=occurred_at,
-            producer=self._producer, correlation_id=causation.correlation_id,
-            causation_id=causation.causation_id, traceparent=traceparent, tracestate=tracestate,
-        ))
+        session.execute(
+            insert(outbox_table).values(
+                id=event_id,
+                aggregate_type=msg.aggregate_type,
+                aggregate_id=msg.key,
+                event_type=msg.record_type,
+                topic=msg.topic,
+                payload=payload,
+                occurred_at=occurred_at,
+                producer=self._producer,
+                correlation_id=causation.correlation_id,
+                causation_id=causation.causation_id,
+                traceparent=traceparent,
+                tracestate=tracestate,
+            )
+        )
         return AppendedMessage(event_id=event_id, envelope=envelope, payload=payload)
 
 
 class Publisher(Protocol):
     """The part of a Kafka producer the relay and forwarders need (lets tests use a fake)."""
 
-    def produce(self, topic: str, value: bytes | None = ..., key: bytes | None = ...,
-                headers: Any = ..., on_delivery: Callable[..., None] | None = ...) -> None: ...
+    def produce(
+        self,
+        topic: str,
+        value: bytes | None = ...,
+        key: bytes | None = ...,
+        headers: Any = ...,
+        on_delivery: Callable[..., None] | None = ...,
+    ) -> None: ...
 
     def flush(self, timeout: float = ...) -> int: ...
 
@@ -96,8 +121,11 @@ class DeliveryFailed(Exception):
     pass
 
 
-def produce_and_wait(producer: Publisher, items: list[tuple[str, bytes | None, bytes | None, list[tuple[str, bytes | None]]]],
-                     timeout: float = 30.0) -> None:
+def produce_and_wait(
+    producer: Publisher,
+    items: list[tuple[str, bytes | None, bytes | None, list[tuple[str, bytes | None]]]],
+    timeout: float = 30.0,
+) -> None:
     """Produce records (topic, key, value, headers) and block until every one is acknowledged."""
     errors: list[str] = []
 
@@ -126,8 +154,15 @@ class PollingRelay:
     guaranteed by running one relay per database, which is the default deployment.
     """
 
-    def __init__(self, db: Database, producer: Publisher, metrics: EdaMetrics, *,
-                 interval: timedelta = timedelta(milliseconds=200), batch_size: int = 500) -> None:
+    def __init__(
+        self,
+        db: Database,
+        producer: Publisher,
+        metrics: EdaMetrics,
+        *,
+        interval: timedelta = timedelta(milliseconds=200),
+        batch_size: int = 500,
+    ) -> None:
         self._db = db
         self._producer = producer
         self._metrics = metrics
@@ -147,28 +182,42 @@ class PollingRelay:
         """Publish one batch. Returns the number of rows published."""
         with self._db.unit_of_work() as uow:
             s = uow.session
-            rows = s.execute(
-                select(outbox_table)
-                .where(outbox_table.c.published_at.is_(None))
-                .order_by(outbox_table.c.created_at, outbox_table.c.id)
-                .limit(self._batch)
-                .with_for_update(skip_locked=True)
-            ).mappings().all()
+            rows = (
+                s.execute(
+                    select(outbox_table)
+                    .where(outbox_table.c.published_at.is_(None))
+                    .order_by(outbox_table.c.created_at, outbox_table.c.id)
+                    .limit(self._batch)
+                    .with_for_update(skip_locked=True)
+                )
+                .mappings()
+                .all()
+            )
             if rows:
-                items = []
+                items: list[tuple[str, bytes | None, bytes | None, list[tuple[str, bytes | None]]]] = []
                 for r in rows:
                     row = OutboxRow(
-                        id=str(r["id"]), aggregate_type=r["aggregate_type"], aggregate_id=r["aggregate_id"],
-                        event_type=r["event_type"], topic=r["topic"], payload=bytes(r["payload"]),
-                        occurred_at=r["occurred_at"], producer=r["producer"], correlation_id=r["correlation_id"],
-                        causation_id=r["causation_id"], traceparent=r["traceparent"], tracestate=r["tracestate"],
+                        id=str(r["id"]),
+                        aggregate_type=r["aggregate_type"],
+                        aggregate_id=r["aggregate_id"],
+                        event_type=r["event_type"],
+                        topic=r["topic"],
+                        payload=bytes(r["payload"]),
+                        occurred_at=r["occurred_at"],
+                        producer=r["producer"],
+                        correlation_id=r["correlation_id"],
+                        causation_id=r["causation_id"],
+                        traceparent=r["traceparent"],
+                        tracestate=r["tracestate"],
                     )
                     items.append((row.topic, encode_key(row.aggregate_id), row.payload, headers_for_row(row)))
                 produce_and_wait(self._producer, items)
-                s.execute(update(outbox_table).where(outbox_table.c.id.in_([r["id"] for r in rows]))
-                          .values(published_at=func.now()))
-            pending = s.execute(select(func.count()).select_from(outbox_table)
-                                .where(outbox_table.c.published_at.is_(None))).scalar_one()
+                s.execute(
+                    update(outbox_table).where(outbox_table.c.id.in_([r["id"] for r in rows])).values(published_at=func.now())
+                )
+            pending = s.execute(
+                select(func.count()).select_from(outbox_table).where(outbox_table.c.published_at.is_(None))
+            ).scalar_one()
         self._metrics.outbox_pending(int(pending))
         return len(rows)
 
@@ -200,10 +249,10 @@ class Housekeeping:
         now: datetime = self._clock.now()
         with self._db.unit_of_work() as uow:
             s = uow.session
-            o = s.execute(delete(outbox_table).where(outbox_table.c.created_at < now - self._outbox)).rowcount
-            i = s.execute(delete(inbox_table).where(inbox_table.c.received_at < now - self._inbox)).rowcount
+            o = s.execute(delete(outbox_table).where(outbox_table.c.created_at < now - self._outbox)).rowcount  # type: ignore[attr-defined]
+            i = s.execute(delete(inbox_table).where(inbox_table.c.received_at < now - self._inbox)).rowcount  # type: ignore[attr-defined]
             has_idem = s.execute(text("SELECT to_regclass('idempotency_key') IS NOT NULL")).scalar_one()
             k = 0
             if has_idem:
-                k = s.execute(delete(idempotency_table).where(idempotency_table.c.expires_at < now)).rowcount
+                k = s.execute(delete(idempotency_table).where(idempotency_table.c.expires_at < now)).rowcount  # type: ignore[attr-defined]
         return {"outbox": o or 0, "inbox": i or 0, "idempotency_key": k or 0}

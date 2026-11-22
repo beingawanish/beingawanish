@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from fastapi import APIRouter, Depends
-from pydantic import Field
-
 from edacommon.db import Database, UnitOfWork
 from edacommon.envelope import Causation, caused_by
 from edacommon.http import Authenticator, CamelModel, Principal, require_scope
 from edacommon.ids import Clock
+from fastapi import APIRouter, Depends
+from pydantic import Field
+
 from inventory_svc.application.use_cases import Inventory
 
 
@@ -18,8 +18,7 @@ class SetStock(CamelModel):
     on_hand: int = Field(ge=0)
 
 
-def admin_router(db: Database, inventory_for: Callable[[UnitOfWork], Inventory], clock: Clock,
-                 auth: Authenticator) -> APIRouter:
+def admin_router(db: Database, inventory_for: Callable[[UnitOfWork], Inventory], clock: Clock, auth: Authenticator) -> APIRouter:
     router = APIRouter(tags=["seed"])
     ops = Depends(require_scope(auth, "ops"))
 

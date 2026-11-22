@@ -7,9 +7,8 @@ import io
 import json
 from typing import Any
 
-import fastavro
-
 import contracts_py
+import fastavro
 from contracts_py.records import DeclineReason, PaymentDeclined, ShippingMethod
 from edacommon.serde import parsed_schema
 

@@ -54,9 +54,20 @@ public class MessageDriver {
   private final JdbcTemplate jdbc;
   private final Clock clock;
 
+  /** Drives an explicit set of handlers as consumer group {@code group} (e.g. a projector). */
+  public MessageDriver(ApplicationContext ctx, String group, List<MessageHandler<?>> handlers) {
+    this.serde = ctx.getBean(AvroSerde.class);
+    this.jdbc = ctx.getBean(JdbcTemplate.class);
+    this.clock = ctx.getBean(Clock.class);
+    this.processor =
+        new RecordProcessor(group, new HandlerRegistry(handlers), ctx.getBean(Inbox.class), serde,
+            ctx.getBean(TransactionTemplate.class), ctx.getBean(MessagingTracing.class), ctx.getBean(EdaMetrics.class), clock);
+  }
+
   @SuppressWarnings({"unchecked", "rawtypes"})
   public MessageDriver(ApplicationContext ctx) {
     List<MessageHandler<?>> handlers = new ArrayList<>((java.util.Collection) ctx.getBeansOfType(MessageHandler.class).values());
+    ctx.getBeansOfType(com.edacommerce.edacommon.consumer.MessageHandlerGroup.class).values().forEach(g -> handlers.addAll(g.handlers()));
     this.serde = ctx.getBean(AvroSerde.class);
     this.jdbc = ctx.getBean(JdbcTemplate.class);
     this.clock = ctx.getBean(Clock.class);

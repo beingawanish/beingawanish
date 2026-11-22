@@ -25,8 +25,12 @@ class ConsumedRecord:
 
         ts_type, ts = msg.timestamp()
         return cls(
-            topic=msg.topic(), partition=msg.partition(), offset=msg.offset(), key=msg.key(),
-            value=msg.value(), headers=list(msg.headers() or []),
+            topic=msg.topic(),
+            partition=msg.partition(),
+            offset=msg.offset(),
+            key=msg.key(),
+            value=msg.value(),
+            headers=list(msg.headers() or []),
             timestamp=from_millis(ts) if ts_type and ts and ts > 0 else None,
         )
 

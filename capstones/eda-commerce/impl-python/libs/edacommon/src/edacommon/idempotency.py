@@ -28,7 +28,8 @@ from typing import Any
 from sqlalchemy import delete, insert, select, text, update
 from sqlalchemy.orm import Session
 
-from edacommon.db import Database, UnitOfWork, idempotency_table as t
+from edacommon.db import Database, UnitOfWork
+from edacommon.db import idempotency_table as t
 from edacommon.errors import DomainError
 from edacommon.ids import Clock
 
@@ -101,8 +102,7 @@ class IdempotencyStore:
 
     def begin(self, session: Session, *, caller: str, key: str, req_hash: str) -> StoredResponse | None:
         """Return a stored response to replay, or ``None`` to proceed (row now IN_PROGRESS)."""
-        locked = session.execute(text("SELECT pg_try_advisory_xact_lock(:k)"),
-                                 {"k": _lock_key(caller, key)}).scalar_one()
+        locked = session.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": _lock_key(caller, key)}).scalar_one()
         if not locked:
             raise IdempotencyConflict("A request with this Idempotency-Key is still being processed")
         now = self._clock.now()
@@ -116,19 +116,42 @@ class IdempotencyStore:
             if row["status"] == "IN_PROGRESS":
                 # Only reachable if another build or a crashed writer left the row behind.
                 raise IdempotencyConflict("A request with this Idempotency-Key is still being processed")
-            return StoredResponse(status=int(row["response_status"]), body=bytes(row["response_body"] or b""),
-                                  headers=dict(row["response_headers"] or {}), replayed=True)
-        session.execute(insert(t).values(caller=caller, key=key, request_hash=req_hash, status="IN_PROGRESS",
-                                         created_at=now, expires_at=now + self._ttl))
+            return StoredResponse(
+                status=int(row["response_status"]),
+                body=bytes(row["response_body"] or b""),
+                headers=dict(row["response_headers"] or {}),
+                replayed=True,
+            )
+        session.execute(
+            insert(t).values(
+                caller=caller, key=key, request_hash=req_hash, status="IN_PROGRESS", created_at=now, expires_at=now + self._ttl
+            )
+        )
         return None
 
     def complete(self, session: Session, *, caller: str, key: str, response: StoredResponse) -> None:
-        session.execute(update(t).where(t.c.caller == caller, t.c.key == key).values(
-            status="COMPLETED", response_status=response.status, response_headers=response.headers,
-            response_body=response.body))
+        session.execute(
+            update(t)
+            .where(t.c.caller == caller, t.c.key == key)
+            .values(
+                status="COMPLETED",
+                response_status=response.status,
+                response_headers=response.headers,
+                response_body=response.body,
+            )
+        )
 
-    def execute(self, db: Database, *, caller: str, key: str | None, method: str, path: str,
-                body: bytes | None, action: Callable[[UnitOfWork], StoredResponse]) -> StoredResponse:
+    def execute(
+        self,
+        db: Database,
+        *,
+        caller: str,
+        key: str | None,
+        method: str,
+        path: str,
+        body: bytes | None,
+        action: Callable[[UnitOfWork], StoredResponse],
+    ) -> StoredResponse:
         """Run ``action`` at most once per (caller, key). Domain errors roll everything back, so a
         retry after a 4xx re-validates instead of replaying the error."""
         k = self.validate_key(key)

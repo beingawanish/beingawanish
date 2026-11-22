@@ -18,10 +18,15 @@ def minter() -> S.Mint:
 
 
 CHECKOUT = S.CheckoutSubmitted(
-    order_id="o1", customer_id="c1", currency="EUR", total_minor=25998,
+    order_id="o1",
+    customer_id="c1",
+    currency="EUR",
+    total_minor=25998,
     lines=(S.Line("l1", "SKU-1001", "Trail Running Shoe", 2, 12999, 25998),),
     ship_to={"recipientName": "Jane Doe", "line1": "x", "city": "Berlin", "postalCode": "10115", "countryCode": "DE"},
-    shipping_method="STANDARD", payment_token="tok_visa_ok")
+    shipping_method="STANDARD",
+    payment_token="tok_visa_ok",
+)
 
 
 @dataclass
@@ -102,8 +107,16 @@ class Run:
         return self.send(S.ShipmentDelivered("ship-1", "2026-11-20T14:05:00+00:00"))
 
     def to(self, target: S.State) -> Run:
-        steps = [self.stock_reserved, self.authorized, self.committed, self.accepted, self.packed, self.dispatched,
-                 self.captured, self.delivered]
+        steps = [
+            self.stock_reserved,
+            self.authorized,
+            self.committed,
+            self.accepted,
+            self.packed,
+            self.dispatched,
+            self.captured,
+            self.delivered,
+        ]
         for step in steps:
             if self.state is target:
                 return self

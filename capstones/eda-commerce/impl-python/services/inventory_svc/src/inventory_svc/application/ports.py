@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Protocol
 
 from edacommon.envelope import OutgoingMessage
+
 from inventory_svc.domain.model import Reservation, Shortage, StockLevel, StockLine
 
 
@@ -34,8 +35,9 @@ class InventoryRepository(Protocol):
 
     def restock_seen(self, restock_id: str) -> tuple[StockLine, ...] | None: ...
 
-    def record_restock(self, restock_id: str, order_id: str, return_id: str, lines: tuple[StockLine, ...],
-                       now: datetime) -> None: ...
+    def record_restock(
+        self, restock_id: str, order_id: str, return_id: str, lines: tuple[StockLine, ...], now: datetime
+    ) -> None: ...
 
 
 class EventPublisher(Protocol):

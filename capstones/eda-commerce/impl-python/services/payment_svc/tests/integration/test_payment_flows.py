@@ -10,8 +10,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
-
 from contracts_py.records import AuthorizePayment, CapturePayment, RefundPayment, VoidPayment
 from edacommon.consumer import Outcome
 from edacommon.http import Authenticator, Readiness, create_app
@@ -20,6 +18,7 @@ from edacommon.serde import AvroSerde
 from edacommon.testing.fakes import counter_value
 from edacommon.testing.service import ServiceHarness
 from edacommon.webhooks import sign
+from fastapi.testclient import TestClient
 from payment_svc.adapters.inbound.http.routes import fake_psp_router, webhook_router
 from payment_svc.adapters.inbound.messaging.handlers import build_registry
 from payment_svc.adapters.outbound.psp.fake.psp import FakePsp, FakePspConfig, WebhookSender
@@ -35,15 +34,21 @@ class Svc:
     def __init__(self, h: ServiceHarness, settings: Settings) -> None:
         self.h = h
         self.settings = settings
-        self.sender = WebhookSender(settings.psp_webhook_url, settings.psp_webhook_secret, send=self._post,
-                                    wall_clock=lambda: h.clock.now().timestamp())
-        self.psp = FakePsp(FakePspConfig(declineRate=0, timeoutRate=0, duplicateWebhookRate=0, apiLatencyMs=0),
-                           self.sender, seed=7)
+        self.sender = WebhookSender(
+            settings.psp_webhook_url, settings.psp_webhook_secret, send=self._post, wall_clock=lambda: h.clock.now().timestamp()
+        )
+        self.psp = FakePsp(
+            FakePspConfig(declineRate=0, timeoutRate=0, duplicateWebhookRate=0, apiLatencyMs=0), self.sender, seed=7
+        )
         infra = Infrastructure(settings=settings, clock=h.clock, metrics=h.metrics, db=h.db, serde=h.serde, outbox=h.outbox)
         self.w = wire(settings, infra, self.psp)
         self.registry = build_registry(self.w.payments_for, h.clock)
-        app = create_app(settings, readiness=Readiness(), instrument=False, routers=[
-            webhook_router(self.w.receiver, h.clock), fake_psp_router(self.psp, Authenticator(settings))])
+        app = create_app(
+            settings,
+            readiness=Readiness(),
+            instrument=False,
+            routers=[webhook_router(self.w.receiver, h.clock), fake_psp_router(self.psp, Authenticator(settings))],
+        )
         self.http = TestClient(app)
         self.webhook_statuses: list[int] = []
 
@@ -51,9 +56,18 @@ class Svc:
         self.webhook_statuses.append(self.http.post("/webhooks/psp", content=raw, headers=headers).status_code)
 
     def authorize(self, token: str = "tok_visa_ok", pid: str = "pay-1", event_id: str | None = None) -> Any:
-        rec = self.h.command(AuthorizePayment, {"orderId": ORDER, "paymentId": pid, "customerId": "cust-1",
-                                                "amount": {"amountMinor": 25998, "currency": "EUR"},
-                                                "paymentMethodToken": token}, key=ORDER, event_id=event_id)
+        rec = self.h.command(
+            AuthorizePayment,
+            {
+                "orderId": ORDER,
+                "paymentId": pid,
+                "customerId": "cust-1",
+                "amount": {"amountMinor": 25998, "currency": "EUR"},
+                "paymentMethodToken": token,
+            },
+            key=ORDER,
+            event_id=event_id,
+        )
         assert self.h.deliver(self.registry, rec) is Outcome.SUCCESS
         return rec
 
@@ -65,8 +79,14 @@ class Svc:
 
 @pytest.fixture
 def svc(pg_url: str, schema_registry: Any, clock: Any, metrics_reader: Any) -> Iterator[Svc]:
-    h = ServiceHarness(url=pg_url, migrations=MIGRATIONS, group="payment-svc", serde=AvroSerde(schema_registry),
-                       clock=clock, metrics=metrics_reader[0])
+    h = ServiceHarness(
+        url=pg_url,
+        migrations=MIGRATIONS,
+        group="payment-svc",
+        serde=AvroSerde(schema_registry),
+        clock=clock,
+        metrics=metrics_reader[0],
+    )
     yield Svc(h, Settings())
     h.close()
 
@@ -118,16 +138,29 @@ def test_timeout_to_psp_timeout_with_void_then_late_success_is_voided(svc: Svc) 
     for _ in range(8):  # every 15 s for 2 minutes
         svc.h.clock.advance(timedelta(seconds=15))
         svc.w.reconciler.run_once()
-    (d,) = [p for p in svc.h.published()]
+    (d,) = list(svc.h.published())
     assert d.type.endswith("PaymentDeclined") and d.value["reason"] == "PSP_TIMEOUT"
     assert ("void", "pay-1") in svc.psp.calls
     # Later the PSP sends authorization.succeeded after all: void it; the saga hears nothing.
     svc.psp.calls.clear()
-    body = json.dumps({"pspEventId": "evt-late", "eventType": "authorization.succeeded", "pspPaymentId": "psp-late",
-                       "merchantReference": "pay-1", "occurredAt": "2026-11-18T11:10:00.000Z"}).encode()
+    body = json.dumps(
+        {
+            "pspEventId": "evt-late",
+            "eventType": "authorization.succeeded",
+            "pspPaymentId": "psp-late",
+            "merchantReference": "pay-1",
+            "occurredAt": "2026-11-18T11:10:00.000Z",
+        }
+    ).encode()
     ts = str(int(svc.h.clock.now().timestamp()))
-    assert svc.http.post("/webhooks/psp", content=body, headers={
-        "X-Webhook-Timestamp": ts, "X-Psp-Signature": sign("dev-psp-secret", ts, body)}).status_code == 200
+    assert (
+        svc.http.post(
+            "/webhooks/psp",
+            content=body,
+            headers={"X-Webhook-Timestamp": ts, "X-Psp-Signature": sign("dev-psp-secret", ts, body)},
+        ).status_code
+        == 200
+    )
     assert types(svc.settle()) == []
     assert ("void", "pay-1") in svc.psp.calls
 
@@ -138,11 +171,13 @@ def test_bad_signature_and_stale_timestamp_are_401(svc: Svc) -> None:
     r = svc.http.post("/webhooks/psp", content=body, headers={"X-Webhook-Timestamp": ts, "X-Psp-Signature": "deadbeef"})
     assert r.status_code == 401 and r.headers["content-type"].startswith("application/problem+json")
     old = str(int(svc.h.clock.now().timestamp()) - 600)
-    r = svc.http.post("/webhooks/psp", content=body, headers={"X-Webhook-Timestamp": old,
-                                                               "X-Psp-Signature": sign("dev-psp-secret", old, body)})
+    r = svc.http.post(
+        "/webhooks/psp", content=body, headers={"X-Webhook-Timestamp": old, "X-Psp-Signature": sign("dev-psp-secret", old, body)}
+    )
     assert r.status_code == 401
-    r = svc.http.post("/webhooks/psp", content=b"{", headers={"X-Webhook-Timestamp": ts,
-                                                               "X-Psp-Signature": sign("dev-psp-secret", ts, b"{")})
+    r = svc.http.post(
+        "/webhooks/psp", content=b"{", headers={"X-Webhook-Timestamp": ts, "X-Psp-Signature": sign("dev-psp-secret", ts, b"{")}
+    )
     assert r.status_code == 400
 
 
@@ -150,7 +185,7 @@ def test_resent_authorize_reemits_original_reply_without_new_psp_charge(svc: Svc
     svc.authorize()
     (first,) = svc.settle()
     resend = svc.authorize()  # new eventId, same paymentId
-    (again,) = [p for p in svc.h.published()]
+    (again,) = list(svc.h.published())
     assert again.type == first.type and again.value["authorizedAt"] == first.value["authorizedAt"]
     assert again.envelope["causationId"] == resend.event_id
     assert svc.psp.calls.count(("authorize", "pay-1")) == 1 and svc.psp.charges("pay-1") == 1
@@ -159,29 +194,46 @@ def test_resent_authorize_reemits_original_reply_without_new_psp_charge(svc: Svc
 def test_capture_then_resend_and_capture_fails_token(svc: Svc) -> None:
     svc.authorize()
     svc.settle()
-    cap = svc.h.command(CapturePayment, {"orderId": ORDER, "paymentId": "pay-1",
-                                         "amount": {"amountMinor": 25998, "currency": "EUR"}}, key=ORDER)
+    cap = svc.h.command(
+        CapturePayment, {"orderId": ORDER, "paymentId": "pay-1", "amount": {"amountMinor": 25998, "currency": "EUR"}}, key=ORDER
+    )
     svc.h.deliver(svc.registry, cap)
     assert types(svc.settle()) == ["PaymentCaptured"]
-    svc.h.deliver(svc.registry, svc.h.command(CapturePayment, {"orderId": ORDER, "paymentId": "pay-1",
-                                                               "amount": {"amountMinor": 25998, "currency": "EUR"}}, key=ORDER))
+    svc.h.deliver(
+        svc.registry,
+        svc.h.command(
+            CapturePayment,
+            {"orderId": ORDER, "paymentId": "pay-1", "amount": {"amountMinor": 25998, "currency": "EUR"}},
+            key=ORDER,
+        ),
+    )
     assert types(svc.settle()) == ["PaymentCaptured"]
     assert svc.psp.calls.count(("capture", "pay-1")) == 1
 
     svc.authorize("tok_capture_fails", pid="pay-2")
     svc.settle()
-    svc.h.deliver(svc.registry, svc.h.command(CapturePayment, {"orderId": ORDER, "paymentId": "pay-2",
-                                                               "amount": {"amountMinor": 25998, "currency": "EUR"}}, key=ORDER))
+    svc.h.deliver(
+        svc.registry,
+        svc.h.command(
+            CapturePayment,
+            {"orderId": ORDER, "paymentId": "pay-2", "amount": {"amountMinor": 25998, "currency": "EUR"}},
+            key=ORDER,
+        ),
+    )
     (f,) = svc.settle()
-    assert f.type.endswith("PaymentCaptureFailed") and f.value["reason"] == "AUTHORIZATION_EXPIRED" and f.value["retryable"] is False
+    assert (
+        f.type.endswith("PaymentCaptureFailed") and f.value["reason"] == "AUTHORIZATION_EXPIRED" and f.value["retryable"] is False
+    )
 
 
 def test_void_and_void_again(svc: Svc) -> None:
     svc.authorize()
     svc.settle()
     for _ in range(2):
-        svc.h.deliver(svc.registry, svc.h.command(VoidPayment, {"orderId": ORDER, "paymentId": "pay-1",
-                                                                "reason": "RESERVATION_EXPIRED"}, key=ORDER))
+        svc.h.deliver(
+            svc.registry,
+            svc.h.command(VoidPayment, {"orderId": ORDER, "paymentId": "pay-1", "reason": "RESERVATION_EXPIRED"}, key=ORDER),
+        )
     voided = svc.settle()
     assert types(voided) == ["PaymentVoided", "PaymentVoided"] and voided[0].value["voidedAt"] == voided[1].value["voidedAt"]
     # void for a payment never seen (authorise lost) answers voided too
@@ -192,21 +244,41 @@ def test_void_and_void_again(svc: Svc) -> None:
 def test_void_after_capture_goes_to_dlq(svc: Svc, metrics_reader: Any) -> None:
     svc.authorize()
     svc.settle()
-    svc.h.deliver(svc.registry, svc.h.command(CapturePayment, {"orderId": ORDER, "paymentId": "pay-1",
-                                                               "amount": {"amountMinor": 25998, "currency": "EUR"}}, key=ORDER))
+    svc.h.deliver(
+        svc.registry,
+        svc.h.command(
+            CapturePayment,
+            {"orderId": ORDER, "paymentId": "pay-1", "amount": {"amountMinor": 25998, "currency": "EUR"}},
+            key=ORDER,
+        ),
+    )
     svc.settle()
-    out = svc.h.deliver(svc.registry, svc.h.command(VoidPayment, {"orderId": ORDER, "paymentId": "pay-1", "reason": "x"}, key=ORDER))
+    out = svc.h.deliver(
+        svc.registry, svc.h.command(VoidPayment, {"orderId": ORDER, "paymentId": "pay-1", "reason": "x"}, key=ORDER)
+    )
     assert out is Outcome.DLQ
 
 
 def test_refund_once_per_refund_id(svc: Svc) -> None:
     svc.authorize()
     svc.settle()
-    svc.h.deliver(svc.registry, svc.h.command(CapturePayment, {"orderId": ORDER, "paymentId": "pay-1",
-                                                               "amount": {"amountMinor": 25998, "currency": "EUR"}}, key=ORDER))
+    svc.h.deliver(
+        svc.registry,
+        svc.h.command(
+            CapturePayment,
+            {"orderId": ORDER, "paymentId": "pay-1", "amount": {"amountMinor": 25998, "currency": "EUR"}},
+            key=ORDER,
+        ),
+    )
     svc.settle()
-    body = {"orderId": ORDER, "paymentId": "pay-1", "refundId": "rf-1", "returnId": "ret-1",
-            "amount": {"amountMinor": 12999, "currency": "EUR"}, "reason": "RETURN"}
+    body = {
+        "orderId": ORDER,
+        "paymentId": "pay-1",
+        "refundId": "rf-1",
+        "returnId": "ret-1",
+        "amount": {"amountMinor": 12999, "currency": "EUR"},
+        "reason": "RETURN",
+    }
     svc.h.deliver(svc.registry, svc.h.command(RefundPayment, body, key=ORDER, producer="returns-svc"))
     assert types(svc.settle()) == ["RefundSucceeded"]
     svc.h.deliver(svc.registry, svc.h.command(RefundPayment, body, key=ORDER, producer="returns-svc"))
@@ -217,8 +289,14 @@ def test_refund_once_per_refund_id(svc: Svc) -> None:
 
 def test_fake_psp_admin_api(svc: Svc) -> None:
     r = svc.http.get("/admin/fakes/psp")
-    assert r.status_code == 200 and set(r.json()) == {"declineRate", "timeoutRate", "duplicateWebhookRate",
-                                                      "webhookDelayMs", "slowWebhookMs", "apiLatencyMs"}
+    assert r.status_code == 200 and set(r.json()) == {
+        "declineRate",
+        "timeoutRate",
+        "duplicateWebhookRate",
+        "webhookDelayMs",
+        "slowWebhookMs",
+        "apiLatencyMs",
+    }
     r = svc.http.put("/admin/fakes/psp", json={"declineRate": 0.5})
     assert r.status_code == 200 and r.json()["declineRate"] == 0.5
     assert svc.http.put("/admin/fakes/psp", json={"declineRate": 2}).status_code == 400

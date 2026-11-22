@@ -40,8 +40,15 @@ class CamelModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
 
 
-def problem(status: int, problem_type: str, title: str, detail: str | None = None, *,
-            errors: list[dict[str, str]] | None = None, headers: dict[str, str] | None = None) -> JSONResponse:
+def problem(
+    status: int,
+    problem_type: str,
+    title: str,
+    detail: str | None = None,
+    *,
+    errors: list[dict[str, str]] | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     body: dict[str, Any] = {"type": PROBLEM_BASE + problem_type, "title": title, "status": status}
     if detail:
         body["detail"] = detail
@@ -53,38 +60,71 @@ def problem(status: int, problem_type: str, title: str, detail: str | None = Non
     return JSONResponse(body, status_code=status, media_type=PROBLEM_JSON, headers=headers)
 
 
-_TITLES = {400: "Bad request", 401: "Unauthorized", 403: "Forbidden", 404: "Not found", 409: "Conflict",
-           412: "Precondition failed", 422: "Unprocessable request", 429: "Too many requests",
-           503: "Service unavailable"}
+_TITLES = {
+    400: "Bad request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not found",
+    409: "Conflict",
+    412: "Precondition failed",
+    422: "Unprocessable request",
+    429: "Too many requests",
+    503: "Service unavailable",
+}
 
 
 def install_problem_handlers(app: FastAPI) -> None:
     @app.exception_handler(DomainError)
     async def _domain(_: Request, exc: DomainError) -> JSONResponse:
         headers = {"Retry-After": "1"} if exc.status == 409 else None
-        return problem(exc.status, exc.problem_type, _TITLES.get(exc.status, "Request refused"), exc.detail,
-                       headers=headers)
+        return problem(exc.status, exc.problem_type, _TITLES.get(exc.status, "Request refused"), exc.detail, headers=headers)
 
     @app.exception_handler(RequestValidationError)
     async def _validation(_: Request, exc: RequestValidationError) -> JSONResponse:
-        errors = [{"field": ".".join(str(p) for p in e.get("loc", ()) if p != "body"), "message": e.get("msg", "")}
-                  for e in exc.errors()]
+        errors = [
+            {"field": ".".join(str(p) for p in e.get("loc", ()) if p != "body"), "message": e.get("msg", "")}
+            for e in exc.errors()
+        ]
         return problem(400, "validation-error", "Bad request", "The request failed validation", errors=errors)
 
     @app.exception_handler(HTTPException)
     async def _http(_: Request, exc: HTTPException) -> JSONResponse:
         ptype = {401: "unauthorized", 403: "forbidden", 404: "not-found", 405: "method-not-allowed"}.get(
-            exc.status_code, "http-error")
-        return problem(exc.status_code, ptype, _TITLES.get(exc.status_code, "Error"), str(exc.detail),
-                       headers=dict(exc.headers or {}))
+            exc.status_code, "http-error"
+        )
+        return problem(
+            exc.status_code, ptype, _TITLES.get(exc.status_code, "Error"), str(exc.detail), headers=dict(exc.headers or {})
+        )
+
+    async def _dependency(_: Request, exc: Exception) -> JSONResponse:
+        log.warning("dependency unavailable", error=exc)
+        return problem(
+            503,
+            "dependency-unavailable",
+            "Service unavailable",
+            "A dependency is temporarily unavailable; retry shortly",
+            headers={"Retry-After": "2"},
+        )
+
+    # Known infrastructure failures are answered here (ExceptionMiddleware), not as unhandled errors.
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    for exc_type in (Transient, RetryLater, OperationalError, PoolTimeout, ConnectionError):
+        app.add_exception_handler(exc_type, _dependency)
 
     @app.exception_handler(Exception)
     async def _unexpected(_: Request, exc: Exception) -> JSONResponse:
         cls = classify(exc)
         if cls in (Transient, RetryLater) and not isinstance(exc, NonRetryable):
             log.warning("dependency unavailable", error=exc)
-            return problem(503, "dependency-unavailable", "Service unavailable",
-                           "A dependency is temporarily unavailable; retry shortly", headers={"Retry-After": "2"})
+            return problem(
+                503,
+                "dependency-unavailable",
+                "Service unavailable",
+                "A dependency is temporarily unavailable; retry shortly",
+                headers={"Retry-After": "2"},
+            )
         log.error("unhandled error", exc_info=exc)
         return problem(500, "internal-error", "Internal error")
 
@@ -110,14 +150,20 @@ class Authenticator:
         if self._jwks is None:
             import jwt
 
-            self._jwks = jwt.PyJWKClient(f"{self._issuer}/protocol/openid-connect/certs", cache_keys=True,
-                                         lifespan=300, timeout=5)
+            self._jwks = jwt.PyJWKClient(
+                f"{self._issuer}/protocol/openid-connect/certs", cache_keys=True, lifespan=300, timeout=5
+            )
         return self._jwks
 
     def authenticate(self, request: Request) -> Principal:
         if self._mode == "none":
-            subject = request.headers.get("X-Debug-Subject") or LOCAL_SUBJECT
-            return Principal(subject, frozenset({"shop", "ops"}))
+            # Local only (ADR-0013): X-Debug-Subject impersonates a customer (scope shop); without it
+            # the caller is a local operator with every scope.
+            subject = request.headers.get("X-Debug-Subject")
+            if subject:
+                raw_scopes = request.headers.get("X-Debug-Scopes", "shop")
+                return Principal(subject, frozenset(raw_scopes.split(",")))
+            return Principal(LOCAL_SUBJECT, frozenset({"shop", "ops"}))
         auth = request.headers.get("Authorization", "")
         if not auth.lower().startswith("bearer "):
             raise HTTPException(401, "missing bearer token", headers={"WWW-Authenticate": "Bearer"})
@@ -126,11 +172,16 @@ class Authenticator:
 
         try:
             key = self._jwks_client().get_signing_key_from_jwt(token).key
-            claims = jwt.decode(token, key, algorithms=["RS256", "ES256"], audience=self._audience,
-                                issuer=self._issuer, options={"require": ["exp", "iat", "sub"]})
+            claims = jwt.decode(
+                token,
+                key,
+                algorithms=["RS256", "ES256"],
+                audience=self._audience,
+                issuer=self._issuer,
+                options={"require": ["exp", "iat", "sub"]},
+            )
         except jwt.PyJWTError as exc:
-            raise HTTPException(401, f"invalid token: {type(exc).__name__}",
-                                headers={"WWW-Authenticate": "Bearer"}) from exc
+            raise HTTPException(401, f"invalid token: {type(exc).__name__}", headers={"WWW-Authenticate": "Bearer"}) from exc
         scopes = frozenset(str(claims.get("scope", "")).split())
         return Principal(str(claims["sub"]), scopes)
 
@@ -201,23 +252,38 @@ def dlq_router(*, dlq: Any, idempotency: Any, db: Any, auth: Authenticator) -> A
         req = json.loads(body) if body else {}
 
         def action(_: Any) -> StoredResponse:
-            n = dlq.replay(max_messages=int(req.get("maxMessages", 100)), event_type=req.get("eventType"),
-                           event_ids=req.get("eventIds"))
+            n = dlq.replay(
+                max_messages=int(req.get("maxMessages", 100)), event_type=req.get("eventType"), event_ids=req.get("eventIds")
+            )
             return StoredResponse(202, json.dumps({"replayed": n}).encode(), {"content-type": "application/json"})
 
-        stored = await run_in_threadpool(idempotency.execute, db, caller=principal.subject,
-                                         key=request.headers.get(HEADER), method="POST", path=request.url.path,
-                                         body=body, action=action)
+        stored = await run_in_threadpool(
+            idempotency.execute,
+            db,
+            caller=principal.subject,
+            key=request.headers.get(HEADER),
+            method="POST",
+            path=request.url.path,
+            body=body,
+            action=action,
+        )
         return to_response(stored)
 
     return router
 
 
 # ------------------------------------------------------------------------------------------- app
-def create_app(settings: ServiceSettings, *, readiness: Readiness, routers: Sequence[APIRouter] = (),
-               title: str | None = None, instrument: bool = True) -> FastAPI:
-    app = FastAPI(title=title or settings.service_name, version="1.0.0", docs_url="/docs",
-                  openapi_url="/openapi.json", redoc_url=None)
+def create_app(
+    settings: ServiceSettings,
+    *,
+    readiness: Readiness,
+    routers: Sequence[APIRouter] = (),
+    title: str | None = None,
+    instrument: bool = True,
+) -> FastAPI:
+    app = FastAPI(
+        title=title or settings.service_name, version="1.0.0", docs_url="/docs", openapi_url="/openapi.json", redoc_url=None
+    )
     install_problem_handlers(app)
     app.include_router(health_router(readiness))
     for r in routers:
@@ -229,8 +295,13 @@ def create_app(settings: ServiceSettings, *, readiness: Readiness, routers: Sequ
         response = await call_next(request)
         if not request.url.path.startswith("/health"):
             route = request.scope.get("route")
-            log.info("http request", method=request.method, route=getattr(route, "path", request.url.path),
-                     status=response.status_code, duration_ms=round((time.perf_counter() - started) * 1000, 1))
+            log.info(
+                "http request",
+                method=request.method,
+                route=getattr(route, "path", request.url.path),
+                status=response.status_code,
+                duration_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
         return response
 
     if instrument:

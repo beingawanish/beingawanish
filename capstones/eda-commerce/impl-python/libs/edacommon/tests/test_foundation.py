@@ -8,14 +8,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-
+from edacommon.config import ServiceSettings
 from edacommon.durations import parse_duration
 from edacommon.envelope import OutboxRow, debezium_time, headers_for_row, topic_major_version
 from edacommon.errors import NonRetryable, RetryLater, Transient, classify
 from edacommon.idempotency import canonical_json, request_hash
 from edacommon.ids import from_millis, new_id, rfc3339, to_millis, uuid7, uuid7_time
 from edacommon.kafka import java_partition, murmur2, producer_config
-from edacommon.config import ServiceSettings
 
 CONNECTORS = Path(__file__).resolve().parents[4] / "infra" / "connect" / "connectors"
 
@@ -37,7 +36,7 @@ def test_time_helpers() -> None:
     assert from_millis(1_795_000_000_123) == dt.replace(microsecond=123000)
     assert rfc3339(dt) == "2026-11-18T11:06:40.123Z"
     with pytest.raises(ValueError, match="naive"):
-        to_millis(datetime(2026, 1, 1))  # noqa: DTZ001
+        to_millis(datetime(2026, 1, 1))
 
 
 @pytest.mark.parametrize(("raw", "seconds"), [("200ms", 0.2), ("30s", 30), ("10m", 600), ("24h", 86400), ("7d", 604800)])
@@ -78,11 +77,20 @@ def test_polling_relay_headers_match_debezium_connector_config() -> None:
     """Header names and order follow infra/connect/connectors/*.json exactly."""
     cfg = json.loads((CONNECTORS / "order-svc-outbox.json").read_text())["config"]
     placement = [p.split(":")[2] for p in cfg["transforms.outbox.table.fields.additional.placement"].split(",")]
-    row = OutboxRow(id="0193a1c4-0000-7000-8000-000000000000", aggregate_type="Order", aggregate_id="o-1",
-                    event_type="com.edacommerce.order.OrderPlaced", topic="order.events.v1", payload=b"\x00",
-                    occurred_at=datetime(2026, 11, 18, 9, 46, 40, 123000, tzinfo=UTC), producer="order-svc",
-                    correlation_id="o-1", causation_id=None, traceparent="00-" + "a" * 32 + "-" + "b" * 16 + "-01",
-                    tracestate=None)
+    row = OutboxRow(
+        id="0193a1c4-0000-7000-8000-000000000000",
+        aggregate_type="Order",
+        aggregate_id="o-1",
+        event_type="com.edacommerce.order.OrderPlaced",
+        topic="order.events.v1",
+        payload=b"\x00",
+        occurred_at=datetime(2026, 11, 18, 9, 46, 40, 123000, tzinfo=UTC),
+        producer="order-svc",
+        correlation_id="o-1",
+        causation_id=None,
+        traceparent="00-" + "a" * 32 + "-" + "b" * 16 + "-01",
+        tracestate=None,
+    )
     names = [n for n, _ in headers_for_row(row)]
     assert names == ["id", *placement, cfg["transforms.specversion.header"]]
     h = dict(headers_for_row(row))
@@ -95,8 +103,11 @@ def test_polling_relay_headers_match_debezium_connector_config() -> None:
 def test_murmur2_matches_kafka_reference_vectors() -> None:
     # org.apache.kafka.common.utils.UtilsTest#testMurmur2
     cases = {
-        "21": -973932308, "foobar": -790332482, "a-little-bit-long-string": -985981536,
-        "a-little-bit-longer-string": -1486304829, "lkjh234lh9fiuh90y23oiuhsafujhadof229phr9h19h89h8": -58897971,
+        "21": -973932308,
+        "foobar": -790332482,
+        "a-little-bit-long-string": -985981536,
+        "a-little-bit-longer-string": -1486304829,
+        "lkjh234lh9fiuh90y23oiuhsafujhadof229phr9h19h89h8": -58897971,
         "abc": 479470107,
     }
     for key, expected in cases.items():

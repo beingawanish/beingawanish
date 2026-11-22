@@ -13,7 +13,7 @@ from collections.abc import Callable
 from datetime import timedelta
 
 from edacommon.db import Database, UnitOfWork
-from edacommon.errors import classify, Transient
+from edacommon.errors import Transient, classify
 from edacommon.ids import Clock
 from edacommon.logging import get_logger
 from edacommon.metrics import EdaMetrics
@@ -24,9 +24,17 @@ OVERDUE_GRACE = timedelta(seconds=60)
 
 
 class DeadlineSweeper:
-    def __init__(self, *, db: Database, saga_type: str, on_deadline: Callable[[UnitOfWork, SagaRow], None],
-                 clock: Clock, metrics: EdaMetrics, interval: timedelta = timedelta(seconds=5),
-                 batch: int = 100) -> None:
+    def __init__(
+        self,
+        *,
+        db: Database,
+        saga_type: str,
+        on_deadline: Callable[[UnitOfWork, SagaRow], None],
+        clock: Clock,
+        metrics: EdaMetrics,
+        interval: timedelta = timedelta(seconds=5),
+        batch: int = 100,
+    ) -> None:
         self._db = db
         self._type = saga_type
         self._on_deadline = on_deadline

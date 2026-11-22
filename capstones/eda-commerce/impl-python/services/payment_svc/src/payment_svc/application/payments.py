@@ -15,6 +15,7 @@ from datetime import datetime
 from edacommon.envelope import Causation, current_causation
 from edacommon.errors import NonRetryable
 from edacommon.logging import get_logger
+
 from payment_svc.application import messages
 from payment_svc.application.ports import EventPublisher, PaymentRepository, PspGateway, PspTimeout
 from payment_svc.domain.payment import (
@@ -86,8 +87,9 @@ class Payments:
             return PspOutcome(OutcomeKind.PENDING)
 
     # --------------------------------------------------------------------------- AuthorizePayment
-    def authorize(self, *, order_id: str, payment_id: str, customer_id: str, amount_minor: int, currency: str,
-                  token: str, now: datetime) -> None:
+    def authorize(
+        self, *, order_id: str, payment_id: str, customer_id: str, amount_minor: int, currency: str, token: str, now: datetime
+    ) -> None:
         existing = self.repo.get(payment_id, for_update=True)
         action = on_authorize(existing)
         if action is CommandAction.REANSWER and existing is not None:
@@ -96,8 +98,14 @@ class Payments:
         if action is CommandAction.WAIT:
             log.info("authorize resend while outcome pending; waiting", payment_id=payment_id)
             return
-        p = existing or Payment(payment_id=payment_id, order_id=order_id, customer_id=customer_id,
-                                amount_minor=amount_minor, currency=currency, status=PaymentStatus.PENDING)
+        p = existing or Payment(
+            payment_id=payment_id,
+            order_id=order_id,
+            customer_id=customer_id,
+            amount_minor=amount_minor,
+            currency=currency,
+            status=PaymentStatus.PENDING,
+        )
         p = replace(p, last_command_id=_command_id() or p.last_command_id)
         self.repo.save(p, now)
         try:
@@ -134,8 +142,9 @@ class Payments:
         p = replace(p, status=PaymentStatus.CAPTURE_PENDING, last_command_id=_command_id() or p.last_command_id)
         self.repo.save(p, now)
         try:
-            outcome = self.psp.capture(payment_id=payment_id, psp_payment_id=p.psp_payment_id,
-                                       amount_minor=amount_minor, currency=p.currency)
+            outcome = self.psp.capture(
+                payment_id=payment_id, psp_payment_id=p.psp_payment_id, amount_minor=amount_minor, currency=p.currency
+            )
         except PspTimeout:
             # The saga's capture deadline resends; the PSP dedupes on the capture key.
             self.repo.record_attempt(payment_id, "capture", "timeout", now)
@@ -148,8 +157,15 @@ class Payments:
         p = self.repo.get(payment_id, for_update=True)
         action = on_void(p)
         if p is None:
-            tomb = Payment(payment_id=payment_id, order_id=order_id, customer_id="", amount_minor=0, currency="XXX",
-                           status=PaymentStatus.VOIDED, voided_at=now)
+            tomb = Payment(
+                payment_id=payment_id,
+                order_id=order_id,
+                customer_id="",
+                amount_minor=0,
+                currency="XXX",
+                status=PaymentStatus.VOIDED,
+                voided_at=now,
+            )
             self.repo.save(tomb, now)
             self.events.publish(messages.reply(tomb, ReplyKind.VOIDED, now))
             return
@@ -168,26 +184,48 @@ class Payments:
         self._apply(p, outcome, now)
 
     # ------------------------------------------------------------------------------ RefundPayment
-    def refund(self, *, order_id: str, payment_id: str, refund_id: str, return_id: str | None, amount_minor: int,
-               currency: str, now: datetime) -> None:
+    def refund(
+        self,
+        *,
+        order_id: str,
+        payment_id: str,
+        refund_id: str,
+        return_id: str | None,
+        amount_minor: int,
+        currency: str,
+        now: datetime,
+    ) -> None:
         r = self.repo.get_refund(refund_id, for_update=True)
         if on_refund(r) is CommandAction.REANSWER and r is not None:
             self.events.publish(messages.refund_reply(r, now))
             return
         p = self.repo.get(payment_id)
-        r = r or Refund(refund_id=refund_id, payment_id=payment_id, order_id=order_id, return_id=return_id,
-                        amount_minor=amount_minor, currency=currency, status=RefundStatus.PENDING)
+        r = r or Refund(
+            refund_id=refund_id,
+            payment_id=payment_id,
+            order_id=order_id,
+            return_id=return_id,
+            amount_minor=amount_minor,
+            currency=currency,
+            status=RefundStatus.PENDING,
+        )
         r = replace(r, status=RefundStatus.PENDING, last_command_id=_command_id() or r.last_command_id)
         if p is None or p.status is not PaymentStatus.CAPTURED:
-            failed = replace(r, status=RefundStatus.FAILED, failure_reason="payment not captured", retryable=False,
-                             finished_at=now)
+            failed = replace(
+                r, status=RefundStatus.FAILED, failure_reason="payment not captured", retryable=False, finished_at=now
+            )
             self.repo.save_refund(failed, now)
             self.events.publish(messages.refund_reply(failed, now))
             return
         self.repo.save_refund(r, now)
         try:
-            outcome = self.psp.refund(refund_id=refund_id, payment_id=payment_id, psp_payment_id=p.psp_payment_id,
-                                      amount_minor=amount_minor, currency=currency)
+            outcome = self.psp.refund(
+                refund_id=refund_id,
+                payment_id=payment_id,
+                psp_payment_id=p.psp_payment_id,
+                amount_minor=amount_minor,
+                currency=currency,
+            )
         except PspTimeout:
             self.repo.record_attempt(payment_id, "refund", "timeout", now, refund_id)
             return

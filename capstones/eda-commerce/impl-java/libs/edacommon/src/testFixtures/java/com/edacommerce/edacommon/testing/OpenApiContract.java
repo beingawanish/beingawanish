@@ -17,6 +17,7 @@ public final class OpenApiContract {
   public static ResultMatcher validResponse(String document) {
     OpenApiInteractionValidator validator =
         OpenApiInteractionValidator.createForSpecificationUrl(Contracts.openApi(document).toUri().toString())
+            .withResolveCombinators(true)
             .withLevelResolver(
                 LevelResolver.create()
                     .withLevel("validation.request", ValidationReport.Level.IGNORE)

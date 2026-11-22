@@ -64,9 +64,13 @@ def test_capture_success_and_failures() -> None:
     pending = replace(a, status=PaymentStatus.CAPTURE_PENDING)
     ok = apply_outcome(pending, PspOutcome(OutcomeKind.CAPTURED), NOW)
     assert ok.payment.status is PaymentStatus.CAPTURED and ok.replies == (ReplyKind.CAPTURED,)
-    retry = apply_outcome(pending, PspOutcome(OutcomeKind.CAPTURE_FAILED, capture_failure=CaptureFailure.PSP_ERROR, retryable=True), NOW)
+    retry = apply_outcome(
+        pending, PspOutcome(OutcomeKind.CAPTURE_FAILED, capture_failure=CaptureFailure.PSP_ERROR, retryable=True), NOW
+    )
     assert retry.payment.status is PaymentStatus.AUTHORIZED, "retryable failure leaves it capturable"
-    final = apply_outcome(pending, PspOutcome(OutcomeKind.CAPTURE_FAILED, capture_failure=CaptureFailure.AUTHORIZATION_EXPIRED), NOW)
+    final = apply_outcome(
+        pending, PspOutcome(OutcomeKind.CAPTURE_FAILED, capture_failure=CaptureFailure.AUTHORIZATION_EXPIRED), NOW
+    )
     assert final.payment.status is PaymentStatus.CAPTURE_FAILED and final.replies == (ReplyKind.CAPTURE_FAILED,)
 
 

@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Protocol
 
 from edacommon.envelope import OutgoingMessage
+
 from payment_svc.domain.payment import Payment, PspOutcome, Refund
 
 
@@ -21,8 +22,9 @@ class PspGateway(Protocol):
 
     def void(self, *, payment_id: str, psp_payment_id: str | None) -> PspOutcome: ...
 
-    def refund(self, *, refund_id: str, payment_id: str, psp_payment_id: str | None, amount_minor: int,
-               currency: str) -> PspOutcome: ...
+    def refund(
+        self, *, refund_id: str, payment_id: str, psp_payment_id: str | None, amount_minor: int, currency: str
+    ) -> PspOutcome: ...
 
     def lookup(self, *, payment_id: str) -> PspOutcome: ...
 

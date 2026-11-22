@@ -84,8 +84,9 @@ def current_ids() -> tuple[str | None, str | None]:
     return format(ctx.trace_id, "032x"), format(ctx.span_id, "016x")
 
 
-def setup_tracing(service_name: str, resource_attributes: Mapping[str, Any], *, endpoint: str,
-                  protocol: str, disabled: bool = False) -> None:
+def setup_tracing(
+    service_name: str, resource_attributes: Mapping[str, Any], *, endpoint: str, protocol: str, disabled: bool = False
+) -> None:
     """Install the SDK tracer provider with an OTLP exporter. Safe to call once per process."""
     from opentelemetry.propagate import set_global_textmap
     from opentelemetry.sdk.resources import Resource

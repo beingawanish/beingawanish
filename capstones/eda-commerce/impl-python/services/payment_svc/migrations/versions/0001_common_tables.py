@@ -2,8 +2,8 @@
 
 Revision ID: 0001
 """
-from alembic import op
 
+from alembic import op
 from edacommon.migrations.common_tables import downgrade_common, upgrade_common
 
 revision = "0001"

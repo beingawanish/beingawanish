@@ -73,7 +73,9 @@ class EdaMetrics:
         self._processed = meter.create_counter(CONSUMER_PROCESSED, unit="{message}", description="Records handled by outcome")
         self._handler = meter.create_histogram(HANDLER_DURATION, unit="s", description="Handler time inside the unit of work")
         self._dlq = meter.create_counter(DLQ_MESSAGES, unit="{message}", description="Records forwarded to the DLQ")
-        self._outbox_pending = meter.create_gauge(OUTBOX_PENDING, unit="{row}", description="Unpublished outbox rows (polling relay)")
+        self._outbox_pending = meter.create_gauge(
+            OUTBOX_PENDING, unit="{row}", description="Unpublished outbox rows (polling relay)"
+        )
         self._saga_outcomes = meter.create_counter(SAGA_OUTCOMES, unit="{saga}", description="Sagas reaching an outcome")
         self._saga_duration = meter.create_histogram(SAGA_DURATION, unit="s", description="Saga start to terminal state")
         self._saga_step = meter.create_histogram(SAGA_STEP_DURATION, unit="s", description="Time spent per saga step")
@@ -120,8 +122,9 @@ class EdaMetrics:
         self._webhooks.add(1, {"source": source, "outcome": outcome})
 
 
-def setup_metrics(resource_attributes: dict[str, Any], *, endpoint: str, disabled: bool = False,
-                  extra_readers: Sequence[Any] = ()) -> Any:
+def setup_metrics(
+    resource_attributes: dict[str, Any], *, endpoint: str, disabled: bool = False, extra_readers: Sequence[Any] = ()
+) -> Any:
     """Build the SDK MeterProvider with the bucket views and an OTLP exporter; set it global."""
     from opentelemetry import metrics as otel_metrics
     from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider

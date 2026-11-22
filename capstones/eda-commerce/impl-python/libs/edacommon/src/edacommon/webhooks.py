@@ -39,8 +39,9 @@ def sign(secret: str, timestamp: int | str, raw_body: bytes) -> str:
     return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
 
-def verify(secret: str, timestamp: str | None, raw_body: bytes, signature: str | None, now: datetime,
-           tolerance_s: int = TOLERANCE_S) -> bool:
+def verify(
+    secret: str, timestamp: str | None, raw_body: bytes, signature: str | None, now: datetime, tolerance_s: int = TOLERANCE_S
+) -> bool:
     if not timestamp or not signature:
         return False
     try:
@@ -67,10 +68,19 @@ class WebhookResult:
 
 
 class WebhookReceiver:
-    def __init__(self, *, db: Database, source: str, consumer: str, secret: str, metrics: EdaMetrics,
-                 event_id_of: Callable[[dict[str, Any]], str], event_type_of: Callable[[dict[str, Any]], str],
-                 store: Callable[[Session, dict[str, Any], bytes], None],
-                 on_stored: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        db: Database,
+        source: str,
+        consumer: str,
+        secret: str,
+        metrics: EdaMetrics,
+        event_id_of: Callable[[dict[str, Any]], str],
+        event_type_of: Callable[[dict[str, Any]], str],
+        store: Callable[[Session, dict[str, Any], bytes], None],
+        on_stored: Callable[[], None] | None = None,
+    ) -> None:
         self._db = db
         self._source = source
         self._consumer = consumer

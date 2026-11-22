@@ -14,7 +14,6 @@ from typing import Any
 
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
-
 from order_svc.domain import saga as S
 
 from .sagahelp import Run
@@ -27,9 +26,9 @@ ENDS = {W.DELIVERED, W.CANCELLED, W.NEEDS_ATTENTION}
 class World:
     draw: Any
     inbox: list[S.Trigger] = field(default_factory=list)
-    reservations: dict[str, str] = field(default_factory=dict)   # HELD/COMMITTED/RELEASED/EXPIRED/REJECTED
-    payments: dict[str, str] = field(default_factory=dict)       # AUTHORIZED/DECLINED/LOST/VOIDED/CAPTURED/CAPTURE_FAILED
-    fulfilments: dict[str, str] = field(default_factory=dict)    # ACCEPTED/PACKED/DISPATCHED/FAILED/CANCELLED/DROPPED
+    reservations: dict[str, str] = field(default_factory=dict)  # HELD/COMMITTED/RELEASED/EXPIRED/REJECTED
+    payments: dict[str, str] = field(default_factory=dict)  # AUTHORIZED/DECLINED/LOST/VOIDED/CAPTURED/CAPTURE_FAILED
+    fulfilments: dict[str, str] = field(default_factory=dict)  # ACCEPTED/PACKED/DISPATCHED/FAILED/CANCELLED/DROPPED
     shipped: bool = False
     seen: int = 0
 
@@ -112,8 +111,9 @@ class World:
                 self.inbox.append(S.FulfilmentAccepted(bid))
                 if st_ == "ACCEPTED":
                     self.fulfilments[bid] = "DISPATCHED"
-                    self.inbox.extend([S.OrderPacked(bid), S.ShipmentCreated("ship-1", "fake", "FC1"),
-                                       S.OrderDispatched(bid, "ship-1")])
+                    self.inbox.extend(
+                        [S.OrderPacked(bid), S.ShipmentCreated("ship-1", "fake", "FC1"), S.OrderDispatched(bid, "ship-1")]
+                    )
                     if self.choose(["deliver", "lost"], "carrier") == "deliver":
                         self.inbox.append(S.ShipmentDelivered("ship-1", "2026-11-20T10:00:00+00:00"))
                     else:
@@ -132,8 +132,7 @@ def run_world(data: Any) -> tuple[Run, World]:
     for _ in range(60):
         if r.state in (W.DELIVERED, W.CANCELLED):
             break
-        action = data.draw(st.sampled_from(["deliver", "deliver", "deliver", "duplicate", "deadline", "expire"]),
-                           label="action")
+        action = data.draw(st.sampled_from(["deliver", "deliver", "deliver", "duplicate", "deadline", "expire"]), label="action")
         if action in ("deliver", "duplicate") and w.inbox:
             i = data.draw(st.integers(0, len(w.inbox) - 1), label="which")
             t = w.inbox[i] if action == "duplicate" else w.inbox.pop(i)
@@ -145,7 +144,7 @@ def run_world(data: Any) -> tuple[Run, World]:
             if held:
                 w.reservations[held[0]] = "EXPIRED"
                 w.inbox.append(S.ReservationExpired(held[0]))
-        for c in r.commands[w.seen:]:
+        for c in r.commands[w.seen :]:
             w.handle(c)
         w.seen = len(r.commands)
     # Settle: deliver everything in order and let deadlines fire, as the real system would.
@@ -158,7 +157,7 @@ def run_world(data: Any) -> tuple[Run, World]:
             r.deadline_fires()
         else:
             break
-        for c in r.commands[w.seen:]:
+        for c in r.commands[w.seen :]:
             w.handle(c)
         w.seen = len(r.commands)
     return r, w

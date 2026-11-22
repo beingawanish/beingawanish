@@ -68,7 +68,7 @@ class Reservation:
     expires_at: datetime | None
     shortages: tuple[Shortage, ...] = field(default_factory=tuple)
     reason: str | None = None
-    changed_at: datetime | None = None   # committed / released / expired at
+    changed_at: datetime | None = None  # committed / released / expired at
 
     def is_expired(self, now: datetime) -> bool:
         return self.status is ReservationStatus.HELD and self.expires_at is not None and now >= self.expires_at
@@ -90,7 +90,7 @@ def hold_until(now: datetime, requested_ttl_s: int, max_ttl: timedelta) -> datet
 
 
 class CommitDecision(StrEnum):
-    COMMIT = "COMMIT"                    # HELD and still valid
+    COMMIT = "COMMIT"  # HELD and still valid
     EXPIRE_THEN_ANSWER_EXPIRED = "EXPIRE_THEN_ANSWER_EXPIRED"  # HELD but past its TTL (sweeper not there yet)
     ANSWER_COMMITTED = "ANSWER_COMMITTED"  # resend after a successful commit
     ANSWER_EXPIRED = "ANSWER_EXPIRED"
@@ -115,7 +115,7 @@ def decide_commit(res: Reservation | None, now: datetime) -> CommitDecision:
 class ReleaseDecision(StrEnum):
     RELEASE_HELD = "RELEASE_HELD"
     RETURN_ALLOCATED = "RETURN_ALLOCATED"
-    TOMBSTONE = "TOMBSTONE"              # unknown reservation: remember it was released
+    TOMBSTONE = "TOMBSTONE"  # unknown reservation: remember it was released
     ANSWER_RELEASED = "ANSWER_RELEASED"  # already released, expired or rejected: nothing held
 
 

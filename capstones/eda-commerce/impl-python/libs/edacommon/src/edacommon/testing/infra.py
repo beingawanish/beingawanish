@@ -85,7 +85,7 @@ def kafka_bootstrap() -> str:
 
 
 def create_topics(bootstrap: str, names: list[str], partitions: int = 1) -> None:
-    from confluent_kafka.admin import AdminClient, NewTopic
+    from confluent_kafka.admin import AdminClient, NewTopic  # type: ignore[attr-defined]
 
     admin = AdminClient({"bootstrap.servers": bootstrap})
     existing = set(admin.list_topics(timeout=10).topics)
@@ -108,10 +108,14 @@ def migrate(url: str, script_location: Path) -> None:
 def information_schema_columns(url: str, tables: list[str]) -> list[tuple[Any, ...]]:
     eng = create_engine(url)
     with eng.connect() as c:
-        rows = c.execute(text(
-            "SELECT table_name, column_name, ordinal_position, data_type, is_nullable, column_default "
-            "FROM information_schema.columns WHERE table_schema = 'public' AND table_name = ANY(:t) "
-            "ORDER BY table_name, ordinal_position"), {"t": tables}).all()
+        rows = c.execute(
+            text(
+                "SELECT table_name, column_name, ordinal_position, data_type, is_nullable, column_default "
+                "FROM information_schema.columns WHERE table_schema = 'public' AND table_name = ANY(:t) "
+                "ORDER BY table_name, ordinal_position"
+            ),
+            {"t": tables},
+        ).all()
     eng.dispose()
     return [tuple(r) for r in rows]
 

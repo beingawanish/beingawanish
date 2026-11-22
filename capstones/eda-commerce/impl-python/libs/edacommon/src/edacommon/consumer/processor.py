@@ -34,7 +34,7 @@ from edacommon.consumer.record import ConsumedRecord
 from edacommon.consumer.registry import Handler, HandlerRegistry
 from edacommon.db import Database
 from edacommon.envelope import MessageContext, caused_by
-from edacommon.errors import NonRetryable, RetryLater, Transient, classify
+from edacommon.errors import NonRetryable, Transient, classify
 from edacommon.ids import Clock
 from edacommon.inbox import try_insert
 from edacommon.logging import get_logger, log_context
@@ -58,7 +58,7 @@ class Outcome(StrEnum):
 def backoff(attempt: int, *, base: float = 0.2, jitter: float = 0.2) -> float:
     """200 ms, 400 ms, 800 ms, 1.6 s, 3.2 s, each +/- 20 % (ADR-0007)."""
     delay = base * (2 ** (attempt - 1))
-    return delay * (1 + random.uniform(-jitter, jitter))  # noqa: S311 - jitter, not crypto
+    return float(delay * (1 + random.uniform(-jitter, jitter)))  # noqa: S311 - jitter, not crypto
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,8 +99,9 @@ class MessageProcessor:
         etype = ce_type or "unknown"
         if handler is None:
             # Dispatch before deserialising: never decode a type we have no reader schema for.
-            self._metrics.processed(topic=self._metric_topic(record), consumer_group=self.group,
-                                    event_type=etype, outcome=Outcome.IGNORED)
+            self._metrics.processed(
+                topic=self._metric_topic(record), consumer_group=self.group, event_type=etype, outcome=Outcome.IGNORED
+            )
             return ProcessResult(Outcome.IGNORED)
 
         last_exc: BaseException | None = None
@@ -111,15 +112,15 @@ class MessageProcessor:
                 cls = classify(exc)
                 last_exc = exc
                 if cls is Transient:
-                    log.warning("transient failure, retrying in place", event_type=etype,
-                                attempt=attempt, error=exc)
+                    log.warning("transient failure, retrying in place", event_type=etype, attempt=attempt, error=exc)
                     self._sleep(backoff(attempt))
                     continue
                 if cls is NonRetryable:
                     return self._to_dlq(record, etype, exc)
                 return self._to_retry(record, etype, exc)
-            self._metrics.processed(topic=self._metric_topic(record), consumer_group=self.group,
-                                    event_type=etype, outcome=outcome)
+            self._metrics.processed(
+                topic=self._metric_topic(record), consumer_group=self.group, event_type=etype, outcome=outcome
+            )
             return ProcessResult(outcome)
         # In-place retries exhausted: hand over to the non-blocking retry topics.
         assert last_exc is not None
@@ -132,8 +133,13 @@ class MessageProcessor:
         started = time.perf_counter()
         with self._db.unit_of_work() as uow:
             if event_id is not None and not try_insert(
-                uow.session, message_id=event_id, consumer=self.group, message_type=handler.record_type,
-                source_topic=record.topic, source_partition=record.partition, source_offset=record.offset,
+                uow.session,
+                message_id=event_id,
+                consumer=self.group,
+                message_type=handler.record_type,
+                source_topic=record.topic,
+                source_partition=record.partition,
+                source_offset=record.offset,
             ):
                 # Duplicate: the transaction holds nothing; leaving the block commits an empty tx.
                 return Outcome.DUPLICATE
@@ -144,14 +150,26 @@ class MessageProcessor:
             if event_id is None:
                 # No ce_id header (a producer that bypassed the outbox): fall back to the envelope.
                 event_id = str(envelope.get("eventId"))
-                if not try_insert(uow.session, message_id=event_id, consumer=self.group,
-                                  message_type=handler.record_type, source_topic=record.topic,
-                                  source_partition=record.partition, source_offset=record.offset):
+                if not try_insert(
+                    uow.session,
+                    message_id=event_id,
+                    consumer=self.group,
+                    message_type=handler.record_type,
+                    source_topic=record.topic,
+                    source_partition=record.partition,
+                    source_offset=record.offset,
+                ):
                     return Outcome.DUPLICATE
             ctx = MessageContext(
-                topic=self._original_topic(record), partition=record.partition, offset=record.offset,
-                key=record.key_str, event_id=event_id, event_type=handler.record_type,
-                consumer_group=self.group, headers=headers, envelope=envelope,
+                topic=self._original_topic(record),
+                partition=record.partition,
+                offset=record.offset,
+                key=record.key_str,
+                event_id=event_id,
+                event_type=handler.record_type,
+                consumer_group=self.group,
+                headers=headers,
+                envelope=envelope,
                 attempt=current_attempt(record),
             )
             try:
@@ -159,41 +177,53 @@ class MessageProcessor:
             except Exception as exc:
                 raise NonRetryable(f"cannot map {handler.record_type}: {exc}") from exc
             with (
-                consumer_span(topic=record.topic, group=self.group, event_type=handler.record_type,
-                              message_id=event_id, partition=record.partition, offset=record.offset,
-                              key=record.key_str, headers=headers),
+                consumer_span(
+                    topic=record.topic,
+                    group=self.group,
+                    event_type=handler.record_type,
+                    message_id=event_id,
+                    partition=record.partition,
+                    offset=record.offset,
+                    key=record.key_str,
+                    headers=headers,
+                ),
                 caused_by(ctx.causation()),
-                log_context(correlation_id=ctx.correlation_id, event_id=event_id,
-                            event_type=handler.record_type, order_id=record.key_str),
+                log_context(
+                    correlation_id=ctx.correlation_id, event_id=event_id, event_type=handler.record_type, order_id=record.key_str
+                ),
             ):
                 handler.fn(msg, ctx, uow)
-        self._metrics.handler_duration(consumer_group=self.group, event_type=handler.record_type,
-                                       seconds=time.perf_counter() - started)
+        self._metrics.handler_duration(
+            consumer_group=self.group, event_type=handler.record_type, seconds=time.perf_counter() - started
+        )
         occurred = ctx.occurred_at
         if occurred is not None:
-            self._metrics.event_age(topic=ctx.topic, consumer_group=self.group, event_type=handler.record_type,
-                                    seconds=(self._clock.now() - occurred).total_seconds())
+            self._metrics.event_age(
+                topic=ctx.topic,
+                consumer_group=self.group,
+                event_type=handler.record_type,
+                seconds=(self._clock.now() - occurred).total_seconds(),
+            )
         return Outcome.SUCCESS
 
     def _to_retry(self, record: ConsumedRecord, etype: str, exc: BaseException) -> ProcessResult:
         route = self._forwarder.topology.next_retry(record, self._clock.now())
         if route.topic == self._forwarder.topology.dlq:
             return self._to_dlq(record, etype, exc)
-        log.warning("forwarding to retry topic", event_type=etype, retry_topic=route.topic,
-                    attempt=route.attempt, error=exc)
-        self._forwarder.forward(record, route, error_class=type(exc).__name__, error_message=str(exc),
-                                now=self._clock.now())
-        self._metrics.processed(topic=self._metric_topic(record), consumer_group=self.group,
-                                event_type=etype, outcome=Outcome.RETRY)
+        log.warning("forwarding to retry topic", event_type=etype, retry_topic=route.topic, attempt=route.attempt, error=exc)
+        self._forwarder.forward(record, route, error_class=type(exc).__name__, error_message=str(exc), now=self._clock.now())
+        self._metrics.processed(
+            topic=self._metric_topic(record), consumer_group=self.group, event_type=etype, outcome=Outcome.RETRY
+        )
         return ProcessResult(Outcome.RETRY, exc)
 
     def _to_dlq(self, record: ConsumedRecord, etype: str, exc: BaseException) -> ProcessResult:
         route = self._forwarder.topology.to_dlq(record)
         log.error("forwarding to DLQ", event_type=etype, dlq_topic=route.topic, error=exc)
-        self._forwarder.forward(record, route, error_class=type(exc).__name__, error_message=str(exc),
-                                now=self._clock.now())
-        self._metrics.processed(topic=self._metric_topic(record), consumer_group=self.group,
-                                event_type=etype, outcome=Outcome.DLQ)
+        self._forwarder.forward(record, route, error_class=type(exc).__name__, error_message=str(exc), now=self._clock.now())
+        self._metrics.processed(
+            topic=self._metric_topic(record), consumer_group=self.group, event_type=etype, outcome=Outcome.DLQ
+        )
         self._metrics.dlq(consumer_group=self.group, event_type=etype, error_class=type(exc).__name__)
         return ProcessResult(Outcome.DLQ, exc)
 

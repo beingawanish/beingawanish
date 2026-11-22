@@ -69,13 +69,13 @@ def validate_response(doc: str, path: str, method: str, status: int, body: Any) 
     if schema is None:
         return
     # Anchor the schema inside its document so relative refs ('#/components/...') resolve.
-    wrapper = {"$id": doc, "$ref": "#/__probe__"}
+    wrapper = {"$ref": f"{doc}#/__probe__"}
     full = dict(_doc(doc))
     full["__probe__"] = schema
-    full["$id"] = doc
     registry = _registry().with_resource(doc, Resource.from_contents(full, default_specification=_spec()))
     validator = Draft202012Validator(wrapper, registry=registry, format_checker=Draft202012Validator.FORMAT_CHECKER)
     errors = sorted(validator.iter_errors(body), key=lambda e: e.path)
     if errors:
-        raise AssertionError(f"{method} {path} {status} violates {doc}: " +
-                             "; ".join(f"{list(e.path)}: {e.message}" for e in errors[:5]))
+        raise AssertionError(
+            f"{method} {path} {status} violates {doc}: " + "; ".join(f"{list(e.path)}: {e.message}" for e in errors[:5])
+        )

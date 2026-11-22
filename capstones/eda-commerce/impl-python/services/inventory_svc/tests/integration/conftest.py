@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from edacommon.db import UnitOfWork
 from edacommon.testing.service import ServiceHarness
 from inventory_svc.adapters.inbound.messaging.handlers import build_registry
@@ -22,8 +21,11 @@ class Svc:
         self.settings = settings
 
         def make(uow: UnitOfWork) -> Inventory:
-            return Inventory(repo=SqlInventoryRepository(uow.session), events=OutboxPublisher(uow.session, h.outbox),
-                             max_ttl=settings.reservation_ttl)
+            return Inventory(
+                repo=SqlInventoryRepository(uow.session),
+                events=OutboxPublisher(uow.session, h.outbox),
+                max_ttl=settings.reservation_ttl,
+            )
 
         self.inventory_for: Callable[[UnitOfWork], Inventory] = make
         self.registry = build_registry(make, h.clock)
@@ -39,8 +41,9 @@ class Svc:
 
 @pytest.fixture
 def svc(pg_url: str, serde: Any, clock: Any, metrics_reader: Any) -> Iterator[Svc]:
-    h = ServiceHarness(url=pg_url, migrations=MIGRATIONS, group="inventory-svc", serde=serde, clock=clock,
-                       metrics=metrics_reader[0])
+    h = ServiceHarness(
+        url=pg_url, migrations=MIGRATIONS, group="inventory-svc", serde=serde, clock=clock, metrics=metrics_reader[0]
+    )
     yield Svc(h, Settings())
     h.close()
 

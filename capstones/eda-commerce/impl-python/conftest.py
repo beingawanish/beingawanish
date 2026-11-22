@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import pytest
-
 from edacommon.ids import ManualClock
 from edacommon.testing import FakeProducer, InMemorySchemaRegistry, metrics_for_test
 from edacommon.testing.infra import fresh_database, kafka_bootstrap

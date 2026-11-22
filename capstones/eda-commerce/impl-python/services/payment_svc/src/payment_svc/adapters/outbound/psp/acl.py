@@ -35,20 +35,34 @@ def outcome_from_notification(n: dict[str, Any]) -> tuple[str, PspOutcome]:
     if et == "authorization.succeeded":
         return ref, PspOutcome(OutcomeKind.AUTHORIZED, psp_payment_id=psp_id, psp_reference=psp_id, at=at)
     if et == "authorization.failed":
-        return ref, PspOutcome(OutcomeKind.DECLINED, psp_payment_id=psp_id, psp_reference=psp_id,
-                               decline_reason=_DECLINE.get(code or "", DeclineReason.CARD_DECLINED), at=at)
+        return ref, PspOutcome(
+            OutcomeKind.DECLINED,
+            psp_payment_id=psp_id,
+            psp_reference=psp_id,
+            decline_reason=_DECLINE.get(code or "", DeclineReason.CARD_DECLINED),
+            at=at,
+        )
     if et == "capture.succeeded":
         return ref, PspOutcome(OutcomeKind.CAPTURED, psp_payment_id=psp_id, psp_reference=psp_id, at=at)
     if et == "capture.failed":
         expired = code == "authorization_expired"
-        return ref, PspOutcome(OutcomeKind.CAPTURE_FAILED, psp_payment_id=psp_id,
-                               capture_failure=CaptureFailure.AUTHORIZATION_EXPIRED if expired else CaptureFailure.PSP_ERROR,
-                               retryable=not expired, at=at)
+        return ref, PspOutcome(
+            OutcomeKind.CAPTURE_FAILED,
+            psp_payment_id=psp_id,
+            capture_failure=CaptureFailure.AUTHORIZATION_EXPIRED if expired else CaptureFailure.PSP_ERROR,
+            retryable=not expired,
+            at=at,
+        )
     if et == "void.succeeded":
         return ref, PspOutcome(OutcomeKind.VOIDED, psp_payment_id=psp_id, at=at)
     if et == "refund.succeeded":
         return ref, PspOutcome(OutcomeKind.REFUNDED, psp_payment_id=psp_id, psp_reference=n.get("pspEventId"), at=at)
     if et == "refund.failed":
-        return ref, PspOutcome(OutcomeKind.REFUND_FAILED, psp_payment_id=psp_id, refund_failure=code or "refund failed",
-                               retryable=code in (None, "processing_error"), at=at)
+        return ref, PspOutcome(
+            OutcomeKind.REFUND_FAILED,
+            psp_payment_id=psp_id,
+            refund_failure=code or "refund failed",
+            retryable=code in (None, "processing_error"),
+            at=at,
+        )
     raise ValueError(f"unknown PSP event type {et!r}")

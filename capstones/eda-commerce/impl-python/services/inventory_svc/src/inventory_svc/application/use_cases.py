@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from edacommon.envelope import Causation
 from edacommon.errors import DomainError
 from edacommon.logging import get_logger
+
 from inventory_svc.application import messages
 from inventory_svc.application.ports import EventPublisher, InventoryRepository
 from inventory_svc.domain.model import (
@@ -37,8 +38,16 @@ class Inventory:
     max_ttl: timedelta
 
     # ------------------------------------------------------------------------------- ReserveStock
-    def reserve(self, *, order_id: str, reservation_id: str, lines: list[StockLine], ttl_seconds: int,
-                now: datetime, command_expired: bool = False) -> None:
+    def reserve(
+        self,
+        *,
+        order_id: str,
+        reservation_id: str,
+        lines: list[StockLine],
+        ttl_seconds: int,
+        now: datetime,
+        command_expired: bool = False,
+    ) -> None:
         existing = self.repo.get_reservation(reservation_id, for_update=True)
         if existing is not None:
             self._reanswer(existing, now)
@@ -46,20 +55,21 @@ class Inventory:
         merged = merge_lines(lines)
         if command_expired:
             # envelope.expiresAt passed: reply with a rejection instead of acting (Envelope doc).
-            res = Reservation(reservation_id, order_id, ReservationStatus.REJECTED, merged, None, (),
-                              reason="command expired", changed_at=now)
+            res = Reservation(
+                reservation_id, order_id, ReservationStatus.REJECTED, merged, None, (), reason="command expired", changed_at=now
+            )
             self.repo.save_reservation(res, now)
             self.events.publish(messages.stock_rejected(res))
             return
         shortages = self.repo.try_hold(merged)
         if shortages:
-            res = Reservation(reservation_id, order_id, ReservationStatus.REJECTED, merged, None, tuple(shortages),
-                              changed_at=now)
+            res = Reservation(
+                reservation_id, order_id, ReservationStatus.REJECTED, merged, None, tuple(shortages), changed_at=now
+            )
             self.repo.save_reservation(res, now)
             self.events.publish(messages.stock_rejected(res))
             return
-        res = Reservation(reservation_id, order_id, ReservationStatus.HELD, merged,
-                          hold_until(now, ttl_seconds, self.max_ttl))
+        res = Reservation(reservation_id, order_id, ReservationStatus.HELD, merged, hold_until(now, ttl_seconds, self.max_ttl))
         self.repo.save_reservation(res, now)
         self.events.publish(messages.stock_reserved(res))
         self._publish_levels([line.sku for line in merged], now)
@@ -73,8 +83,9 @@ class Inventory:
         elif res.status is ReservationStatus.EXPIRED:
             self.events.publish(messages.expired(res, res.changed_at or now))
         else:
-            self.events.publish(messages.released(res.order_id, res.reservation_id, res.reason or "released",
-                                                  res.changed_at or now))
+            self.events.publish(
+                messages.released(res.order_id, res.reservation_id, res.reason or "released", res.changed_at or now)
+            )
 
     # -------------------------------------------------------------------------- CommitReservation
     def commit(self, *, order_id: str, reservation_id: str, now: datetime) -> None:
@@ -100,8 +111,9 @@ class Inventory:
         elif decision is CommitDecision.ANSWER_EXPIRED:
             self.events.publish(messages.expired(res, res.changed_at or now))
         elif decision is CommitDecision.ANSWER_RELEASED:
-            self.events.publish(messages.released(res.order_id, res.reservation_id, res.reason or "released",
-                                                  res.changed_at or now))
+            self.events.publish(
+                messages.released(res.order_id, res.reservation_id, res.reason or "released", res.changed_at or now)
+            )
         else:
             self.events.publish(messages.stock_rejected(res))
 
@@ -110,15 +122,13 @@ class Inventory:
         res = self.repo.get_reservation(reservation_id, for_update=True)
         decision = decide_release(res)
         if decision is ReleaseDecision.TOMBSTONE:
-            tomb = Reservation(reservation_id, order_id, ReservationStatus.RELEASED, (), None, reason=reason,
-                               changed_at=now)
+            tomb = Reservation(reservation_id, order_id, ReservationStatus.RELEASED, (), None, reason=reason, changed_at=now)
             self.repo.save_reservation(tomb, now)
             self.events.publish(messages.released(order_id, reservation_id, reason, now))
             return
         assert res is not None
         if decision is ReleaseDecision.ANSWER_RELEASED:
-            self.events.publish(messages.released(res.order_id, reservation_id, res.reason or reason,
-                                                  res.changed_at or now))
+            self.events.publish(messages.released(res.order_id, reservation_id, res.reason or reason, res.changed_at or now))
             return
         if decision is ReleaseDecision.RELEASE_HELD:
             self.repo.release_held(res.lines)
@@ -161,8 +171,10 @@ class Inventory:
             raise DomainError("onHand must be >= 0", problem_type="validation-error", status=400)
         current = self.repo.levels([sku])
         if current and on_hand < current[0].reserved:
-            raise DomainError(f"onHand {on_hand} is below the {current[0].reserved} units currently reserved",
-                              problem_type="stock-below-reserved")
+            raise DomainError(
+                f"onHand {on_hand} is below the {current[0].reserved} units currently reserved",
+                problem_type="stock-below-reserved",
+            )
         self.repo.set_on_hand(sku, on_hand)
         self._publish_levels([sku], now)
 

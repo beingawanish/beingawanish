@@ -39,12 +39,18 @@ def test_every_instrument_has_contract_name_unit_and_buckets() -> None:
     m.webhook(source="psp", outcome="accepted")
     data = collect(reader)
     kinds = {
-        "eda.event.age": ("s", "histogram"), "eda.consumer.processed": ("{message}", "counter"),
-        "eda.consumer.handler.duration": ("s", "histogram"), "eda.dlq.messages": ("{message}", "counter"),
-        "eda.outbox.pending": ("{row}", "gauge"), "eda.saga.outcomes": ("{saga}", "counter"),
-        "eda.saga.duration": ("s", "histogram"), "eda.saga.step.duration": ("s", "histogram"),
-        "eda.saga.step.timeouts": ("{timeout}", "counter"), "eda.saga.overdue": ("{saga}", "gauge"),
-        "eda.claimcheck.object.size": ("By", "histogram"), "eda.webhook.received": ("{webhook}", "counter"),
+        "eda.event.age": ("s", "histogram"),
+        "eda.consumer.processed": ("{message}", "counter"),
+        "eda.consumer.handler.duration": ("s", "histogram"),
+        "eda.dlq.messages": ("{message}", "counter"),
+        "eda.outbox.pending": ("{row}", "gauge"),
+        "eda.saga.outcomes": ("{saga}", "counter"),
+        "eda.saga.duration": ("s", "histogram"),
+        "eda.saga.step.duration": ("s", "histogram"),
+        "eda.saga.step.timeouts": ("{timeout}", "counter"),
+        "eda.saga.overdue": ("{saga}", "gauge"),
+        "eda.claimcheck.object.size": ("By", "histogram"),
+        "eda.webhook.received": ("{webhook}", "counter"),
     }
     for name, (unit, kind) in kinds.items():
         assert name in data, name
@@ -62,8 +68,11 @@ def test_logs_are_json_with_required_fields_and_no_pii() -> None:
     configure_logging("order-svc", stream=buf)
     log = get_logger("t")
     with log_context(correlation_id="c-1", event_id="e-1", event_type="com.x.Y", order_id="o-1"):
-        log.info("handled", contactEmail="jane.doe@example.com",
-                 body={"shippingAddress": {"line1": "Invalidenstrasse 1"}, "sku": "SKU-1"})
+        log.info(
+            "handled",
+            contactEmail="jane.doe@example.com",
+            body={"shippingAddress": {"line1": "Invalidenstrasse 1"}, "sku": "SKU-1"},
+        )
         try:
             raise ValueError("boom")
         except ValueError:

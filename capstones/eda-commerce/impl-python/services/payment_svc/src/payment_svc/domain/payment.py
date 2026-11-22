@@ -24,8 +24,8 @@ RECONCILE_WINDOW = timedelta(minutes=2)
 
 
 class PaymentStatus(StrEnum):
-    PENDING = "PENDING"                # authorise sent, result will come by webhook
-    UNKNOWN = "UNKNOWN"                # PSP did not answer: reconciling
+    PENDING = "PENDING"  # authorise sent, result will come by webhook
+    UNKNOWN = "UNKNOWN"  # PSP did not answer: reconciling
     AUTHORIZED = "AUTHORIZED"
     DECLINED = "DECLINED"
     CAPTURE_PENDING = "CAPTURE_PENDING"
@@ -122,26 +122,39 @@ def apply_outcome(p: Payment, o: PspOutcome, now: datetime) -> Decision:
     s = p.status
     if o.kind is OutcomeKind.AUTHORIZED:
         if s in (PaymentStatus.PENDING, PaymentStatus.UNKNOWN):
-            q = replace(p, status=PaymentStatus.AUTHORIZED, psp_payment_id=o.psp_payment_id or p.psp_payment_id,
-                        psp_reference=o.psp_reference or p.psp_reference, authorized_at=at,
-                        authorization_expires_at=at + AUTHORIZATION_VALIDITY, unknown_since=None, next_reconcile_at=None)
+            q = replace(
+                p,
+                status=PaymentStatus.AUTHORIZED,
+                psp_payment_id=o.psp_payment_id or p.psp_payment_id,
+                psp_reference=o.psp_reference or p.psp_reference,
+                authorized_at=at,
+                authorization_expires_at=at + AUTHORIZATION_VALIDITY,
+                unknown_since=None,
+                next_reconcile_at=None,
+            )
             return Decision(q, (ReplyKind.AUTHORIZED,))
         if s is PaymentStatus.DECLINED and p.decline_reason is DeclineReason.PSP_TIMEOUT and not p.late_success_voided:
             # Late success after we gave up: void it, tell nobody (ACL, architecture §5.6).
-            return Decision(replace(p, late_success_voided=True, psp_payment_id=o.psp_payment_id or p.psp_payment_id),
-                            (), void_at_psp=True)
+            return Decision(
+                replace(p, late_success_voided=True, psp_payment_id=o.psp_payment_id or p.psp_payment_id), (), void_at_psp=True
+            )
         return Decision(p)
     if o.kind is OutcomeKind.DECLINED:
         if s in (PaymentStatus.PENDING, PaymentStatus.UNKNOWN):
-            q = replace(p, status=PaymentStatus.DECLINED, decline_reason=o.decline_reason or DeclineReason.CARD_DECLINED,
-                        psp_reference=o.psp_reference or p.psp_reference, declined_at=at, unknown_since=None,
-                        next_reconcile_at=None)
+            q = replace(
+                p,
+                status=PaymentStatus.DECLINED,
+                decline_reason=o.decline_reason or DeclineReason.CARD_DECLINED,
+                psp_reference=o.psp_reference or p.psp_reference,
+                declined_at=at,
+                unknown_since=None,
+                next_reconcile_at=None,
+            )
             return Decision(q, (ReplyKind.DECLINED,))
         return Decision(p)
     if o.kind is OutcomeKind.CAPTURED:
         if s in (PaymentStatus.CAPTURE_PENDING, PaymentStatus.AUTHORIZED):
-            q = replace(p, status=PaymentStatus.CAPTURED, captured_at=at,
-                        psp_reference=o.psp_reference or p.psp_reference)
+            q = replace(p, status=PaymentStatus.CAPTURED, captured_at=at, psp_reference=o.psp_reference or p.psp_reference)
             return Decision(q, (ReplyKind.CAPTURED,))
         return Decision(p)
     if o.kind is OutcomeKind.CAPTURE_FAILED:
@@ -153,28 +166,35 @@ def apply_outcome(p: Payment, o: PspOutcome, now: datetime) -> Decision:
         return Decision(p)
     if o.kind is OutcomeKind.VOIDED:
         if s in (PaymentStatus.VOID_PENDING, PaymentStatus.AUTHORIZED, PaymentStatus.PENDING, PaymentStatus.UNKNOWN):
-            return Decision(replace(p, status=PaymentStatus.VOIDED, voided_at=at, unknown_since=None,
-                                    next_reconcile_at=None), (ReplyKind.VOIDED,))
+            return Decision(
+                replace(p, status=PaymentStatus.VOIDED, voided_at=at, unknown_since=None, next_reconcile_at=None),
+                (ReplyKind.VOIDED,),
+            )
         return Decision(p)
     return Decision(p)
 
 
 class CommandAction(StrEnum):
     CALL_PSP = "CALL_PSP"
-    REANSWER = "REANSWER"   # re-emit the original reply (resend with the same business id)
-    WAIT = "WAIT"           # a result is on its way (webhook or reconciliation)
-    REFUSE = "REFUSE"       # cannot be done (e.g. void after capture): needs a human
+    REANSWER = "REANSWER"  # re-emit the original reply (resend with the same business id)
+    WAIT = "WAIT"  # a result is on its way (webhook or reconciliation)
+    REFUSE = "REFUSE"  # cannot be done (e.g. void after capture): needs a human
 
 
 def on_authorize(p: Payment | None) -> CommandAction:
     if p is None:
         return CommandAction.CALL_PSP
-    if p.status in (PaymentStatus.AUTHORIZED, PaymentStatus.DECLINED, PaymentStatus.CAPTURED,
-                    PaymentStatus.CAPTURE_PENDING, PaymentStatus.CAPTURE_FAILED):
+    if p.status in (
+        PaymentStatus.AUTHORIZED,
+        PaymentStatus.DECLINED,
+        PaymentStatus.CAPTURED,
+        PaymentStatus.CAPTURE_PENDING,
+        PaymentStatus.CAPTURE_FAILED,
+    ):
         return CommandAction.REANSWER
     if p.status is PaymentStatus.PENDING:
         return CommandAction.CALL_PSP  # re-drive: the PSP is idempotent on paymentId
-    return CommandAction.WAIT          # UNKNOWN (reconciling), VOID_PENDING, VOIDED
+    return CommandAction.WAIT  # UNKNOWN (reconciling), VOID_PENDING, VOIDED
 
 
 def on_capture(p: Payment, now: datetime) -> tuple[CommandAction, CaptureFailure | None]:
@@ -195,8 +215,8 @@ def on_void(p: Payment | None) -> CommandAction:
     if p.status is PaymentStatus.VOIDED or p.status is PaymentStatus.DECLINED:
         return CommandAction.REANSWER
     if p.status in (PaymentStatus.CAPTURED, PaymentStatus.CAPTURE_PENDING, PaymentStatus.CAPTURE_FAILED):
-        return CommandAction.REFUSE    # past the pivot: never void a capture (ADR-0015)
-    return CommandAction.CALL_PSP      # PENDING, UNKNOWN, AUTHORIZED, VOID_PENDING
+        return CommandAction.REFUSE  # past the pivot: never void a capture (ADR-0015)
+    return CommandAction.CALL_PSP  # PENDING, UNKNOWN, AUTHORIZED, VOID_PENDING
 
 
 def timeout(p: Payment, now: datetime) -> Payment:
@@ -206,7 +226,7 @@ def timeout(p: Payment, now: datetime) -> Payment:
 class ReconcileStep(StrEnum):
     APPLY = "APPLY"
     TRY_AGAIN = "TRY_AGAIN"
-    GIVE_UP = "GIVE_UP"   # void at the PSP (safe even if nothing exists) and decline PSP_TIMEOUT
+    GIVE_UP = "GIVE_UP"  # void at the PSP (safe even if nothing exists) and decline PSP_TIMEOUT
 
 
 def reconcile_step(p: Payment, lookup: PspOutcome, now: datetime) -> ReconcileStep:
@@ -219,8 +239,14 @@ def reconcile_step(p: Payment, lookup: PspOutcome, now: datetime) -> ReconcileSt
 
 
 def give_up(p: Payment, now: datetime) -> Payment:
-    return replace(p, status=PaymentStatus.DECLINED, decline_reason=DeclineReason.PSP_TIMEOUT, declined_at=now,
-                   unknown_since=None, next_reconcile_at=None)
+    return replace(
+        p,
+        status=PaymentStatus.DECLINED,
+        decline_reason=DeclineReason.PSP_TIMEOUT,
+        declined_at=now,
+        unknown_since=None,
+        next_reconcile_at=None,
+    )
 
 
 # ------------------------------------------------------------------------------------------ refunds
@@ -259,6 +285,11 @@ def apply_refund_outcome(r: Refund, o: PspOutcome, now: datetime) -> tuple[Refun
     if o.kind is OutcomeKind.REFUNDED:
         return replace(r, status=RefundStatus.SUCCEEDED, psp_reference=o.psp_reference, finished_at=o.at or now), True
     if o.kind is OutcomeKind.REFUND_FAILED:
-        return replace(r, status=RefundStatus.FAILED, failure_reason=o.refund_failure or "refund failed",
-                       retryable=o.retryable, finished_at=o.at or now), True
+        return replace(
+            r,
+            status=RefundStatus.FAILED,
+            failure_reason=o.refund_failure or "refund failed",
+            retryable=o.retryable,
+            finished_at=o.at or now,
+        ), True
     return r, False

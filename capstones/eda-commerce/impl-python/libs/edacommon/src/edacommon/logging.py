@@ -28,12 +28,36 @@ import structlog
 
 from edacommon.tracing import current_ids
 
-PII_KEYS = frozenset({
-    "email", "contactEmail", "contact_email", "name", "recipientName", "recipient_name", "address",
-    "shippingAddress", "shipping_address", "shipTo", "ship_to", "pickupFrom", "pickup_from", "phone",
-    "line1", "line2", "postalCode", "postal_code", "paymentMethodToken", "payment_method_token",
-    "token", "authorization", "jwt", "secret", "password", "signature",
-})
+PII_KEYS = frozenset(
+    {
+        "email",
+        "contactEmail",
+        "contact_email",
+        "name",
+        "recipientName",
+        "recipient_name",
+        "address",
+        "shippingAddress",
+        "shipping_address",
+        "shipTo",
+        "ship_to",
+        "pickupFrom",
+        "pickup_from",
+        "phone",
+        "line1",
+        "line2",
+        "postalCode",
+        "postal_code",
+        "paymentMethodToken",
+        "payment_method_token",
+        "token",
+        "authorization",
+        "jwt",
+        "secret",
+        "password",
+        "signature",
+    }
+)
 REDACTED = "[REDACTED]"
 
 _log_context: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("eda_log_ctx", default=None)
@@ -103,8 +127,7 @@ def _shape(service: str, impl: str) -> Any:
     return processor
 
 
-def configure_logging(service: str, *, level: str = "INFO", fmt: str = "json", impl: str = "python",
-                      stream: Any = None) -> None:
+def configure_logging(service: str, *, level: str = "INFO", fmt: str = "json", impl: str = "python", stream: Any = None) -> None:
     """Configure structlog (and route stdlib logging through it) once per process."""
     renderer: Any = structlog.processors.JSONRenderer() if fmt == "json" else structlog.dev.ConsoleRenderer()
     structlog.configure(
@@ -118,7 +141,8 @@ def configure_logging(service: str, *, level: str = "INFO", fmt: str = "json", i
         def emit(self, record: logging.LogRecord) -> None:
             log = structlog.get_logger(record.name)
             method = {logging.DEBUG: log.debug, logging.INFO: log.info, logging.WARNING: log.warning}.get(
-                record.levelno, log.error)
+                record.levelno, log.error
+            )
             kw: dict[str, Any] = {"logger": record.name}
             if record.exc_info:
                 kw["exc_info"] = record.exc_info

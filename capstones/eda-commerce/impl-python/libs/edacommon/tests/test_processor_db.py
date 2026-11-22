@@ -12,12 +12,6 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from sqlalchemy import select, text
-
 from contracts_py.records import ReserveStock
 from edacommon.consumer import ConsumedRecord, HandlerRegistry, MessageProcessor, Outcome
 from edacommon.consumer.forwarder import Forwarder
@@ -27,6 +21,11 @@ from edacommon.errors import NonRetryable, RetryLater, Transient
 from edacommon.outbox import OutboxWriter
 from edacommon.serde import AvroSerde
 from edacommon.testing.fakes import counter_value
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from sqlalchemy import select, text
 
 from .conftest import example
 
@@ -43,18 +42,30 @@ _provider.add_span_processor(SimpleSpanProcessor(_exporter))
 trace.set_tracer_provider(_provider)
 
 
-def make_record(serde: AvroSerde, *, event_id: str = "0193a1c4-aaaa-7000-8000-000000000001", offset: int = 7,
-                ce_type: str = TYPE, topic: str = TOPIC, extra: list[tuple[str, bytes | None]] | None = None) -> ConsumedRecord:
+def make_record(
+    serde: AvroSerde,
+    *,
+    event_id: str = "0193a1c4-aaaa-7000-8000-000000000001",
+    offset: int = 7,
+    ce_type: str = TYPE,
+    topic: str = TOPIC,
+    extra: list[tuple[str, bytes | None]] | None = None,
+) -> ConsumedRecord:
     value = example(TYPE)
     value["envelope"]["eventId"] = event_id
     data = serde.serialize(TOPIC, TYPE, value)
     headers: list[tuple[str, bytes | None]] = [
-        ("id", event_id.encode()), ("ce_id", event_id.encode()), ("ce_type", ce_type.encode()),
-        ("ce_source", b"order-svc"), ("correlation_id", value["orderId"].encode()),
-        ("traceparent", TRACEPARENT.encode()), ("ce_specversion", b"1.0"),
+        ("id", event_id.encode()),
+        ("ce_id", event_id.encode()),
+        ("ce_type", ce_type.encode()),
+        ("ce_source", b"order-svc"),
+        ("correlation_id", value["orderId"].encode()),
+        ("traceparent", TRACEPARENT.encode()),
+        ("ce_specversion", b"1.0"),
     ]
-    return ConsumedRecord(topic=topic, partition=3, offset=offset, key=value["orderId"].encode(), value=data,
-                          headers=headers + (extra or []))
+    return ConsumedRecord(
+        topic=topic, partition=3, offset=offset, key=value["orderId"].encode(), value=data, headers=headers + (extra or [])
+    )
 
 
 class Harness:
@@ -71,17 +82,37 @@ class Harness:
             self.calls += 1
             if self.failures:
                 raise self.failures.pop(0)
-            uow.session.execute(text("INSERT INTO effect (id, n) VALUES (:id, 1) "
-                                     "ON CONFLICT (id) DO UPDATE SET n = effect.n + 1"), {"id": cmd.reservation_id})
-            self.outbox.append(uow.session, OutgoingMessage(
-                topic="inventory.events.v1", record_type="com.edacommerce.inventory.ReservationReleased",
-                key=cmd.order_id, aggregate_type="Reservation", aggregate_id=cmd.reservation_id,
-                body={"orderId": cmd.order_id, "reservationId": cmd.reservation_id, "reason": "test",
-                      "releasedAt": clock.now()}))
+            uow.session.execute(
+                text("INSERT INTO effect (id, n) VALUES (:id, 1) ON CONFLICT (id) DO UPDATE SET n = effect.n + 1"),
+                {"id": cmd.reservation_id},
+            )
+            self.outbox.append(
+                uow.session,
+                OutgoingMessage(
+                    topic="inventory.events.v1",
+                    record_type="com.edacommerce.inventory.ReservationReleased",
+                    key=cmd.order_id,
+                    aggregate_type="Reservation",
+                    aggregate_id=cmd.reservation_id,
+                    body={
+                        "orderId": cmd.order_id,
+                        "reservationId": cmd.reservation_id,
+                        "reason": "test",
+                        "releasedAt": clock.now(),
+                    },
+                ),
+            )
 
-        self.processor = MessageProcessor(group=GROUP, registry=self.registry, db=db, serde=serde,
-                                          forwarder=Forwarder(producer, GROUP), metrics=metrics, clock=clock,
-                                          sleep=self.sleeps.append)
+        self.processor = MessageProcessor(
+            group=GROUP,
+            registry=self.registry,
+            db=db,
+            serde=serde,
+            forwarder=Forwarder(producer, GROUP),
+            metrics=metrics,
+            clock=clock,
+            sleep=self.sleeps.append,
+        )
 
     def effects(self) -> int:
         with self.db.unit_of_work() as uow:
@@ -105,8 +136,9 @@ def test_success_writes_effect_inbox_and_outbox_with_envelope(h: Harness, serde:
     (row,) = h.outbox_rows()
     assert row["causation_id"] == r.event_id
     assert row["correlation_id"] == r.key_str
-    env = serde.deserialize("inventory.events.v1", "com.edacommerce.inventory.ReservationReleased",
-                            bytes(row["payload"]))["envelope"]
+    env = serde.deserialize("inventory.events.v1", "com.edacommerce.inventory.ReservationReleased", bytes(row["payload"]))[
+        "envelope"
+    ]
     assert env["type"] == "com.edacommerce.inventory.ReservationReleased"
     assert env["producer"] == GROUP and env["partitionKey"] == r.key_str and env["causationId"] == r.event_id
     assert env["eventId"] == str(row["id"])
@@ -126,8 +158,14 @@ def test_duplicate_has_one_effect_and_is_counted(h: Harness, serde: AvroSerde, m
 
 
 def test_unknown_type_is_ignored_without_deserialising(h: Harness, serde: AvroSerde, metrics_reader: Any) -> None:
-    r = ConsumedRecord(topic=TOPIC, partition=0, offset=1, key=b"k", value=b"not avro at all",
-                       headers=[("ce_type", b"com.edacommerce.inventory.SomethingNew"), ("ce_id", b"x")])
+    r = ConsumedRecord(
+        topic=TOPIC,
+        partition=0,
+        offset=1,
+        key=b"k",
+        value=b"not avro at all",
+        headers=[("ce_type", b"com.edacommerce.inventory.SomethingNew"), ("ce_id", b"x")],
+    )
     assert h.processor.process(r).outcome is Outcome.IGNORED
     assert h.calls == 0
     _, reader = metrics_reader
@@ -175,8 +213,14 @@ def test_non_retryable_goes_straight_to_dlq(h: Harness, serde: AvroSerde, fake_p
 
 
 def test_bad_bytes_are_non_retryable(h: Harness, serde: AvroSerde, fake_producer: Any) -> None:
-    r = ConsumedRecord(topic=TOPIC, partition=0, offset=1, key=b"k", value=b"\x00\x00\x00\x00\x01garbage",
-                       headers=[("ce_type", TYPE.encode()), ("ce_id", b"bad-1")])
+    r = ConsumedRecord(
+        topic=TOPIC,
+        partition=0,
+        offset=1,
+        key=b"k",
+        value=b"\x00\x00\x00\x00\x01garbage",
+        headers=[("ce_type", TYPE.encode()), ("ce_id", b"bad-1")],
+    )
     assert h.processor.process(r).outcome is Outcome.DLQ
     assert fake_producer.records[0].topic == f"{GROUP}.dlq"
 
@@ -191,8 +235,7 @@ def test_retry_chain_walks_every_tier_then_dlq(h: Harness, serde: AvroSerde, fak
         assert fwd.topic == topic
         assert fwd.value == r.value
         assert fwd.header_map["x-original-topic"] == TOPIC and fwd.header_map["x-original-offset"] == "7"
-        r = ConsumedRecord(topic=fwd.topic, partition=0, offset=100 + i, key=fwd.key, value=fwd.value,
-                           headers=fwd.headers)
+        r = ConsumedRecord(topic=fwd.topic, partition=0, offset=100 + i, key=fwd.key, value=fwd.value, headers=fwd.headers)
     assert [x.header_map["x-retry-attempt"] for x in fake_producer.records] == ["1", "2", "3", "3"]
 
 

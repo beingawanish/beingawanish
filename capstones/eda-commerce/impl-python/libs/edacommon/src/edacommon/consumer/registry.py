@@ -23,7 +23,7 @@ HandlerFn = Callable[[Any, MessageContext, UnitOfWork], None]
 
 @dataclass(frozen=True, slots=True)
 class Handler:
-    record_type: str                      # ce_type and the reader schema name
+    record_type: str  # ce_type and the reader schema name
     decode: Callable[[dict[str, Any]], Any]
     fn: HandlerFn
 

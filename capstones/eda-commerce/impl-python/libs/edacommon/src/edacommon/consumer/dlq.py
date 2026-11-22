@@ -56,16 +56,28 @@ class DlqEntry:
                 return None
 
         return cls(
-            eventId=r.event_id, eventType=r.event_type, originalTopic=h.get(X_ORIGINAL_TOPIC),
-            originalPartition=as_int(h.get(X_ORIGINAL_PARTITION)), originalOffset=as_int(h.get(X_ORIGINAL_OFFSET)),
-            attempts=as_int(h.get(X_RETRY_ATTEMPT)) or 0, errorClass=h.get(X_ERROR_CLASS),
-            errorMessage=h.get(X_ERROR_MESSAGE), failedAt=rfc3339(r.timestamp) if r.timestamp else None,
+            eventId=r.event_id,
+            eventType=r.event_type,
+            originalTopic=h.get(X_ORIGINAL_TOPIC),
+            originalPartition=as_int(h.get(X_ORIGINAL_PARTITION)),
+            originalOffset=as_int(h.get(X_ORIGINAL_OFFSET)),
+            attempts=as_int(h.get(X_RETRY_ATTEMPT)) or 0,
+            errorClass=h.get(X_ERROR_CLASS),
+            errorMessage=h.get(X_ERROR_MESSAGE),
+            failedAt=rfc3339(r.timestamp) if r.timestamp else None,
         )
 
 
 class DlqOps:
-    def __init__(self, *, consumer_conf: dict[str, Any], producer: Publisher, group: str, clock: Clock,
-                 consumer_factory: Callable[[dict[str, Any]], Any] = Consumer) -> None:
+    def __init__(
+        self,
+        *,
+        consumer_conf: dict[str, Any],
+        producer: Publisher,
+        group: str,
+        clock: Clock,
+        consumer_factory: Callable[[dict[str, Any]], Any] = Consumer,
+    ) -> None:
         self._topology = RetryTopology(group)
         self._group = group
         self._ops_group = f"{group}-dlq-ops"
@@ -113,8 +125,7 @@ class DlqOps:
             c.close()
         return [DlqEntry.of(r) for r in records]
 
-    def replay(self, *, max_messages: int = 100, event_type: str | None = None,
-               event_ids: list[str] | None = None) -> int:
+    def replay(self, *, max_messages: int = 100, event_type: str | None = None, event_ids: list[str] | None = None) -> int:
         c, records = self._scan(min(max_messages, 10000) if not (event_type or event_ids) else 10000)
         if c is None:
             return 0
@@ -127,15 +138,18 @@ class DlqOps:
             for r in records:
                 if replayed >= max_messages:
                     break
-                matches = (event_type is None or r.event_type == event_type) and (
-                    not wanted or (r.event_id in wanted))
+                matches = (event_type is None or r.event_type == event_type) and (not wanted or (r.event_id in wanted))
                 if not matches:
                     blocked.add(r.partition)  # leave it pending; stop advancing this partition
                     continue
                 headers = forwarded_headers(
-                    r, group=self._group, attempt=1, not_before=now,
+                    r,
+                    group=self._group,
+                    attempt=1,
+                    not_before=now,
                     error_class=r.header(X_ERROR_CLASS) or "Replayed",
-                    error_message=r.header(X_ERROR_MESSAGE) or "", now=now,
+                    error_message=r.header(X_ERROR_MESSAGE) or "",
+                    now=now,
                 )
                 route = RetryRoute(self._topology.retry[0], 1, now)
                 produce_and_wait(self._producer, [(route.topic, r.key, r.value, headers)])
@@ -143,8 +157,7 @@ class DlqOps:
                 if r.partition not in blocked:
                     commit[r.partition] = r.offset + 1
             if commit:
-                c.commit(offsets=[TopicPartition(self._topology.dlq, p, o) for p, o in commit.items()],
-                         asynchronous=False)
+                c.commit(offsets=[TopicPartition(self._topology.dlq, p, o) for p, o in commit.items()], asynchronous=False)
         finally:
             c.close()
         return replayed

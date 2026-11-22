@@ -6,7 +6,6 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-
 from order_svc.domain import saga as S
 
 from .sagahelp import CFG, Run
@@ -351,8 +350,13 @@ def test_terminal_states_ignore_late_replies(terminal: S.State) -> None:
         r.to(W.DELIVERED)
     else:
         r.send(S.StockReservationRejected(r.data.reservation_id))
-    for t in (S.Deadline(), S.OperatorRetry(), S.ReservationCommitted(r.data.reservation_id),
-              S.FulfilmentAccepted("x"), S.ShipmentDelivered("s", "2026-11-20T00:00:00+00:00")):
+    for t in (
+        S.Deadline(),
+        S.OperatorRetry(),
+        S.ReservationCommitted(r.data.reservation_id),
+        S.FulfilmentAccepted("x"),
+        S.ShipmentDelivered("s", "2026-11-20T00:00:00+00:00"),
+    ):
         assert r.send(t).ignored
 
 
@@ -363,7 +367,7 @@ def test_late_authorization_after_cancelled_is_voided() -> None:
     assert r.state is W.CANCELLED
     d = r.authorized()
     assert r.state is W.CANCELLED and [c.name for c in d.commands] == ["VoidPayment"]
-    
+
 
 def test_duplicate_checkout_submitted_is_ignored() -> None:
     from .sagahelp import CHECKOUT

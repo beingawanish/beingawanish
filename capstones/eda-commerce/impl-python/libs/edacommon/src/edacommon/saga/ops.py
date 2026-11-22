@@ -33,16 +33,32 @@ def saga_view(db: Database, saga_id: str) -> dict[str, Any]:
             raise SagaNotFound(f"no saga {saga_id}")
         history = repo.history(saga_id)
     return {
-        "sagaId": row.saga_id, "sagaType": row.saga_type, "state": row.state, "version": row.version,
-        "deadlineAt": rfc3339(row.deadline_at) if row.deadline_at else None, "attempts": row.step_attempts,
-        "history": [{"at": rfc3339(h.at), "from": h.from_state, "to": h.to_state, "trigger": h.trigger_type,
-                     "eventId": h.trigger_id or ""} for h in history],
+        "sagaId": row.saga_id,
+        "sagaType": row.saga_type,
+        "state": row.state,
+        "version": row.version,
+        "deadlineAt": rfc3339(row.deadline_at) if row.deadline_at else None,
+        "attempts": row.step_attempts,
+        "history": [
+            {
+                "at": rfc3339(h.at),
+                "from": h.from_state,
+                "to": h.to_state,
+                "trigger": h.trigger_type,
+                "eventId": h.trigger_id or "",
+            }
+            for h in history
+        ],
     }
 
 
-def saga_ops_router(*, db: Database, idempotency: IdempotencyStore,
-                    retry_step: Callable[[UnitOfWork, SagaRow], bool],
-                    caller_of: Callable[[Request], str]) -> APIRouter:
+def saga_ops_router(
+    *,
+    db: Database,
+    idempotency: IdempotencyStore,
+    retry_step: Callable[[UnitOfWork, SagaRow], bool],
+    caller_of: Callable[[Request], str],
+) -> APIRouter:
     """``retry_step(uow, locked_row)`` re-issues the current step's command; ``False`` -> 409."""
     router = APIRouter(tags=["ops"])
 
@@ -61,14 +77,22 @@ def saga_ops_router(*, db: Database, idempotency: IdempotencyStore,
                 raise SagaNotFound(f"no saga {saga_id}")
             if not retry_step(uow, row):
                 raise SagaNotRetryable(f"saga {saga_id} in state {row.state} has no step to retry")
-            return StoredResponse(status=202, body=json.dumps({"sagaId": saga_id}).encode(),
-                                  headers={"content-type": "application/json"})
+            return StoredResponse(
+                status=202, body=json.dumps({"sagaId": saga_id}).encode(), headers={"content-type": "application/json"}
+            )
 
         from starlette.concurrency import run_in_threadpool
 
         stored = await run_in_threadpool(
-            idempotency.execute, db, caller=caller, key=request.headers.get(HEADER), method="POST",
-            path=request.url.path, body=body, action=action)
+            idempotency.execute,
+            db,
+            caller=caller,
+            key=request.headers.get(HEADER),
+            method="POST",
+            path=request.url.path,
+            body=body,
+            action=action,
+        )
         return to_response(stored)
 
     return router

@@ -36,6 +36,35 @@ log = get_logger(__name__)
 GRACE_S = 25.0
 
 
+def _sqlalchemy_instrumentable() -> bool:
+    """opentelemetry-instrumentation-sqlalchemy 0.66b2 declares support for SQLAlchemy < 2.1 only;
+    with the pinned 2.1 it would do nothing and log an error. DB spans come back when it catches up."""
+    import sqlalchemy
+
+    major, minor = (int(x) for x in sqlalchemy.__version__.split(".")[:2])
+    return (major, minor) < (2, 1)
+
+
+class SchemaReadiness:
+    """Readiness check "schema cache warm" (guide §6.5): look up the id of every produced subject
+    once; until that succeeds the service is not ready (chaos-registry: a cold start fails
+    readiness instead of failing writes)."""
+
+    def __init__(self, serde: AvroSerde, record_classes: list[Any]) -> None:
+        self._serde = serde
+        self._pairs = [(c.TOPIC, c.AVRO_NAME) for c in record_classes]
+        self._warm = False
+
+    def __call__(self) -> bool:
+        if not self._warm:
+            try:
+                self._serde.warm(self._pairs)
+                self._warm = True
+            except Exception as exc:
+                log.warning("schema cache not warm", error=exc)
+        return self._warm
+
+
 class Background(Protocol):
     def run(self) -> None: ...
 
@@ -75,30 +104,39 @@ class Infrastructure:
     meter_provider: Any = None
 
     @classmethod
-    def from_settings(cls, settings: ServiceSettings, *, observability: bool = True,
-                      schema_registry: Any = None, clock: Clock | None = None) -> Infrastructure:
+    def from_settings(
+        cls, settings: ServiceSettings, *, observability: bool = True, schema_registry: Any = None, clock: Clock | None = None
+    ) -> Infrastructure:
         if observability:
             configure_logging(settings.service_name, level=settings.log_level, fmt=settings.log_format)
             attrs = settings.resource_attributes()
-            setup_tracing(settings.service_name, attrs, endpoint=settings.otel_exporter_otlp_endpoint,
-                          protocol=settings.otel_exporter_otlp_protocol, disabled=settings.otel_sdk_disabled)
-            provider = setup_metrics(attrs, endpoint=settings.otel_exporter_otlp_endpoint,
-                                     disabled=settings.otel_sdk_disabled)
+            setup_tracing(
+                settings.service_name,
+                attrs,
+                endpoint=settings.otel_exporter_otlp_endpoint,
+                protocol=settings.otel_exporter_otlp_protocol,
+                disabled=settings.otel_sdk_disabled,
+            )
+            provider = setup_metrics(attrs, endpoint=settings.otel_exporter_otlp_endpoint, disabled=settings.otel_sdk_disabled)
         else:
             provider = None
         clock = clock or SystemClock()
         metrics = EdaMetrics(provider)
         engine = make_engine(settings)
-        if observability:
-            try:
-                from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+        if observability and _sqlalchemy_instrumentable():
+            from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 
-                SQLAlchemyInstrumentor().instrument(engine=engine)
-            except Exception as exc:  # pragma: no cover
-                log.warning("SQLAlchemy instrumentation unavailable", error=exc)
+            SQLAlchemyInstrumentor().instrument(engine=engine)
         serde = AvroSerde(schema_registry or make_registry_client(settings.schema_registry_url))
-        return cls(settings=settings, clock=clock, metrics=metrics, db=Database(engine), serde=serde,
-                   outbox=OutboxWriter(serde, settings.service_name, clock), meter_provider=provider)
+        return cls(
+            settings=settings,
+            clock=clock,
+            metrics=metrics,
+            db=Database(engine),
+            serde=serde,
+            outbox=OutboxWriter(serde, settings.service_name, clock),
+            meter_provider=provider,
+        )
 
     @property
     def producer(self) -> Any:
@@ -109,9 +147,15 @@ class Infrastructure:
         return self._producer
 
     def processor(self, registry: HandlerRegistry) -> MessageProcessor:
-        return MessageProcessor(group=self.settings.group, registry=registry, db=self.db, serde=self.serde,
-                                forwarder=Forwarder(self.producer, self.settings.group), metrics=self.metrics,
-                                clock=self.clock)
+        return MessageProcessor(
+            group=self.settings.group,
+            registry=registry,
+            db=self.db,
+            serde=self.serde,
+            forwarder=Forwarder(self.producer, self.settings.group),
+            metrics=self.metrics,
+            clock=self.clock,
+        )
 
     def consumer_loops(self, registry: HandlerRegistry, topics: list[str], *, threads: int = 1) -> list[ConsumerLoop]:
         """Main loop(s) on the service topics plus one retry loop on <group>.retry.*."""
@@ -120,13 +164,25 @@ class Infrastructure:
         group = self.settings.group
         proc = self.processor(registry)
         loops = [
-            ConsumerLoop(consumer_conf=consumer_config(self.settings, group, client_suffix=f"-{i}"),
-                         topics=topics, processor=proc, clock=self.clock, name=f"{group}-{i}")
+            ConsumerLoop(
+                consumer_conf=consumer_config(self.settings, group, client_suffix=f"-{i}"),
+                topics=topics,
+                processor=proc,
+                clock=self.clock,
+                name=f"{group}-{i}",
+            )
             for i in range(threads)
         ]
-        loops.append(ConsumerLoop(consumer_conf=consumer_config(self.settings, f"{group}-retry", client_suffix="-retry"),
-                                  topics=list(retry_topics(group)), processor=proc, clock=self.clock,
-                                  retry_mode=True, name=f"{group}-retry"))
+        loops.append(
+            ConsumerLoop(
+                consumer_conf=consumer_config(self.settings, f"{group}-retry", client_suffix="-retry"),
+                topics=list(retry_topics(group)),
+                processor=proc,
+                clock=self.clock,
+                retry_mode=True,
+                name=f"{group}-retry",
+            )
+        )
         return loops
 
     def relay(self) -> PollingRelay | None:
@@ -141,8 +197,12 @@ class Infrastructure:
     def dlq_ops(self) -> Any:
         from edacommon.consumer.dlq import DlqOps
 
-        return DlqOps(consumer_conf=consumer_config(self.settings, f"{self.settings.group}-dlq-ops", client_suffix="-dlq"),
-                      producer=self.producer, group=self.settings.group, clock=self.clock)
+        return DlqOps(
+            consumer_conf=consumer_config(self.settings, f"{self.settings.group}-dlq-ops", client_suffix="-dlq"),
+            producer=self.producer,
+            group=self.settings.group,
+            clock=self.clock,
+        )
 
 
 @dataclass
@@ -163,8 +223,14 @@ class ServiceRuntime:
             t = threading.Thread(target=item.run, name=getattr(item, "name", type(item).__name__), daemon=True)
             t.start()
             threads.append(t)
-        config = uvicorn.Config(self.app, host="0.0.0.0", port=self.settings.http_port,  # noqa: S104
-                                log_config=None, access_log=False, timeout_graceful_shutdown=10)
+        config = uvicorn.Config(
+            self.app,
+            host="0.0.0.0",  # noqa: S104 - containers bind all interfaces
+            port=self.settings.http_port,
+            log_config=None,
+            access_log=False,
+            timeout_graceful_shutdown=10,
+        )
         server = uvicorn.Server(config)
 
         def shutdown(signum: int, _frame: Any) -> None:
@@ -173,7 +239,8 @@ class ServiceRuntime:
                 item.stop()
             server.should_exit = True
 
-        server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+        # uvicorn captures SIGTERM while serving, restores these handlers on exit and re-raises the
+        # signal, so ``shutdown`` runs either way and the threads below are stopped and joined.
         signal.signal(signal.SIGTERM, shutdown)
         signal.signal(signal.SIGINT, shutdown)
         server.run()

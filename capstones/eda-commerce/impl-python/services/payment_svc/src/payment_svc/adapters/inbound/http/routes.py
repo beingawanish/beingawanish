@@ -6,13 +6,13 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
+from edacommon.http import Authenticator, Principal, problem, require_scope
+from edacommon.ids import Clock
+from edacommon.webhooks import WebhookReceiver
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from edacommon.http import Authenticator, Principal, problem, require_scope
-from edacommon.ids import Clock
-from edacommon.webhooks import WebhookReceiver
 from payment_svc.adapters.outbound.psp.fake.psp import FakePsp
 
 
@@ -23,8 +23,12 @@ def webhook_router(receiver: WebhookReceiver, clock: Clock) -> APIRouter:
     async def receive(request: Request) -> Response:
         raw = await request.body()
         result = await run_in_threadpool(
-            receiver.receive, raw_body=raw, timestamp=request.headers.get("X-Webhook-Timestamp"),
-            signature=request.headers.get("X-Psp-Signature"), now=clock.now())
+            receiver.receive,
+            raw_body=raw,
+            timestamp=request.headers.get("X-Webhook-Timestamp"),
+            signature=request.headers.get("X-Psp-Signature"),
+            now=clock.now(),
+        )
         if result.status == 401:
             return problem(401, "webhook-signature", "Unauthorized", result.detail)
         if result.status == 400:

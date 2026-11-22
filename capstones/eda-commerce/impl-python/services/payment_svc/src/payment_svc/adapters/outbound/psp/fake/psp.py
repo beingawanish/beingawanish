@@ -35,6 +35,7 @@ from datetime import UTC, datetime
 from edacommon.ids import new_id, rfc3339
 from edacommon.logging import get_logger
 from edacommon.webhooks import sign
+
 from payment_svc.application.ports import PspTimeout
 from payment_svc.domain.payment import OutcomeKind, PspOutcome
 
@@ -61,7 +62,7 @@ class _FakePayment:
     token: str
     amount_minor: int
     currency: str
-    status: str                  # pending | authorized | declined | captured | voided
+    status: str  # pending | authorized | declined | captured | voided
     failure: str | None = None
     duplicates: int = 1
     events: list[str] = field(default_factory=list)
@@ -70,8 +71,13 @@ class _FakePayment:
 class WebhookSender:
     """Delivers signed notifications after a delay (a heap and one thread). Tests pass ``send``."""
 
-    def __init__(self, url: str, secret: str, send: Callable[[str, dict[str, str], bytes], None] | None = None,
-                 wall_clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        url: str,
+        secret: str,
+        send: Callable[[str, dict[str, str], bytes], None] | None = None,
+        wall_clock: Callable[[], float] = time.time,
+    ) -> None:
         self._wall_clock = wall_clock
         self._url = url
         self._secret = secret
@@ -99,8 +105,7 @@ class WebhookSender:
 
     def deliver(self, raw: bytes) -> None:
         ts = str(int(self._wall_clock()))
-        headers = {"Content-Type": "application/json", "X-Webhook-Timestamp": ts,
-                   "X-Psp-Signature": sign(self._secret, ts, raw)}
+        headers = {"Content-Type": "application/json", "X-Webhook-Timestamp": ts, "X-Psp-Signature": sign(self._secret, ts, raw)}
         self._send(self._url, headers, raw)
 
     def flush(self) -> int:
@@ -120,7 +125,7 @@ class WebhookSender:
                     return
             except httpx.HTTPError as exc:
                 log.warning("fake PSP webhook delivery failed", attempt=attempt, error=exc)
-            time.sleep(2 ** attempt)
+            time.sleep(2**attempt)
 
     def run(self) -> None:
         while True:
@@ -144,8 +149,14 @@ class FakePsp:
 
     name = "fake-psp"
 
-    def __init__(self, config: FakePspConfig, sender: WebhookSender, *, seed: int | None = None,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+    def __init__(
+        self,
+        config: FakePspConfig,
+        sender: WebhookSender,
+        *,
+        seed: int | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.config = config
         self._sender = sender
         self._rng = random.Random(seed)  # noqa: S311 - simulation, not crypto
@@ -164,16 +175,21 @@ class FakePsp:
         event_id = f"evt_{new_id()}"
         fp.events.append(event_id)
         body: dict[str, object] = {
-            "pspEventId": event_id, "eventType": kind, "pspPaymentId": fp.psp_payment_id, "merchantReference": ref,
-            "amount": {"amountMinor": fp.amount_minor, "currency": fp.currency}, "failureCode": failure,
+            "pspEventId": event_id,
+            "eventType": kind,
+            "pspPaymentId": fp.psp_payment_id,
+            "merchantReference": ref,
+            "amount": {"amountMinor": fp.amount_minor, "currency": fp.currency},
+            "failureCode": failure,
             "occurredAt": rfc3339(datetime.now(UTC)),
         }
         delay = self.config.webhookDelayMs if delay_ms is None else delay_ms
         self._sender.schedule(delay, body, copies=fp.duplicates)
 
     def _result(self, fp: _FakePayment) -> PspOutcome:
-        kind = {"authorized": OutcomeKind.AUTHORIZED, "captured": OutcomeKind.CAPTURED,
-                "voided": OutcomeKind.VOIDED}.get(fp.status, OutcomeKind.PENDING)
+        kind = {"authorized": OutcomeKind.AUTHORIZED, "captured": OutcomeKind.CAPTURED, "voided": OutcomeKind.VOIDED}.get(
+            fp.status, OutcomeKind.PENDING
+        )
         return PspOutcome(kind, psp_payment_id=fp.psp_payment_id, psp_reference=fp.psp_payment_id)
 
     # ---------------------------------------------------------------------------------- port
@@ -187,18 +203,25 @@ class FakePsp:
                 if fp.status == "declined":
                     from payment_svc.adapters.outbound.psp.acl import outcome_from_notification
 
-                    return outcome_from_notification({"eventType": "authorization.failed", "merchantReference": payment_id,
-                                                      "pspPaymentId": fp.psp_payment_id, "failureCode": fp.failure})[1]
+                    return outcome_from_notification(
+                        {
+                            "eventType": "authorization.failed",
+                            "merchantReference": payment_id,
+                            "pspPaymentId": fp.psp_payment_id,
+                            "failureCode": fp.failure,
+                        }
+                    )[1]
                 if fp.status == "lost":
                     raise PspTimeout("fake PSP: no answer")
                 return self._result(fp)
-            fp = _FakePayment(psp_payment_id=f"psp_{new_id()}", token=token, amount_minor=amount_minor,
-                              currency=currency, status="pending")
+            fp = _FakePayment(
+                psp_payment_id=f"psp_{new_id()}", token=token, amount_minor=amount_minor, currency=currency, status="pending"
+            )
             if token == "tok_dup_webhook" or (token not in _MAGIC and self._rng.random() < self.config.duplicateWebhookRate):
                 fp.duplicates = 3 if token == "tok_dup_webhook" else 2
             self._payments[payment_id] = fp
             if token == "tok_timeout":
-                fp.status = "lost"   # the request never reached the PSP's ledger
+                fp.status = "lost"  # the request never reached the PSP's ledger
                 raise PspTimeout("fake PSP: no answer within 5 s")
             failure = _DECLINES.get(token)
             if failure is None and token not in _MAGIC and self._rng.random() < self.config.declineRate:
@@ -244,8 +267,9 @@ class FakePsp:
                 return PspOutcome(OutcomeKind.VOIDED, psp_payment_id=fp.psp_payment_id)
             return PspOutcome(OutcomeKind.PENDING, psp_payment_id=fp.psp_payment_id)
 
-    def refund(self, *, refund_id: str, payment_id: str, psp_payment_id: str | None, amount_minor: int,
-               currency: str) -> PspOutcome:
+    def refund(
+        self, *, refund_id: str, payment_id: str, psp_payment_id: str | None, amount_minor: int, currency: str
+    ) -> PspOutcome:
         self._latency()
         with self._lock:
             self.calls.append(("refund", refund_id))
@@ -269,8 +293,14 @@ class FakePsp:
             if fp.status == "declined":
                 from payment_svc.adapters.outbound.psp.acl import outcome_from_notification
 
-                return outcome_from_notification({"eventType": "authorization.failed", "merchantReference": payment_id,
-                                                  "pspPaymentId": fp.psp_payment_id, "failureCode": fp.failure})[1]
+                return outcome_from_notification(
+                    {
+                        "eventType": "authorization.failed",
+                        "merchantReference": payment_id,
+                        "pspPaymentId": fp.psp_payment_id,
+                        "failureCode": fp.failure,
+                    }
+                )[1]
             return self._result(fp)
 
     # ------------------------------------------------------------------------------- test aids

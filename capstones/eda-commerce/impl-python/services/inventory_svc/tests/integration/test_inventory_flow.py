@@ -8,25 +8,28 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import create_engine
-
 from contracts_py.records import CommitReservation, ReleaseReservation, ReserveStock, RestockItems
 from edacommon.consumer import Outcome
 from edacommon.testing.fakes import counter_value
 from edacommon.testing.infra import contract_sql_path, fresh_database, information_schema_columns
 from inventory_svc.adapters.inbound.jobs.expiry import ExpirySweeper
+from sqlalchemy import create_engine
 
-from .conftest import MIGRATIONS, Svc
+from .conftest import Svc
 
 pytestmark = pytest.mark.integration
 ORDER = "0193a1c4-0000-7000-8000-00000000a001"
 
 
-def reserve(svc: Svc, rid: str, lines: list[tuple[str, int]], *, order: str = ORDER, ttl: int = 900,
-            event_id: str | None = None) -> Any:
-    return svc.h.command(ReserveStock, {"orderId": order, "reservationId": rid, "ttlSeconds": ttl,
-                                        "lines": [{"sku": s, "quantity": q} for s, q in lines]},
-                         key=order, event_id=event_id)
+def reserve(
+    svc: Svc, rid: str, lines: list[tuple[str, int]], *, order: str = ORDER, ttl: int = 900, event_id: str | None = None
+) -> Any:
+    return svc.h.command(
+        ReserveStock,
+        {"orderId": order, "reservationId": rid, "ttlSeconds": ttl, "lines": [{"sku": s, "quantity": q} for s, q in lines]},
+        key=order,
+        event_id=event_id,
+    )
 
 
 def test_migrations_create_contract_shared_tables_and_private_tables(svc: Svc) -> None:
@@ -44,7 +47,6 @@ def test_migrations_create_contract_shared_tables_and_private_tables(svc: Svc) -
 def test_orm_models_match_migrated_schema(svc: Svc) -> None:
     from alembic.autogenerate import compare_metadata
     from alembic.migration import MigrationContext
-
     from inventory_svc.adapters.outbound.persistence.models import Base
 
     e = create_engine(svc.h.url)
@@ -52,8 +54,12 @@ def test_orm_models_match_migrated_schema(svc: Svc) -> None:
         diff = compare_metadata(MigrationContext.configure(c), Base.metadata)
     e.dispose()
     # Only differences that matter: missing/extra tables or columns. (CHECKs/indexes live in SQL.)
-    relevant = [d for d in diff if d[0] in ("add_table", "add_column", "remove_column")
-                and getattr(d[1], "name", "") not in ("outbox", "inbox", "idempotency_key")]
+    relevant = [
+        d
+        for d in diff
+        if d[0] in ("add_table", "add_column", "remove_column")
+        and getattr(d[1], "name", "") not in ("outbox", "inbox", "idempotency_key")
+    ]
     assert relevant == []
 
 
@@ -91,7 +97,7 @@ def test_duplicate_delivery_one_effect_one_reply(svc: Svc, metrics_reader: Any) 
 def test_resent_command_reemits_original_reply_without_repeating_effect(svc: Svc) -> None:
     svc.set_stock("SKU-1001", 50)
     svc.h.deliver(svc.registry, reserve(svc, "r-1", [("SKU-1001", 2)]))
-    first = [p for p in svc.h.published() if p.type.endswith("StockReserved")][0]
+    first = next(p for p in svc.h.published() if p.type.endswith("StockReserved"))
     resend = reserve(svc, "r-1", [("SKU-1001", 2)])  # new eventId, same reservationId (saga resend)
     assert svc.h.deliver(svc.registry, resend) is Outcome.SUCCESS
     again = [p for p in svc.h.published() if p.type.endswith("StockReserved")]
@@ -106,8 +112,10 @@ def test_all_or_nothing_and_rejection_with_shortages(svc: Svc) -> None:
     svc.h.published()
     svc.h.deliver(svc.registry, reserve(svc, "r-2", [("SKU-1001", 1), ("SKU-1006", 1), ("SKU-404", 1)]))
     (rej,) = [p for p in svc.h.published() if p.type.endswith("StockReservationRejected")]
-    assert rej.value["shortages"] == [{"sku": "SKU-1006", "requested": 1, "available": 0},
-                                      {"sku": "SKU-404", "requested": 1, "available": 0}]
+    assert rej.value["shortages"] == [
+        {"sku": "SKU-1006", "requested": 1, "available": 0},
+        {"sku": "SKU-404", "requested": 1, "available": 0},
+    ]
     assert svc.level("SKU-1001").reserved == 0, "no partial hold"
     svc.h.deliver(svc.registry, reserve(svc, "r-2", [("SKU-1001", 1)]))  # resend: same answer
     assert [p.type for p in svc.h.published()] == ["com.edacommerce.inventory.StockReservationRejected"]
@@ -172,8 +180,12 @@ def test_commit_then_release_returns_allocated_units_and_release_twice_is_noop(s
     assert (lv.on_hand, lv.reserved) == (7, 0)
     svc.h.published()
     for _ in range(2):
-        svc.h.deliver(svc.registry, svc.h.command(
-            ReleaseReservation, {"orderId": ORDER, "reservationId": "r-5", "reason": "PAYMENT_DECLINED"}, key=ORDER))
+        svc.h.deliver(
+            svc.registry,
+            svc.h.command(
+                ReleaseReservation, {"orderId": ORDER, "reservationId": "r-5", "reason": "PAYMENT_DECLINED"}, key=ORDER
+            ),
+        )
     released = [p for p in svc.h.published() if p.type.endswith("ReservationReleased")]
     assert len(released) == 2 and released[0].value["releasedAt"] == released[1].value["releasedAt"]
     assert svc.level("SKU-1001").on_hand == 10
@@ -181,8 +193,10 @@ def test_commit_then_release_returns_allocated_units_and_release_twice_is_noop(s
 
 def test_release_before_reserve_tombstones_the_reservation(svc: Svc) -> None:
     svc.set_stock("SKU-1001", 10)
-    svc.h.deliver(svc.registry, svc.h.command(
-        ReleaseReservation, {"orderId": ORDER, "reservationId": "r-6", "reason": "SAGA_TIMEOUT"}, key=ORDER))
+    svc.h.deliver(
+        svc.registry,
+        svc.h.command(ReleaseReservation, {"orderId": ORDER, "reservationId": "r-6", "reason": "SAGA_TIMEOUT"}, key=ORDER),
+    )
     svc.h.deliver(svc.registry, reserve(svc, "r-6", [("SKU-1001", 1)]))  # late, via a retry topic
     types = [p.type for p in svc.h.published() if p.topic == "inventory.events.v1"]
     assert types == ["com.edacommerce.inventory.ReservationReleased"] * 2
@@ -201,9 +215,12 @@ def test_restock_is_idempotent_on_restock_id(svc: Svc) -> None:
 def test_command_past_envelope_expiry_is_rejected(svc: Svc) -> None:
     svc.set_stock("SKU-1001", 10)
     svc.h.published()
-    rec = svc.h.command(ReserveStock, {"orderId": ORDER, "reservationId": "r-7", "ttlSeconds": 900,
-                                       "lines": [{"sku": "SKU-1001", "quantity": 1}]}, key=ORDER,
-                        expires_at=svc.h.clock.now() - timedelta(seconds=1))
+    rec = svc.h.command(
+        ReserveStock,
+        {"orderId": ORDER, "reservationId": "r-7", "ttlSeconds": 900, "lines": [{"sku": "SKU-1001", "quantity": 1}]},
+        key=ORDER,
+        expires_at=svc.h.clock.now() - timedelta(seconds=1),
+    )
     svc.h.deliver(svc.registry, rec)
     assert [p.type for p in svc.h.published()] == ["com.edacommerce.inventory.StockReservationRejected"]
 
@@ -211,19 +228,28 @@ def test_command_past_envelope_expiry_is_rejected(svc: Svc) -> None:
 def test_unknown_type_on_command_topic_is_ignored(svc: Svc) -> None:
     from edacommon.consumer import ConsumedRecord
 
-    rec = ConsumedRecord(topic="inventory.commands.v1", partition=0, offset=1, key=b"o", value=b"??",
-                         headers=[("ce_type", b"com.edacommerce.inventory.TransferStock"), ("ce_id", b"x1")])
+    rec = ConsumedRecord(
+        topic="inventory.commands.v1",
+        partition=0,
+        offset=1,
+        key=b"o",
+        value=b"??",
+        headers=[("ce_type", b"com.edacommerce.inventory.TransferStock"), ("ce_id", b"x1")],
+    )
     assert svc.h.deliver(svc.registry, rec) is Outcome.IGNORED
 
 
 def test_admin_api_sets_stock_and_publishes_level(svc: Svc) -> None:
-    from fastapi.testclient import TestClient
-
     from edacommon.http import Authenticator, Readiness, create_app
+    from fastapi.testclient import TestClient
     from inventory_svc.adapters.inbound.http.routes import admin_router
 
-    app = create_app(svc.settings, readiness=Readiness(), instrument=False,
-                     routers=[admin_router(svc.h.db, svc.inventory_for, svc.h.clock, Authenticator(svc.settings))])
+    app = create_app(
+        svc.settings,
+        readiness=Readiness(),
+        instrument=False,
+        routers=[admin_router(svc.h.db, svc.inventory_for, svc.h.clock, Authenticator(svc.settings))],
+    )
     c = TestClient(app)
     r = c.put("/admin/stock/SKU-1003", json={"onHand": 200})
     assert r.status_code == 200 and r.json()["available"] == 200

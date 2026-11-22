@@ -83,9 +83,7 @@ class ServiceSettings(BaseSettings):
 
     @property
     def db_url(self) -> str:
-        return (
-            f"postgresql+psycopg://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
-        )
+        return f"postgresql+psycopg://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
 
     def resource_attributes(self) -> dict[str, Any]:
         attrs: dict[str, Any] = {}

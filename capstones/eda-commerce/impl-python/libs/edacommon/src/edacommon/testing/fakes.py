@@ -8,12 +8,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import contracts_py
 from confluent_kafka.schema_registry import Schema
 from confluent_kafka.schema_registry._sync.mock_schema_registry_client import MockSchemaRegistryClient
 from confluent_kafka.schema_registry.error import SchemaRegistryError
-
-import contracts_py
 from contracts_py.topics import TOPICS
+
 from edacommon.metrics import EdaMetrics, views
 
 
@@ -22,7 +22,7 @@ def _canonical(schema_str: str) -> str:
     return json.dumps(json.loads(schema_str), sort_keys=True, separators=(",", ":"))
 
 
-class InMemorySchemaRegistry(MockSchemaRegistryClient):  # type: ignore[misc]
+class InMemorySchemaRegistry(MockSchemaRegistryClient):
     """confluent-kafka's mock registry, with lookups by normalised schema like the real registry."""
 
     def __init__(self) -> None:
@@ -30,17 +30,17 @@ class InMemorySchemaRegistry(MockSchemaRegistryClient):  # type: ignore[misc]
         self._ids: dict[tuple[str, str], Any] = {}
         self.available = True
 
-    def register_schema_full_response(self, subject_name: str, schema: Schema, normalize_schemas: bool = False,
-                                      **kw: Any) -> Any:
+    def register_schema_full_response(self, subject_name: str, schema: Schema, normalize_schemas: bool = False, **kw: Any) -> Any:
         rs = super().register_schema_full_response(subject_name, schema, normalize_schemas=False, **kw)
-        self._ids[(subject_name, _canonical(schema.schema_str))] = rs
+        self._ids[(subject_name, _canonical(schema.schema_str or ""))] = rs
         return rs
 
-    def lookup_schema(self, subject_name: str, schema: Schema, normalize_schemas: bool = False,
-                      fmt: str | None = None, deleted: bool = False) -> Any:
+    def lookup_schema(
+        self, subject_name: str, schema: Schema, normalize_schemas: bool = False, fmt: str | None = None, deleted: bool = False
+    ) -> Any:
         if not self.available:
             raise ConnectionError("schema registry down (test)")
-        rs = self._ids.get((subject_name, _canonical(schema.schema_str)))
+        rs = self._ids.get((subject_name, _canonical(schema.schema_str or "")))
         if rs is None:
             raise SchemaRegistryError(404, 40403, "Schema not found")
         return rs
@@ -79,8 +79,15 @@ class FakeProducer:
     _pending: list[tuple[ProducedRecord, Callable[..., None] | None]] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def produce(self, topic: str, value: bytes | None = None, key: bytes | None = None, headers: Any = None,
-                on_delivery: Callable[..., None] | None = None, **_: Any) -> None:
+    def produce(
+        self,
+        topic: str,
+        value: bytes | None = None,
+        key: bytes | None = None,
+        headers: Any = None,
+        on_delivery: Callable[..., None] | None = None,
+        **_: Any,
+    ) -> None:
         with self._lock:
             self._pending.append((ProducedRecord(topic, key, value, list(headers or [])), on_delivery))
 

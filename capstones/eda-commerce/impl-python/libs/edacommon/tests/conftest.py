@@ -6,12 +6,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import create_engine, text
-
 from edacommon.config import ServiceSettings
 from edacommon.db import Database
 from edacommon.migrations.common_tables import statements
 from edacommon.serde import AvroSerde, decode_raw
+from sqlalchemy import create_engine, text
 
 EXAMPLES = Path(__file__).resolve().parents[4] / "contracts" / "examples"
 

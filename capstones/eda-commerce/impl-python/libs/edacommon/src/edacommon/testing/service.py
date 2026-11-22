@@ -47,8 +47,18 @@ class Published:
 
 
 class ServiceHarness:
-    def __init__(self, *, url: str, migrations: Path, group: str, serde: AvroSerde, clock: Clock,
-                 metrics: EdaMetrics, producer: FakeProducer | None = None, pool_size: int = 8) -> None:
+    def __init__(
+        self,
+        *,
+        url: str,
+        migrations: Path,
+        group: str,
+        serde: AvroSerde,
+        clock: Clock,
+        metrics: EdaMetrics,
+        producer: FakeProducer | None = None,
+        pool_size: int = 8,
+    ) -> None:
         migrate(url, migrations)
         self.url = url
         self.group = group
@@ -65,30 +75,63 @@ class ServiceHarness:
         self.db.dispose()
 
     def processor(self, registry: HandlerRegistry) -> MessageProcessor:
-        return MessageProcessor(group=self.group, registry=registry, db=self.db, serde=self.serde,
-                                forwarder=Forwarder(self.producer, self.group), metrics=self.metrics,
-                                clock=self.clock, sleep=lambda s: None)
+        return MessageProcessor(
+            group=self.group,
+            registry=registry,
+            db=self.db,
+            serde=self.serde,
+            forwarder=Forwarder(self.producer, self.group),
+            metrics=self.metrics,
+            clock=self.clock,
+            sleep=lambda s: None,
+        )
 
-    def command(self, record_cls: type[Any], body: dict[str, Any], *, key: str, event_id: str | None = None,
-                correlation_id: str | None = None, producer: str = "order-svc", occurred_at: datetime | None = None,
-                expires_at: datetime | None = None, aggregate_version: int = 0) -> ConsumedRecord:
+    def command(
+        self,
+        record_cls: type[Any],
+        body: dict[str, Any],
+        *,
+        key: str,
+        event_id: str | None = None,
+        correlation_id: str | None = None,
+        producer: str = "order-svc",
+        occurred_at: datetime | None = None,
+        expires_at: datetime | None = None,
+        aggregate_version: int = 0,
+    ) -> ConsumedRecord:
         """Build a record exactly as another service's outbox + Debezium would deliver it."""
         event_id = event_id or new_id()
         topic = record_cls.TOPIC
         env = build_envelope(
-            event_id=event_id, record_type=record_cls.AVRO_NAME, topic=topic, producer=producer, key=key,
-            aggregate_type=record_cls.AGGREGATE_TYPE, aggregate_id=key, aggregate_version=aggregate_version,
-            correlation_id=correlation_id or key, causation_id=None, occurred_at=occurred_at or self.clock.now(),
-            traceparent=TRACEPARENT, tracestate=None, expires_at=expires_at)
+            event_id=event_id,
+            record_type=record_cls.AVRO_NAME,
+            topic=topic,
+            producer=producer,
+            key=key,
+            aggregate_type=record_cls.AGGREGATE_TYPE,
+            aggregate_id=key,
+            aggregate_version=aggregate_version,
+            correlation_id=correlation_id or key,
+            causation_id=None,
+            occurred_at=occurred_at or self.clock.now(),
+            traceparent=TRACEPARENT,
+            tracestate=None,
+            expires_at=expires_at,
+        )
         value = {"envelope": env, **body}
         validate(record_cls.AVRO_NAME, value)
         data = self.serde.serialize(topic, record_cls.AVRO_NAME, value)
         self._offset += 1
-        headers = [("id", event_id.encode()), ("ce_id", event_id.encode()), ("ce_type", record_cls.AVRO_NAME.encode()),
-                   ("ce_source", producer.encode()), ("correlation_id", (correlation_id or key).encode()),
-                   ("traceparent", TRACEPARENT.encode()), ("ce_specversion", b"1.0")]
-        return ConsumedRecord(topic=topic, partition=0, offset=self._offset, key=key.encode(), value=data,
-                              headers=headers)
+        headers = [
+            ("id", event_id.encode()),
+            ("ce_id", event_id.encode()),
+            ("ce_type", record_cls.AVRO_NAME.encode()),
+            ("ce_source", producer.encode()),
+            ("correlation_id", (correlation_id or key).encode()),
+            ("traceparent", TRACEPARENT.encode()),
+            ("ce_specversion", b"1.0"),
+        ]
+        return ConsumedRecord(topic=topic, partition=0, offset=self._offset, key=key.encode(), value=data, headers=headers)
 
     def deliver(self, registry: HandlerRegistry, record: ConsumedRecord) -> Outcome:
         return self.processor(registry).process(record).outcome
@@ -96,7 +139,7 @@ class ServiceHarness:
     def published(self) -> list[Published]:
         """Run the polling relay and return (decoded) records published since the last call."""
         PollingRelay(self.db, self.producer, self.metrics).publish_once()
-        new = self.producer.records[self._seen:]
+        new = self.producer.records[self._seen :]
         self._seen = len(self.producer.records)
         out = []
         for r in new:

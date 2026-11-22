@@ -9,6 +9,7 @@ from collections.abc import Callable
 
 from edacommon.db import Database, UnitOfWork
 from edacommon.ids import Clock
+
 from inventory_svc.application.use_cases import Inventory
 
 

@@ -16,6 +16,7 @@ partitions (and from running several loop threads or processes in the same group
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from datetime import datetime
@@ -84,8 +85,7 @@ class ConsumerLoop:
 
     def run(self) -> None:
         self._consumer = self._factory(self._conf)
-        self._consumer.subscribe(self._topics, on_assign=self._on_assign, on_revoke=self._on_revoke,
-                                 on_lost=self._on_lost)
+        self._consumer.subscribe(self._topics, on_assign=self._on_assign, on_revoke=self._on_revoke, on_lost=self._on_lost)
         self.subscribed.set()
         log.info("consumer started", consumer=self.name, topics=self._topics, group=self._conf["group.id"])
         try:
@@ -134,8 +134,14 @@ class ConsumerLoop:
             except Exception as exc:
                 # Only a failed forward (or a bug in the runtime) gets here. The record is not
                 # done; keep the partition position and try again shortly.
-                log.error("record not processed; retrying", consumer=self.name, topic=record.topic,
-                          partition=record.partition, offset=record.offset, error=exc)
+                log.error(
+                    "record not processed; retrying",
+                    consumer=self.name,
+                    topic=record.topic,
+                    partition=record.partition,
+                    offset=record.offset,
+                    error=exc,
+                )
                 self._stop.wait(1.0)
         else:
             # Stopping in the middle of a retry: rewind so the record is not skipped.
@@ -162,10 +168,8 @@ class ConsumerLoop:
                 del self._paused_until[tp]
 
     def _seek(self, record: ConsumedRecord) -> None:
-        try:
+        with contextlib.suppress(KafkaException):
             self._consumer.seek(TopicPartition(record.topic, record.partition, record.offset))
-        except KafkaException:
-            pass
 
     def _handle_error(self, err: KafkaError) -> None:
         if err.code() == KafkaError._PARTITION_EOF:
@@ -177,9 +181,7 @@ class ConsumerLoop:
 
     # -------------------------------------------------------------------------------- offsets
     def _maybe_commit(self) -> None:
-        if self._since_commit >= COMMIT_EVERY_N or (
-            self._done and time.monotonic() - self._last_commit >= COMMIT_INTERVAL_S
-        ):
+        if self._since_commit >= COMMIT_EVERY_N or (self._done and time.monotonic() - self._last_commit >= COMMIT_INTERVAL_S):
             self._commit(sync=False)
 
     def _commit(self, *, sync: bool, only: list[tuple[str, int]] | None = None) -> None:

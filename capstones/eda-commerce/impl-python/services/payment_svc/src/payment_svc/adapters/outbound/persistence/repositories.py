@@ -6,12 +6,12 @@ from dataclasses import fields
 from datetime import datetime
 from typing import Any
 
+from edacommon.envelope import OutgoingMessage
+from edacommon.outbox import OutboxWriter
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from edacommon.envelope import OutgoingMessage
-from edacommon.outbox import OutboxWriter
 from payment_svc.adapters.outbound.persistence.models import PaymentAttemptRow, PaymentRow, PspWebhookRow, RefundRow
 from payment_svc.domain.payment import (
     CaptureFailure,
@@ -61,13 +61,24 @@ class SqlPaymentRepository:
         values = {k: _plain(getattr(p, k)) for k in _PAYMENT_FIELDS}
         values["updated_at"] = now
         stmt = pg_insert(PaymentRow).values(created_at=now, **values)
-        self._s.execute(stmt.on_conflict_do_update(index_elements=["payment_id"],
-                                                   set_={k: stmt.excluded[k] for k in values if k != "payment_id"}))
+        self._s.execute(
+            stmt.on_conflict_do_update(
+                index_elements=["payment_id"], set_={k: stmt.excluded[k] for k in values if k != "payment_id"}
+            )
+        )
 
     def due_reconciliation(self, now: datetime, limit: int) -> list[Payment]:
-        rows = self._s.execute(
-            select(PaymentRow).where(PaymentRow.status == PaymentStatus.UNKNOWN.value, PaymentRow.next_reconcile_at <= now)
-            .order_by(PaymentRow.next_reconcile_at).limit(limit).with_for_update(skip_locked=True)).scalars().all()
+        rows = (
+            self._s.execute(
+                select(PaymentRow)
+                .where(PaymentRow.status == PaymentStatus.UNKNOWN.value, PaymentRow.next_reconcile_at <= now)
+                .order_by(PaymentRow.next_reconcile_at)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+            .scalars()
+            .all()
+        )
         return [_payment(r) for r in rows]
 
     def record_attempt(self, payment_id: str, operation: str, outcome: str, now: datetime, detail: str | None = None) -> None:
@@ -85,8 +96,11 @@ class SqlPaymentRepository:
         values = {k: _plain(getattr(r, k)) for k in _REFUND_FIELDS}
         values["updated_at"] = now
         stmt = pg_insert(RefundRow).values(created_at=now, **values)
-        self._s.execute(stmt.on_conflict_do_update(index_elements=["refund_id"],
-                                                   set_={k: stmt.excluded[k] for k in values if k != "refund_id"}))
+        self._s.execute(
+            stmt.on_conflict_do_update(
+                index_elements=["refund_id"], set_={k: stmt.excluded[k] for k in values if k != "refund_id"}
+            )
+        )
 
 
 class WebhookStore:
@@ -96,14 +110,28 @@ class WebhookStore:
         self._s = session
 
     def store(self, payload: dict[str, Any]) -> None:
-        self._s.add(PspWebhookRow(psp_event_id=payload["pspEventId"], event_type=payload["eventType"],
-                                  merchant_reference=payload["merchantReference"], payload=payload))
+        self._s.add(
+            PspWebhookRow(
+                psp_event_id=payload["pspEventId"],
+                event_type=payload["eventType"],
+                merchant_reference=payload["merchantReference"],
+                payload=payload,
+            )
+        )
         self._s.flush()
 
     def claim(self, limit: int) -> list[PspWebhookRow]:
-        return list(self._s.execute(
-            select(PspWebhookRow).where(PspWebhookRow.processed_at.is_(None)).order_by(PspWebhookRow.received_at)
-            .limit(limit).with_for_update(skip_locked=True)).scalars().all())
+        return list(
+            self._s.execute(
+                select(PspWebhookRow)
+                .where(PspWebhookRow.processed_at.is_(None))
+                .order_by(PspWebhookRow.received_at)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+            .scalars()
+            .all()
+        )
 
     def mark_processed(self, psp_event_id: str, now: datetime) -> None:
         self._s.execute(update(PspWebhookRow).where(PspWebhookRow.psp_event_id == psp_event_id).values(processed_at=now))

@@ -32,7 +32,8 @@ from edacommon.config import ServiceSettings
 shared_metadata = MetaData()
 
 outbox_table = Table(
-    "outbox", shared_metadata,
+    "outbox",
+    shared_metadata,
     Column("id", UUID(as_uuid=False), primary_key=True),
     Column("aggregate_type", Text, nullable=False),
     Column("aggregate_id", Text, nullable=False),
@@ -50,7 +51,8 @@ outbox_table = Table(
 )
 
 inbox_table = Table(
-    "inbox", shared_metadata,
+    "inbox",
+    shared_metadata,
     Column("message_id", Text, primary_key=True),
     Column("consumer", Text, primary_key=True),
     Column("message_type", Text, nullable=False),
@@ -61,7 +63,8 @@ inbox_table = Table(
 )
 
 idempotency_table = Table(
-    "idempotency_key", shared_metadata,
+    "idempotency_key",
+    shared_metadata,
     Column("caller", Text, primary_key=True),
     Column("key", Text, primary_key=True),
     Column("request_hash", Text, nullable=False),
@@ -74,7 +77,8 @@ idempotency_table = Table(
 )
 
 saga_instance_table = Table(
-    "saga_instance", shared_metadata,
+    "saga_instance",
+    shared_metadata,
     Column("saga_id", Text, primary_key=True),
     Column("saga_type", Text, nullable=False),
     Column("state", Text, nullable=False),
@@ -89,7 +93,8 @@ saga_instance_table = Table(
 )
 
 saga_transition_table = Table(
-    "saga_transition", shared_metadata,
+    "saga_transition",
+    shared_metadata,
     Column("saga_id", Text, primary_key=True),
     Column("seq", BigInteger, primary_key=True),
     Column("from_state", Text, nullable=False),
@@ -105,7 +110,7 @@ def make_engine(settings: ServiceSettings, *, url: str | None = None, **kw: Any)
         url or settings.db_url,
         pool_size=settings.db_pool_size,
         max_overflow=0,
-        pool_timeout=2,            # guide §6.5: 2 s pool acquisition -> fast 503 when Postgres stalls
+        pool_timeout=2,  # guide §6.5: 2 s pool acquisition -> fast 503 when Postgres stalls
         pool_pre_ping=True,
         connect_args={"connect_timeout": 5, "application_name": settings.service_name},
         **kw,

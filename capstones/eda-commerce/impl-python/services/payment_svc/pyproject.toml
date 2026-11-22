@@ -21,3 +21,7 @@ packages = ["src/payment_svc"]
 [tool.uv.sources]
 edacommon = { workspace = true }
 contracts-py = { workspace = true }
+
+[tool.hatch.build.targets.wheel.force-include]
+# Ship the Alembic scripts inside the wheel so a non-editable install (container) can migrate.
+"migrations" = "payment_svc/_migrations"
