@@ -91,10 +91,21 @@ public class MessageDriver {
   public Delivery deliver(
       String topic, String key, SpecificRecord record, String correlationId, @Nullable String causationId) {
     String eventId = Ids.newId();
+    // Keep the aggregate fields of a record that already carries a real envelope (e.g. one taken from
+    // the outbox), so version guards downstream see the producer's aggregateVersion.
+    Envelope existing = null;
+    try {
+      existing = Envelopes.of(record);
+    } catch (RuntimeException e) {
+      existing = null;
+    }
+    boolean real = existing != null && existing.getAggregateType() != null && !existing.getAggregateType().isEmpty();
     Envelope env =
         Envelopes.build(
             eventId,
-            OutgoingMessage.of(topic, key, record, "Test", key, 1),
+            real
+                ? OutgoingMessage.of(topic, key, record, existing.getAggregateType(), existing.getAggregateId(), existing.getAggregateVersion())
+                : OutgoingMessage.of(topic, key, record, "Test", key, 1),
             new Causation(correlationId, causationId),
             "test-producer",
             clock.instant(),

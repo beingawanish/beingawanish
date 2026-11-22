@@ -23,6 +23,9 @@ public final class OpenApiContract {
                     .withLevel("validation.request", ValidationReport.Level.IGNORE)
                     .withLevel("validation.response.security", ValidationReport.Level.IGNORE)
                     .withLevel("validation.request.security", ValidationReport.Level.IGNORE)
+                    // The contracts do not forbid extra properties; do not inject additionalProperties=false.
+                    .withLevel("validation.schema.additionalProperties", ValidationReport.Level.IGNORE)
+                    .withLevel("validation.response.body.schema.additionalProperties", ValidationReport.Level.IGNORE)
                     .build())
             .build();
     return OpenApiValidationMatchers.openApi().isValid(validator);
