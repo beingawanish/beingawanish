@@ -1,0 +1,52 @@
+# Example overlay: payment-svc, Java build, with the KEDA lag scaler.
+# Copy this directory per service and environment. Render with: make k8s-render
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: eda-commerce
+namePrefix: payment-
+resources:
+  - ../../base
+components:
+  - ../../components/keda-lag-scaler
+labels:
+  # The base selects on app.kubernetes.io/name=svc for every service. This instance label goes into
+  # every selector, so two services in one namespace never select each other's pods.
+  - pairs:
+      app.kubernetes.io/instance: payment-svc
+    includeSelectors: true
+  - pairs:
+      app.kubernetes.io/component: payment
+      eda.impl: java
+    includeSelectors: false
+images:
+  - name: registry.example.com/eda-commerce/svc
+    newName: registry.example.com/eda-commerce/payment-svc-java
+    newTag: 0.1.0
+configMapGenerator:
+  - name: svc-config
+    behavior: merge
+    literals:
+      - SERVICE_NAME=payment-svc
+      - OTEL_SERVICE_NAME=payment-svc
+      - DB_HOST=payment-db.databases.svc
+      - DB_NAME=payment_db
+      - DB_USER=payment_svc
+      - CONSUMER_GROUP=payment-svc
+patches:
+  - target:
+      kind: ScaledObject
+      name: svc
+    patch: |-
+      - op: replace
+        path: /spec/triggers/0/metadata/consumerGroup
+        value: payment-svc
+  - target:
+      kind: Deployment
+      name: svc
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom/1/secretRef/name
+        value: payment-svc-secrets
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints/0/labelSelector/matchLabels/app.kubernetes.io~1instance
+        value: payment-svc

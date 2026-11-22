@@ -200,7 +200,8 @@ components:
           type: string
           description: |
             Token from the PSP's client-side tokenisation. The fake PSP understands magic tokens:
-            tok_visa_ok, tok_decline, tok_insufficient_funds, tok_timeout, tok_slow, tok_dup_webhook.
+            tok_visa_ok, tok_decline, tok_insufficient_funds, tok_fraud, tok_timeout, tok_slow,
+            tok_dup_webhook, tok_capture_fails. See contracts/openapi/admin.yaml FakePspConfig.
         expectedTotal:
           $ref: './common.yaml#/components/schemas/Money'
           description: The total the customer saw. A mismatch returns 422 instead of charging a surprise amount.

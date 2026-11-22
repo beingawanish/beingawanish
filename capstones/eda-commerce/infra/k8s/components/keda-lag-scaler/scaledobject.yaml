@@ -1,0 +1,28 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: svc
+spec:
+  scaleTargetRef:
+    name: svc
+  minReplicaCount: 2
+  maxReplicaCount: 12          # = partitions of the busiest subscribed topic
+  pollingInterval: 15
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka-bootstrap.kafka.svc:9093
+        consumerGroup: REPLACE_WITH_GROUP     # overlay patches this, e.g. payment-svc
+        lagThreshold: "200"                   # target lag per replica
+        activationLagThreshold: "10"
+        offsetResetPolicy: earliest
+        allowIdleConsumers: "false"
+        excludePersistentLag: "true"          # a poison message stuck in place must not scale the group to max
+      authenticationRef:
+        name: kafka-mtls                      # TriggerAuthentication with the client cert; not included

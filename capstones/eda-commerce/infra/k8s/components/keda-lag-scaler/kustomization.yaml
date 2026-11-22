@@ -1,0 +1,17 @@
+# OPTIONAL. Scale on Kafka consumer lag with KEDA instead of CPU. Requires KEDA 2.x in the cluster.
+# Use it for services whose work is mostly consuming (payment-svc, fulfilment-svc, notification-svc,
+# order-history-projector). Removes the base HPA, because KEDA creates and owns its own.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - scaledobject.yaml
+patches:
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: svc
+    patch: |-
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: svc

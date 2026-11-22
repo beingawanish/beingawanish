@@ -1,0 +1,11 @@
+# At most one pod down for voluntary disruptions (node drains), so a drain causes one rebalance
+# at a time instead of all consumers leaving the group together.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: svc
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: svc

@@ -1,0 +1,19 @@
+# STARTING POINT, NOT A PRODUCTION DEPLOYMENT.
+# A generic Kustomize base for any eda-commerce service (Python or Java build). An overlay sets the
+# name (namePrefix), the image, the env ConfigMap and the resource sizes. What is deliberately missing:
+# Ingress/Gateway, mesh mTLS policy, secrets management (External Secrets / Vault), Kafka ACL and
+# topic CRDs (e.g. Strimzi KafkaUser/KafkaTopic), and per-environment tuning. See README "Kubernetes".
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: eda-commerce
+    includeSelectors: false
+resources:
+  - serviceaccount.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
