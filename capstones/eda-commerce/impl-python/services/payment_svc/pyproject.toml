@@ -1,0 +1,23 @@
+[project]
+name = "payment-svc"
+version = "0.1.0"
+description = "eda-commerce payment-svc (Python build)"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "edacommon",
+    "contracts-py",
+]
+
+[project.scripts]
+payment-svc = "payment_svc.main:main"
+
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/payment_svc"]
+
+[tool.uv.sources]
+edacommon = { workspace = true }
+contracts-py = { workspace = true }
