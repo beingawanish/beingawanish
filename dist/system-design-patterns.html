@@ -3947,6 +3947,7 @@ components:
 
 <h2 id=dd-eventdriven-architecture-adv-capstone level=2>Deep Dive: The Hands-On Capstone</h2>
 <p>Reading about sagas and outboxes only goes so far. The repository includes a hands-on capstone template under <code>capstones/eda-commerce/</code>. It builds a small version of the order workflow from this deep dive, with implementations in Python and Java and a set of architecture decision records (ADRs) that write down the trade-offs.</p>
+<p>It contains nine services (catalog, checkout, order, payment, inventory, fulfilment, shipping, notification, returns) and two sagas: the order saga (authorize at checkout, capture at dispatch) and a returns-and-refunds saga. The contracts are shared by both languages: Avro schemas, AsyncAPI 3.0, OpenAPI 3.1 and the outbox, inbox and saga tables. Sixteen ADRs cover orchestration versus choreography, the Debezium outbox, partition keys, inbox idempotency, retry topics and the DLQ, claim checks and observability. One Docker Compose file runs Kafka (KRaft), Schema Registry, Debezium, Postgres, MinIO, the OpenTelemetry Collector, Jaeger, Prometheus and Grafana, and twelve chaos drills come as <code>make</code> targets. The README lays the build out as a ten-day plan with acceptance criteria for each day.</p>
 <p>The capstone is meant to be worked through alongside the lesson, not instead of it. A reasonable way to use it:</p>
 <ol>
 <li><strong>Read the lesson and both deep dives first.</strong> The capstone assumes the vocabulary: commands and events, outbox and inbox, saga state, retry tiers.</li>
