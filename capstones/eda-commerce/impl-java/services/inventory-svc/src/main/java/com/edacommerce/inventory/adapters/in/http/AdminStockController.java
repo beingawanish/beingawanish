@@ -26,12 +26,15 @@ public class AdminStockController {
   }
 
   @PutMapping("/admin/stock/{sku}")
-  public ResponseEntity<Void> setStock(@PathVariable("sku") String sku, @Valid @RequestBody SetStock body) {
+  public ResponseEntity<Void> setStock(
+      @PathVariable("sku") String sku, @Valid @RequestBody SetStock body) {
     try {
       useCases.setStock(sku, body.onHand());
     } catch (DataIntegrityViolationException e) {
       throw ApiProblem.unprocessable(
-          "stock-below-reserved", "On-hand below reserved", "on-hand stock cannot be set below the reserved quantity");
+          "stock-below-reserved",
+          "On-hand below reserved",
+          "on-hand stock cannot be set below the reserved quantity");
     }
     return ResponseEntity.ok().build();
   }

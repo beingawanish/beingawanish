@@ -14,8 +14,8 @@ import javax.crypto.spec.SecretKeySpec;
 import org.springframework.lang.Nullable;
 
 /**
- * Webhook authentication (webhooks.yaml, ADR-0013): {@code hex(HMAC-SHA256(secret, "<timestamp>.<raw
- * body>"))}, 300 s timestamp tolerance, constant-time comparison.
+ * Webhook authentication (webhooks.yaml, ADR-0013): {@code hex(HMAC-SHA256(secret,
+ * "<timestamp>.<raw body>"))}, 300 s timestamp tolerance, constant-time comparison.
  */
 public class WebhookVerifier {
   public static final Duration TOLERANCE = Duration.ofMinutes(5); // 300 s
@@ -30,7 +30,8 @@ public class WebhookVerifier {
 
   /** Why a webhook was rejected; null when it is authentic. */
   @Nullable
-  public String rejectionReason(@Nullable String timestampHeader, @Nullable String signature, byte[] body) {
+  public String rejectionReason(
+      @Nullable String timestampHeader, @Nullable String signature, byte[] body) {
     if (timestampHeader == null || signature == null) {
       return "missing signature or timestamp";
     }

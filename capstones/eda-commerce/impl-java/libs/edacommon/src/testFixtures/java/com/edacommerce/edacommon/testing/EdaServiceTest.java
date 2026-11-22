@@ -11,9 +11,9 @@ import org.springframework.test.context.ContextConfiguration;
 
 /**
  * A service integration test: the real Spring context and Flyway migrations on a fresh PostgreSQL,
- * with the Kafka listener containers and background jobs off (tests drive handlers through
- * {@link MessageDriver} and call jobs directly), an in-memory registry and claim-check store, and a
- * {@link MutableClock}. Skipped when no PostgreSQL is available.
+ * with the Kafka listener containers and background jobs off (tests drive handlers through {@link
+ * MessageDriver} and call jobs directly), an in-memory registry and claim-check store, and a {@link
+ * MutableClock}. Skipped when no PostgreSQL is available.
  */
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)

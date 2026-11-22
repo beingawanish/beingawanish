@@ -5,8 +5,8 @@ import org.springframework.util.backoff.BackOff;
 import org.springframework.util.backoff.BackOffExecution;
 
 /**
- * In-place retry schedule of ADR-0007: exponential from 200 ms, capped at 3.2 s, with +/-20 % jitter,
- * {@code maxRetries} retries after the first attempt (default 4, i.e. 5 attempts).
+ * In-place retry schedule of ADR-0007: exponential from 200 ms, capped at 3.2 s, with +/-20 %
+ * jitter, {@code maxRetries} retries after the first attempt (default 4, i.e. 5 attempts).
  */
 public class JitteredExponentialBackOff implements BackOff {
   private final long initialMs;

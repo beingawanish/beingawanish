@@ -9,7 +9,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 /**
  * The store-then-ack part of every webhook endpoint (webhooks.yaml rules 1-3): verify, inbox-dedupe
  * on the provider event id, store the raw payload in the same transaction, answer quickly. Domain
- * processing happens afterwards from the stored row, so a slow database never causes provider retries.
+ * processing happens afterwards from the stored row, so a slow database never causes provider
+ * retries.
  */
 public class WebhookReceiver {
 
@@ -46,7 +47,11 @@ public class WebhookReceiver {
    * @param source {@code psp} or {@code carrier}; the inbox consumer is {@code <source>-webhook}
    */
   public WebhookReceiver(
-      String source, WebhookVerifier verifier, Inbox inbox, TransactionTemplate tx, EdaMetrics metrics) {
+      String source,
+      WebhookVerifier verifier,
+      Inbox inbox,
+      TransactionTemplate tx,
+      EdaMetrics metrics) {
     this.source = source;
     this.verifier = verifier;
     this.inbox = inbox;
@@ -67,7 +72,8 @@ public class WebhookReceiver {
     Boolean fresh =
         tx.execute(
             status -> {
-              if (!inbox.tryInsert(providerEventId, source + "-webhook", messageType, null, null, null)) {
+              if (!inbox.tryInsert(
+                  providerEventId, source + "-webhook", messageType, null, null, null)) {
                 return Boolean.FALSE;
               }
               store.store(providerEventId, body);

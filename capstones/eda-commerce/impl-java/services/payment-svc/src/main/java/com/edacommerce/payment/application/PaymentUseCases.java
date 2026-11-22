@@ -17,8 +17,8 @@ import org.springframework.transaction.annotation.Transactional;
 
 /**
  * payment-svc use cases. Each command runs in the consumer's transaction. PSP calls are made inside
- * it: they are idempotent on paymentId/refundId, so a rollback followed by redelivery repeats the call
- * safely, and the transaction holds at most the 5 s PSP timeout (guide §6.5).
+ * it: they are idempotent on paymentId/refundId, so a rollback followed by redelivery repeats the
+ * call safely, and the transaction holds at most the 5 s PSP timeout (guide §6.5).
  */
 public class PaymentUseCases {
   private final PaymentRepository payments;
@@ -47,7 +47,13 @@ public class PaymentUseCases {
   }
 
   @Transactional
-  public Payment authorize(String orderId, String paymentId, String customerId, Money amount, String token, Causation causation) {
+  public Payment authorize(
+      String orderId,
+      String paymentId,
+      String customerId,
+      Money amount,
+      String token,
+      Causation causation) {
     Optional<Payment> existing = payments.findForUpdate(paymentId);
     if (existing.isPresent()) {
       return apply(existing.get().resendAuthorize(), causation);
@@ -62,7 +68,10 @@ public class PaymentUseCases {
 
   @Transactional
   public Payment capture(String paymentId, Causation causation) {
-    Payment p = payments.findForUpdate(paymentId).orElseThrow(() -> new RetryLaterException("unknown payment " + paymentId));
+    Payment p =
+        payments
+            .findForUpdate(paymentId)
+            .orElseThrow(() -> new RetryLaterException("unknown payment " + paymentId));
     Payment.Decision d = p.capture(clock.instant());
     if (d.notYet()) {
       throw new RetryLaterException("payment " + paymentId + " not yet authorised");
@@ -71,11 +80,15 @@ public class PaymentUseCases {
   }
 
   @Transactional
-  public Payment voidPayment(String orderId, String paymentId, Money amountIfUnknown, Causation causation) {
+  public Payment voidPayment(
+      String orderId, String paymentId, Money amountIfUnknown, Causation causation) {
     Instant now = clock.instant();
     try {
       Payment.Decision d =
-          payments.findForUpdate(paymentId).map(p -> p.voidPayment(now)).orElseGet(() -> Payment.voidUnknown(paymentId, orderId, amountIfUnknown, now));
+          payments
+              .findForUpdate(paymentId)
+              .map(p -> p.voidPayment(now))
+              .orElseGet(() -> Payment.voidUnknown(paymentId, orderId, amountIfUnknown, now));
       return apply(d, causation);
     } catch (PaymentException e) {
       throw new NonRetryableException(e.getMessage(), e);
@@ -83,9 +96,26 @@ public class PaymentUseCases {
   }
 
   @Transactional
-  public Refund refund(String paymentId, String refundId, String returnId, Money amount, String reason, Causation causation) {
-    Payment p = payments.findForUpdate(paymentId).orElseThrow(() -> new RetryLaterException("unknown payment " + paymentId));
-    Refund.Decision d = Refund.request(refunds.findForUpdate(refundId), p, refundId, returnId, amount, reason, clock.instant());
+  public Refund refund(
+      String paymentId,
+      String refundId,
+      String returnId,
+      Money amount,
+      String reason,
+      Causation causation) {
+    Payment p =
+        payments
+            .findForUpdate(paymentId)
+            .orElseThrow(() -> new RetryLaterException("unknown payment " + paymentId));
+    Refund.Decision d =
+        Refund.request(
+            refunds.findForUpdate(refundId),
+            p,
+            refundId,
+            returnId,
+            amount,
+            reason,
+            clock.instant());
     if (d.changed()) {
       refunds.save(d.refund());
     }
@@ -99,25 +129,43 @@ public class PaymentUseCases {
     return d.refund();
   }
 
-  /** Applies stored webhooks (after the endpoint acknowledged them). Returns how many were applied. */
+  /**
+   * Applies stored webhooks (after the endpoint acknowledged them). Returns how many were applied.
+   */
   @Transactional
   public int processNotifications(int limit) {
     List<PspNotifications.Stored> batch = notifications.lockUnprocessed(limit);
     for (PspNotifications.Stored n : batch) {
       switch (n) {
         case PspNotifications.Stored.ForPayment fp ->
-            payments.findForUpdate(fp.paymentId()).ifPresent(p -> apply(p.onNotification(fp.notification(), clock.instant()), Causation.root(p.orderId())));
+            payments
+                .findForUpdate(fp.paymentId())
+                .ifPresent(
+                    p ->
+                        apply(
+                            p.onNotification(fp.notification(), clock.instant()),
+                            Causation.root(p.orderId())));
         case PspNotifications.Stored.ForRefund fr ->
-            refunds.findForUpdate(fr.refundId()).ifPresent(r -> {
-              Refund.Decision d = r.onResult(fr.succeeded(), fr.pspReference(), fr.failure(), fr.retryable(), clock.instant());
-              if (d.changed()) {
-                refunds.save(d.refund());
-              }
-              if (d.reply()) {
-                outbox.append(PaymentMessages.refund(d.refund()), Causation.root(r.orderId()));
-              }
-            });
-        case PspNotifications.Stored.Ignored ignored -> { }
+            refunds
+                .findForUpdate(fr.refundId())
+                .ifPresent(
+                    r -> {
+                      Refund.Decision d =
+                          r.onResult(
+                              fr.succeeded(),
+                              fr.pspReference(),
+                              fr.failure(),
+                              fr.retryable(),
+                              clock.instant());
+                      if (d.changed()) {
+                        refunds.save(d.refund());
+                      }
+                      if (d.reply()) {
+                        outbox.append(
+                            PaymentMessages.refund(d.refund()), Causation.root(r.orderId()));
+                      }
+                    });
+        case PspNotifications.Stored.Ignored ignored -> {}
       }
       notifications.markProcessed(n.pspEventId());
     }
@@ -129,11 +177,15 @@ public class PaymentUseCases {
   public int reconcileDue(int limit) {
     List<String> due = payments.lockDueForReconciliation(clock.instant(), limit);
     for (String id : due) {
-      payments.findForUpdate(id).ifPresent(p -> {
-        Payment.PspStatus status = psp.status(id);
-        payments.recordAttempt(id, "status", status.getClass().getSimpleName(), clock.instant());
-        apply(p.onReconcile(status, policy, clock.instant()), Causation.root(p.orderId()));
-      });
+      payments
+          .findForUpdate(id)
+          .ifPresent(
+              p -> {
+                Payment.PspStatus status = psp.status(id);
+                payments.recordAttempt(
+                    id, "status", status.getClass().getSimpleName(), clock.instant());
+                apply(p.onReconcile(status, policy, clock.instant()), Causation.root(p.orderId()));
+              });
     }
     return due.size();
   }
@@ -148,7 +200,8 @@ public class PaymentUseCases {
         case CAPTURE -> psp.capture(p.paymentId(), p.pspReference(), p.amount());
         case VOID -> psp.voidAuthorization(p.paymentId());
       }
-      payments.recordAttempt(p.paymentId(), action.name().toLowerCase(java.util.Locale.ROOT), "sent", clock.instant());
+      payments.recordAttempt(
+          p.paymentId(), action.name().toLowerCase(java.util.Locale.ROOT), "sent", clock.instant());
     }
     d.events().forEach(e -> outbox.append(PaymentMessages.event(p, e), causation));
     return p;

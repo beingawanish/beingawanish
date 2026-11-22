@@ -19,7 +19,8 @@ public sealed interface OrderSagaTrigger {
 
   record ReservationExpired(String reservationId) implements OrderSagaTrigger {}
 
-  record PaymentAuthorized(String paymentId, Instant authorizationExpiresAt) implements OrderSagaTrigger {}
+  record PaymentAuthorized(String paymentId, Instant authorizationExpiresAt)
+      implements OrderSagaTrigger {}
 
   record PaymentDeclined(String paymentId, String reason) implements OrderSagaTrigger {}
 
@@ -27,7 +28,8 @@ public sealed interface OrderSagaTrigger {
 
   record PaymentCaptured(String paymentId, Money amount) implements OrderSagaTrigger {}
 
-  record PaymentCaptureFailed(String paymentId, String reason, boolean retryable) implements OrderSagaTrigger {}
+  record PaymentCaptureFailed(String paymentId, String reason, boolean retryable)
+      implements OrderSagaTrigger {}
 
   record FulfilmentAccepted(String fulfilmentId) implements OrderSagaTrigger {}
 
@@ -39,11 +41,14 @@ public sealed interface OrderSagaTrigger {
 
   record FulfilmentCancelled(String fulfilmentId) implements OrderSagaTrigger {}
 
-  record ShipmentCreated(String shipmentId, boolean outbound, String carrier, String trackingNumber) implements OrderSagaTrigger {}
+  record ShipmentCreated(String shipmentId, boolean outbound, String carrier, String trackingNumber)
+      implements OrderSagaTrigger {}
 
-  record ShipmentDelivered(String shipmentId, boolean outbound, Instant deliveredAt) implements OrderSagaTrigger {}
+  record ShipmentDelivered(String shipmentId, boolean outbound, Instant deliveredAt)
+      implements OrderSagaTrigger {}
 
-  record ShipmentException(String shipmentId, boolean outbound, boolean lost, String code) implements OrderSagaTrigger {}
+  record ShipmentException(String shipmentId, boolean outbound, boolean lost, String code)
+      implements OrderSagaTrigger {}
 
   record Deadline() implements OrderSagaTrigger {}
 

@@ -25,9 +25,12 @@ public final class Contracts {
   /** The bundled schema text exactly as registered by {@code make schemas}. */
   public static Schema bundledSchema(String fullName) {
     try (InputStream in =
-        Contracts.class.getClassLoader().getResourceAsStream("avro-bundled/" + fullName + ".avsc")) {
+        Contracts.class
+            .getClassLoader()
+            .getResourceAsStream("avro-bundled/" + fullName + ".avsc")) {
       if (in == null) {
-        return new Schema.Parser().parse(dir().resolve("avro-bundled/" + fullName + ".avsc").toFile());
+        return new Schema.Parser()
+            .parse(dir().resolve("avro-bundled/" + fullName + ".avsc").toFile());
       }
       return new Schema.Parser().parse(in);
     } catch (IOException e) {
@@ -40,7 +43,9 @@ public final class Contracts {
   }
 
   public static String exampleJson(String fullName) {
-    return new String(read(dir().resolve("examples/" + fullName + ".json")), java.nio.charset.StandardCharsets.UTF_8);
+    return new String(
+        read(dir().resolve("examples/" + fullName + ".json")),
+        java.nio.charset.StandardCharsets.UTF_8);
   }
 
   /** Full names of every golden example. */
@@ -58,7 +63,8 @@ public final class Contracts {
   }
 
   public static String commonTablesSql() {
-    return new String(read(dir().resolve("sql/common-tables.sql")), java.nio.charset.StandardCharsets.UTF_8);
+    return new String(
+        read(dir().resolve("sql/common-tables.sql")), java.nio.charset.StandardCharsets.UTF_8);
   }
 
   public static Path openApi(String file) {

@@ -12,8 +12,9 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * {@code POST /webhooks/psp} (webhooks.yaml): verify HMAC over the raw body, dedupe on pspEventId in the
- * inbox, store, answer 200. The payment is updated afterwards by the notification processor job.
+ * {@code POST /webhooks/psp} (webhooks.yaml): verify HMAC over the raw body, dedupe on pspEventId
+ * in the inbox, store, answer 200. The payment is updated afterwards by the notification processor
+ * job.
  */
 @RestController
 public class PspWebhookController {
@@ -22,7 +23,11 @@ public class PspWebhookController {
   private final ObjectMapper json;
   private final Runnable kick;
 
-  public PspWebhookController(WebhookReceiver receiver, JdbcPspNotifications store, ObjectMapper json, Runnable pspNotificationKick) {
+  public PspWebhookController(
+      WebhookReceiver receiver,
+      JdbcPspNotifications store,
+      ObjectMapper json,
+      Runnable pspNotificationKick) {
     this.receiver = receiver;
     this.store = store;
     this.json = json;
@@ -44,12 +49,24 @@ public class PspWebhookController {
     } catch (IOException e) {
       return ResponseEntity.badRequest().build();
     }
-    if (payload.pspEventId() == null || payload.eventType() == null || payload.merchantReference() == null) {
+    if (payload.pspEventId() == null
+        || payload.eventType() == null
+        || payload.merchantReference() == null) {
       return ResponseEntity.badRequest().build();
     }
     WebhookReceiver.Result result =
-        receiver.receive(payload.pspEventId(), payload.eventType(), raw, (id, bytes) ->
-            store.store(id, payload.eventType(), payload.merchantReference(), payload.pspPaymentId(), payload.failureCode(), bytes));
+        receiver.receive(
+            payload.pspEventId(),
+            payload.eventType(),
+            raw,
+            (id, bytes) ->
+                store.store(
+                    id,
+                    payload.eventType(),
+                    payload.merchantReference(),
+                    payload.pspPaymentId(),
+                    payload.failureCode(),
+                    bytes));
     if (result == WebhookReceiver.Result.ACCEPTED) {
       kick.run();
     }

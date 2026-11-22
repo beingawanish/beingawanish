@@ -6,8 +6,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
 
 /**
- * A known HTTP failure, rendered as RFC 9457 problem details by {@link ProblemHandler}. The type URI
- * is {@code https://errors.edacommerce.example/<slug>} (guide §4 "http").
+ * A known HTTP failure, rendered as RFC 9457 problem details by {@link ProblemHandler}. The type
+ * URI is {@code https://errors.edacommerce.example/<slug>} (guide §4 "http").
  */
 public class ApiProblem extends RuntimeException {
   private static final long serialVersionUID = 1L;

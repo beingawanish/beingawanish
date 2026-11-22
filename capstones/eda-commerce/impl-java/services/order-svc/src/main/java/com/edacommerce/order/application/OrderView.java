@@ -5,7 +5,9 @@ import com.edacommerce.order.domain.OrderStatus;
 import java.time.Instant;
 import java.util.List;
 
-/** What the Orders API shows (orders.yaml Order), from the read model or the write-model fallback. */
+/**
+ * What the Orders API shows (orders.yaml Order), from the read model or the write-model fallback.
+ */
 public record OrderView(
     String orderId,
     String customerId,
@@ -29,7 +31,14 @@ public record OrderView(
   }
 
   /** One order line. */
-  public record Line(String lineId, String sku, String productName, int quantity, Money unitPrice, Money lineTotal, int returnedQuantity) {}
+  public record Line(
+      String lineId,
+      String sku,
+      String productName,
+      int quantity,
+      Money unitPrice,
+      Money lineTotal,
+      int returnedQuantity) {}
 
   /** Carrier and tracking. */
   public record Shipment(String carrier, String trackingNumber, String status) {}
@@ -38,7 +47,9 @@ public record OrderView(
   public record TimelineEntry(Instant at, String kind, String description, String eventId) {}
 
   public boolean terminal() {
-    return status == OrderStatus.DELIVERED || status == OrderStatus.CANCELLED || status == OrderStatus.RETURNED
+    return status == OrderStatus.DELIVERED
+        || status == OrderStatus.CANCELLED
+        || status == OrderStatus.RETURNED
         || status == OrderStatus.PARTIALLY_RETURNED;
   }
 }

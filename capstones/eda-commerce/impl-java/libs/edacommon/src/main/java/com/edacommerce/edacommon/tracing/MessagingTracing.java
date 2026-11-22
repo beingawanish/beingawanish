@@ -19,8 +19,8 @@ import org.apache.kafka.common.header.Headers;
 import org.springframework.lang.Nullable;
 
 /**
- * W3C trace context through the outbox and Kafka headers (ADR-0011). Only the W3C propagator is used,
- * never B3 or Jaeger (guide §5 rule 12), regardless of what the SDK's global propagators are.
+ * W3C trace context through the outbox and Kafka headers (ADR-0011). Only the W3C propagator is
+ * used, never B3 or Jaeger (guide §5 rule 12), regardless of what the SDK's global propagators are.
  */
 public class MessagingTracing {
 
@@ -45,7 +45,9 @@ public class MessagingTracing {
             return null;
           }
           Header h = carrier.lastHeader(key);
-          return h == null || h.value() == null ? null : new String(h.value(), StandardCharsets.UTF_8);
+          return h == null || h.value() == null
+              ? null
+              : new String(h.value(), StandardCharsets.UTF_8);
         }
       };
 

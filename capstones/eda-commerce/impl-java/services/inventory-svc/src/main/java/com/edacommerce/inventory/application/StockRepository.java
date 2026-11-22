@@ -8,12 +8,15 @@ import java.util.Optional;
 
 /** Port: stock rows. */
 public interface StockRepository {
-  /** Locks the rows of {@code skus} in SKU order (so two orders never deadlock); missing SKUs are absent. */
+  /**
+   * Locks the rows of {@code skus} in SKU order (so two orders never deadlock); missing SKUs are
+   * absent.
+   */
   Map<String, StockLevel> lockAll(Collection<String> skus);
 
   /**
-   * Applies one effect with a conditional update. Throws if the condition fails, which under the row
-   * locks above means a bug, never a race.
+   * Applies one effect with a conditional update. Throws if the condition fails, which under the
+   * row locks above means a bug, never a race.
    */
   void apply(StockEffect effect);
 

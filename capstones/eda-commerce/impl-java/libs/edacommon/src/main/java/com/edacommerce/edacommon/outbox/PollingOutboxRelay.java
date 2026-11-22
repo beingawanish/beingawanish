@@ -36,6 +36,7 @@ public class PollingOutboxRelay {
       "SELECT id, aggregate_id, event_type, topic, payload, occurred_at, producer, correlation_id,"
           + " causation_id, traceparent, tracestate FROM outbox WHERE published_at IS NULL"
           + " ORDER BY created_at, id LIMIT ? FOR UPDATE SKIP LOCKED";
+
   /** Debezium renders timestamptz columns as io.debezium.time.ZonedTimestamp (ISO-8601). */
   static final DateTimeFormatter CE_TIME = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
 

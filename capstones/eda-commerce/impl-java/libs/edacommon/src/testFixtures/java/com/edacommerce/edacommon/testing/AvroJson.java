@@ -53,7 +53,8 @@ public final class AvroJson {
       }
       case MAP -> {
         Map<String, Object> out = new LinkedHashMap<>();
-        for (Iterator<Map.Entry<String, JsonNode>> it = node.properties().iterator(); it.hasNext(); ) {
+        for (Iterator<Map.Entry<String, JsonNode>> it = node.properties().iterator();
+            it.hasNext(); ) {
           Map.Entry<String, JsonNode> e = it.next();
           out.put(e.getKey(), fromPlain(e.getValue(), schema.getValueType()));
         }
@@ -81,7 +82,8 @@ public final class AvroJson {
         return (float) node.asDouble();
       }
       case BYTES -> {
-        return ByteBuffer.wrap(node.asText().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+        return ByteBuffer.wrap(
+            node.asText().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
       }
       case NULL -> {
         return null;
@@ -116,7 +118,8 @@ public final class AvroJson {
       }
       case MAP -> {
         ObjectNode o = F.objectNode();
-        ((Map<?, ?>) datum).forEach((k, v) -> o.set(k.toString(), toPlain(v, schema.getValueType())));
+        ((Map<?, ?>) datum)
+            .forEach((k, v) -> o.set(k.toString(), toPlain(v, schema.getValueType())));
         return o;
       }
       case ENUM, STRING -> {

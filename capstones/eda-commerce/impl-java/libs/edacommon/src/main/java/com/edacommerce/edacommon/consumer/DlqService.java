@@ -30,9 +30,10 @@ import org.springframework.lang.Nullable;
 
 /**
  * DLQ peek and replay for one consumer group (admin.yaml /ops/dlq). Replay re-publishes into the
- * group's own first retry topic, never the original topic, so only this group sees the message again.
- * Replay commits its progress under group {@code G-dlq-replay}. A partition stops at the first record
- * that does not match the filter, so a filtered replay never skips (and so loses) other records.
+ * group's own first retry topic, never the original topic, so only this group sees the message
+ * again. Replay commits its progress under group {@code G-dlq-replay}. A partition stops at the
+ * first record that does not match the filter, so a filtered replay never skips (and so loses)
+ * other records.
  */
 public class DlqService {
   private static final Duration POLL = Duration.ofMillis(500);
@@ -75,7 +76,8 @@ public class DlqService {
   public List<DlqEntry> peek(int limit) {
     int max = Math.max(1, Math.min(limit, 500));
     List<DlqEntry> entries = new ArrayList<>();
-    try (Consumer<String, byte[]> consumer = consumerFactory.createConsumer(null, null, "-dlq-peek", noCommit())) {
+    try (Consumer<String, byte[]> consumer =
+        consumerFactory.createConsumer(null, null, "-dlq-peek", noCommit())) {
       List<TopicPartition> partitions = partitions(consumer);
       consumer.assign(partitions);
       consumer.seekToBeginning(partitions);
@@ -134,7 +136,8 @@ public class DlqService {
         if (!progress.isEmpty()) {
           consumer.commitSync(progress);
         }
-        // Re-seek partitions we stopped part-way, so a later replay starts at the first unreplayed record.
+        // Re-seek partitions we stopped part-way, so a later replay starts at the first unreplayed
+        // record.
         for (TopicPartition tp : batch.partitions()) {
           OffsetAndMetadata p = progress.get(tp);
           if (p != null && stopped.contains(tp)) {
@@ -154,10 +157,14 @@ public class DlqService {
       }
     }
     headers.add(EdaHeaders.X_RETRY_ATTEMPT, "1".getBytes(StandardCharsets.UTF_8));
-    headers.add(EdaHeaders.X_NOT_BEFORE, clock.instant().toString().getBytes(StandardCharsets.UTF_8));
+    headers.add(
+        EdaHeaders.X_NOT_BEFORE,
+        FailureHeaders.TIMESTAMP.format(clock.instant()).getBytes(StandardCharsets.UTF_8));
     try {
       kafka
-          .send(new ProducerRecord<>(RetryTopics.firstRetry(consumerGroup), null, r.key(), r.value(), headers))
+          .send(
+              new ProducerRecord<>(
+                  RetryTopics.firstRetry(consumerGroup), null, r.key(), r.value(), headers))
           .get(30, TimeUnit.SECONDS);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
@@ -175,7 +182,8 @@ public class DlqService {
     return infos.stream().map(p -> new TopicPartition(p.topic(), p.partition())).toList();
   }
 
-  private static boolean reachedEnd(Consumer<String, byte[]> consumer, Map<TopicPartition, Long> end) {
+  private static boolean reachedEnd(
+      Consumer<String, byte[]> consumer, Map<TopicPartition, Long> end) {
     for (Map.Entry<TopicPartition, Long> e : end.entrySet()) {
       if (!consumer.paused().contains(e.getKey()) && consumer.position(e.getKey()) < e.getValue()) {
         return false;

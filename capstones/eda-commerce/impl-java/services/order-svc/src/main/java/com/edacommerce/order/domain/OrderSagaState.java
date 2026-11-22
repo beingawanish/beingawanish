@@ -22,7 +22,13 @@ public enum OrderSagaState {
   /** Before the pivot (OrderDispatched) every step is compensatable (ADR-0015). */
   public boolean beforeDispatch() {
     return switch (this) {
-      case RESERVING_STOCK, AUTHORIZING_PAYMENT, COMMITTING_STOCK, AWAITING_FULFILMENT_ACK, FULFILLING, PACKED -> true;
+      case RESERVING_STOCK,
+          AUTHORIZING_PAYMENT,
+          COMMITTING_STOCK,
+          AWAITING_FULFILMENT_ACK,
+          FULFILLING,
+          PACKED ->
+          true;
       default -> false;
     };
   }

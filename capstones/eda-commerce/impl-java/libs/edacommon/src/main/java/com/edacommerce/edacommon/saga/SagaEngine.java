@@ -79,7 +79,8 @@ public class SagaEngine {
               String correlationId =
                   current
                       .map(SagaRow::correlationId)
-                      .orElseGet(() -> Objects.requireNonNull(correlationIdIfNew, "correlationIdIfNew"));
+                      .orElseGet(
+                          () -> Objects.requireNonNull(correlationIdIfNew, "correlationIdIfNew"));
               Causation cause = causation != null ? causation : Causation.root(correlationId);
               for (OutgoingMessage message : step.messages()) {
                 outbox.append(message, cause);
@@ -112,7 +113,8 @@ public class SagaEngine {
                   current.isPresent() && !from.equals(to)
                       ? repository.enteredStateAt(sagaId, from)
                       : Optional.empty();
-              afterCommit(() -> recordMetrics(sagaType, from, to, step, createdAt, enteredFrom, now));
+              afterCommit(
+                  () -> recordMetrics(sagaType, from, to, step, createdAt, enteredFrom, now));
               return Result.APPLIED;
             });
     return result == null ? Result.IGNORED : result;
@@ -126,7 +128,8 @@ public class SagaEngine {
       Instant createdAt,
       Optional<Instant> enteredFrom,
       Instant now) {
-    enteredFrom.ifPresent(at -> metrics.sagaStepDuration(sagaType, from, Duration.between(at, now)));
+    enteredFrom.ifPresent(
+        at -> metrics.sagaStepDuration(sagaType, from, Duration.between(at, now)));
     if (step.decisionReached()) {
       metrics.sagaStepDuration(sagaType, "DECISION", Duration.between(createdAt, now));
     }

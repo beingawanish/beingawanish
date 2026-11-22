@@ -3,9 +3,9 @@ package com.edacommerce.edacommon.serde;
 import org.apache.avro.Schema;
 
 /**
- * The two Schema Registry calls a service needs (ADR-0004). Services never register schemas
- * ({@code auto.register.schemas=false}); {@code make schemas} does. Implementations cache: a
- * registry outage then only hurts cold starts and new schemas ({@code chaos-registry} drill).
+ * The two Schema Registry calls a service needs (ADR-0004). Services never register schemas ({@code
+ * auto.register.schemas=false}); {@code make schemas} does. Implementations cache: a registry
+ * outage then only hurts cold starts and new schemas ({@code chaos-registry} drill).
  */
 public interface SchemaRegistryClient {
 
@@ -13,7 +13,8 @@ public interface SchemaRegistryClient {
    * The id of {@code schema} under {@code subject}, looked up with {@code normalize=true} so that a
    * schema differing only in whitespace or property order resolves to the same id.
    *
-   * @throws SchemaNotRegisteredException if the registry does not know this schema under the subject
+   * @throws SchemaNotRegisteredException if the registry does not know this schema under the
+   *     subject
    */
   int lookupId(String subject, Schema schema);
 

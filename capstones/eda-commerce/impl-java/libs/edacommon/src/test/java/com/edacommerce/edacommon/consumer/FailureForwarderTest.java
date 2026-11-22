@@ -7,6 +7,7 @@ import com.edacommerce.edacommon.errors.NonRetryableException;
 import com.edacommerce.edacommon.errors.RetryLaterException;
 import com.edacommerce.edacommon.errors.TransientException;
 import com.edacommerce.edacommon.metrics.EdaMetrics;
+import com.edacommerce.edacommon.testing.KeepOpenMockProducer;
 import com.edacommerce.edacommon.testing.TestTelemetry;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
@@ -22,7 +23,6 @@ import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.record.TimestampType;
 import org.junit.jupiter.api.Test;
 import org.springframework.kafka.core.KafkaTemplate;
-import com.edacommerce.edacommon.testing.KeepOpenMockProducer;
 import org.springframework.kafka.mock.MockProducerFactory;
 
 /** Checklist: RetryLater lands on G.retry.10s with all x-* headers and raw bytes unchanged. */
@@ -40,20 +40,35 @@ class FailureForwarderTest {
 
   ConsumerRecord<String, byte[]> record(String topic, RecordHeaders headers) {
     return new ConsumerRecord<>(
-        topic, 3, 1234L, 0L, TimestampType.CREATE_TIME, 0, 0, "order-1", value, headers, java.util.Optional.empty());
+        topic,
+        3,
+        1234L,
+        0L,
+        TimestampType.CREATE_TIME,
+        0,
+        0,
+        "order-1",
+        value,
+        headers,
+        java.util.Optional.empty());
   }
 
   RecordHeaders original() {
     RecordHeaders h = new RecordHeaders();
     h.add(EdaHeaders.CE_ID, "e1".getBytes(StandardCharsets.UTF_8));
-    h.add(EdaHeaders.CE_TYPE, "com.edacommerce.payment.AuthorizePayment".getBytes(StandardCharsets.UTF_8));
-    h.add(EdaHeaders.TRACEPARENT, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".getBytes(StandardCharsets.UTF_8));
+    h.add(
+        EdaHeaders.CE_TYPE,
+        "com.edacommerce.payment.AuthorizePayment".getBytes(StandardCharsets.UTF_8));
+    h.add(
+        EdaHeaders.TRACEPARENT,
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".getBytes(StandardCharsets.UTF_8));
     return h;
   }
 
   @Test
   void retryLaterGoesToTheFirstRetryTopicWithBytesAndHeaders() {
-    forwarder.accept(record("payment.commands.v1", original()), null, new RetryLaterException("psp degraded"));
+    forwarder.accept(
+        record("payment.commands.v1", original()), null, new RetryLaterException("psp degraded"));
 
     ProducerRecord<String, byte[]> sent = producer.history().get(0);
     assertThat(sent.topic()).isEqualTo("payment-svc.retry.10s");
@@ -61,9 +76,17 @@ class FailureForwarderTest {
     assertThat(sent.value()).isEqualTo(value);
     assertThat(names(sent))
         .containsExactly(
-            "ce_id", "ce_type", "traceparent",
-            "x-retry-attempt", "x-original-topic", "x-original-partition", "x-original-offset",
-            "x-not-before", "x-error-class", "x-error-message", "x-failed-consumer-group");
+            "ce_id",
+            "ce_type",
+            "traceparent",
+            "x-retry-attempt",
+            "x-original-topic",
+            "x-original-partition",
+            "x-original-offset",
+            "x-not-before",
+            "x-error-class",
+            "x-error-message",
+            "x-failed-consumer-group");
     assertThat(header(sent, "x-retry-attempt")).isEqualTo("1");
     assertThat(header(sent, "x-original-topic")).isEqualTo("payment.commands.v1");
     assertThat(header(sent, "x-original-partition")).isEqualTo("3");
@@ -80,7 +103,8 @@ class FailureForwarderTest {
     forwarder.accept(record("payment.commands.v1", original()), null, new RetryLaterException("a"));
     ProducerRecord<String, byte[]> first = producer.history().get(0);
     RecordHeaders hop = new RecordHeaders(first.headers().toArray());
-    forwarder.accept(record("payment-svc.retry.10s", hop), null, new TransientException("still down"));
+    forwarder.accept(
+        record("payment-svc.retry.10s", hop), null, new TransientException("still down"));
 
     ProducerRecord<String, byte[]> second = producer.history().get(1);
     assertThat(second.topic()).isEqualTo("payment-svc.retry.1m");
@@ -94,7 +118,8 @@ class FailureForwarderTest {
 
   @Test
   void nonRetryableAndExhaustedRetriesGoToTheDlq() {
-    forwarder.accept(record("payment.commands.v1", original()), null, new NonRetryableException("bad"));
+    forwarder.accept(
+        record("payment.commands.v1", original()), null, new NonRetryableException("bad"));
     assertThat(producer.history().get(0).topic()).isEqualTo("payment-svc.dlq");
 
     RecordHeaders third = original();

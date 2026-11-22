@@ -14,9 +14,9 @@ import org.testcontainers.DockerClientFactory;
 import org.testcontainers.containers.PostgreSQLContainer;
 
 /**
- * Fresh, empty PostgreSQL databases for integration tests. With Docker: one Testcontainers
- * {@code postgres:16-alpine} per JVM, a new database per call. Without Docker: the server named by
- * {@code EDA_TEST_JDBC_URL} (an admin connection URL, e.g. {@code
+ * Fresh, empty PostgreSQL databases for integration tests. With Docker: one Testcontainers {@code
+ * postgres:16-alpine} per JVM, a new database per call. Without Docker: the server named by {@code
+ * EDA_TEST_JDBC_URL} (an admin connection URL, e.g. {@code
  * jdbc:postgresql://127.0.0.1:5432/postgres}) with {@code EDA_TEST_JDBC_USER/PASSWORD}.
  */
 public final class TestDatabases {
@@ -60,7 +60,8 @@ public final class TestDatabases {
     if (admin == null) {
       if (container == null) {
         PostgreSQLContainer<?> c =
-            new PostgreSQLContainer<>("postgres:16-alpine").withCommand("postgres", "-c", "wal_level=logical");
+            new PostgreSQLContainer<>("postgres:16-alpine")
+                .withCommand("postgres", "-c", "wal_level=logical");
         c.start();
         container = c;
       }
@@ -71,7 +72,13 @@ public final class TestDatabases {
       user = env("EDA_TEST_JDBC_USER", "postgres");
       password = env("EDA_TEST_JDBC_PASSWORD", "postgres");
     }
-    String name = "t_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16).toLowerCase(Locale.ROOT);
+    String name =
+        "t_"
+            + UUID.randomUUID()
+                .toString()
+                .replace("-", "")
+                .substring(0, 16)
+                .toLowerCase(Locale.ROOT);
     try (Connection c = DriverManager.getConnection(admin, user, password);
         Statement s = c.createStatement()) {
       s.execute("CREATE DATABASE " + name);

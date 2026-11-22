@@ -4,8 +4,8 @@ import org.slf4j.MDC;
 import org.springframework.lang.Nullable;
 
 /**
- * MDC keys for the JSON log fields of guide §6.4. {@code trace_id} and {@code span_id} are filled by
- * the OpenTelemetry logback MDC instrumentation; the message fields are set here by the consumer
+ * MDC keys for the JSON log fields of guide §6.4. {@code trace_id} and {@code span_id} are filled
+ * by the OpenTelemetry logback MDC instrumentation; the message fields are set here by the consumer
  * runtime and cleared when the record is done.
  */
 public final class LogFields {

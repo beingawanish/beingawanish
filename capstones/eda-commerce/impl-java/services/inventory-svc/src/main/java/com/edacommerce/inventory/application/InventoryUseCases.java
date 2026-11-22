@@ -51,7 +51,12 @@ public class InventoryUseCases {
    */
   @Transactional
   public Reservation.Decision reserve(
-      String orderId, String reservationId, List<StockLine> lines, int ttlSeconds, boolean commandExpired, Causation causation) {
+      String orderId,
+      String reservationId,
+      List<StockLine> lines,
+      int ttlSeconds,
+      boolean commandExpired,
+      Causation causation) {
     Instant now = clock.instant();
     Optional<Reservation> existing = reservations.findForUpdate(reservationId);
     Map<String, Integer> available = new LinkedHashMap<>();
@@ -65,18 +70,22 @@ public class InventoryUseCases {
       ttl = maxTtl;
     }
     Reservation.Decision d =
-        Reservation.reserve(existing, reservationId, orderId, lines, ttl, available, commandExpired, now);
+        Reservation.reserve(
+            existing, reservationId, orderId, lines, ttl, available, commandExpired, now);
     return finish(d, causation, now);
   }
 
   @Transactional
   public Optional<Reservation.Decision> commit(String reservationId, Causation causation) {
     Instant now = clock.instant();
-    return reservations.findForUpdate(reservationId).map(r -> finish(lockAnd(r).commit(now), causation, now));
+    return reservations
+        .findForUpdate(reservationId)
+        .map(r -> finish(lockAnd(r).commit(now), causation, now));
   }
 
   @Transactional
-  public Reservation.Decision release(String orderId, String reservationId, String reason, Causation causation) {
+  public Reservation.Decision release(
+      String orderId, String reservationId, String reason, Causation causation) {
     Instant now = clock.instant();
     Reservation.Decision d =
         reservations
@@ -88,7 +97,11 @@ public class InventoryUseCases {
 
   @Transactional
   public Restock.Decision restock(
-      String orderId, String returnId, String restockId, List<StockLine> lines, Causation causation) {
+      String orderId,
+      String returnId,
+      String restockId,
+      List<StockLine> lines,
+      Causation causation) {
     Instant now = clock.instant();
     Optional<Restock> existing = restocks.find(restockId);
     if (existing.isEmpty()) {
@@ -159,7 +172,9 @@ public class InventoryUseCases {
     TreeSet<String> skus = new TreeSet<>();
     effects.forEach(e -> skus.add(e.sku()));
     for (String sku : skus) {
-      stock.find(sku).ifPresent(level -> outbox.append(InventoryMessages.stockLevel(level, now), causation));
+      stock
+          .find(sku)
+          .ifPresent(level -> outbox.append(InventoryMessages.stockLevel(level, now), causation));
     }
   }
 }

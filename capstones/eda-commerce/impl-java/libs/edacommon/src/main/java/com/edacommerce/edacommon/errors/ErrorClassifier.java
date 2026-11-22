@@ -68,7 +68,10 @@ public final class ErrorClassifier {
     };
   }
 
-  /** The most specific cause's simple class name; low-cardinality label for x-error-class and metrics. */
+  /**
+   * The most specific cause's simple class name; low-cardinality label for x-error-class and
+   * metrics.
+   */
   public static String errorClassName(Throwable error) {
     Throwable t = error;
     while ((t instanceof TransientException

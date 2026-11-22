@@ -25,7 +25,8 @@ public class InventoryConfiguration {
   public record InventoryProperties(Duration reservationTtl, Duration reservationSweepInterval) {
     public InventoryProperties {
       reservationTtl = reservationTtl == null ? Duration.ofMinutes(15) : reservationTtl;
-      reservationSweepInterval = reservationSweepInterval == null ? Duration.ofSeconds(5) : reservationSweepInterval;
+      reservationSweepInterval =
+          reservationSweepInterval == null ? Duration.ofSeconds(5) : reservationSweepInterval;
     }
   }
 
@@ -37,7 +38,8 @@ public class InventoryConfiguration {
       OutboxWriter outbox,
       Clock clock,
       InventoryProperties properties) {
-    return new InventoryUseCases(reservations, stock, restocks, outbox, clock, properties.reservationTtl());
+    return new InventoryUseCases(
+        reservations, stock, restocks, outbox, clock, properties.reservationTtl());
   }
 
   @Bean
@@ -64,6 +66,7 @@ public class InventoryConfiguration {
   @Bean
   @ConditionalOnProperty(name = "eda.jobs.enabled", havingValue = "true", matchIfMissing = true)
   PeriodicJob reservationExpiryJob(InventoryUseCases useCases, InventoryProperties properties) {
-    return new PeriodicJob("reservation-expiry", properties.reservationSweepInterval(), () -> useCases.expireDue(100));
+    return new PeriodicJob(
+        "reservation-expiry", properties.reservationSweepInterval(), () -> useCases.expireDue(100));
   }
 }

@@ -46,7 +46,8 @@ public final class HexagonalArchitecture {
         .should()
         .dependOnClassesThat()
         .resideOutsideOfPackages(basePackage + ".domain..", "java..", "com.edacommerce.kernel..")
-        .because("the domain is pure (JDK and the shared kernel only): no frameworks, Avro, SQL, Kafka, HTTP or clocks (guide §3)")
+        .because(
+            "the domain is pure (JDK and the shared kernel only): no frameworks, Avro, SQL, Kafka, HTTP or clocks (guide §3)")
         .allowEmptyShould(true)
         .check(classes);
 

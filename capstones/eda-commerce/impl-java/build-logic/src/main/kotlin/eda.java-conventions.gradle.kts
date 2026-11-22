@@ -7,6 +7,10 @@ plugins {
     id("com.diffplug.spotless")
 }
 
+repositories {
+    mavenCentral()
+}
+
 val libs = extensions.getByType<VersionCatalogsExtension>().named("libs")
 fun lib(alias: String) = libs.findLibrary(alias).get()
 

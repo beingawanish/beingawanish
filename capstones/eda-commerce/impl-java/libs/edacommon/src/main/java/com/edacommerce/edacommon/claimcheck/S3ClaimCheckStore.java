@@ -42,9 +42,11 @@ public class S3ClaimCheckStore implements ClaimCheckStore {
     this.clock = clock;
   }
 
-  public static S3ClaimCheckStore fromProperties(EdaProperties.S3 p, EdaMetrics metrics, Clock clock) {
+  public static S3ClaimCheckStore fromProperties(
+      EdaProperties.S3 p, EdaMetrics metrics, Clock clock) {
     var credentials =
-        StaticCredentialsProvider.create(AwsBasicCredentials.create(p.getAccessKey(), p.getSecretKey()));
+        StaticCredentialsProvider.create(
+            AwsBasicCredentials.create(p.getAccessKey(), p.getSecretKey()));
     S3Configuration pathStyle = S3Configuration.builder().pathStyleAccessEnabled(true).build();
     S3Client client =
         S3Client.builder()
@@ -96,7 +98,8 @@ public class S3ClaimCheckStore implements ClaimCheckStore {
                       .build())
               .asByteArray();
     } catch (NoSuchKeyException e) {
-      throw new RetryLaterException("claim-check object not found: " + claimCheck.getObjectKey(), e);
+      throw new RetryLaterException(
+          "claim-check object not found: " + claimCheck.getObjectKey(), e);
     } catch (SdkClientException e) {
       throw new TransientException("object storage unreachable: " + e.getMessage(), e);
     } catch (S3Exception e) {
@@ -124,6 +127,7 @@ public class S3ClaimCheckStore implements ClaimCheckStore {
     if (e.statusCode() >= 500 || e.statusCode() == 429) {
       return new TransientException("object storage answered " + e.statusCode(), e);
     }
-    return new RetryLaterException("object storage refused " + key + " (" + e.statusCode() + ")", e);
+    return new RetryLaterException(
+        "object storage refused " + key + " (" + e.statusCode() + ")", e);
   }
 }

@@ -13,7 +13,8 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 /**
  * Day 1 acceptance: every golden example decodes with our Avro code to its .json, and encoding the
- * .json reproduces the bytes, both with generic records and with the generated SpecificRecord classes.
+ * .json reproduces the bytes, both with generic records and with the generated SpecificRecord
+ * classes.
  */
 class GoldenFixturesTest {
 

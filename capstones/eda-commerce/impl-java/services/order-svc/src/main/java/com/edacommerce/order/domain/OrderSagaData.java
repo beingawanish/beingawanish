@@ -8,9 +8,9 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Saga-local data (saga_instance.data): business ids minted once per step and reused on every resend
- * (architecture §5.3 rule 2), compensation bookkeeping, facts recorded early (rule 4).
- * A plain mutable holder: the transition function works on a copy and returns it.
+ * Saga-local data (saga_instance.data): business ids minted once per step and reused on every
+ * resend (architecture §5.3 rule 2), compensation bookkeeping, facts recorded early (rule 4). A
+ * plain mutable holder: the transition function works on a copy and returns it.
  */
 public final class OrderSagaData {
   public String orderId;
@@ -57,7 +57,8 @@ public final class OrderSagaData {
     d.captured = captured;
     d.capturedAmount = capturedAmount;
     d.captureRetries = captureRetries;
-    d.outstanding = outstanding.isEmpty() ? EnumSet.noneOf(Compensation.class) : EnumSet.copyOf(outstanding);
+    d.outstanding =
+        outstanding.isEmpty() ? EnumSet.noneOf(Compensation.class) : EnumSet.copyOf(outstanding);
     d.compensationAttempts = compensationAttempts;
     d.cancellationReason = cancellationReason;
     d.cancellationDetail = cancellationDetail;

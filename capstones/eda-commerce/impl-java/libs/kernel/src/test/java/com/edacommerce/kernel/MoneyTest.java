@@ -12,7 +12,8 @@ import org.junit.jupiter.api.Test;
 class MoneyTest {
   @Test
   void addsAndMultipliesInMinorUnits() {
-    assertThat(Money.of(1999, "EUR").times(3).plus(Money.of(499, "EUR"))).isEqualTo(Money.of(6496, "EUR"));
+    assertThat(Money.of(1999, "EUR").times(3).plus(Money.of(499, "EUR")))
+        .isEqualTo(Money.of(6496, "EUR"));
   }
 
   @Test
@@ -27,14 +28,16 @@ class MoneyTest {
     BigDecimal vat = new BigDecimal("0.19");
     // 12999 * 0.19 / 1.19 = 2075.48... -> 2075
     assertThat(Money.of(12999, "EUR").includedTax(vat)).isEqualTo(Money.of(2075, "EUR"));
-    // exactly .5 cases round to even: 119 * 0.19/1.19 = 19.0; 1309*0.19/1.19 = 209.0; use rate 1 (50 %)
+    // exactly .5 cases round to even: 119 * 0.19/1.19 = 19.0; 1309*0.19/1.19 = 209.0; use rate 1
+    // (50 %)
     assertThat(Money.of(1, "EUR").includedTax(BigDecimal.ONE)).isEqualTo(Money.of(0, "EUR"));
     assertThat(Money.of(3, "EUR").includedTax(BigDecimal.ONE)).isEqualTo(Money.of(2, "EUR"));
     assertThat(Money.of(5, "EUR").includedTax(BigDecimal.ONE)).isEqualTo(Money.of(2, "EUR"));
   }
 
   @Property
-  void additionIsCommutativeAndMinusInvertsPlus(@ForAll @LongRange(min = -1_000_000_000L, max = 1_000_000_000L) long a,
+  void additionIsCommutativeAndMinusInvertsPlus(
+      @ForAll @LongRange(min = -1_000_000_000L, max = 1_000_000_000L) long a,
       @ForAll @LongRange(min = -1_000_000_000L, max = 1_000_000_000L) long b) {
     Money x = Money.of(a, "EUR");
     Money y = Money.of(b, "EUR");

@@ -49,7 +49,8 @@ public class IdempotencyStore {
   }
 
   public Optional<StoredKey> find(String caller, String key, Instant now) {
-    return jdbc.query(
+    return jdbc
+        .query(
             "SELECT request_hash, status, response_status, response_headers::text AS headers, response_body"
                 + " FROM idempotency_key WHERE caller = ? AND key = ? AND expires_at > ?",
             (rs, i) ->
@@ -68,7 +69,11 @@ public class IdempotencyStore {
 
   public void begin(String caller, String key, String requestHash, Instant now, Instant expiresAt) {
     // An expired row for the same key may still exist until housekeeping runs.
-    jdbc.update("DELETE FROM idempotency_key WHERE caller = ? AND key = ? AND expires_at <= ?", caller, key, Timestamp.from(now));
+    jdbc.update(
+        "DELETE FROM idempotency_key WHERE caller = ? AND key = ? AND expires_at <= ?",
+        caller,
+        key,
+        Timestamp.from(now));
     jdbc.update(
         "INSERT INTO idempotency_key (caller, key, request_hash, status, created_at, expires_at)"
             + " VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?)",
@@ -79,7 +84,8 @@ public class IdempotencyStore {
         Timestamp.from(expiresAt));
   }
 
-  public void complete(String caller, String key, int status, Map<String, String> headers, byte[] body) {
+  public void complete(
+      String caller, String key, int status, Map<String, String> headers, byte[] body) {
     String headersJson;
     try {
       headersJson = json.writeValueAsString(headers);

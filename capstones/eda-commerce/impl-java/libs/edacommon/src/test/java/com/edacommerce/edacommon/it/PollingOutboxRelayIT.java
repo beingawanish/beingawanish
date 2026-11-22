@@ -19,13 +19,20 @@ import org.junit.jupiter.api.Test;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.mock.MockProducerFactory;
 
-/** Checklist: polling relay publishes in order with headers identical to the Debezium configuration. */
+/**
+ * Checklist: polling relay publishes in order with headers identical to the Debezium configuration.
+ */
 @RequiresPostgres
 class PollingOutboxRelayIT {
   final DbFixture db = new DbFixture();
   final KeepOpenMockProducer producer = KeepOpenMockProducer.create();
   final PollingOutboxRelay relay =
-      new PollingOutboxRelay(db.jdbc, db.tx, new KafkaTemplate<>(new MockProducerFactory<>(() -> producer)), db.metrics, 100);
+      new PollingOutboxRelay(
+          db.jdbc,
+          db.tx,
+          new KafkaTemplate<>(new MockProducerFactory<>(() -> producer)),
+          db.metrics,
+          100);
 
   @AfterEach
   void close() {
@@ -40,7 +47,10 @@ class PollingOutboxRelayIT {
       String key = "order-" + (i % 2);
       ids.add(
           db.tx.execute(
-              s -> db.outbox.append(OutgoingMessage.of("order.events.v1", key, e, "Order", key, 1), Causation.root(key))));
+              s ->
+                  db.outbox.append(
+                      OutgoingMessage.of("order.events.v1", key, e, "Order", key, 1),
+                      Causation.root(key))));
     }
 
     assertThat(relay.relayOnce()).isEqualTo(5);
@@ -58,13 +68,22 @@ class PollingOutboxRelayIT {
     }
     assertThat(names)
         .containsExactly(
-            "id", "ce_id", "ce_type", "ce_source", "ce_time", "correlation_id", "causation_id",
-            "traceparent", "tracestate", "ce_specversion");
+            "id",
+            "ce_id",
+            "ce_type",
+            "ce_source",
+            "ce_time",
+            "correlation_id",
+            "causation_id",
+            "traceparent",
+            "tracestate",
+            "ce_specversion");
     assertThat(header(first, "id")).isEqualTo(ids.get(0));
     assertThat(header(first, "ce_type")).isEqualTo("com.edacommerce.order.OrderPlaced");
     assertThat(header(first, "ce_source")).isEqualTo("test-svc");
     assertThat(header(first, "ce_specversion")).isEqualTo("1.0");
-    assertThat(header(first, "ce_time")).matches("\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d(\\.\\d+)?Z");
+    assertThat(header(first, "ce_time"))
+        .matches("\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d(\\.\\d+)?Z");
     assertThat(first.headers().lastHeader("causation_id").value()).isNull();
     assertThat(db.count("SELECT count(*) FROM outbox WHERE published_at IS NULL")).isZero();
     assertThat(db.telemetry.metric("eda.outbox.pending")).isPresent();

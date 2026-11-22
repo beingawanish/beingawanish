@@ -26,7 +26,13 @@ public final class PaymentCommandHandlers {
 
     @Override
     public void handle(AuthorizePayment c, MessageContext ctx) {
-      useCases.authorize(c.getOrderId(), c.getPaymentId(), c.getCustomerId(), money(c.getAmount()), c.getPaymentMethodToken(), ctx.causation());
+      useCases.authorize(
+          c.getOrderId(),
+          c.getPaymentId(),
+          c.getCustomerId(),
+          money(c.getAmount()),
+          c.getPaymentMethodToken(),
+          ctx.causation());
     }
   }
 
@@ -65,7 +71,13 @@ public final class PaymentCommandHandlers {
 
     @Override
     public void handle(RefundPayment c, MessageContext ctx) {
-      useCases.refund(c.getPaymentId(), c.getRefundId(), c.getReturnId(), money(c.getAmount()), c.getReason(), ctx.causation());
+      useCases.refund(
+          c.getPaymentId(),
+          c.getRefundId(),
+          c.getReturnId(),
+          money(c.getAmount()),
+          c.getReason(),
+          ctx.causation());
     }
   }
 }

@@ -14,6 +14,7 @@ public class PostgresAvailableCondition implements ExecutionCondition {
     if (TestDatabases.dockerAvailable()) {
       return ConditionEvaluationResult.enabled("using Testcontainers PostgreSQL");
     }
-    return ConditionEvaluationResult.disabled("no PostgreSQL: Docker unavailable and EDA_TEST_JDBC_URL unset");
+    return ConditionEvaluationResult.disabled(
+        "no PostgreSQL: Docker unavailable and EDA_TEST_JDBC_URL unset");
   }
 }

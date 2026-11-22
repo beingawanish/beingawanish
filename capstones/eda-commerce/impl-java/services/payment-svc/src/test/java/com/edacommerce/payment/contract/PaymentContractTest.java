@@ -23,7 +23,9 @@ class PaymentContractTest {
 
   @Test
   void consumedCommandsDecodeFromTheirGoldenBytes() {
-    assertThat(GoldenFixtures.assertSpecificRoundTrip(AuthorizePayment.class).getPaymentMethodToken()).isEqualTo("tok_visa_ok");
+    assertThat(
+            GoldenFixtures.assertSpecificRoundTrip(AuthorizePayment.class).getPaymentMethodToken())
+        .isEqualTo("tok_visa_ok");
     GoldenFixtures.assertSpecificRoundTrip(CapturePayment.class);
     GoldenFixtures.assertSpecificRoundTrip(VoidPayment.class);
     GoldenFixtures.assertSpecificRoundTrip(RefundPayment.class);
@@ -32,17 +34,23 @@ class PaymentContractTest {
   @Test
   void everyProducedEventValidates() {
     Payment p = Payment.requested("p1", "o1", "c1", Money.of(100, "EUR"), "tok", T);
-    for (PaymentEvent e : List.of(
-        new PaymentEvent.Authorized("psp", Money.of(100, "EUR"), T, T), new PaymentEvent.Declined(DeclineCode.PSP_TIMEOUT, null, T),
-        new PaymentEvent.Captured(Money.of(100, "EUR"), "psp", T), new PaymentEvent.CaptureFailed(true, false, T), new PaymentEvent.Voided(T))) {
+    for (PaymentEvent e :
+        List.of(
+            new PaymentEvent.Authorized("psp", Money.of(100, "EUR"), T, T),
+            new PaymentEvent.Declined(DeclineCode.PSP_TIMEOUT, null, T),
+            new PaymentEvent.Captured(Money.of(100, "EUR"), "psp", T),
+            new PaymentEvent.CaptureFailed(true, false, T),
+            new PaymentEvent.Voided(T))) {
       OutgoingMessage m = PaymentMessages.event(p, e);
       assertThat(m.topic()).isEqualTo("payment.events.v1");
       assertThat(m.key()).isEqualTo("o1");
       GoldenFixtures.assertValidAgainstBundled(m.record());
     }
     for (Refund.Status s : List.of(Refund.Status.SUCCEEDED, Refund.Status.FAILED)) {
-      GoldenFixtures.assertValidAgainstBundled(PaymentMessages.refund(
-          new Refund("rf", "p1", "o1", null, Money.of(1, "EUR"), "r", s, "x", "f", true, T)).record());
+      GoldenFixtures.assertValidAgainstBundled(
+          PaymentMessages.refund(
+                  new Refund("rf", "p1", "o1", null, Money.of(1, "EUR"), "r", s, "x", "f", true, T))
+              .record());
     }
   }
 }

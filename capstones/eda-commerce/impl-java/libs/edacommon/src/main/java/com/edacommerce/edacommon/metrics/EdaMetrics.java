@@ -14,14 +14,15 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The metric contract of guide §8, registered once through the OpenTelemetry metrics API. Names,
- * units, attributes and bucket boundaries are part of the contract: the dashboard and the alert rules
- * query them, and the Python build registers the same ones. Bucket boundaries are given as advice on
- * the instrument, so no SDK view is needed. Never put ids on these attributes.
+ * units, attributes and bucket boundaries are part of the contract: the dashboard and the alert
+ * rules query them, and the Python build registers the same ones. Bucket boundaries are given as
+ * advice on the instrument, so no SDK view is needed. Never put ids on these attributes.
  */
 public class EdaMetrics {
 
   public static final AttributeKey<String> TOPIC = AttributeKey.stringKey("topic");
-  public static final AttributeKey<String> CONSUMER_GROUP = AttributeKey.stringKey("consumer_group");
+  public static final AttributeKey<String> CONSUMER_GROUP =
+      AttributeKey.stringKey("consumer_group");
   public static final AttributeKey<String> EVENT_TYPE = AttributeKey.stringKey("event_type");
   public static final AttributeKey<String> OUTCOME = AttributeKey.stringKey("outcome");
   public static final AttributeKey<String> ERROR_CLASS = AttributeKey.stringKey("error_class");
@@ -127,7 +128,8 @@ public class EdaMetrics {
         meter
             .histogramBuilder("eda.saga.step.duration")
             .setUnit("s")
-            .setDescription("Time spent per saga step; step=DECISION is start to confirmed/cancelled.")
+            .setDescription(
+                "Time spent per saga step; step=DECISION is start to confirmed/cancelled.")
             .setExplicitBucketBoundariesAdvice(SAGA_STEP_BUCKETS)
             .build();
     sagaStepTimeouts =
@@ -173,7 +175,8 @@ public class EdaMetrics {
   }
 
   public void handlerDuration(String group, String eventType, Duration duration) {
-    handlerDuration.record(seconds(duration), Attributes.of(CONSUMER_GROUP, group, EVENT_TYPE, eventType));
+    handlerDuration.record(
+        seconds(duration), Attributes.of(CONSUMER_GROUP, group, EVENT_TYPE, eventType));
   }
 
   public void dlq(String group, String eventType, String errorClass) {

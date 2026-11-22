@@ -38,7 +38,8 @@ final class SagaRun {
   }
 
   OrderSaga.Decision on(OrderSagaTrigger t) {
-    OrderSaga.Decision d = OrderSaga.apply(new OrderSaga.Snapshot(state, data, deadline, attempts), t, ctx());
+    OrderSaga.Decision d =
+        OrderSaga.apply(new OrderSaga.Snapshot(state, data, deadline, attempts), t, ctx());
     if (!d.ignored()) {
       record(d);
     }
@@ -105,8 +106,17 @@ final class SagaRun {
   }
 
   SagaRun to(OrderSagaState target) {
-    List<java.util.function.Supplier<OrderSagaTrigger>> path = List.of(this::reserved, this::authorized, this::committed,
-        this::accepted, this::packed, this::shipmentCreated, this::dispatched, this::captured, this::delivered);
+    List<java.util.function.Supplier<OrderSagaTrigger>> path =
+        List.of(
+            this::reserved,
+            this::authorized,
+            this::committed,
+            this::accepted,
+            this::packed,
+            this::shipmentCreated,
+            this::dispatched,
+            this::captured,
+            this::delivered);
     for (var step : path) {
       if (state == target) {
         return this;

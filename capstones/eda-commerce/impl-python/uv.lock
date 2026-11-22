@@ -9,9 +9,13 @@ members = [
     "contracts-py",
     "eda-commerce-python",
     "edacommon",
+    "fulfilment-svc",
     "inventory-svc",
+    "notification-svc",
     "order-svc",
     "payment-svc",
+    "returns-svc",
+    "shipping-svc",
 ]
 
 [[package]]
@@ -474,9 +478,13 @@ dependencies = [
     { name = "checkout-svc" },
     { name = "contracts-py" },
     { name = "edacommon" },
+    { name = "fulfilment-svc" },
     { name = "inventory-svc" },
+    { name = "notification-svc" },
     { name = "order-svc" },
     { name = "payment-svc" },
+    { name = "returns-svc" },
+    { name = "shipping-svc" },
 ]
 
 [package.dev-dependencies]
@@ -500,9 +508,13 @@ requires-dist = [
     { name = "checkout-svc", editable = "services/checkout_svc" },
     { name = "contracts-py", editable = "libs/contracts_py" },
     { name = "edacommon", editable = "libs/edacommon" },
+    { name = "fulfilment-svc", editable = "services/fulfilment_svc" },
     { name = "inventory-svc", editable = "services/inventory_svc" },
+    { name = "notification-svc", editable = "services/notification_svc" },
     { name = "order-svc", editable = "services/order_svc" },
     { name = "payment-svc", editable = "services/payment_svc" },
+    { name = "returns-svc", editable = "services/returns_svc" },
+    { name = "shipping-svc", editable = "services/shipping_svc" },
 ]
 
 [package.metadata.requires-dev]
@@ -646,6 +658,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ec/be/440da8ede1cf7aaff73be5c5a6d0dc6f2938df6604ffbc313f9c6dc63f55/fpdf2-2.9.0.tar.gz", hash = "sha256:af2e7e06a5a2f9e32e24b146b56f58166142dfff45f55370ab03bfac9c8e3e21", size = 408671, upload-time = "2026-10-29T23:13:20.353Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2f/b0/f0e770163d0e635c81e8ba117686e31c6b172715e1185ff00ea2eb0b2f3d/fpdf2-2.9.0-py3-none-any.whl", hash = "sha256:e57f9eb183a61bbfc1a16ccb3eb68654f9ef3de0d9a78e37015a0df2eb29ab89", size = 360586, upload-time = "2026-10-29T23:13:18.341Z" },
+]
+
+[[package]]
+name = "fulfilment-svc"
+version = "0.1.0"
+source = { editable = "services/fulfilment_svc" }
+dependencies = [
+    { name = "contracts-py" },
+    { name = "edacommon" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "contracts-py", editable = "libs/contracts_py" },
+    { name = "edacommon", editable = "libs/edacommon" },
 ]
 
 [[package]]
@@ -1085,6 +1112,21 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d0/6f/43edf3be2748d0e40974a5ee046a8bb4c9961a4bdd3e7d5c6dcbf32d1af6/mypy_extensions-1.2.0.tar.gz", hash = "sha256:c6e275a07f1c2fc096b62940452d0eaa3f3af7de45d704787866240a7c6d5a51", size = 6566, upload-time = "2026-11-03T16:26:33.692Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b5/99/7b1adac7e97ce7bbda34792dc6e9b2f5cc5cffd1875883f78a818b2a2687/mypy_extensions-1.2.0-py3-none-any.whl", hash = "sha256:993e7a20aa5671eb41a7132cf555af30062da99729601601b9a8382b11cae768", size = 5114, upload-time = "2026-11-03T16:26:32.731Z" },
+]
+
+[[package]]
+name = "notification-svc"
+version = "0.1.0"
+source = { editable = "services/notification_svc" }
+dependencies = [
+    { name = "contracts-py" },
+    { name = "edacommon" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "contracts-py", editable = "libs/contracts_py" },
+    { name = "edacommon", editable = "libs/edacommon" },
 ]
 
 [[package]]
@@ -1635,6 +1677,21 @@ wheels = [
 ]
 
 [[package]]
+name = "returns-svc"
+version = "0.1.0"
+source = { editable = "services/returns_svc" }
+dependencies = [
+    { name = "contracts-py" },
+    { name = "edacommon" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "contracts-py", editable = "libs/contracts_py" },
+    { name = "edacommon", editable = "libs/edacommon" },
+]
+
+[[package]]
 name = "rich"
 version = "15.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1705,6 +1762,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/49/c5/0a5ce655109cb96b8dfad36908a4e108d15f5dc2eff8fbc3146c4312e704/s3transfer-0.19.3.tar.gz", hash = "sha256:8326acc3d056d7f7b8a37110c7d2aea41f67e83f6ae79cd3b5fbcca34c726406", size = 166087, upload-time = "2026-10-19T19:19:49.751Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e2/a4/88f9e10498759121060b8050a1554753dfc04df39bbbcc7aad9ecc8d9440/s3transfer-0.19.3-py3-none-any.whl", hash = "sha256:24eb7535804306355e31c952a90022bf5b2f9d760f9a11062c7493a217c08553", size = 90252, upload-time = "2026-10-19T19:19:48.309Z" },
+]
+
+[[package]]
+name = "shipping-svc"
+version = "0.1.0"
+source = { editable = "services/shipping_svc" }
+dependencies = [
+    { name = "contracts-py" },
+    { name = "edacommon" },
+    { name = "fpdf2" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "contracts-py", editable = "libs/contracts_py" },
+    { name = "edacommon", editable = "libs/edacommon" },
+    { name = "fpdf2", specifier = "==2.9.0" },
 ]
 
 [[package]]

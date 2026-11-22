@@ -24,7 +24,8 @@ public final class SharedTables {
     JdbcTemplate svc = new JdbcTemplate(migrated);
     assertThat(columns(svc)).as("shared table columns").isEqualTo(columns(ref));
     assertThat(indexes(svc)).as("shared table indexes").containsAll(indexes(ref));
-    assertThat(svc.queryForList("SELECT pubname FROM pg_publication", String.class)).contains("outbox_pub");
+    assertThat(svc.queryForList("SELECT pubname FROM pg_publication", String.class))
+        .contains("outbox_pub");
   }
 
   static List<String> columns(JdbcTemplate jdbc) {

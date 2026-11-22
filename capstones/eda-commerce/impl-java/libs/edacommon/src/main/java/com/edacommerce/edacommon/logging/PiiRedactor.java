@@ -8,9 +8,9 @@ import org.apache.avro.Schema;
 import org.apache.avro.generic.IndexedRecord;
 
 /**
- * Renders an Avro record for logs with every field tagged {@code "pii": true} in the schema replaced
- * by {@value #REDACTED} (guide §6.4, ADR-0013). Use this whenever a record must be logged; never log
- * a record's {@code toString()}.
+ * Renders an Avro record for logs with every field tagged {@code "pii": true} in the schema
+ * replaced by {@value #REDACTED} (guide §6.4, ADR-0013). Use this whenever a record must be logged;
+ * never log a record's {@code toString()}.
  */
 public final class PiiRedactor {
   private PiiRedactor() {}

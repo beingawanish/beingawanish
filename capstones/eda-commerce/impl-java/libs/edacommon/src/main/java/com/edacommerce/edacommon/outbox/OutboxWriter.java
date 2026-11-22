@@ -16,9 +16,10 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 /**
  * Appends events and commands to the transactional outbox (ADR-0003), inside the caller's database
- * transaction. The payload is serialised here, at write time, into the Confluent wire format; Debezium
- * (or the polling relay) then passes the bytes through untouched. The envelope's trace context is the
- * current span's, so the consumer's span becomes a child of the span that wrote the row.
+ * transaction. The payload is serialised here, at write time, into the Confluent wire format;
+ * Debezium (or the polling relay) then passes the bytes through untouched. The envelope's trace
+ * context is the current span's, so the consumer's span becomes a child of the span that wrote the
+ * row.
  */
 public class OutboxWriter {
   static final String INSERT =
@@ -55,7 +56,8 @@ public class OutboxWriter {
     Instant now = clock.instant();
     MessagingTracing.TraceHeaders trace = MessagingTracing.current();
     Envelope envelope =
-        Envelopes.build(eventId, message, causation, producer, now, trace.traceparent(), trace.tracestate());
+        Envelopes.build(
+            eventId, message, causation, producer, now, trace.traceparent(), trace.tracestate());
     Envelopes.set(message.record(), envelope);
     byte[] payload = serde.serialize(message.topic(), message.record());
     jdbc.update(

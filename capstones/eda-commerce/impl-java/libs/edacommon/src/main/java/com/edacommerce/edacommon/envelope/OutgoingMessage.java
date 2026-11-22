@@ -35,7 +35,8 @@ public record OutgoingMessage(
       String aggregateType,
       String aggregateId,
       long aggregateVersion) {
-    return new OutgoingMessage(topic, key, record, aggregateType, aggregateId, aggregateVersion, null);
+    return new OutgoingMessage(
+        topic, key, record, aggregateType, aggregateId, aggregateVersion, null);
   }
 
   public String type() {

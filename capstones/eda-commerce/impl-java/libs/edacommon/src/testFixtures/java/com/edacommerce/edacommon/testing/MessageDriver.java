@@ -60,14 +60,24 @@ public class MessageDriver {
     this.jdbc = ctx.getBean(JdbcTemplate.class);
     this.clock = ctx.getBean(Clock.class);
     this.processor =
-        new RecordProcessor(group, new HandlerRegistry(handlers), ctx.getBean(Inbox.class), serde,
-            ctx.getBean(TransactionTemplate.class), ctx.getBean(MessagingTracing.class), ctx.getBean(EdaMetrics.class), clock);
+        new RecordProcessor(
+            group,
+            new HandlerRegistry(handlers),
+            ctx.getBean(Inbox.class),
+            serde,
+            ctx.getBean(TransactionTemplate.class),
+            ctx.getBean(MessagingTracing.class),
+            ctx.getBean(EdaMetrics.class),
+            clock);
   }
 
   @SuppressWarnings({"unchecked", "rawtypes"})
   public MessageDriver(ApplicationContext ctx) {
-    List<MessageHandler<?>> handlers = new ArrayList<>((java.util.Collection) ctx.getBeansOfType(MessageHandler.class).values());
-    ctx.getBeansOfType(com.edacommerce.edacommon.consumer.MessageHandlerGroup.class).values().forEach(g -> handlers.addAll(g.handlers()));
+    List<MessageHandler<?>> handlers =
+        new ArrayList<>((java.util.Collection) ctx.getBeansOfType(MessageHandler.class).values());
+    ctx.getBeansOfType(com.edacommerce.edacommon.consumer.MessageHandlerGroup.class)
+        .values()
+        .forEach(g -> handlers.addAll(g.handlers()));
     this.serde = ctx.getBean(AvroSerde.class);
     this.jdbc = ctx.getBean(JdbcTemplate.class);
     this.clock = ctx.getBean(Clock.class);
@@ -89,9 +99,14 @@ public class MessageDriver {
   }
 
   public Delivery deliver(
-      String topic, String key, SpecificRecord record, String correlationId, @Nullable String causationId) {
+      String topic,
+      String key,
+      SpecificRecord record,
+      String correlationId,
+      @Nullable String causationId) {
     String eventId = Ids.newId();
-    // Keep the aggregate fields of a record that already carries a real envelope (e.g. one taken from
+    // Keep the aggregate fields of a record that already carries a real envelope (e.g. one taken
+    // from
     // the outbox), so version guards downstream see the producer's aggregateVersion.
     Envelope existing = null;
     try {
@@ -99,12 +114,21 @@ public class MessageDriver {
     } catch (RuntimeException e) {
       existing = null;
     }
-    boolean real = existing != null && existing.getAggregateType() != null && !existing.getAggregateType().isEmpty();
+    boolean real =
+        existing != null
+            && existing.getAggregateType() != null
+            && !existing.getAggregateType().isEmpty();
     Envelope env =
         Envelopes.build(
             eventId,
             real
-                ? OutgoingMessage.of(topic, key, record, existing.getAggregateType(), existing.getAggregateId(), existing.getAggregateVersion())
+                ? OutgoingMessage.of(
+                    topic,
+                    key,
+                    record,
+                    existing.getAggregateType(),
+                    existing.getAggregateId(),
+                    existing.getAggregateVersion())
                 : OutgoingMessage.of(topic, key, record, "Test", key, 1),
             new Causation(correlationId, causationId),
             "test-producer",

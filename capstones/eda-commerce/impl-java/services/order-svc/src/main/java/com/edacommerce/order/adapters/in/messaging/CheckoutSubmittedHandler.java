@@ -10,7 +10,8 @@ import com.edacommerce.order.application.OrderSagaService;
 import com.edacommerce.order.domain.Order;
 
 /** checkout.events.v1 CheckoutSubmitted: the order saga starts here. */
-public record CheckoutSubmittedHandler(OrderSagaService saga) implements MessageHandler<CheckoutSubmitted> {
+public record CheckoutSubmittedHandler(OrderSagaService saga)
+    implements MessageHandler<CheckoutSubmitted> {
 
   @Override
   public Class<CheckoutSubmitted> messageType() {
@@ -24,16 +25,38 @@ public record CheckoutSubmittedHandler(OrderSagaService saga) implements Message
 
   static Order toOrder(CheckoutSubmitted c) {
     Address a = c.getShippingAddress();
-    return new Order(c.getOrderId(), c.getCheckoutId(), c.getCustomerId(),
+    return new Order(
+        c.getOrderId(),
+        c.getCheckoutId(),
+        c.getCustomerId(),
         c.getLines().stream().map(CheckoutSubmittedHandler::line).toList(),
-        money(c.getSubtotal()), money(c.getShippingFee()), money(c.getTax()), money(c.getTotal()),
-        new Order.PostalAddress(a.getRecipientName(), a.getLine1(), a.getLine2(), a.getCity(), a.getRegion(), a.getPostalCode(),
-            a.getCountryCode(), a.getPhone()),
-        c.getContactEmail(), c.getShippingMethod().name(), c.getPaymentMethodToken(), c.getPriceSnapshotAt());
+        money(c.getSubtotal()),
+        money(c.getShippingFee()),
+        money(c.getTax()),
+        money(c.getTotal()),
+        new Order.PostalAddress(
+            a.getRecipientName(),
+            a.getLine1(),
+            a.getLine2(),
+            a.getCity(),
+            a.getRegion(),
+            a.getPostalCode(),
+            a.getCountryCode(),
+            a.getPhone()),
+        c.getContactEmail(),
+        c.getShippingMethod().name(),
+        c.getPaymentMethodToken(),
+        c.getPriceSnapshotAt());
   }
 
   static Order.OrderLine line(LineItem l) {
-    return new Order.OrderLine(l.getLineId(), l.getSku(), l.getProductName(), l.getQuantity(), money(l.getUnitPrice()), money(l.getLineTotal()));
+    return new Order.OrderLine(
+        l.getLineId(),
+        l.getSku(),
+        l.getProductName(),
+        l.getQuantity(),
+        money(l.getUnitPrice()),
+        money(l.getLineTotal()));
   }
 
   static Money money(com.edacommerce.common.Money m) {

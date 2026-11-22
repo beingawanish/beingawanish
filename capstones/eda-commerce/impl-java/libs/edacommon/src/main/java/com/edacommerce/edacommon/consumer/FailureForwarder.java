@@ -22,10 +22,10 @@ import org.springframework.lang.Nullable;
 /**
  * Forwards a failed record to the group's next retry topic or its DLQ (ADR-0007), built on Spring's
  * {@link DeadLetterPublishingRecoverer} with a destination resolver that produces our topic names
- * instead of Spring's {@code <topic>-retry-N}. The original key and value bytes are copied unchanged
- * (never re-serialised); Spring's {@code kafka_dlt-*} headers are suppressed and replaced by the
- * {@code x-*} headers both builds use. The send is awaited, so the offset is committed only after the
- * broker acknowledged the forward.
+ * instead of Spring's {@code <topic>-retry-N}. The original key and value bytes are copied
+ * unchanged (never re-serialised); Spring's {@code kafka_dlt-*} headers are suppressed and replaced
+ * by the {@code x-*} headers both builds use. The send is awaited, so the offset is committed only
+ * after the broker acknowledged the forward.
  */
 public class FailureForwarder extends DeadLetterPublishingRecoverer {
   private final String consumerGroup;
@@ -33,7 +33,9 @@ public class FailureForwarder extends DeadLetterPublishingRecoverer {
 
   public FailureForwarder(
       KafkaOperations<?, ?> template, String consumerGroup, EdaMetrics metrics, Clock clock) {
-    super(template, (record, ex) -> new TopicPartition(destination(consumerGroup, record, ex).topic(), -1));
+    super(
+        template,
+        (record, ex) -> new TopicPartition(destination(consumerGroup, record, ex).topic(), -1));
     this.consumerGroup = consumerGroup;
     this.metrics = metrics;
     setHeadersFunction(
@@ -107,5 +109,4 @@ public class FailureForwarder extends DeadLetterPublishingRecoverer {
     }
     return ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
   }
-
 }

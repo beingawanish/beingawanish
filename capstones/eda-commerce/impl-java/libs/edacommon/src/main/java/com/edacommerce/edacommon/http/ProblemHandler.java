@@ -46,21 +46,26 @@ public class ProblemHandler {
   }
 
   @ExceptionHandler(MethodArgumentNotValidException.class)
-  public ResponseEntity<ProblemDetail> invalid(MethodArgumentNotValidException e, HttpServletRequest request) {
+  public ResponseEntity<ProblemDetail> invalid(
+      MethodArgumentNotValidException e, HttpServletRequest request) {
     List<ApiProblem.FieldError> errors =
         e.getBindingResult().getFieldErrors().stream()
-            .map(f -> new ApiProblem.FieldError(f.getField(), String.valueOf(f.getDefaultMessage())))
+            .map(
+                f -> new ApiProblem.FieldError(f.getField(), String.valueOf(f.getDefaultMessage())))
             .toList();
-    return api(ApiProblem.badRequest("validation", "The request failed validation", errors), request);
+    return api(
+        ApiProblem.badRequest("validation", "The request failed validation", errors), request);
   }
 
   @ExceptionHandler(ConstraintViolationException.class)
-  public ResponseEntity<ProblemDetail> constraint(ConstraintViolationException e, HttpServletRequest request) {
+  public ResponseEntity<ProblemDetail> constraint(
+      ConstraintViolationException e, HttpServletRequest request) {
     List<ApiProblem.FieldError> errors =
         e.getConstraintViolations().stream()
             .map(v -> new ApiProblem.FieldError(v.getPropertyPath().toString(), v.getMessage()))
             .toList();
-    return api(ApiProblem.badRequest("validation", "The request failed validation", errors), request);
+    return api(
+        ApiProblem.badRequest("validation", "The request failed validation", errors), request);
   }
 
   @ExceptionHandler({
@@ -69,18 +74,25 @@ public class ProblemHandler {
     MethodArgumentTypeMismatchException.class
   })
   public ResponseEntity<ProblemDetail> malformed(Exception e, HttpServletRequest request) {
-    return api(ApiProblem.badRequest("malformed-request", "The request is malformed", List.of()), request);
+    return api(
+        ApiProblem.badRequest("malformed-request", "The request is malformed", List.of()), request);
   }
 
   @ExceptionHandler(NoResourceFoundException.class)
-  public ResponseEntity<ProblemDetail> noResource(NoResourceFoundException e, HttpServletRequest request) {
+  public ResponseEntity<ProblemDetail> noResource(
+      NoResourceFoundException e, HttpServletRequest request) {
     return api(ApiProblem.notFound(request.getRequestURI()), request);
   }
 
   @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
-  public ResponseEntity<ProblemDetail> method(HttpRequestMethodNotSupportedException e, HttpServletRequest request) {
+  public ResponseEntity<ProblemDetail> method(
+      HttpRequestMethodNotSupportedException e, HttpServletRequest request) {
     return api(
-        ApiProblem.of(HttpStatus.METHOD_NOT_ALLOWED, "method-not-allowed", "Method not allowed", e.getMessage()),
+        ApiProblem.of(
+            HttpStatus.METHOD_NOT_ALLOWED,
+            "method-not-allowed",
+            "Method not allowed",
+            e.getMessage()),
         request);
   }
 
@@ -91,7 +103,8 @@ public class ProblemHandler {
       return api(ApiProblem.unavailable("A dependency is temporarily unavailable", 5), request);
     }
     log.error("unexpected error serving {}", request.getRequestURI(), e);
-    ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR, "Unexpected error");
+    ProblemDetail pd =
+        ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR, "Unexpected error");
     pd.setType(URI.create(ApiProblem.TYPE_BASE + "internal"));
     pd.setTitle("Internal error");
     return respond(pd, request, new HttpHeaders());
@@ -104,6 +117,9 @@ public class ProblemHandler {
     if (Span.current().getSpanContext().isValid()) {
       pd.setProperty("traceId", traceId);
     }
-    return ResponseEntity.status(pd.getStatus()).headers(headers).contentType(PROBLEM_JSON).body(pd);
+    return ResponseEntity.status(pd.getStatus())
+        .headers(headers)
+        .contentType(PROBLEM_JSON)
+        .body(pd);
   }
 }

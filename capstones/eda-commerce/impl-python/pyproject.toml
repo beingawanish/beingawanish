@@ -18,6 +18,10 @@ dependencies = [
     "order-svc",
     "inventory-svc",
     "payment-svc",
+    "fulfilment-svc",
+    "shipping-svc",
+    "notification-svc",
+    "returns-svc",
 ]
 
 [dependency-groups]
@@ -49,6 +53,10 @@ checkout-svc = { workspace = true }
 order-svc = { workspace = true }
 inventory-svc = { workspace = true }
 payment-svc = { workspace = true }
+fulfilment-svc = { workspace = true }
+shipping-svc = { workspace = true }
+notification-svc = { workspace = true }
+returns-svc = { workspace = true }
 
 # ------------------------------------------------------------------------------------------- pytest
 [tool.pytest.ini_options]
@@ -84,7 +92,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "**/tests/**" = ["S", "PLR", "N802", "DTZ", "PT018", "E501", "PT012", "RUF059"]
 "**/config.py" = ["S105"]
-"**/psp/fake/*.py" = ["S105"]                                # magic test tokens, not secrets                                   # local-only defaults of guide §7 (dev-psp-secret...)
+"**/psp/fake/*.py" = ["S105"]                                # magic test tokens, not secrets
 
 # --------------------------------------------------------------------------------------------- mypy
 [tool.mypy]
@@ -94,11 +102,13 @@ mypy_path = [
     "libs/edacommon/src", "libs/contracts_py/src",
     "services/catalog_svc/src", "services/checkout_svc/src", "services/order_svc/src",
     "services/inventory_svc/src", "services/payment_svc/src",
+    "services/fulfilment_svc/src", "services/shipping_svc/src", "services/notification_svc/src", "services/returns_svc/src",
 ]
 files = [
     "libs/edacommon/src", "libs/contracts_py/src",
     "services/catalog_svc/src", "services/checkout_svc/src", "services/order_svc/src",
     "services/inventory_svc/src", "services/payment_svc/src",
+    "services/fulfilment_svc/src", "services/shipping_svc/src", "services/notification_svc/src", "services/returns_svc/src",
 ]
 explicit_package_bases = true
 plugins = ["pydantic.mypy"]
@@ -112,13 +122,20 @@ ignore_missing_imports = true
 # The dependency rule of guide §3: adapters > application > domain, and the domain imports nothing
 # but the standard library. One contract set per service; wave 2 services add their own block.
 [tool.importlinter]
-root_packages = ["catalog_svc", "checkout_svc", "order_svc", "inventory_svc", "payment_svc", "edacommon", "contracts_py"]
+root_packages = [
+    "catalog_svc", "checkout_svc", "order_svc", "inventory_svc", "payment_svc",
+    "fulfilment_svc", "shipping_svc", "notification_svc", "returns_svc",
+    "edacommon", "contracts_py",
+]
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
 name = "Hexagonal layers (every service)"
 type = "layers"
-containers = ["catalog_svc", "checkout_svc", "order_svc", "inventory_svc", "payment_svc"]
+containers = [
+    "catalog_svc", "checkout_svc", "order_svc", "inventory_svc", "payment_svc",
+    "fulfilment_svc", "shipping_svc", "notification_svc", "returns_svc",
+]
 layers = ["adapters", "application", "domain"]
 exhaustive = false
 
@@ -127,6 +144,7 @@ name = "Domain is pure: no frameworks, no Avro, no SQL, no Kafka, no HTTP, no sh
 type = "forbidden"
 source_modules = [
     "catalog_svc.domain", "checkout_svc.domain", "order_svc.domain", "inventory_svc.domain", "payment_svc.domain",
+    "fulfilment_svc.domain", "shipping_svc.domain", "notification_svc.domain", "returns_svc.domain",
 ]
 forbidden_modules = [
     "edacommon", "contracts_py", "sqlalchemy", "fastapi", "starlette", "pydantic", "confluent_kafka",
@@ -139,6 +157,7 @@ type = "forbidden"
 source_modules = [
     "catalog_svc.application", "checkout_svc.application", "order_svc.application",
     "inventory_svc.application", "payment_svc.application",
+    "fulfilment_svc.application", "shipping_svc.application", "notification_svc.application", "returns_svc.application",
 ]
 forbidden_modules = ["fastapi", "starlette", "confluent_kafka", "httpx", "boto3", "psycopg"]
 allow_indirect_imports = true
@@ -152,7 +171,21 @@ source_modules = [
 forbidden_modules = ["payment_svc.adapters"]
 
 [[tool.importlinter.contracts]]
+name = "Fakes are never imported by domain or application (wave 2)"
+type = "forbidden"
+source_modules = [
+    "fulfilment_svc.domain", "fulfilment_svc.application",
+    "shipping_svc.domain", "shipping_svc.application",
+    "notification_svc.domain", "notification_svc.application",
+    "returns_svc.domain", "returns_svc.application",
+]
+forbidden_modules = ["fulfilment_svc.adapters", "shipping_svc.adapters", "notification_svc.adapters", "returns_svc.adapters"]
+
+[[tool.importlinter.contracts]]
 name = "Shared library depends on no service"
 type = "forbidden"
 source_modules = ["edacommon", "contracts_py"]
-forbidden_modules = ["catalog_svc", "checkout_svc", "order_svc", "inventory_svc", "payment_svc"]
+forbidden_modules = [
+    "catalog_svc", "checkout_svc", "order_svc", "inventory_svc", "payment_svc",
+    "fulfilment_svc", "shipping_svc", "notification_svc", "returns_svc",
+]

@@ -26,14 +26,19 @@ public class SagaRepository {
   }
 
   public Optional<SagaRow> find(String sagaId) {
-    return jdbc.query("SELECT " + COLUMNS + " FROM saga_instance WHERE saga_id = ?", SagaRepository::row, sagaId)
+    return jdbc
+        .query(
+            "SELECT " + COLUMNS + " FROM saga_instance WHERE saga_id = ?",
+            SagaRepository::row,
+            sagaId)
         .stream()
         .findFirst();
   }
 
   /** {@code SELECT ... FOR UPDATE}: serialises concurrent triggers for one saga. */
   public Optional<SagaRow> loadForUpdate(String sagaId) {
-    return jdbc.query(
+    return jdbc
+        .query(
             "SELECT " + COLUMNS + " FROM saga_instance WHERE saga_id = ? FOR UPDATE",
             SagaRepository::row,
             sagaId)
@@ -76,7 +81,11 @@ public class SagaRepository {
             expectedVersion);
     if (n != 1) {
       throw new OptimisticLockingFailureException(
-          "saga " + row.sagaId() + " changed concurrently (expected version " + expectedVersion + ")");
+          "saga "
+              + row.sagaId()
+              + " changed concurrently (expected version "
+              + expectedVersion
+              + ")");
     }
   }
 
@@ -120,9 +129,12 @@ public class SagaRepository {
     return Optional.ofNullable(t).map(Timestamp::toInstant);
   }
 
-  /** Locks one due saga, skipping rows other sweepers hold, excluding ids already handled this pass. */
+  /**
+   * Locks one due saga, skipping rows other sweepers hold, excluding ids already handled this pass.
+   */
   public Optional<String> lockNextDue(String sagaType, Instant now, List<String> exclude) {
-    return jdbc.query(
+    return jdbc
+        .query(
             "SELECT saga_id FROM saga_instance WHERE saga_type = ? AND deadline_at <= ?"
                 + " AND NOT (saga_id = ANY (?)) ORDER BY deadline_at LIMIT 1 FOR UPDATE SKIP LOCKED",
             ps -> {

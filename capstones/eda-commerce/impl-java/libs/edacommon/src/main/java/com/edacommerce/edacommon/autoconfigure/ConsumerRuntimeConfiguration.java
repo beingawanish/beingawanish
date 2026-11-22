@@ -15,10 +15,9 @@ import com.edacommerce.edacommon.metrics.EdaMetrics;
 import com.edacommerce.edacommon.serde.AvroSerde;
 import com.edacommerce.edacommon.tracing.MessagingTracing;
 import java.time.Clock;
-import java.util.List;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -26,18 +25,20 @@ import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * The consumer runtime (guide §4.1): enabled when the service subscribes to topics and
- * {@code eda.consumer.enabled} is true (tests switch it off to drive {@link RecordProcessor}
- * directly). Creates the main and retry containers, the failure forwarder and the DLQ endpoints.
+ * The consumer runtime (guide §4.1): enabled when the service subscribes to topics and {@code
+ * eda.consumer.enabled} is true (tests switch it off to drive {@link RecordProcessor} directly).
+ * Creates the main and retry containers, the failure forwarder and the DLQ endpoints.
  */
 @Configuration(proxyBeanMethods = false)
-@ConditionalOnExpression("${eda.consumer.enabled:true} and '${eda.consumer.topics:}' != ''")
+@Conditional(OnConsumerTopicsCondition.class)
 public class ConsumerRuntimeConfiguration {
 
   @Bean
   HandlerRegistry edaHandlerRegistry(
       org.springframework.beans.factory.ObjectProvider<MessageHandler<?>> handlers,
-      org.springframework.beans.factory.ObjectProvider<com.edacommerce.edacommon.consumer.MessageHandlerGroup> groups) {
+      org.springframework.beans.factory.ObjectProvider<
+              com.edacommerce.edacommon.consumer.MessageHandlerGroup>
+          groups) {
     return new HandlerRegistry(
         com.edacommerce.edacommon.consumer.MessageHandlerGroup.collect(
             handlers.orderedStream().toList(), groups.orderedStream().toList()));
@@ -72,13 +73,16 @@ public class ConsumerRuntimeConfiguration {
       EdaProperties properties,
       RecordProcessor processor,
       FailureForwarder forwarder) {
-    return ConsumerContainers.main(
-        consumerFactory,
-        properties.getConsumer().getTopics(),
-        processor,
-        ConsumerContainers.errorHandler(forwarder, JitteredExponentialBackOff.adr0007()),
-        properties.getConsumer().getConcurrency(),
-        properties.getConsumer().getShutdownTimeout());
+    ConcurrentMessageListenerContainer<String, byte[]> c =
+        ConsumerContainers.main(
+            consumerFactory,
+            properties.getConsumer().getTopics(),
+            processor,
+            ConsumerContainers.errorHandler(forwarder, JitteredExponentialBackOff.adr0007()),
+            properties.getConsumer().getConcurrency(),
+            properties.getConsumer().getShutdownTimeout());
+    c.setAutoStartup(properties.getConsumer().isAutoStartup());
+    return c;
   }
 
   @Bean
@@ -88,13 +92,16 @@ public class ConsumerRuntimeConfiguration {
       RecordProcessor processor,
       FailureForwarder forwarder,
       Clock clock) {
-    return ConsumerContainers.retry(
-        consumerFactory,
-        processor,
-        ConsumerContainers.errorHandler(forwarder, JitteredExponentialBackOff.adr0007()),
-        properties.getConsumer().getRetryConcurrency(),
-        properties.getConsumer().getShutdownTimeout(),
-        clock);
+    ConcurrentMessageListenerContainer<String, byte[]> c =
+        ConsumerContainers.retry(
+            consumerFactory,
+            processor,
+            ConsumerContainers.errorHandler(forwarder, JitteredExponentialBackOff.adr0007()),
+            properties.getConsumer().getRetryConcurrency(),
+            properties.getConsumer().getShutdownTimeout(),
+            clock);
+    c.setAutoStartup(properties.getConsumer().isAutoStartup());
+    return c;
   }
 
   @Bean

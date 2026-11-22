@@ -50,12 +50,18 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
-/** payment-svc checklist: decline, timeout paths, duplicate webhooks, late success, bad signature. */
+/**
+ * payment-svc checklist: decline, timeout paths, duplicate webhooks, late success, bad signature.
+ */
 @EdaServiceTest
 @Import(PaymentServiceIT.Webhooks.class)
-@TestPropertySource(properties = {
-  "payment.psp.request-timeout=50ms", "payment.fake-psp.api-latency-ms=0", "payment.fake-psp.webhook-delay-ms=0",
-  "payment.fake-psp.decline-rate=0", "payment.fake-psp.timeout-rate=0", "payment.fake-psp.duplicate-webhook-rate=0"})
+@TestPropertySource(
+    properties = {
+      "payment.psp.request-timeout=50ms", "payment.fake-psp.api-latency-ms=0",
+          "payment.fake-psp.webhook-delay-ms=0",
+      "payment.fake-psp.decline-rate=0", "payment.fake-psp.timeout-rate=0",
+          "payment.fake-psp.duplicate-webhook-rate=0"
+    })
 class PaymentServiceIT {
   /** One captured webhook. */
   record Sent(byte[] body, long ts, String signature) {}
@@ -90,14 +96,24 @@ class PaymentServiceIT {
   @AfterEach
   void reset() {
     clock.reset();
-    psp.update(new com.edacommerce.payment.adapters.out.psp.fake.FakePspConfig(0.0, 0.0, 0.0, 0, 90_000, 0));
+    psp.update(
+        new com.edacommerce.payment.adapters.out.psp.fake.FakePspConfig(
+            0.0, 0.0, 0.0, 0, 90_000, 0));
   }
 
   String authorize(String orderId, String token) {
     String paymentId = Ids.newId();
-    driver.deliver("payment.commands.v1", orderId, AuthorizePayment.newBuilder().setEnvelope(Envelopes.placeholder())
-        .setOrderId(orderId).setPaymentId(paymentId).setCustomerId("c1").setAmount(new Money(12999L, "EUR"))
-        .setPaymentMethodToken(token).build());
+    driver.deliver(
+        "payment.commands.v1",
+        orderId,
+        AuthorizePayment.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setPaymentId(paymentId)
+            .setCustomerId("c1")
+            .setAmount(new Money(12999L, "EUR"))
+            .setPaymentMethodToken(token)
+            .build());
     return paymentId;
   }
 
@@ -112,9 +128,14 @@ class PaymentServiceIT {
     return n;
   }
 
-  org.springframework.test.web.servlet.ResultActions postWebhook(byte[] body, long ts, String sig) throws Exception {
-    return mvc.perform(post("/webhooks/psp").contentType(MediaType.APPLICATION_JSON).content(body)
-        .header("X-Webhook-Timestamp", Long.toString(ts)).header("X-Psp-Signature", sig));
+  org.springframework.test.web.servlet.ResultActions postWebhook(byte[] body, long ts, String sig)
+      throws Exception {
+    return mvc.perform(
+        post("/webhooks/psp")
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(body)
+            .header("X-Webhook-Timestamp", Long.toString(ts))
+            .header("X-Psp-Signature", sig));
   }
 
   @Test
@@ -131,16 +152,33 @@ class PaymentServiceIT {
     assertThat(a.getPaymentId()).isEqualTo(paymentId);
     assertThat(a.getEnvelope().getProducer()).isEqualTo("payment-svc");
 
-    driver.deliver("payment.commands.v1", orderId, CapturePayment.newBuilder().setEnvelope(Envelopes.placeholder())
-        .setOrderId(orderId).setPaymentId(paymentId).setAmount(new Money(12999L, "EUR")).build());
+    driver.deliver(
+        "payment.commands.v1",
+        orderId,
+        CapturePayment.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setPaymentId(paymentId)
+            .setAmount(new Money(12999L, "EUR"))
+            .build());
     deliverWebhooks(1);
     assertThat(driver.published(PaymentCaptured.class, orderId)).hasSize(1);
 
-    driver.deliver("payment.commands.v1", orderId, RefundPayment.newBuilder().setEnvelope(Envelopes.placeholder())
-        .setOrderId(orderId).setPaymentId(paymentId).setRefundId("rf-" + orderId).setReturnId("ret").setAmount(new Money(5000L, "EUR"))
-        .setReason("return").build());
+    driver.deliver(
+        "payment.commands.v1",
+        orderId,
+        RefundPayment.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setPaymentId(paymentId)
+            .setRefundId("rf-" + orderId)
+            .setReturnId("ret")
+            .setAmount(new Money(5000L, "EUR"))
+            .setReason("return")
+            .build());
     deliverWebhooks(1);
-    assertThat(driver.published(RefundSucceeded.class, orderId)).singleElement()
+    assertThat(driver.published(RefundSucceeded.class, orderId))
+        .singleElement()
         .satisfies(r -> assertThat(r.getAmount().getAmountMinor()).isEqualTo(5000L));
   }
 
@@ -149,7 +187,8 @@ class PaymentServiceIT {
     String orderId = Ids.newId();
     authorize(orderId, "tok_decline");
     deliverWebhooks(1);
-    assertThat(driver.published(PaymentDeclined.class, orderId)).singleElement()
+    assertThat(driver.published(PaymentDeclined.class, orderId))
+        .singleElement()
         .satisfies(d -> assertThat(d.getReason()).isEqualTo(DeclineReason.CARD_DECLINED));
   }
 
@@ -159,16 +198,23 @@ class PaymentServiceIT {
     authorize(orderId, "tok_dup_webhook");
     assertThat(deliverWebhooks(3)).isEqualTo(3);
     assertThat(driver.published(PaymentAuthorized.class, orderId)).hasSize(1);
-    assertThat(jdbc.queryForObject("SELECT count(*) FROM psp_webhook", Integer.class)).isGreaterThanOrEqualTo(1);
+    assertThat(jdbc.queryForObject("SELECT count(*) FROM psp_webhook", Integer.class))
+        .isGreaterThanOrEqualTo(1);
   }
 
   @Test
   void badSignatureAndStaleTimestampAre401() throws Exception {
-    byte[] body = "{\"pspEventId\":\"x\",\"eventType\":\"authorization.succeeded\",\"merchantReference\":\"p\"}".getBytes(StandardCharsets.UTF_8);
+    byte[] body =
+        "{\"pspEventId\":\"x\",\"eventType\":\"authorization.succeeded\",\"merchantReference\":\"p\"}"
+            .getBytes(StandardCharsets.UTF_8);
     long now = clock.instant().getEpochSecond();
     postWebhook(body, now, "deadbeef").andExpect(status().isUnauthorized());
-    postWebhook(body, now - 301, verifier.sign(now - 301, body)).andExpect(status().isUnauthorized());
-    postWebhook("not json".getBytes(StandardCharsets.UTF_8), now, verifier.sign(now, "not json".getBytes(StandardCharsets.UTF_8)))
+    postWebhook(body, now - 301, verifier.sign(now - 301, body))
+        .andExpect(status().isUnauthorized());
+    postWebhook(
+            "not json".getBytes(StandardCharsets.UTF_8),
+            now,
+            verifier.sign(now, "not json".getBytes(StandardCharsets.UTF_8)))
         .andExpect(status().isBadRequest());
   }
 
@@ -176,7 +222,10 @@ class PaymentServiceIT {
   void timeoutReconcilesToAuthorised() {
     String orderId = Ids.newId();
     String paymentId = authorize(orderId, "tok_timeout");
-    assertThat(jdbc.queryForObject("SELECT status FROM payment WHERE payment_id = ?", String.class, paymentId)).isEqualTo("UNKNOWN");
+    assertThat(
+            jdbc.queryForObject(
+                "SELECT status FROM payment WHERE payment_id = ?", String.class, paymentId))
+        .isEqualTo("UNKNOWN");
     clock.advance(Duration.ofSeconds(16));
     useCases.reconcileDue(10);
     assertThat(driver.published(PaymentAuthorized.class, orderId)).isEmpty();
@@ -187,26 +236,43 @@ class PaymentServiceIT {
 
   @Test
   void lostRequestEndsPspTimeoutWithVoidAndALateSuccessIsVoided() throws Exception {
-    mvc.perform(put("/admin/fakes/psp").contentType(MediaType.APPLICATION_JSON).content("{\"timeoutRate\":1.0}"))
+    mvc.perform(
+            put("/admin/fakes/psp")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"timeoutRate\":1.0}"))
         .andExpect(status().isOk());
-    mvc.perform(get("/admin/fakes/psp")).andExpect(status().isOk()).andExpect(OpenApiContract.validResponse("admin.yaml"));
+    mvc.perform(get("/admin/fakes/psp"))
+        .andExpect(status().isOk())
+        .andExpect(OpenApiContract.validResponse("admin.yaml"));
     String orderId = Ids.newId();
     String paymentId = authorize(orderId, "tok_random");
     for (int i = 0; i < 9; i++) {
       clock.advance(Duration.ofSeconds(15));
       useCases.reconcileDue(10);
     }
-    assertThat(driver.published(PaymentDeclined.class, orderId)).singleElement()
+    assertThat(driver.published(PaymentDeclined.class, orderId))
+        .singleElement()
         .satisfies(d -> assertThat(d.getReason()).isEqualTo(DeclineReason.PSP_TIMEOUT));
     assertThat(psp.isVoided(paymentId)).isTrue();
 
-    byte[] late = ("{\"pspEventId\":\"late-" + paymentId + "\",\"eventType\":\"authorization.succeeded\",\"pspPaymentId\":\"psp\","
-        + "\"merchantReference\":\"" + paymentId + "\",\"occurredAt\":\"2026-11-18T09:00:00Z\"}").getBytes(StandardCharsets.UTF_8);
+    byte[] late =
+        ("{\"pspEventId\":\"late-"
+                + paymentId
+                + "\",\"eventType\":\"authorization.succeeded\",\"pspPaymentId\":\"psp\","
+                + "\"merchantReference\":\""
+                + paymentId
+                + "\",\"occurredAt\":\"2026-11-18T09:00:00Z\"}")
+            .getBytes(StandardCharsets.UTF_8);
     long ts = clock.instant().getEpochSecond();
     postWebhook(late, ts, verifier.sign(ts, late)).andExpect(status().isOk());
     useCases.processNotifications(10);
     assertThat(driver.published(PaymentAuthorized.class, orderId)).isEmpty();
-    assertThat(jdbc.queryForObject("SELECT late_success_voided FROM payment WHERE payment_id = ?", Boolean.class, paymentId)).isTrue();
+    assertThat(
+            jdbc.queryForObject(
+                "SELECT late_success_voided FROM payment WHERE payment_id = ?",
+                Boolean.class,
+                paymentId))
+        .isTrue();
   }
 
   @Test
@@ -214,13 +280,23 @@ class PaymentServiceIT {
     String orderId = Ids.newId();
     String paymentId = authorize(orderId, "tok_capture_fails");
     deliverWebhooks(1);
-    driver.deliver("payment.commands.v1", orderId, CapturePayment.newBuilder().setEnvelope(Envelopes.placeholder())
-        .setOrderId(orderId).setPaymentId(paymentId).setAmount(new Money(12999L, "EUR")).build());
+    driver.deliver(
+        "payment.commands.v1",
+        orderId,
+        CapturePayment.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setPaymentId(paymentId)
+            .setAmount(new Money(12999L, "EUR"))
+            .build());
     deliverWebhooks(1);
-    assertThat(driver.published(PaymentCaptureFailed.class, orderId)).singleElement().satisfies(f -> {
-      assertThat(f.getReason()).isEqualTo(CaptureFailureReason.AUTHORIZATION_EXPIRED);
-      assertThat(f.getRetryable()).isFalse();
-    });
+    assertThat(driver.published(PaymentCaptureFailed.class, orderId))
+        .singleElement()
+        .satisfies(
+            f -> {
+              assertThat(f.getReason()).isEqualTo(CaptureFailureReason.AUTHORIZATION_EXPIRED);
+              assertThat(f.getRetryable()).isFalse();
+            });
   }
 
   @Test
@@ -229,14 +305,35 @@ class PaymentServiceIT {
     String paymentId = authorize(orderId, "tok_visa_ok");
     deliverWebhooks(1);
     // Resend: new eventId, same paymentId -> the original reply again, no second PSP call.
-    driver.deliver("payment.commands.v1", orderId, AuthorizePayment.newBuilder().setEnvelope(Envelopes.placeholder())
-        .setOrderId(orderId).setPaymentId(paymentId).setCustomerId("c1").setAmount(new Money(12999L, "EUR"))
-        .setPaymentMethodToken("tok_visa_ok").build());
+    driver.deliver(
+        "payment.commands.v1",
+        orderId,
+        AuthorizePayment.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setPaymentId(paymentId)
+            .setCustomerId("c1")
+            .setAmount(new Money(12999L, "EUR"))
+            .setPaymentMethodToken("tok_visa_ok")
+            .build());
     assertThat(driver.published(PaymentAuthorized.class, orderId)).hasSize(2);
-    assertThat(jdbc.queryForObject("SELECT count(*) FROM payment_attempt WHERE payment_id = ? AND operation = 'authorize'", Integer.class, paymentId)).isEqualTo(1);
+    assertThat(
+            jdbc.queryForObject(
+                "SELECT count(*) FROM payment_attempt WHERE payment_id = ? AND operation = 'authorize'",
+                Integer.class,
+                paymentId))
+        .isEqualTo(1);
 
-    MessageDriver.Delivery v = driver.deliver("payment.commands.v1", orderId, VoidPayment.newBuilder().setEnvelope(Envelopes.placeholder())
-        .setOrderId(orderId).setPaymentId(paymentId).setReason("cancel").build());
+    MessageDriver.Delivery v =
+        driver.deliver(
+            "payment.commands.v1",
+            orderId,
+            VoidPayment.newBuilder()
+                .setEnvelope(Envelopes.placeholder())
+                .setOrderId(orderId)
+                .setPaymentId(paymentId)
+                .setReason("cancel")
+                .build());
     assertThat(driver.redeliver(v).outcome()).isEqualTo(Outcome.DUPLICATE);
     assertThat(driver.published(PaymentVoided.class, orderId)).hasSize(1);
   }

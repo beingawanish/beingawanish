@@ -14,11 +14,15 @@ import org.springframework.lang.Nullable;
 public final class ClaimChecks {
   private ClaimChecks() {}
 
-  /** {@code <context>/<yyyy>/<mm>/<aggregateId>/<documentId>.<ext>}, e.g. order/2026/11/o1/i1.pdf. */
-  public static String key(String context, Instant at, String aggregateId, String documentId, String ext) {
+  /**
+   * {@code <context>/<yyyy>/<mm>/<aggregateId>/<documentId>.<ext>}, e.g. order/2026/11/o1/i1.pdf.
+   */
+  public static String key(
+      String context, Instant at, String aggregateId, String documentId, String ext) {
     ZonedDateTime t = at.atZone(ZoneOffset.UTC);
     return String.format(
-        "%s/%04d/%02d/%s/%s.%s", context, t.getYear(), t.getMonthValue(), aggregateId, documentId, ext);
+        "%s/%04d/%02d/%s/%s.%s",
+        context, t.getYear(), t.getMonthValue(), aggregateId, documentId, ext);
   }
 
   public static String sha256(byte[] bytes) {
@@ -46,11 +50,16 @@ public final class ClaimChecks {
   public static byte[] verify(ClaimCheck claimCheck, byte[] bytes) {
     if (bytes.length != claimCheck.getSizeBytes()) {
       throw new NonRetryableException(
-          "claim check size mismatch for " + claimCheck.getObjectKey() + ": " + bytes.length
-              + " != " + claimCheck.getSizeBytes());
+          "claim check size mismatch for "
+              + claimCheck.getObjectKey()
+              + ": "
+              + bytes.length
+              + " != "
+              + claimCheck.getSizeBytes());
     }
     if (!sha256(bytes).equals(claimCheck.getSha256())) {
-      throw new NonRetryableException("claim check sha256 mismatch for " + claimCheck.getObjectKey());
+      throw new NonRetryableException(
+          "claim check sha256 mismatch for " + claimCheck.getObjectKey());
     }
     return bytes;
   }

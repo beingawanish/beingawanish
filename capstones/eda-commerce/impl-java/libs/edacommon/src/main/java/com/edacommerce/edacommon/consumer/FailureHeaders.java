@@ -10,12 +10,17 @@ import org.apache.kafka.common.header.internals.RecordHeaders;
 /**
  * The x-* headers added when a record is forwarded to a retry topic or the DLQ (architecture §8.1).
  * The x-original-* headers always describe the first source record, so they survive every hop.
- * {@code x-not-before} is an ISO-8601 UTC instant.
+ * {@code x-not-before} is RFC 3339 UTC with milliseconds, e.g. 2026-11-22T09:15:00.123Z.
  */
 public final class FailureHeaders {
   private FailureHeaders() {}
 
   static final int MAX_ERROR_MESSAGE = 1000;
+
+  /** RFC 3339 UTC with milliseconds and 'Z', the same text the Python build writes. */
+  public static final java.time.format.DateTimeFormatter TIMESTAMP =
+      java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+          .withZone(java.time.ZoneOffset.UTC);
 
   public static int previousAttempt(Headers headers) {
     String v = RecordProcessor.header(headers, EdaHeaders.X_RETRY_ATTEMPT);
@@ -47,7 +52,7 @@ public final class FailureHeaders {
     put(out, EdaHeaders.X_ORIGINAL_TOPIC, originalTopic);
     put(out, EdaHeaders.X_ORIGINAL_PARTITION, originalPartition);
     put(out, EdaHeaders.X_ORIGINAL_OFFSET, originalOffset);
-    put(out, EdaHeaders.X_NOT_BEFORE, now.plus(destination.delay()).toString());
+    put(out, EdaHeaders.X_NOT_BEFORE, TIMESTAMP.format(now.plus(destination.delay())));
     put(out, EdaHeaders.X_ERROR_CLASS, errorClass);
     put(out, EdaHeaders.X_ERROR_MESSAGE, truncate(errorMessage));
     put(out, EdaHeaders.X_FAILED_CONSUMER_GROUP, consumerGroup);

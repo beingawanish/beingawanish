@@ -43,7 +43,10 @@ public final class InventoryMessages {
                   .setReservationId(r.reservationId())
                   .setShortages(
                       x.shortages().stream()
-                          .map(s -> new com.edacommerce.inventory.Shortage(s.sku(), s.requested(), s.available()))
+                          .map(
+                              s ->
+                                  new com.edacommerce.inventory.Shortage(
+                                      s.sku(), s.requested(), s.available()))
                           .toList())
                   .build();
           case Reply.Committed x ->
@@ -69,7 +72,8 @@ public final class InventoryMessages {
                   .setExpiredAt(x.expiredAt())
                   .build();
         };
-    return OutgoingMessage.of(EVENTS, r.orderId(), record, "Reservation", r.reservationId(), r.version());
+    return OutgoingMessage.of(
+        EVENTS, r.orderId(), record, "Reservation", r.reservationId(), r.version());
   }
 
   public static OutgoingMessage restocked(Restock r) {
@@ -95,10 +99,13 @@ public final class InventoryMessages {
             .setAvailable(level.available())
             .setAsOf(asOf)
             .build();
-    return OutgoingMessage.of(STOCK_LEVEL, level.sku(), e, "StockLevel", level.sku(), level.version());
+    return OutgoingMessage.of(
+        STOCK_LEVEL, level.sku(), e, "StockLevel", level.sku(), level.version());
   }
 
   static List<com.edacommerce.common.StockLine> lines(List<StockLine> lines) {
-    return lines.stream().map(l -> new com.edacommerce.common.StockLine(l.sku(), l.quantity())).toList();
+    return lines.stream()
+        .map(l -> new com.edacommerce.common.StockLine(l.sku(), l.quantity()))
+        .toList();
   }
 }

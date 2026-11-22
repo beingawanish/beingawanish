@@ -14,7 +14,8 @@ class PiiRedactorTest {
     Map<String, Object> safe = PiiRedactor.redact(c);
     assertThat(safe.get("contactEmail")).isEqualTo(PiiRedactor.REDACTED);
     assertThat(safe.get("shippingAddress")).isEqualTo(PiiRedactor.REDACTED);
-    assertThat(safe.toString()).doesNotContain("jane.doe@example.com", "Jane Doe", "Invalidenstrasse");
+    assertThat(safe.toString())
+        .doesNotContain("jane.doe@example.com", "Jane Doe", "Invalidenstrasse");
     assertThat(safe.get("orderId")).isEqualTo(c.getOrderId());
   }
 }

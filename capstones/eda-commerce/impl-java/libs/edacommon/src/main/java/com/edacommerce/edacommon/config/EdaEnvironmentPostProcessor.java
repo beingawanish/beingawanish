@@ -72,7 +72,8 @@ public class EdaEnvironmentPostProcessor implements EnvironmentPostProcessor, Or
     }
 
     String service = env.getProperty("SERVICE_NAME", env.getProperty("eda.service-name", "app"));
-    // eda.db-context lets two processes of one codebase share a database (order-svc and its projector).
+    // eda.db-context lets two processes of one codebase share a database (order-svc and its
+    // projector).
     String context = env.getProperty("eda.db-context", contextOf(service));
     Map<String, Object> defaults = new LinkedHashMap<>();
     defaults.put("spring.application.name", service);
@@ -102,7 +103,10 @@ public class EdaEnvironmentPostProcessor implements EnvironmentPostProcessor, Or
   }
 
   static String contextOf(String serviceName) {
-    String s = serviceName.endsWith("-svc") ? serviceName.substring(0, serviceName.length() - 4) : serviceName;
+    String s =
+        serviceName.endsWith("-svc")
+            ? serviceName.substring(0, serviceName.length() - 4)
+            : serviceName;
     return s.replace('-', '_');
   }
 
@@ -110,7 +114,8 @@ public class EdaEnvironmentPostProcessor implements EnvironmentPostProcessor, Or
     String service = env.getProperty("SERVICE_NAME", env.getProperty("eda.service-name", "app"));
     String host = env.getProperty("DB_HOST", "localhost");
     String port = env.getProperty("DB_PORT", "5432");
-    String name = env.getProperty("DB_NAME", env.getProperty("eda.db-context", contextOf(service)) + "_db");
+    String name =
+        env.getProperty("DB_NAME", env.getProperty("eda.db-context", contextOf(service)) + "_db");
     return "jdbc:postgresql://" + host + ":" + port + "/" + name;
   }
 

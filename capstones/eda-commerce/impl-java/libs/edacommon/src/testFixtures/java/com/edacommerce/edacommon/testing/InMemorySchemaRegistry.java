@@ -10,9 +10,9 @@ import org.apache.avro.SchemaNormalization;
 
 /**
  * Schema Registry stand-in for tests without a registry container. Behaves like a registry into
- * which {@code make schemas} registered every bundled schema: a lookup succeeds for any subject whose
- * record name is a bundled contract, ids are stable per schema. Unknown schemas are rejected, like
- * {@code auto.register.schemas=false}.
+ * which {@code make schemas} registered every bundled schema: a lookup succeeds for any subject
+ * whose record name is a bundled contract, ids are stable per schema. Unknown schemas are rejected,
+ * like {@code auto.register.schemas=false}.
  */
 public class InMemorySchemaRegistry implements SchemaRegistryClient {
   private final AtomicInteger nextId = new AtomicInteger(1);
@@ -23,7 +23,8 @@ public class InMemorySchemaRegistry implements SchemaRegistryClient {
   @Override
   public int lookupId(String subject, Schema schema) {
     if (!subject.endsWith("-" + schema.getFullName())) {
-      throw new SchemaNotRegisteredException("subject does not follow TopicRecordNameStrategy: " + subject);
+      throw new SchemaNotRegisteredException(
+          "subject does not follow TopicRecordNameStrategy: " + subject);
     }
     Schema bundled;
     try {
@@ -33,7 +34,8 @@ public class InMemorySchemaRegistry implements SchemaRegistryClient {
     }
     long fp = SchemaNormalization.parsingFingerprint64(bundled);
     if (fp != SchemaNormalization.parsingFingerprint64(schema)) {
-      throw new SchemaNotRegisteredException("schema differs from the bundled contract: " + subject);
+      throw new SchemaNotRegisteredException(
+          "schema differs from the bundled contract: " + subject);
     }
     int id =
         idsByFingerprint.computeIfAbsent(

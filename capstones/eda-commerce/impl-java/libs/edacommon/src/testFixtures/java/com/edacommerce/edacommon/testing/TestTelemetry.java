@@ -25,7 +25,9 @@ public final class TestTelemetry {
     sdk =
         OpenTelemetrySdk.builder()
             .setTracerProvider(
-                SdkTracerProvider.builder().addSpanProcessor(SimpleSpanProcessor.create(spans)).build())
+                SdkTracerProvider.builder()
+                    .addSpanProcessor(SimpleSpanProcessor.create(spans))
+                    .build())
             .setMeterProvider(SdkMeterProvider.builder().registerMetricReader(metrics).build())
             .setPropagators(ContextPropagators.create(W3CTraceContextPropagator.getInstance()))
             .build();

@@ -11,5 +11,10 @@ public interface OrderHistoryReadModel {
   Optional<OrderView> find(String orderId);
 
   /** Newest first, keyset-paginated after (placedAt, orderId). */
-  List<OrderView> listForCustomer(String customerId, Set<OrderStatus> statuses, Instant beforePlacedAt, String beforeOrderId, int limit);
+  List<OrderView> listForCustomer(
+      String customerId,
+      Set<OrderStatus> statuses,
+      Instant beforePlacedAt,
+      String beforeOrderId,
+      int limit);
 }

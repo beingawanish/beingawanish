@@ -16,8 +16,8 @@ import java.util.List;
 
 /**
  * Handlers for inventory.commands.v1, registered by ce_type with the edacommon consumer runtime.
- * They translate contract messages into use-case calls and domain errors into NonRetryable; they hold
- * no business rules.
+ * They translate contract messages into use-case calls and domain errors into NonRetryable; they
+ * hold no business rules.
  */
 public final class InventoryCommandHandlers {
   private InventoryCommandHandlers() {}
@@ -31,7 +31,8 @@ public final class InventoryCommandHandlers {
   }
 
   /** ReserveStock. */
-  public record Reserve(InventoryUseCases useCases, Clock clock) implements MessageHandler<ReserveStock> {
+  public record Reserve(InventoryUseCases useCases, Clock clock)
+      implements MessageHandler<ReserveStock> {
     @Override
     public Class<ReserveStock> messageType() {
       return ReserveStock.class;
@@ -53,7 +54,9 @@ public final class InventoryCommandHandlers {
     }
   }
 
-  /** CommitReservation. An unknown reservation is probably a ReserveStock still in a retry topic. */
+  /**
+   * CommitReservation. An unknown reservation is probably a ReserveStock still in a retry topic.
+   */
   public record Commit(InventoryUseCases useCases) implements MessageHandler<CommitReservation> {
     @Override
     public Class<CommitReservation> messageType() {
@@ -90,7 +93,12 @@ public final class InventoryCommandHandlers {
 
     @Override
     public void handle(RestockItems cmd, MessageContext ctx) {
-      useCases.restock(cmd.getOrderId(), cmd.getReturnId(), cmd.getRestockId(), lines(cmd.getLines()), ctx.causation());
+      useCases.restock(
+          cmd.getOrderId(),
+          cmd.getReturnId(),
+          cmd.getRestockId(),
+          lines(cmd.getLines()),
+          ctx.causation());
     }
   }
 }

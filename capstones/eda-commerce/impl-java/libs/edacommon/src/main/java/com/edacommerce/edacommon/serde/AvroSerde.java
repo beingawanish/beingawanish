@@ -59,7 +59,8 @@ public class AvroSerde {
     Schema reader = model.getSchema(type);
     try {
       SpecificDatumReader<T> datumReader = new SpecificDatumReader<>(writer, reader, model);
-      return datumReader.read(null, DecoderFactory.get().binaryDecoder(data, 5, data.length - 5, null));
+      return datumReader.read(
+          null, DecoderFactory.get().binaryDecoder(data, 5, data.length - 5, null));
     } catch (IOException | AvroRuntimeException | ClassCastException e) {
       throw new NonRetryableException(
           "cannot deserialise schema id " + id + " as " + reader.getFullName(), e);

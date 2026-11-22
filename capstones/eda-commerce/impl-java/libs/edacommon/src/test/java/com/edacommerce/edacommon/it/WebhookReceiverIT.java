@@ -27,10 +27,12 @@ class WebhookReceiverIT {
     long ts = System.currentTimeMillis() / 1000;
     assertThat(receiver.authentic(Long.toString(ts), verifier.sign(ts, body), body)).isTrue();
     assertThat(receiver.authentic(Long.toString(ts), "bad", body)).isFalse();
-    WebhookReceiver.Store store = (id, raw) -> db.jdbc.update("INSERT INTO effect (id, n) VALUES (?, 1)", id);
+    WebhookReceiver.Store store =
+        (id, raw) -> db.jdbc.update("INSERT INTO effect (id, n) VALUES (?, 1)", id);
     for (int i = 0; i < 3; i++) {
       WebhookReceiver.Result r = receiver.receive("e9", "authorization.succeeded", body, store);
-      assertThat(r).isEqualTo(i == 0 ? WebhookReceiver.Result.ACCEPTED : WebhookReceiver.Result.DUPLICATE);
+      assertThat(r)
+          .isEqualTo(i == 0 ? WebhookReceiver.Result.ACCEPTED : WebhookReceiver.Result.DUPLICATE);
       assertThat(r.status().value()).isEqualTo(200);
     }
     assertThat(db.count("SELECT count(*) FROM effect")).isEqualTo(1);

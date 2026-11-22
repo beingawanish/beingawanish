@@ -35,9 +35,18 @@ class EdaMetricsTest {
         t.collectMetrics().stream().collect(Collectors.toMap(MetricData::getName, x -> x));
     assertThat(byName.keySet())
         .containsExactlyInAnyOrder(
-            "eda.event.age", "eda.consumer.processed", "eda.consumer.handler.duration", "eda.dlq.messages",
-            "eda.outbox.pending", "eda.saga.outcomes", "eda.saga.duration", "eda.saga.step.duration",
-            "eda.saga.step.timeouts", "eda.saga.overdue", "eda.claimcheck.object.size", "eda.webhook.received");
+            "eda.event.age",
+            "eda.consumer.processed",
+            "eda.consumer.handler.duration",
+            "eda.dlq.messages",
+            "eda.outbox.pending",
+            "eda.saga.outcomes",
+            "eda.saga.duration",
+            "eda.saga.step.duration",
+            "eda.saga.step.timeouts",
+            "eda.saga.overdue",
+            "eda.claimcheck.object.size",
+            "eda.webhook.received");
 
     assertUnit(byName, "eda.event.age", "s");
     assertUnit(byName, "eda.consumer.processed", "{message}");
@@ -53,9 +62,11 @@ class EdaMetricsTest {
     assertBuckets(byName, "eda.saga.step.duration", EdaMetrics.SAGA_STEP_BUCKETS);
     assertBuckets(byName, "eda.claimcheck.object.size", EdaMetrics.CLAIMCHECK_BUCKETS);
     assertThat(EdaMetrics.EVENT_AGE_BUCKETS)
-        .containsExactly(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 1800.0);
+        .containsExactly(
+            0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 1800.0);
 
-    var processed = byName.get("eda.consumer.processed").getLongSumData().getPoints().iterator().next();
+    var processed =
+        byName.get("eda.consumer.processed").getLongSumData().getPoints().iterator().next();
     assertThat(processed.getAttributes().asMap().keySet().stream().map(Object::toString))
         .containsExactlyInAnyOrder("topic", "consumer_group", "event_type", "outcome");
     assertThat(processed.getAttributes().get(EdaMetrics.OUTCOME)).isEqualTo("duplicate");

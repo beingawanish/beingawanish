@@ -59,14 +59,27 @@ class RecordProcessorIT {
                   .setCommittedAt(Instant.now())
                   .build();
           db.outbox.append(
-              OutgoingMessage.of("inventory.events.v1", cmd.getOrderId(), reply, "Reservation", cmd.getReservationId(), 2),
+              OutgoingMessage.of(
+                  "inventory.events.v1",
+                  cmd.getOrderId(),
+                  reply,
+                  "Reservation",
+                  cmd.getReservationId(),
+                  2),
               ctx.causation());
         }
       };
 
   final RecordProcessor processor =
       new RecordProcessor(
-          "inventory-svc", new HandlerRegistry(List.of(handler)), db.inbox, db.serde, db.tx, db.tracing, db.metrics, db.clock);
+          "inventory-svc",
+          new HandlerRegistry(List.of(handler)),
+          db.inbox,
+          db.serde,
+          db.tx,
+          db.tracing,
+          db.metrics,
+          db.clock);
 
   @AfterEach
   void close() {
@@ -74,7 +87,8 @@ class RecordProcessorIT {
   }
 
   ConsumerRecord<String, byte[]> record(String eventId, String type, byte[] value) {
-    ConsumerRecord<String, byte[]> r = new ConsumerRecord<>("inventory.commands.v1", 4, 77L, "order-1", value);
+    ConsumerRecord<String, byte[]> r =
+        new ConsumerRecord<>("inventory.commands.v1", 4, 77L, "order-1", value);
     r.headers().add(EdaHeaders.CE_ID, eventId.getBytes(StandardCharsets.UTF_8));
     r.headers().add(EdaHeaders.CE_TYPE, type.getBytes(StandardCharsets.UTF_8));
     r.headers().add(EdaHeaders.TRACEPARENT, TRACEPARENT.getBytes(StandardCharsets.UTF_8));
@@ -83,7 +97,10 @@ class RecordProcessorIT {
 
   ConsumerRecord<String, byte[]> commit(String eventId) {
     CommitReservation cmd = GoldenFixtures.decode(CommitReservation.class);
-    return record(eventId, "com.edacommerce.inventory.CommitReservation", db.serde.serialize("inventory.commands.v1", cmd));
+    return record(
+        eventId,
+        "com.edacommerce.inventory.CommitReservation",
+        db.serde.serialize("inventory.commands.v1", cmd));
   }
 
   @Test
@@ -91,7 +108,10 @@ class RecordProcessorIT {
     assertThat(processor.process(commit("e-1"))).isEqualTo(Outcome.SUCCESS);
 
     assertThat(db.count("SELECT n FROM effect")).isEqualTo(1);
-    assertThat(db.count("SELECT count(*) FROM inbox WHERE message_id = 'e-1' AND consumer = 'inventory-svc'")).isEqualTo(1);
+    assertThat(
+            db.count(
+                "SELECT count(*) FROM inbox WHERE message_id = 'e-1' AND consumer = 'inventory-svc'"))
+        .isEqualTo(1);
     var row = db.jdbc.queryForMap("SELECT causation_id, traceparent, correlation_id FROM outbox");
     assertThat(row.get("causation_id")).isEqualTo("e-1");
     SpanData consumerSpan = db.telemetry.spans().get(0);
@@ -112,19 +132,28 @@ class RecordProcessorIT {
     assertThat(calls.get()).isEqualTo(1);
     var processed = db.telemetry.metric("eda.consumer.processed").orElseThrow();
     assertThat(processed.getLongSumData().getPoints())
-        .anySatisfy(p -> assertThat(p.getAttributes().asMap().toString()).contains("outcome=duplicate"));
+        .anySatisfy(
+            p -> assertThat(p.getAttributes().asMap().toString()).contains("outcome=duplicate"));
   }
 
   @Test
   void unknownTypesAreIgnoredWithoutDeserialising() {
-    assertThat(processor.process(record("e-2", "com.edacommerce.inventory.Unheard", new byte[] {9, 9})))
+    assertThat(
+            processor.process(
+                record("e-2", "com.edacommerce.inventory.Unheard", new byte[] {9, 9})))
         .isEqualTo(Outcome.IGNORED);
     assertThat(db.count("SELECT count(*) FROM inbox")).isZero();
   }
 
   @Test
   void undecodableValuesAreNonRetryableAndLeaveNoTrace() {
-    assertThatThrownBy(() -> processor.process(record("e-3", "com.edacommerce.inventory.CommitReservation", new byte[] {0, 0, 0, 0, 1, 7})))
+    assertThatThrownBy(
+            () ->
+                processor.process(
+                    record(
+                        "e-3",
+                        "com.edacommerce.inventory.CommitReservation",
+                        new byte[] {0, 0, 0, 0, 1, 7})))
         .isInstanceOf(NonRetryableException.class);
     assertThat(db.count("SELECT count(*) FROM inbox")).isZero();
   }
@@ -132,7 +161,8 @@ class RecordProcessorIT {
   @Test
   void aFailingHandlerRollsBackTheInboxSoTheRetrySucceeds() {
     failWith = new IllegalStateException("downstream degraded");
-    assertThatThrownBy(() -> processor.process(commit("e-4"))).isInstanceOf(RetryLaterException.class);
+    assertThatThrownBy(() -> processor.process(commit("e-4")))
+        .isInstanceOf(RetryLaterException.class);
     assertThat(db.count("SELECT count(*) FROM inbox")).isZero();
     assertThat(db.count("SELECT count(*) FROM outbox")).isZero();
 
@@ -150,10 +180,17 @@ class RecordProcessorIT {
                 + " causation_id, traceparent, tracestate FROM outbox",
             (rs, i) ->
                 new PollingOutboxRelay.OutboxRow(
-                    rs.getObject("id", java.util.UUID.class), rs.getString("aggregate_id"), rs.getString("event_type"),
-                    rs.getString("topic"), rs.getBytes("payload"), rs.getTimestamp("occurred_at").toInstant(),
-                    rs.getString("producer"), rs.getString("correlation_id"), rs.getString("causation_id"),
-                    rs.getString("traceparent"), rs.getString("tracestate")));
+                    rs.getObject("id", java.util.UUID.class),
+                    rs.getString("aggregate_id"),
+                    rs.getString("event_type"),
+                    rs.getString("topic"),
+                    rs.getBytes("payload"),
+                    rs.getTimestamp("occurred_at").toInstant(),
+                    rs.getString("producer"),
+                    rs.getString("correlation_id"),
+                    rs.getString("causation_id"),
+                    rs.getString("traceparent"),
+                    rs.getString("tracestate")));
     assertThat(PollingOutboxRelay.toRecord(row).headers().lastHeader("causation_id").value())
         .isEqualTo("e-5".getBytes(StandardCharsets.UTF_8));
   }

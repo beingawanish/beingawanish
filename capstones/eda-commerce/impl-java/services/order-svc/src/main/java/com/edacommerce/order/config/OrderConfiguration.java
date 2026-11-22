@@ -37,16 +37,35 @@ public class OrderConfiguration {
 
   /** SAGA_* step timeouts (guide §7). */
   @ConfigurationProperties(prefix = "order.saga")
-  public record SagaProperties(Duration stockTimeout, Duration paymentTimeout, Duration commitTimeout, Duration fulfilmentAckTimeout,
-      int fulfilmentMaxResends, Duration dispatchTimeout, Duration captureTimeout, Duration compensationTimeout, Duration sweepInterval) {
+  public record SagaProperties(
+      Duration stockTimeout,
+      Duration paymentTimeout,
+      Duration commitTimeout,
+      Duration fulfilmentAckTimeout,
+      int fulfilmentMaxResends,
+      Duration dispatchTimeout,
+      Duration captureTimeout,
+      Duration compensationTimeout,
+      Duration sweepInterval) {
     SagaTimeouts timeouts() {
-      return new SagaTimeouts(stockTimeout, paymentTimeout, commitTimeout, fulfilmentAckTimeout, fulfilmentMaxResends, dispatchTimeout,
-          captureTimeout, compensationTimeout);
+      return new SagaTimeouts(
+          stockTimeout,
+          paymentTimeout,
+          commitTimeout,
+          fulfilmentAckTimeout,
+          fulfilmentMaxResends,
+          dispatchTimeout,
+          captureTimeout,
+          compensationTimeout);
     }
   }
 
   @Bean
-  OrderQueries orderQueries(JdbcOrderHistory history, OrderRepository orders, InvoiceRepository invoices, ClaimCheckStore documents) {
+  OrderQueries orderQueries(
+      JdbcOrderHistory history,
+      OrderRepository orders,
+      InvoiceRepository invoices,
+      ClaimCheckStore documents) {
     return new OrderQueries(history, orders, invoices, documents);
   }
 
@@ -60,9 +79,26 @@ public class OrderConfiguration {
     }
 
     @Bean
-    OrderSagaService orderSagaService(SagaEngine engine, OrderRepository orders, InvoiceRepository invoices, InvoiceRenderer renderer,
-        ClaimCheckStore documents, SagaDataCodec codec, IdGenerator ids, SagaProperties properties, Clock clock) {
-      return new OrderSagaService(engine, orders, invoices, renderer, documents, codec, ids::newId, properties.timeouts(), clock);
+    OrderSagaService orderSagaService(
+        SagaEngine engine,
+        OrderRepository orders,
+        InvoiceRepository invoices,
+        InvoiceRenderer renderer,
+        ClaimCheckStore documents,
+        SagaDataCodec codec,
+        IdGenerator ids,
+        SagaProperties properties,
+        Clock clock) {
+      return new OrderSagaService(
+          engine,
+          orders,
+          invoices,
+          renderer,
+          documents,
+          codec,
+          ids::newId,
+          properties.timeouts(),
+          clock);
     }
 
     @Bean
@@ -76,15 +112,21 @@ public class OrderConfiguration {
     }
 
     @Bean
-    DeadlineSweeper orderDeadlineSweeper(SagaRepository repository, TransactionTemplate tx, OrderSagaService saga, EdaMetrics metrics,
+    DeadlineSweeper orderDeadlineSweeper(
+        SagaRepository repository,
+        TransactionTemplate tx,
+        OrderSagaService saga,
+        EdaMetrics metrics,
         Clock clock) {
-      return new DeadlineSweeper(OrderSagaService.SAGA_TYPE, repository, tx, saga::onDeadline, metrics, clock);
+      return new DeadlineSweeper(
+          OrderSagaService.SAGA_TYPE, repository, tx, saga::onDeadline, metrics, clock);
     }
 
     @Bean
     @ConditionalOnProperty(name = "eda.jobs.enabled", havingValue = "true", matchIfMissing = true)
     PeriodicJob orderDeadlineSweeperJob(DeadlineSweeper sweeper, SagaProperties properties) {
-      return new PeriodicJob("order-deadline-sweeper", properties.sweepInterval(), sweeper::sweepOnce);
+      return new PeriodicJob(
+          "order-deadline-sweeper", properties.sweepInterval(), sweeper::sweepOnce);
     }
   }
 

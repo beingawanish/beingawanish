@@ -10,7 +10,9 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-/** {@code GET /ops/dlq} and {@code POST /ops/dlq/replay} (admin.yaml), on every consuming service. */
+/**
+ * {@code GET /ops/dlq} and {@code POST /ops/dlq/replay} (admin.yaml), on every consuming service.
+ */
 @RestController
 public class DlqController {
   private final DlqService dlq;
@@ -26,7 +28,8 @@ public class DlqController {
 
   /** The Idempotency-Key header is enforced by the idempotency filter (ADR-0012). */
   @PostMapping("/ops/dlq/replay")
-  public ResponseEntity<Map<String, Integer>> replay(@RequestBody DlqService.ReplayRequest request) {
+  public ResponseEntity<Map<String, Integer>> replay(
+      @RequestBody DlqService.ReplayRequest request) {
     return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of("replayed", dlq.replay(request)));
   }
 }

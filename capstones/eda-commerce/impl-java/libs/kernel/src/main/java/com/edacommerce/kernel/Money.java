@@ -48,7 +48,8 @@ public record Money(long amountMinor, String currency) implements Comparable<Mon
    */
   public Money includedTax(BigDecimal rate) {
     BigDecimal gross = BigDecimal.valueOf(amountMinor);
-    BigDecimal tax = gross.multiply(rate).divide(BigDecimal.ONE.add(rate), 0, RoundingMode.HALF_EVEN);
+    BigDecimal tax =
+        gross.multiply(rate).divide(BigDecimal.ONE.add(rate), 0, RoundingMode.HALF_EVEN);
     return new Money(tax.longValueExact(), currency);
   }
 

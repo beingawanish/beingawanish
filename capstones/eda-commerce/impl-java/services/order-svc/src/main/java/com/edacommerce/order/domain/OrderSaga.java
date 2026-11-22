@@ -35,15 +35,17 @@ import java.util.Iterator;
 import java.util.List;
 
 /**
- * The order saga as a pure function (ADR-0008): {@code (state, data, trigger, now) -> decision}. This
- * class is the executable form of the state machine in architecture §5.1 and the step table in §5.2.
- * No I/O, no clock, no framework: the application layer persists the decision in one transaction.
+ * The order saga as a pure function (ADR-0008): {@code (state, data, trigger, now) -> decision}.
+ * This class is the executable form of the state machine in architecture §5.1 and the step table in
+ * §5.2. No I/O, no clock, no framework: the application layer persists the decision in one
+ * transaction.
  */
 public final class OrderSaga {
   private OrderSaga() {}
 
   /** Where the saga is now (the persisted row). */
-  public record Snapshot(OrderSagaState state, OrderSagaData data, Instant deadlineAt, int stepAttempts) {}
+  public record Snapshot(
+      OrderSagaState state, OrderSagaData data, Instant deadlineAt, int stepAttempts) {}
 
   /** Inputs that are not saga state. */
   public record Context(Instant now, IdSource ids, SagaTimeouts timeouts) {}
@@ -87,7 +89,9 @@ public final class OrderSaga {
    * (architecture §5.3 rule 4).
    */
   public static Decision apply(Snapshot current, OrderSagaTrigger trigger, Context ctx) {
-    Step s = new Step(current.state(), current.data().copy(), current.deadlineAt(), current.stepAttempts());
+    Step s =
+        new Step(
+            current.state(), current.data().copy(), current.deadlineAt(), current.stepAttempts());
     Outcome first = step(s, trigger, ctx);
     if (first == Outcome.IGNORED) {
       return Step.ignored();
@@ -124,7 +128,9 @@ public final class OrderSaga {
   }
 
   private static boolean isDeferrable(OrderSagaTrigger t) {
-    return t instanceof ShipmentDelivered || t instanceof ShipmentException || t instanceof OrderPacked
+    return t instanceof ShipmentDelivered
+        || t instanceof ShipmentException
+        || t instanceof OrderPacked
         || t instanceof OrderDispatched;
   }
 
@@ -140,7 +146,9 @@ public final class OrderSaga {
           return Outcome.IGNORED;
         }
         d.paymentId = ctx.ids().next();
-        s.to(OrderSagaState.AUTHORIZING_PAYMENT).command(new AuthorizePayment(d.paymentId)).deadline(now.plus(t.payment()), 0);
+        s.to(OrderSagaState.AUTHORIZING_PAYMENT)
+            .command(new AuthorizePayment(d.paymentId))
+            .deadline(now.plus(t.payment()), 0);
         return Outcome.APPLIED;
       }
       case StockReservationRejected r -> {
@@ -169,7 +177,9 @@ public final class OrderSaga {
         return Outcome.APPLIED;
       }
       case ReservationReleased r -> {
-        return r.reservationId().equals(d.reservationId) ? compensationConfirmed(s, Compensation.RELEASE_RESERVATION) : Outcome.IGNORED;
+        return r.reservationId().equals(d.reservationId)
+            ? compensationConfirmed(s, Compensation.RELEASE_RESERVATION)
+            : Outcome.IGNORED;
       }
       case ReservationExpired r -> {
         if (!r.reservationId().equals(d.reservationId)) {
@@ -205,7 +215,9 @@ public final class OrderSaga {
               d.cancellationReason = CancellationReason.RESERVATION_EXPIRED;
               startCancelling(s, ctx, Compensation.VOID_PAYMENT);
             } else {
-              s.to(OrderSagaState.COMMITTING_STOCK).command(new CommitReservation(d.reservationId)).deadline(now.plus(t.commit()), 0);
+              s.to(OrderSagaState.COMMITTING_STOCK)
+                  .command(new CommitReservation(d.reservationId))
+                  .deadline(now.plus(t.commit()), 0);
             }
             return Outcome.APPLIED;
           }
@@ -249,7 +261,9 @@ public final class OrderSaga {
         return compensationConfirmed(s, Compensation.VOID_PAYMENT);
       }
       case PaymentVoided p -> {
-        if (!p.paymentId().equals(d.paymentId) || st != OrderSagaState.CANCELLING || !d.outstanding.contains(Compensation.VOID_PAYMENT)) {
+        if (!p.paymentId().equals(d.paymentId)
+            || st != OrderSagaState.CANCELLING
+            || !d.outstanding.contains(Compensation.VOID_PAYMENT)) {
           return Outcome.IGNORED;
         }
         d.paymentVoided = true;
@@ -259,7 +273,8 @@ public final class OrderSaga {
         if (!f.fulfilmentId().equals(d.fulfilmentId)) {
           return Outcome.IGNORED;
         }
-        if (st == OrderSagaState.AWAITING_FULFILMENT_ACK || attentionFrom(s, OrderSagaState.AWAITING_FULFILMENT_ACK)) {
+        if (st == OrderSagaState.AWAITING_FULFILMENT_ACK
+            || attentionFrom(s, OrderSagaState.AWAITING_FULFILMENT_ACK)) {
           s.to(OrderSagaState.FULFILLING).deadline(dispatchDeadline(d, ctx), 0);
           return Outcome.APPLIED;
         }
@@ -269,7 +284,8 @@ public final class OrderSaga {
         if (!f.fulfilmentId().equals(d.fulfilmentId)) {
           return Outcome.IGNORED;
         }
-        if (st == OrderSagaState.FULFILLING || attentionFrom(s, OrderSagaState.AWAITING_FULFILMENT_ACK)) {
+        if (st == OrderSagaState.FULFILLING
+            || attentionFrom(s, OrderSagaState.AWAITING_FULFILMENT_ACK)) {
           s.to(OrderSagaState.PACKED).deadline(dispatchDeadline(d, ctx), 0);
           return Outcome.APPLIED;
         }
@@ -283,16 +299,22 @@ public final class OrderSaga {
           // The pivot: from here on nothing is compensated (ADR-0015).
           d.shipmentId = f.shipmentId();
           d.invoiceId = ctx.ids().next();
-          s.to(OrderSagaState.CAPTURING).command(new CapturePayment(d.paymentId)).deadline(now.plus(t.capture()), 0);
+          s.to(OrderSagaState.CAPTURING)
+              .command(new CapturePayment(d.paymentId))
+              .deadline(now.plus(t.capture()), 0);
           return Outcome.APPLIED;
         }
-        return st == OrderSagaState.AWAITING_FULFILMENT_ACK || st == OrderSagaState.FULFILLING ? Outcome.DEFERRED : Outcome.IGNORED;
+        return st == OrderSagaState.AWAITING_FULFILMENT_ACK || st == OrderSagaState.FULFILLING
+            ? Outcome.DEFERRED
+            : Outcome.IGNORED;
       }
       case FulfilmentFailed f -> {
         if (!f.fulfilmentId().equals(d.fulfilmentId)) {
           return Outcome.IGNORED;
         }
-        if (st == OrderSagaState.AWAITING_FULFILMENT_ACK || st == OrderSagaState.FULFILLING || st == OrderSagaState.PACKED
+        if (st == OrderSagaState.AWAITING_FULFILMENT_ACK
+            || st == OrderSagaState.FULFILLING
+            || st == OrderSagaState.PACKED
             || attentionFrom(s, OrderSagaState.AWAITING_FULFILMENT_ACK)) {
           d.cancellationReason = CancellationReason.FULFILMENT_FAILED;
           d.cancellationDetail = f.reason();
@@ -302,7 +324,9 @@ public final class OrderSaga {
         return Outcome.IGNORED;
       }
       case FulfilmentCancelled f -> {
-        return f.fulfilmentId().equals(d.fulfilmentId) ? compensationConfirmed(s, Compensation.CANCEL_FULFILMENT) : Outcome.IGNORED;
+        return f.fulfilmentId().equals(d.fulfilmentId)
+            ? compensationConfirmed(s, Compensation.CANCEL_FULFILMENT)
+            : Outcome.IGNORED;
       }
       case PaymentCaptured p -> {
         if (!p.paymentId().equals(d.paymentId)) {
@@ -356,7 +380,11 @@ public final class OrderSaga {
         }
         if (st == OrderSagaState.SHIPPED || attentionFrom(s, OrderSagaState.SHIPPED)) {
           s.to(OrderSagaState.DELIVERED)
-              .event(new OrderEvent.Delivered(d.nextVersion(), del.deliveredAt(), del.deliveredAt().plus(SagaTimeouts.RETURN_WINDOW)))
+              .event(
+                  new OrderEvent.Delivered(
+                      d.nextVersion(),
+                      del.deliveredAt(),
+                      del.deliveredAt().plus(SagaTimeouts.RETURN_WINDOW)))
               .deadline(null, 0);
           return Outcome.APPLIED;
         }
@@ -395,7 +423,9 @@ public final class OrderSaga {
               return Outcome.IGNORED;
             }
             d.captureRetries = 0;
-            s.to(OrderSagaState.CAPTURING).command(new CapturePayment(d.paymentId)).deadline(now.plus(t.capture()), 0);
+            s.to(OrderSagaState.CAPTURING)
+                .command(new CapturePayment(d.paymentId))
+                .deadline(now.plus(t.capture()), 0);
           }
           default -> {
             return Outcome.IGNORED;
@@ -415,7 +445,8 @@ public final class OrderSaga {
     switch (s.state) {
       case RESERVING_STOCK -> {
         if (s.attempts < SagaTimeouts.RESERVE_RESENDS) {
-          s.command(new ReserveStock(d.reservationId, SagaTimeouts.RESERVATION_TTL_SECONDS)).deadline(now.plus(t.stock()), s.attempts + 1);
+          s.command(new ReserveStock(d.reservationId, SagaTimeouts.RESERVATION_TTL_SECONDS))
+              .deadline(now.plus(t.stock()), s.attempts + 1);
         } else {
           // The reply may have been lost: release in case something is held.
           d.cancellationReason = CancellationReason.SAGA_TIMEOUT;
@@ -424,7 +455,8 @@ public final class OrderSaga {
       }
       case AUTHORIZING_PAYMENT -> {
         if (s.attempts < SagaTimeouts.AUTHORIZE_RESENDS) {
-          s.command(new AuthorizePayment(d.paymentId)).deadline(now.plus(t.payment()), s.attempts + 1);
+          s.command(new AuthorizePayment(d.paymentId))
+              .deadline(now.plus(t.payment()), s.attempts + 1);
         } else {
           d.cancellationReason = CancellationReason.SAGA_TIMEOUT;
           if (d.reservationExpired) {
@@ -434,27 +466,43 @@ public final class OrderSaga {
           }
         }
       }
-      case COMMITTING_STOCK -> s.command(new CommitReservation(d.reservationId)).deadline(now.plus(t.commit()), s.attempts + 1);
+      case COMMITTING_STOCK ->
+          s.command(new CommitReservation(d.reservationId))
+              .deadline(now.plus(t.commit()), s.attempts + 1);
       case AWAITING_FULFILMENT_ACK -> {
         if (d.fulfilmentAttempt < 1 + t.fulfilmentMaxResends()) {
           d.fulfilmentAttempt++;
-          s.command(new RequestFulfilment(d.fulfilmentId, d.fulfilmentAttempt)).deadline(now.plus(t.fulfilmentAck()), s.attempts + 1);
+          s.command(new RequestFulfilment(d.fulfilmentId, d.fulfilmentAttempt))
+              .deadline(now.plus(t.fulfilmentAck()), s.attempts + 1);
         } else {
-          attention(s, "warehouse did not acknowledge fulfilment after " + d.fulfilmentAttempt + " attempts");
+          attention(
+              s,
+              "warehouse did not acknowledge fulfilment after "
+                  + d.fulfilmentAttempt
+                  + " attempts");
         }
       }
-      case FULFILLING, PACKED -> attention(s, d.authorizationExpiresAt != null && !now.isBefore(d.authorizationExpiresAt.minus(SagaTimeouts.AUTHORIZATION_SAFETY))
-          ? "authorisation expires before dispatch" : "no dispatch within the deadline");
+      case FULFILLING, PACKED ->
+          attention(
+              s,
+              d.authorizationExpiresAt != null
+                      && !now.isBefore(
+                          d.authorizationExpiresAt.minus(SagaTimeouts.AUTHORIZATION_SAFETY))
+                  ? "authorisation expires before dispatch"
+                  : "no dispatch within the deadline");
       case CAPTURING -> {
         if (d.captured) {
           attention(s, "captured but no shipment details from the carrier");
         } else {
-          s.command(new CapturePayment(d.paymentId)).deadline(now.plus(t.capture()), s.attempts + 1);
+          s.command(new CapturePayment(d.paymentId))
+              .deadline(now.plus(t.capture()), s.attempts + 1);
         }
       }
-      case SHIPPED -> attention(s, "not delivered within " + SagaTimeouts.SHIPPED_TIMEOUT.toDays() + " days");
+      case SHIPPED ->
+          attention(s, "not delivered within " + SagaTimeouts.SHIPPED_TIMEOUT.toDays() + " days");
       case CANCELLING -> {
-        // Compensations must succeed: resend forever, with backoff (alerting is on the timeout metric).
+        // Compensations must succeed: resend forever, with backoff (alerting is on the timeout
+        // metric).
         d.compensationAttempts++;
         resendCompensations(s, d);
         long factor = 1L << Math.min(d.compensationAttempts, 4);
@@ -502,7 +550,9 @@ public final class OrderSaga {
   private static void cancelled(Step s) {
     OrderSagaData d = s.data;
     s.to(OrderSagaState.CANCELLED)
-        .event(new OrderEvent.Cancelled(d.nextVersion(), d.cancellationReason, d.cancellationDetail, d.paymentVoided))
+        .event(
+            new OrderEvent.Cancelled(
+                d.nextVersion(), d.cancellationReason, d.cancellationDetail, d.paymentVoided))
         .deadline(null, 0);
     s.decisionReached = !d.confirmed;
   }
@@ -520,7 +570,9 @@ public final class OrderSaga {
     d.attentionFrom = s.state;
     d.attentionIssue = issue;
     OrderSagaState from = s.state;
-    s.to(OrderSagaState.NEEDS_ATTENTION).event(new OrderEvent.RequiresAttention(d.nextVersion(), from, issue)).deadline(null, 0);
+    s.to(OrderSagaState.NEEDS_ATTENTION)
+        .event(new OrderEvent.RequiresAttention(d.nextVersion(), from, issue))
+        .deadline(null, 0);
   }
 
   private static boolean attentionFrom(Step s, OrderSagaState from) {
@@ -528,7 +580,9 @@ public final class OrderSaga {
   }
 
   private static boolean beforeShipped(OrderSagaState st) {
-    return st == OrderSagaState.AWAITING_FULFILMENT_ACK || st == OrderSagaState.FULFILLING || st == OrderSagaState.PACKED
+    return st == OrderSagaState.AWAITING_FULFILMENT_ACK
+        || st == OrderSagaState.FULFILLING
+        || st == OrderSagaState.PACKED
         || st == OrderSagaState.CAPTURING;
   }
 
@@ -603,8 +657,16 @@ public final class OrderSaga {
     }
 
     Decision decide() {
-      return new Decision(false, state, data, List.copyOf(commands), List.copyOf(events), deadline, attempts, timeout, decisionReached);
+      return new Decision(
+          false,
+          state,
+          data,
+          List.copyOf(commands),
+          List.copyOf(events),
+          deadline,
+          attempts,
+          timeout,
+          decisionReached);
     }
   }
-
 }

@@ -47,7 +47,8 @@ import org.testcontainers.kafka.KafkaContainer;
 /**
  * Layer-3 checklist items for the consumer runtime on a real broker (skipped without Docker):
  * in-place retry of Transient, RetryLater to G.retry.10s with x-* headers and unchanged bytes,
- * NonRetryable to G.dlq, DLQ replay processed once, graceful shutdown finishing the in-flight record.
+ * NonRetryable to G.dlq, DLQ replay processed once, graceful shutdown finishing the in-flight
+ * record.
  */
 @Testcontainers(disabledWithoutDocker = true)
 class ConsumerRuntimeKafkaIT {
@@ -85,37 +86,71 @@ class ConsumerRuntimeKafkaIT {
             case "slow" -> sleep(2000);
             default -> {}
           }
-          db.jdbc.update("INSERT INTO effect (id, n) VALUES (?, 1) ON CONFLICT (id) DO UPDATE SET n = effect.n + 1", ctx.eventId());
+          db.jdbc.update(
+              "INSERT INTO effect (id, n) VALUES (?, 1) ON CONFLICT (id) DO UPDATE SET n = effect.n + 1",
+              ctx.eventId());
         }
       };
 
   @BeforeEach
   void setUp() throws Exception {
     db = new DbFixture();
-    try (AdminClient admin = AdminClient.create(Map.of("bootstrap.servers", KAFKA.getBootstrapServers()))) {
+    try (AdminClient admin =
+        AdminClient.create(Map.of("bootstrap.servers", KAFKA.getBootstrapServers()))) {
       List<NewTopic> topics = new ArrayList<>();
-      for (String t : List.of(TOPIC, GROUP + ".retry.10s", GROUP + ".retry.1m", GROUP + ".retry.10m", GROUP + ".dlq")) {
+      for (String t :
+          List.of(
+              TOPIC,
+              GROUP + ".retry.10s",
+              GROUP + ".retry.1m",
+              GROUP + ".retry.10m",
+              GROUP + ".dlq")) {
         topics.add(new NewTopic(t, 1, (short) 1));
       }
-      admin.createTopics(topics).values().values().forEach(f -> {
-        try {
-          f.get();
-        } catch (Exception ignored) {
-          // already exists from a previous test
-        }
-      });
+      admin
+          .createTopics(topics)
+          .values()
+          .values()
+          .forEach(
+              f -> {
+                try {
+                  f.get();
+                } catch (Exception ignored) {
+                  // already exists from a previous test
+                }
+              });
     }
     EdaProperties.Kafka k = new EdaProperties.Kafka();
     k.setBootstrapServers(KAFKA.getBootstrapServers());
     template = new KafkaTemplate<>(new DefaultKafkaProducerFactory<>(KafkaClients.producer(k)));
     consumerFactory = new DefaultKafkaConsumerFactory<>(KafkaClients.consumer(k));
     RecordProcessor processor =
-        new RecordProcessor(GROUP, new HandlerRegistry(List.of(handler)), db.inbox, db.serde, db.tx, db.tracing, db.metrics, db.clock);
+        new RecordProcessor(
+            GROUP,
+            new HandlerRegistry(List.of(handler)),
+            db.inbox,
+            db.serde,
+            db.tx,
+            db.tracing,
+            db.metrics,
+            db.clock);
     FailureForwarder forwarder = new FailureForwarder(template, GROUP, db.metrics, db.clock);
-    containers.add(ConsumerContainers.main(consumerFactory, List.of(TOPIC), processor,
-        ConsumerContainers.errorHandler(forwarder, JitteredExponentialBackOff.adr0007()), 1, Duration.ofSeconds(10)));
-    containers.add(ConsumerContainers.retry(consumerFactory, processor,
-        ConsumerContainers.errorHandler(forwarder, JitteredExponentialBackOff.adr0007()), 1, Duration.ofSeconds(10), db.clock));
+    containers.add(
+        ConsumerContainers.main(
+            consumerFactory,
+            List.of(TOPIC),
+            processor,
+            ConsumerContainers.errorHandler(forwarder, JitteredExponentialBackOff.adr0007()),
+            1,
+            Duration.ofSeconds(10)));
+    containers.add(
+        ConsumerContainers.retry(
+            consumerFactory,
+            processor,
+            ConsumerContainers.errorHandler(forwarder, JitteredExponentialBackOff.adr0007()),
+            1,
+            Duration.ofSeconds(10),
+            db.clock));
     containers.forEach(ConcurrentMessageListenerContainer::start);
   }
 
@@ -130,17 +165,25 @@ class ConsumerRuntimeKafkaIT {
     byte[] value = db.serde.serialize(TOPIC, GoldenFixtures.decode(CommitReservation.class));
     ProducerRecord<String, byte[]> r = new ProducerRecord<>(TOPIC, "order-1", value);
     r.headers().add("ce_id", eventId.getBytes(StandardCharsets.UTF_8));
-    r.headers().add("ce_type", "com.edacommerce.inventory.CommitReservation".getBytes(StandardCharsets.UTF_8));
+    r.headers()
+        .add(
+            "ce_type",
+            "com.edacommerce.inventory.CommitReservation".getBytes(StandardCharsets.UTF_8));
     template.send(r).get();
     return eventId;
   }
 
   List<ConsumerRecord<String, byte[]>> read(String topic) {
-    Map<String, Object> props = Map.of(
-        ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
-        ConsumerConfig.GROUP_ID_CONFIG, "reader-" + UUID.randomUUID(),
-        ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-    try (KafkaConsumer<String, byte[]> c = new KafkaConsumer<>(props, new StringDeserializer(), new ByteArrayDeserializer())) {
+    Map<String, Object> props =
+        Map.of(
+            ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
+            KAFKA.getBootstrapServers(),
+            ConsumerConfig.GROUP_ID_CONFIG,
+            "reader-" + UUID.randomUUID(),
+            ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,
+            "earliest");
+    try (KafkaConsumer<String, byte[]> c =
+        new KafkaConsumer<>(props, new StringDeserializer(), new ByteArrayDeserializer())) {
       c.subscribe(List.of(topic));
       List<ConsumerRecord<String, byte[]>> out = new ArrayList<>();
       long until = System.currentTimeMillis() + 5000;
@@ -171,12 +214,22 @@ class ConsumerRuntimeKafkaIT {
     String eventId = send();
     await().atMost(Duration.ofSeconds(30)).until(() -> !read(GROUP + ".retry.10s").isEmpty());
     ConsumerRecord<String, byte[]> r = read(GROUP + ".retry.10s").get(0);
-    assertThat(new String(r.headers().lastHeader("ce_id").value(), StandardCharsets.UTF_8)).isEqualTo(eventId);
-    for (String h : List.of("x-retry-attempt", "x-original-topic", "x-original-partition", "x-original-offset",
-        "x-not-before", "x-error-class", "x-error-message", "x-failed-consumer-group")) {
+    assertThat(new String(r.headers().lastHeader("ce_id").value(), StandardCharsets.UTF_8))
+        .isEqualTo(eventId);
+    for (String h :
+        List.of(
+            "x-retry-attempt",
+            "x-original-topic",
+            "x-original-partition",
+            "x-original-offset",
+            "x-not-before",
+            "x-error-class",
+            "x-error-message",
+            "x-failed-consumer-group")) {
       assertThat(r.headers().lastHeader(h)).as(h).isNotNull();
     }
-    assertThat(r.value()).isEqualTo(db.serde.serialize(TOPIC, GoldenFixtures.decode(CommitReservation.class)));
+    assertThat(r.value())
+        .isEqualTo(db.serde.serialize(TOPIC, GoldenFixtures.decode(CommitReservation.class)));
   }
 
   @Test

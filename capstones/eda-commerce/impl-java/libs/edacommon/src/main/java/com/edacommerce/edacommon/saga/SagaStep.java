@@ -9,8 +9,8 @@ import org.springframework.lang.Nullable;
  * The outcome of applying one trigger to a saga, as the engine persists it. Built by the service's
  * application layer from its pure domain decision.
  *
- * @param terminalOutcome metric outcome when the saga reaches a terminal state (DELIVERED, CANCELLED,
- *     REFUNDED, ...), else null
+ * @param terminalOutcome metric outcome when the saga reaches a terminal state (DELIVERED,
+ *     CANCELLED, REFUNDED, ...), else null
  * @param attention true when the saga enters a human-owned state (counted as MANUAL_REVIEW)
  * @param timeout true when the trigger was a deadline (counted on eda.saga.step.timeouts)
  * @param decisionReached true when this transition is the saga's "decision" (order: confirmed or

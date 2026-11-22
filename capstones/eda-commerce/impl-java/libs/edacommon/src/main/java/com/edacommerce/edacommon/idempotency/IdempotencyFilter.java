@@ -29,8 +29,8 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.util.ContentCachingResponseWrapper;
 
 /**
- * {@code Idempotency-Key} handling for unsafe POSTs (ADR-0012), identical in behaviour to the Python
- * build: same table, same hash.
+ * {@code Idempotency-Key} handling for unsafe POSTs (ADR-0012), identical in behaviour to the
+ * Python build: same table, same hash.
  *
  * <p>The whole request runs in one database transaction that also holds a transaction-scoped
  * advisory lock on (caller, key) and the key row itself. That gives the four contract outcomes:
@@ -52,7 +52,8 @@ import org.springframework.web.util.ContentCachingResponseWrapper;
 public class IdempotencyFilter extends OncePerRequestFilter {
   public static final String HEADER = "Idempotency-Key";
   public static final String REPLAYED = "Idempotent-Replayed";
-  static final List<String> STORED_HEADERS = List.of("Location", "ETag", "Retry-After", "Content-Type");
+  static final List<String> STORED_HEADERS =
+      List.of("Location", "ETag", "Retry-After", "Content-Type");
 
   private final IdempotencyStore store;
   private final TransactionTemplate tx;
@@ -137,7 +138,8 @@ public class IdempotencyFilter extends OncePerRequestFilter {
               }
               int code = captured.getStatus();
               if (code >= 200 && code < 300) {
-                store.complete(who, key, code, headersOf(captured), captured.getContentAsByteArray());
+                store.complete(
+                    who, key, code, headersOf(captured), captured.getContentAsByteArray());
               } else {
                 status.setRollbackOnly();
               }
@@ -282,5 +284,4 @@ public class IdempotencyFilter extends OncePerRequestFilter {
       return body.length;
     }
   }
-
 }

@@ -37,8 +37,16 @@ class StockInvariantPropertyTest {
       final Instant at = now;
       Reservation.Decision d =
           switch ((op / 5) % 4) {
-            case 0 -> Reservation.reserve(existing, id, "o", List.of(new StockLine("A", 1 + op % 2), new StockLine("B", 1)),
-                Duration.ofMinutes(15), available(stock), false, now);
+            case 0 ->
+                Reservation.reserve(
+                    existing,
+                    id,
+                    "o",
+                    List.of(new StockLine("A", 1 + op % 2), new StockLine("B", 1)),
+                    Duration.ofMinutes(15),
+                    available(stock),
+                    false,
+                    now);
             case 1 -> existing.map(r -> r.commit(at)).orElse(null);
             case 2 -> existing.map(r -> r.release("x", at)).orElse(null);
             default -> existing.map(r -> r.expire(at)).orElse(null);
@@ -63,8 +71,13 @@ class StockInvariantPropertyTest {
       reservations.put(id, d.reservation());
     }
     for (String sku : List.of("A", "B")) {
-      int held = reservations.values().stream().filter(r -> r.status() == ReservationStatus.HELD)
-          .flatMap(r -> r.lines().stream()).filter(l -> l.sku().equals(sku)).mapToInt(StockLine::quantity).sum();
+      int held =
+          reservations.values().stream()
+              .filter(r -> r.status() == ReservationStatus.HELD)
+              .flatMap(r -> r.lines().stream())
+              .filter(l -> l.sku().equals(sku))
+              .mapToInt(StockLine::quantity)
+              .sum();
       assertThat(stock.get(sku)[1]).isEqualTo(held);
     }
   }

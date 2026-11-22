@@ -1,0 +1,8 @@
+eda:
+  service-name: checkout-svc
+  consumer:
+    topics: [catalog.product.v1, catalog.price.v1, inventory.stock-level.v1, order.events.v1]
+  idempotency:
+    paths: [/carts, /checkouts, /ops/dlq/replay, /ops/sagas/*/retry-step]
+server:
+  port: 8102

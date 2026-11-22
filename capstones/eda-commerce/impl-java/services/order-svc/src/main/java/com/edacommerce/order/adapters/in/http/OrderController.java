@@ -37,12 +37,29 @@ public class OrderController {
   }
 
   /** orders.yaml Order: the summary fields plus details. */
-  public record OrderJson(String orderId, String status, MoneyJson total, int itemCount, Instant placedAt, long version,
-      List<LineJson> lines, String cancellationReason, ShipmentJson shipment, boolean invoiceAvailable, MoneyJson refundedTotal,
-      List<TimelineJson> timeline, String source) {}
+  public record OrderJson(
+      String orderId,
+      String status,
+      MoneyJson total,
+      int itemCount,
+      Instant placedAt,
+      long version,
+      List<LineJson> lines,
+      String cancellationReason,
+      ShipmentJson shipment,
+      boolean invoiceAvailable,
+      MoneyJson refundedTotal,
+      List<TimelineJson> timeline,
+      String source) {}
 
   /** orders.yaml OrderSummary. */
-  public record SummaryJson(String orderId, String status, MoneyJson total, int itemCount, Instant placedAt, long version) {}
+  public record SummaryJson(
+      String orderId,
+      String status,
+      MoneyJson total,
+      int itemCount,
+      Instant placedAt,
+      long version) {}
 
   /** common.yaml Money. */
   public record MoneyJson(long amountMinor, String currency) {
@@ -52,7 +69,13 @@ public class OrderController {
   }
 
   /** An order line. */
-  public record LineJson(String lineId, String sku, String productName, int quantity, MoneyJson unitPrice, MoneyJson lineTotal,
+  public record LineJson(
+      String lineId,
+      String sku,
+      String productName,
+      int quantity,
+      MoneyJson unitPrice,
+      MoneyJson lineTotal,
       int returnedQuantity) {}
 
   /** Carrier and tracking. */
@@ -62,9 +85,14 @@ public class OrderController {
   public record TimelineJson(Instant at, String kind, String description, String eventId) {}
 
   @GetMapping("/orders/{orderId}")
-  public ResponseEntity<OrderJson> get(@PathVariable("orderId") String orderId,
-      @RequestHeader(name = "If-None-Match", required = false) String ifNoneMatch, HttpServletRequest request) {
-    OrderView v = queries.get(orderId, caller.id(request)).orElseThrow(() -> ApiProblem.notFound("order " + orderId));
+  public ResponseEntity<OrderJson> get(
+      @PathVariable("orderId") String orderId,
+      @RequestHeader(name = "If-None-Match", required = false) String ifNoneMatch,
+      HttpServletRequest request) {
+    OrderView v =
+        queries
+            .get(orderId, caller.id(request))
+            .orElseThrow(() -> ApiProblem.notFound("order " + orderId));
     String etag = "\"" + v.version() + "\"";
     ResponseEntity.BodyBuilder ok = ResponseEntity.ok().eTag(etag);
     if (!v.terminal()) {
@@ -77,48 +105,103 @@ public class OrderController {
   }
 
   @GetMapping("/orders/{orderId}/invoice")
-  public ResponseEntity<Void> invoice(@PathVariable("orderId") String orderId, HttpServletRequest request) {
-    URI url = queries.invoiceUrl(orderId, caller.id(request)).map(u -> URI.create(u.toString()))
-        .orElseThrow(() -> ApiProblem.notFound("invoice for order " + orderId));
+  public ResponseEntity<Void> invoice(
+      @PathVariable("orderId") String orderId, HttpServletRequest request) {
+    URI url =
+        queries
+            .invoiceUrl(orderId, caller.id(request))
+            .map(u -> URI.create(u.toString()))
+            .orElseThrow(() -> ApiProblem.notFound("invoice for order " + orderId));
     return ResponseEntity.status(HttpStatus.FOUND).location(url).build();
   }
 
   @GetMapping("/customers/me/orders")
-  public Map<String, Object> mine(@RequestParam(name = "cursor", required = false) String cursor,
+  public Map<String, Object> mine(
+      @RequestParam(name = "cursor", required = false) String cursor,
       @RequestParam(name = "limit", defaultValue = "20") int limit,
-      @RequestParam(name = "status", required = false) String status, HttpServletRequest request) {
+      @RequestParam(name = "status", required = false) String status,
+      HttpServletRequest request) {
     if (limit < 1 || limit > 100) {
-      throw ApiProblem.badRequest("validation", "limit must be between 1 and 100", List.of(new ApiProblem.FieldError("limit", "1..100")));
+      throw ApiProblem.badRequest(
+          "validation",
+          "limit must be between 1 and 100",
+          List.of(new ApiProblem.FieldError("limit", "1..100")));
     }
     Set<OrderStatus> statuses = EnumSet.noneOf(OrderStatus.class);
     if (status != null && !status.isBlank()) {
       try {
-        Arrays.stream(status.split(",")).map(String::trim).map(OrderStatus::valueOf).forEach(statuses::add);
+        Arrays.stream(status.split(","))
+            .map(String::trim)
+            .map(OrderStatus::valueOf)
+            .forEach(statuses::add);
       } catch (IllegalArgumentException e) {
-        throw ApiProblem.badRequest("validation", "unknown status", List.of(new ApiProblem.FieldError("status", status)));
+        throw ApiProblem.badRequest(
+            "validation", "unknown status", List.of(new ApiProblem.FieldError("status", status)));
       }
     }
     OrderQueries.Page page;
     try {
       page = queries.list(caller.id(request), statuses, cursor, limit);
     } catch (RuntimeException e) {
-      throw ApiProblem.badRequest("validation", "invalid cursor", List.of(new ApiProblem.FieldError("cursor", "invalid")));
+      throw ApiProblem.badRequest(
+          "validation", "invalid cursor", List.of(new ApiProblem.FieldError("cursor", "invalid")));
     }
     Map<String, Object> body = new LinkedHashMap<>();
-    body.put("items", page.items().stream().map(v -> new SummaryJson(v.orderId(), v.status().name(), MoneyJson.of(v.total()),
-        v.itemCount(), v.placedAt(), v.version())).toList());
+    body.put(
+        "items",
+        page.items().stream()
+            .map(
+                v ->
+                    new SummaryJson(
+                        v.orderId(),
+                        v.status().name(),
+                        MoneyJson.of(v.total()),
+                        v.itemCount(),
+                        v.placedAt(),
+                        v.version()))
+            .toList());
     body.put("nextCursor", page.nextCursor());
     return body;
   }
 
   static OrderJson json(OrderView v) {
-    return new OrderJson(v.orderId(), v.status().name(), MoneyJson.of(v.total()), v.itemCount(), v.placedAt(), v.version(),
-        v.lines().stream().map(l -> new LineJson(l.lineId(), l.sku(), l.productName(), l.quantity(), MoneyJson.of(l.unitPrice()),
-            MoneyJson.of(l.lineTotal()), l.returnedQuantity())).toList(),
-        v.cancellationReason(), v.shipment() == null ? null : new ShipmentJson(v.shipment().carrier(), v.shipment().trackingNumber(),
-            v.shipment().status() == null ? "UNKNOWN" : v.shipment().status()),
-        v.invoiceAvailable(), MoneyJson.of(v.refundedTotal()),
-        v.timeline().stream().map(t -> new TimelineJson(t.at(), t.kind(), t.description() == null ? t.kind() : t.description(), t.eventId())).toList(),
+    return new OrderJson(
+        v.orderId(),
+        v.status().name(),
+        MoneyJson.of(v.total()),
+        v.itemCount(),
+        v.placedAt(),
+        v.version(),
+        v.lines().stream()
+            .map(
+                l ->
+                    new LineJson(
+                        l.lineId(),
+                        l.sku(),
+                        l.productName(),
+                        l.quantity(),
+                        MoneyJson.of(l.unitPrice()),
+                        MoneyJson.of(l.lineTotal()),
+                        l.returnedQuantity()))
+            .toList(),
+        v.cancellationReason(),
+        v.shipment() == null
+            ? null
+            : new ShipmentJson(
+                v.shipment().carrier(),
+                v.shipment().trackingNumber(),
+                v.shipment().status() == null ? "UNKNOWN" : v.shipment().status()),
+        v.invoiceAvailable(),
+        MoneyJson.of(v.refundedTotal()),
+        v.timeline().stream()
+            .map(
+                t ->
+                    new TimelineJson(
+                        t.at(),
+                        t.kind(),
+                        t.description() == null ? t.kind() : t.description(),
+                        t.eventId()))
+            .toList(),
         v.source().name());
   }
 }

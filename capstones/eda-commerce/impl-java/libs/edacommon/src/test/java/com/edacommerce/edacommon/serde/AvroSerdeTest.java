@@ -36,7 +36,8 @@ class AvroSerdeTest {
 
     assertThat(bytes[0]).isEqualTo((byte) 0);
     int id = ByteBuffer.wrap(bytes, 1, 4).getInt();
-    assertThat(registry.subjects()).containsEntry("order.events.v1-com.edacommerce.order.OrderCancelled", id);
+    assertThat(registry.subjects())
+        .containsEntry("order.events.v1-com.edacommerce.order.OrderCancelled", id);
     byte[] avro = java.util.Arrays.copyOfRange(bytes, 5, bytes.length);
     assertThat(avro).isEqualTo(Contracts.exampleBin("com.edacommerce.order.OrderCancelled"));
     assertThat(serde.deserialize(bytes, OrderCancelled.class)).isEqualTo(record);
@@ -62,22 +63,30 @@ class AvroSerdeTest {
   void anUnknownEnumSymbolFromANewerWriterDecodesToUnknown() throws Exception {
     // A newer producer adds a decline reason this reader does not know (FULL_TRANSITIVE evolution).
     ObjectMapper json = new ObjectMapper();
-    ObjectNode newer = (ObjectNode) json.readTree(Contracts.bundledSchema("com.edacommerce.payment.PaymentDeclined").toString());
+    ObjectNode newer =
+        (ObjectNode)
+            json.readTree(
+                Contracts.bundledSchema("com.edacommerce.payment.PaymentDeclined").toString());
     for (var field : newer.withArray("fields")) {
       if (field.path("name").asText().equals("reason")) {
         ArrayNode symbols = ((ObjectNode) field.get("type")).withArray("symbols");
         symbols.insert(0, "CARD_EXPIRED");
       }
     }
-    newer.withArray("fields").add(json.readTree("{\"name\":\"riskScore\",\"type\":[\"null\",\"int\"],\"default\":null}"));
+    newer
+        .withArray("fields")
+        .add(
+            json.readTree("{\"name\":\"riskScore\",\"type\":[\"null\",\"int\"],\"default\":null}"));
     Schema writer = new Schema.Parser().parse(newer.toString());
 
     PaymentDeclined golden = GoldenFixtures.decode(PaymentDeclined.class);
     GenericRecord asOld =
         (GenericRecord)
             new GenericDatumReader<>(golden.getSchema(), writer)
-                .read(null, DecoderFactory.get().binaryDecoder(GoldenFixtures.encode(golden), null));
-    asOld.put("reason", new GenericData.EnumSymbol(writer.getField("reason").schema(), "CARD_EXPIRED"));
+                .read(
+                    null, DecoderFactory.get().binaryDecoder(GoldenFixtures.encode(golden), null));
+    asOld.put(
+        "reason", new GenericData.EnumSymbol(writer.getField("reason").schema(), "CARD_EXPIRED"));
     asOld.put("riskScore", 7);
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     out.write(0);
@@ -108,7 +117,8 @@ class AvroSerdeTest {
             return true;
           }
         };
-    PaymentDeclined read = new AvroSerde(newerRegistry).deserialize(out.toByteArray(), PaymentDeclined.class);
+    PaymentDeclined read =
+        new AvroSerde(newerRegistry).deserialize(out.toByteArray(), PaymentDeclined.class);
     assertThat(read.getReason()).isEqualTo(com.edacommerce.payment.DeclineReason.UNKNOWN);
     assertThat(read.getPaymentId()).isEqualTo(golden.getPaymentId());
   }

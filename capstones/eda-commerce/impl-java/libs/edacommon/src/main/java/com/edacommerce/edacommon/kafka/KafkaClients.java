@@ -19,9 +19,9 @@ import org.apache.kafka.common.serialization.StringSerializer;
 
 /**
  * Kafka client settings of guide §7.1, identical for every service. Keys are UTF-8 strings without
- * Avro (guide §5 rule 2); values stay raw bytes so the runtime can dispatch on {@code ce_type} before
- * deserialising and forward records without re-serialising. The Java client's default partitioner is
- * murmur2, the same as Kafka Connect's (guide §5 rule 1).
+ * Avro (guide §5 rule 2); values stay raw bytes so the runtime can dispatch on {@code ce_type}
+ * before deserialising and forward records without re-serialising. The Java client's default
+ * partitioner is murmur2, the same as Kafka Connect's (guide §5 rule 1).
  */
 public final class KafkaClients {
   private KafkaClients() {}
@@ -51,7 +51,9 @@ public final class KafkaClients {
     m.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
     m.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
     m.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
-    m.put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, CooperativeStickyAssignor.class.getName());
+    m.put(
+        ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG,
+        CooperativeStickyAssignor.class.getName());
     m.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, 45_000);
     m.put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300_000);
     m.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 100);

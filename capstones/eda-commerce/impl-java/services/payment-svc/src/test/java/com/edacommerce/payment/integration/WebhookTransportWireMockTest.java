@@ -22,18 +22,35 @@ class WebhookTransportWireMockTest {
     WireMockServer server = new WireMockServer(WireMockConfiguration.options().dynamicPort());
     server.start();
     try {
-      server.stubFor(post("/webhooks/psp").inScenario("s").whenScenarioStateIs("Started").willReturn(aResponse().withStatus(503)).willSetStateTo("up"));
-      server.stubFor(post("/webhooks/psp").inScenario("s").whenScenarioStateIs("up").willReturn(aResponse().withStatus(200)));
+      server.stubFor(
+          post("/webhooks/psp")
+              .inScenario("s")
+              .whenScenarioStateIs("Started")
+              .willReturn(aResponse().withStatus(503))
+              .willSetStateTo("up"));
+      server.stubFor(
+          post("/webhooks/psp")
+              .inScenario("s")
+              .whenScenarioStateIs("up")
+              .willReturn(aResponse().withStatus(200)));
       WebhookVerifier signer = new WebhookVerifier("dev-psp-secret", Clock.systemUTC());
       byte[] body = "{\"pspEventId\":\"e1\"}".getBytes(StandardCharsets.UTF_8);
       long ts = System.currentTimeMillis() / 1000;
-      new HttpPspWebhookTransport("http://localhost:" + server.port() + "/webhooks/psp", 3).send(body, ts, signer.sign(ts, body));
+      new HttpPspWebhookTransport("http://localhost:" + server.port() + "/webhooks/psp", 3)
+          .send(body, ts, signer.sign(ts, body));
 
-      server.verify(2, postRequestedFor(urlEqualTo("/webhooks/psp"))
-          .withHeader("X-Webhook-Timestamp", equalTo(Long.toString(ts)))
-          .withHeader("X-Psp-Signature", equalTo(signer.sign(ts, body))));
+      server.verify(
+          2,
+          postRequestedFor(urlEqualTo("/webhooks/psp"))
+              .withHeader("X-Webhook-Timestamp", equalTo(Long.toString(ts)))
+              .withHeader("X-Psp-Signature", equalTo(signer.sign(ts, body))));
       var req = server.getAllServeEvents().get(0).getRequest();
-      assertThat(signer.rejectionReason(req.getHeader("X-Webhook-Timestamp"), req.getHeader("X-Psp-Signature"), req.getBody())).isNull();
+      assertThat(
+              signer.rejectionReason(
+                  req.getHeader("X-Webhook-Timestamp"),
+                  req.getHeader("X-Psp-Signature"),
+                  req.getBody()))
+          .isNull();
     } finally {
       server.stop();
     }

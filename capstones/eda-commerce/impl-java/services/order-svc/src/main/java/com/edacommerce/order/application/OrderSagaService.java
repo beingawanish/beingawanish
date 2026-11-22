@@ -46,8 +46,16 @@ public class OrderSagaService implements SagaOperator {
   private final SagaTimeouts timeouts;
   private final Clock clock;
 
-  public OrderSagaService(SagaEngine engine, OrderRepository orders, InvoiceRepository invoices, InvoiceRenderer renderer,
-      ClaimCheckStore documents, SagaDataCodec codec, IdSource ids, SagaTimeouts timeouts, Clock clock) {
+  public OrderSagaService(
+      SagaEngine engine,
+      OrderRepository orders,
+      InvoiceRepository invoices,
+      InvoiceRenderer renderer,
+      ClaimCheckStore documents,
+      SagaDataCodec codec,
+      IdSource ids,
+      SagaTimeouts timeouts,
+      Clock clock) {
     this.engine = engine;
     this.orders = orders;
     this.invoices = invoices;
@@ -60,35 +68,62 @@ public class OrderSagaService implements SagaOperator {
   }
 
   /** CheckoutSubmitted: create the order and start the saga. A repeated checkout is ignored. */
-  public SagaEngine.Result start(Order order, String triggerType, String triggerId, Causation causation) {
-    return engine.handle(SAGA_TYPE, order.orderId(), triggerType, triggerId, causation, order.orderId(), (current, now) -> {
-      if (current.isPresent()) {
-        return SagaStep.ignore();
-      }
-      orders.insert(order);
-      OrderSaga.Decision d = OrderSaga.start(order.orderId(), order.total(), context(now));
-      return toStep(d, order, 0, now);
-    });
+  public SagaEngine.Result start(
+      Order order, String triggerType, String triggerId, Causation causation) {
+    return engine.handle(
+        SAGA_TYPE,
+        order.orderId(),
+        triggerType,
+        triggerId,
+        causation,
+        order.orderId(),
+        (current, now) -> {
+          if (current.isPresent()) {
+            return SagaStep.ignore();
+          }
+          orders.insert(order);
+          OrderSaga.Decision d = OrderSaga.start(order.orderId(), order.total(), context(now));
+          return toStep(d, order, 0, now);
+        });
   }
 
   /** Any reply, event, deadline or operator action for an existing saga. */
-  public SagaEngine.Result handle(String orderId, OrderSagaTrigger trigger, String triggerType, @Nullable String triggerId,
+  public SagaEngine.Result handle(
+      String orderId,
+      OrderSagaTrigger trigger,
+      String triggerType,
+      @Nullable String triggerId,
       @Nullable Causation causation) {
-    return engine.handle(SAGA_TYPE, orderId, triggerType, triggerId, causation, null, (current, now) -> {
-      if (current.isEmpty()) {
-        // The CheckoutSubmitted may still be in a retry topic (ADR-0007 reorders retried records).
-        throw new RetryLaterException("no saga yet for order " + orderId);
-      }
-      SagaRow row = current.get();
-      OrderSaga.Snapshot snapshot = new OrderSaga.Snapshot(
-          OrderSagaState.valueOf(row.state()), codec.read(row.data()), row.deadlineAt(), row.stepAttempts());
-      OrderSaga.Decision d = OrderSaga.apply(snapshot, trigger, context(now));
-      if (d.ignored()) {
-        return SagaStep.ignore();
-      }
-      Order order = orders.find(orderId).orElseThrow(() -> new IllegalStateException("saga without order " + orderId));
-      return toStep(d, order, row.version(), now);
-    });
+    return engine.handle(
+        SAGA_TYPE,
+        orderId,
+        triggerType,
+        triggerId,
+        causation,
+        null,
+        (current, now) -> {
+          if (current.isEmpty()) {
+            // The CheckoutSubmitted may still be in a retry topic (ADR-0007 reorders retried
+            // records).
+            throw new RetryLaterException("no saga yet for order " + orderId);
+          }
+          SagaRow row = current.get();
+          OrderSaga.Snapshot snapshot =
+              new OrderSaga.Snapshot(
+                  OrderSagaState.valueOf(row.state()),
+                  codec.read(row.data()),
+                  row.deadlineAt(),
+                  row.stepAttempts());
+          OrderSaga.Decision d = OrderSaga.apply(snapshot, trigger, context(now));
+          if (d.ignored()) {
+            return SagaStep.ignore();
+          }
+          Order order =
+              orders
+                  .find(orderId)
+                  .orElseThrow(() -> new IllegalStateException("saga without order " + orderId));
+          return toStep(d, order, row.version(), now);
+        });
   }
 
   public void onDeadline(String orderId) {
@@ -104,7 +139,8 @@ public class OrderSagaService implements SagaOperator {
     if (status.get() == OrderStatus.DELIVERED || status.get() == OrderStatus.CANCELLED) {
       return RetryOutcome.TERMINAL;
     }
-    SagaEngine.Result r = handle(sagaId, new OrderSagaTrigger.OperatorRetry(), "OPERATOR", null, null);
+    SagaEngine.Result r =
+        handle(sagaId, new OrderSagaTrigger.OperatorRetry(), "OPERATOR", null, null);
     return r == SagaEngine.Result.APPLIED ? RetryOutcome.ACCEPTED : RetryOutcome.NOT_APPLICABLE;
   }
 
@@ -126,9 +162,21 @@ public class OrderSagaService implements SagaOperator {
       messages.add(OrderMessages.command(c, order, sagaVersion));
     }
     orders.updateStatus(order.orderId(), OrderStatus.of(d.state()));
-    String outcome = d.state() == OrderSagaState.DELIVERED ? "DELIVERED" : d.state() == OrderSagaState.CANCELLED ? "CANCELLED" : null;
-    return new SagaStep(false, d.state().name(), codec.write(d.data()), d.deadlineAt(), d.stepAttempts(), messages, outcome,
-        d.attention(), d.timeout(), d.decisionReached());
+    String outcome =
+        d.state() == OrderSagaState.DELIVERED
+            ? "DELIVERED"
+            : d.state() == OrderSagaState.CANCELLED ? "CANCELLED" : null;
+    return new SagaStep(
+        false,
+        d.state().name(),
+        codec.write(d.data()),
+        d.deadlineAt(),
+        d.stepAttempts(),
+        messages,
+        outcome,
+        d.attention(),
+        d.timeout(),
+        d.decisionReached());
   }
 
   /**
@@ -142,16 +190,32 @@ public class OrderSagaService implements SagaOperator {
     ClaimCheck document;
     if (existing != null) {
       invoice = existing;
-      document = ClaimCheck.newBuilder().setBucket(existing.bucket()).setObjectKey(existing.objectKey())
-          .setContentType("application/pdf").setSizeBytes(existing.sizeBytes()).setSha256(existing.sha256()).setExpiresAt(null).build();
+      document =
+          ClaimCheck.newBuilder()
+              .setBucket(existing.bucket())
+              .setObjectKey(existing.objectKey())
+              .setContentType("application/pdf")
+              .setSizeBytes(existing.sizeBytes())
+              .setSha256(existing.sha256())
+              .setExpiresAt(null)
+              .build();
     } else {
       int year = Invoice.yearOf(now);
       String number = Invoice.number(year, invoices.nextSequence(year));
       byte[] pdf = renderer.render(order, number, now);
       String key = ClaimChecks.key("order", now, order.orderId(), inv.invoiceId(), "pdf");
       document = documents.put(INVOICE_BUCKET, key, pdf, "application/pdf", null);
-      invoice = new Invoice(inv.invoiceId(), order.orderId(), number, order.total(), now, INVOICE_BUCKET, key,
-          document.getSizeBytes(), document.getSha256());
+      invoice =
+          new Invoice(
+              inv.invoiceId(),
+              order.orderId(),
+              number,
+              order.total(),
+              now,
+              INVOICE_BUCKET,
+              key,
+              document.getSizeBytes(),
+              document.getSha256());
       invoices.save(invoice);
     }
     return OrderMessages.invoiceIssued(invoice, document, inv.version());

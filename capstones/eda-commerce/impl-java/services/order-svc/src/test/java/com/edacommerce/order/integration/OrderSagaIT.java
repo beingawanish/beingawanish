@@ -78,7 +78,9 @@ class OrderSagaIT {
   @BeforeEach
   void setUp() {
     driver = new MessageDriver(ctx);
-    projector = new MessageDriver(ctx, "order-history-projector", new OrderHistoryProjector(history).handlers());
+    projector =
+        new MessageDriver(
+            ctx, "order-history-projector", new OrderHistoryProjector(history).handlers());
   }
 
   @AfterEach
@@ -109,7 +111,8 @@ class OrderSagaIT {
   }
 
   String state(String orderId) {
-    return jdbc.queryForObject("SELECT state FROM saga_instance WHERE saga_id = ?", String.class, orderId);
+    return jdbc.queryForObject(
+        "SELECT state FROM saga_instance WHERE saga_id = ?", String.class, orderId);
   }
 
   Money m(long minor) {
@@ -139,7 +142,8 @@ class OrderSagaIT {
         .andExpect(jsonPath("$.source").value("WRITE_MODEL_FALLBACK"))
         .andExpect(header().exists("Retry-After"))
         .andExpect(OpenApiContract.validResponse("orders.yaml"));
-    mvc.perform(get("/orders/" + orderId).header("X-Local-Customer-Id", "someone-else")).andExpect(status().isNotFound());
+    mvc.perform(get("/orders/" + orderId).header("X-Local-Customer-Id", "someone-else"))
+        .andExpect(status().isNotFound());
   }
 
   @Test
@@ -157,50 +161,128 @@ class OrderSagaIT {
   void happyPathToDeliveredWithInvoiceAndReadModel() throws Exception {
     String orderId = checkout();
     String res = last(ReserveStock.class, orderId).getReservationId();
-    reply("inventory.events.v1", orderId, StockReserved.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId)
-        .setReservationId(res).setLines(List.of()).setExpiresAt(clock.instant().plusSeconds(900)).build());
+    reply(
+        "inventory.events.v1",
+        orderId,
+        StockReserved.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setReservationId(res)
+            .setLines(List.of())
+            .setExpiresAt(clock.instant().plusSeconds(900))
+            .build());
     AuthorizePayment auth = last(AuthorizePayment.class, orderId);
     assertThat(auth.getAmount().getAmountMinor()).isEqualTo(1999L);
     assertThat(auth.getPaymentMethodToken()).isEqualTo("tok_visa_ok");
     String pay = auth.getPaymentId();
-    reply("payment.events.v1", orderId, PaymentAuthorized.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId)
-        .setPaymentId(pay).setPspReference("psp").setAmount(m(1999)).setAuthorizedAt(clock.instant())
-        .setAuthorizationExpiresAt(clock.instant().plus(Duration.ofDays(7))).build());
-    reply("inventory.events.v1", orderId, ReservationCommitted.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId)
-        .setReservationId(res).setCommittedAt(clock.instant()).build());
+    reply(
+        "payment.events.v1",
+        orderId,
+        PaymentAuthorized.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setPaymentId(pay)
+            .setPspReference("psp")
+            .setAmount(m(1999))
+            .setAuthorizedAt(clock.instant())
+            .setAuthorizationExpiresAt(clock.instant().plus(Duration.ofDays(7)))
+            .build());
+    reply(
+        "inventory.events.v1",
+        orderId,
+        ReservationCommitted.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setReservationId(res)
+            .setCommittedAt(clock.instant())
+            .build());
     assertThat(last(OrderConfirmed.class, orderId).getPaymentId()).isEqualTo(pay);
     RequestFulfilment rf = last(RequestFulfilment.class, orderId);
     assertThat(rf.getAttempt()).isEqualTo(1);
     assertThat(rf.getShipTo().getCity()).isEqualTo("Berlin");
     String ful = rf.getFulfilmentId();
-    reply("fulfilment.events.v1", orderId, FulfilmentAccepted.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId)
-        .setFulfilmentId(ful).setWarehouseId("w").setAcceptedAt(clock.instant()).build());
-    reply("fulfilment.events.v1", orderId, OrderPacked.newBuilder(GoldenFixtures.decode(OrderPacked.class)).setOrderId(orderId).setFulfilmentId(ful).build());
-    reply("shipping.events.v1", orderId, ShipmentCreated.newBuilder(GoldenFixtures.decode(ShipmentCreated.class)).setOrderId(orderId)
-        .setShipmentId("ship-1").setDirection(ShipmentDirection.OUTBOUND).build());
-    reply("fulfilment.events.v1", orderId, OrderDispatched.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId)
-        .setFulfilmentId(ful).setShipmentId("ship-1").setDispatchedAt(clock.instant()).build());
+    reply(
+        "fulfilment.events.v1",
+        orderId,
+        FulfilmentAccepted.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setFulfilmentId(ful)
+            .setWarehouseId("w")
+            .setAcceptedAt(clock.instant())
+            .build());
+    reply(
+        "fulfilment.events.v1",
+        orderId,
+        OrderPacked.newBuilder(GoldenFixtures.decode(OrderPacked.class))
+            .setOrderId(orderId)
+            .setFulfilmentId(ful)
+            .build());
+    reply(
+        "shipping.events.v1",
+        orderId,
+        ShipmentCreated.newBuilder(GoldenFixtures.decode(ShipmentCreated.class))
+            .setOrderId(orderId)
+            .setShipmentId("ship-1")
+            .setDirection(ShipmentDirection.OUTBOUND)
+            .build());
+    reply(
+        "fulfilment.events.v1",
+        orderId,
+        OrderDispatched.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setFulfilmentId(ful)
+            .setShipmentId("ship-1")
+            .setDispatchedAt(clock.instant())
+            .build());
     assertThat(last(CapturePayment.class, orderId).getPaymentId()).isEqualTo(pay);
-    reply("payment.events.v1", orderId, PaymentCaptured.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId)
-        .setPaymentId(pay).setAmount(m(1999)).setPspReference("psp").setCapturedAt(clock.instant()).build());
+    reply(
+        "payment.events.v1",
+        orderId,
+        PaymentCaptured.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setPaymentId(pay)
+            .setAmount(m(1999))
+            .setPspReference("psp")
+            .setCapturedAt(clock.instant())
+            .build());
 
     OrderShipped shipped = last(OrderShipped.class, orderId);
     assertThat(shipped.getTrackingNumber()).isEqualTo("FC123456789DE");
     InvoiceIssued invoice = last(InvoiceIssued.class, orderId);
     assertThat(invoice.getInvoiceNumber()).matches("INV-\\d{4}-\\d{6}");
     assertThat(invoice.getDocument().getObjectKey())
-        .isEqualTo(ClaimChecks.key("order", invoice.getIssuedAt(), orderId, invoice.getInvoiceId(), "pdf"));
+        .isEqualTo(
+            ClaimChecks.key(
+                "order", invoice.getIssuedAt(), orderId, invoice.getInvoiceId(), "pdf"));
     byte[] pdf = documents.get(invoice.getDocument());
-    assertThat(new String(pdf, 0, 5, java.nio.charset.StandardCharsets.US_ASCII)).isEqualTo("%PDF-");
+    assertThat(new String(pdf, 0, 5, java.nio.charset.StandardCharsets.US_ASCII))
+        .isEqualTo("%PDF-");
 
-    reply("shipping.events.v1", orderId, ShipmentDelivered.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId)
-        .setShipmentId("ship-1").setDirection(ShipmentDirection.OUTBOUND).setCarrierEventId("c3").setDeliveredAt(clock.instant()).build());
+    reply(
+        "shipping.events.v1",
+        orderId,
+        ShipmentDelivered.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setShipmentId("ship-1")
+            .setDirection(ShipmentDirection.OUTBOUND)
+            .setCarrierEventId("c3")
+            .setDeliveredAt(clock.instant())
+            .build());
     assertThat(state(orderId)).isEqualTo("DELIVERED");
-    assertThat(last(OrderDelivered.class, orderId).getEnvelope().getAggregateVersion()).isEqualTo(5);
+    assertThat(last(OrderDelivered.class, orderId).getEnvelope().getAggregateVersion())
+        .isEqualTo(5);
 
-    mvc.perform(get("/orders/" + orderId + "/invoice")).andExpect(status().isFound()).andExpect(header().exists("Location"));
-    mvc.perform(get("/ops/sagas/" + orderId)).andExpect(status().isOk())
-        .andExpect(jsonPath("$.state").value("DELIVERED")).andExpect(jsonPath("$.history.length()").value(10))
+    mvc.perform(get("/orders/" + orderId + "/invoice"))
+        .andExpect(status().isFound())
+        .andExpect(header().exists("Location"));
+    mvc.perform(get("/ops/sagas/" + orderId))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.state").value("DELIVERED"))
+        .andExpect(jsonPath("$.history.length()").value(10))
         .andExpect(OpenApiContract.validResponse("admin.yaml"));
 
     // Project every order event and read the order from the read model.
@@ -209,31 +291,64 @@ class OrderSagaIT {
         projector.deliver(p.topic(), orderId, p.record());
       }
     }
-    mvc.perform(get("/orders/" + orderId)).andExpect(status().isOk())
-        .andExpect(jsonPath("$.source").value("READ_MODEL")).andExpect(jsonPath("$.status").value("DELIVERED"))
-        .andExpect(jsonPath("$.version").value(5)).andExpect(jsonPath("$.invoiceAvailable").value(true))
+    mvc.perform(get("/orders/" + orderId))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.source").value("READ_MODEL"))
+        .andExpect(jsonPath("$.status").value("DELIVERED"))
+        .andExpect(jsonPath("$.version").value(5))
+        .andExpect(jsonPath("$.invoiceAvailable").value(true))
         .andExpect(header().doesNotExist("Retry-After"))
         .andExpect(OpenApiContract.validResponse("orders.yaml"));
-    mvc.perform(get("/orders/" + orderId).header("If-None-Match", "\"5\"")).andExpect(status().isNotModified());
-    mvc.perform(get("/customers/me/orders")).andExpect(status().isOk()).andExpect(OpenApiContract.validResponse("orders.yaml"));
+    mvc.perform(get("/orders/" + orderId).header("If-None-Match", "\"5\""))
+        .andExpect(status().isNotModified());
+    mvc.perform(get("/customers/me/orders"))
+        .andExpect(status().isOk())
+        .andExpect(OpenApiContract.validResponse("orders.yaml"));
   }
 
   @Test
   void declinePathReleasesStockAndCancels() {
     String orderId = checkout();
     String res = last(ReserveStock.class, orderId).getReservationId();
-    reply("inventory.events.v1", orderId, StockReserved.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId)
-        .setReservationId(res).setLines(List.of()).setExpiresAt(clock.instant()).build());
+    reply(
+        "inventory.events.v1",
+        orderId,
+        StockReserved.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setReservationId(res)
+            .setLines(List.of())
+            .setExpiresAt(clock.instant())
+            .build());
     String pay = last(AuthorizePayment.class, orderId).getPaymentId();
-    reply("payment.events.v1", orderId, PaymentDeclined.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId)
-        .setPaymentId(pay).setReason(DeclineReason.CARD_DECLINED).setDeclinedAt(clock.instant()).build());
+    reply(
+        "payment.events.v1",
+        orderId,
+        PaymentDeclined.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setPaymentId(pay)
+            .setReason(DeclineReason.CARD_DECLINED)
+            .setDeclinedAt(clock.instant())
+            .build());
     assertThat(last(ReleaseReservation.class, orderId).getReservationId()).isEqualTo(res);
-    reply("inventory.events.v1", orderId, ReservationReleased.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId)
-        .setReservationId(res).setReason("x").setReleasedAt(clock.instant()).build());
+    reply(
+        "inventory.events.v1",
+        orderId,
+        ReservationReleased.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setReservationId(res)
+            .setReason("x")
+            .setReleasedAt(clock.instant())
+            .build());
     OrderCancelled c = last(OrderCancelled.class, orderId);
     assertThat(c.getReason()).isEqualTo(com.edacommerce.order.CancellationReason.PAYMENT_DECLINED);
     assertThat(c.getPaymentVoided()).isFalse();
-    assertThat(jdbc.queryForObject("SELECT status FROM orders WHERE order_id = ?", String.class, orderId)).isEqualTo("CANCELLED");
+    assertThat(
+            jdbc.queryForObject(
+                "SELECT status FROM orders WHERE order_id = ?", String.class, orderId))
+        .isEqualTo("CANCELLED");
   }
 
   @Test
@@ -245,7 +360,8 @@ class OrderSagaIT {
     List<ReserveStock> sent = driver.published(ReserveStock.class, orderId);
     assertThat(sent).hasSize(2);
     assertThat(sent.get(1).getReservationId()).isEqualTo(res);
-    assertThat(sent.get(1).getEnvelope().getEventId()).isNotEqualTo(sent.get(0).getEnvelope().getEventId());
+    assertThat(sent.get(1).getEnvelope().getEventId())
+        .isNotEqualTo(sent.get(0).getEnvelope().getEventId());
   }
 
   @Test
@@ -257,10 +373,11 @@ class OrderSagaIT {
     var tx = ctx.getBean(org.springframework.transaction.support.TransactionTemplate.class);
     int year = 2031;
     long a = tx.execute(s -> repo.nextSequence(year));
-    tx.executeWithoutResult(s -> {
-      repo.nextSequence(year);
-      s.setRollbackOnly(); // a failed issue gives its number back
-    });
+    tx.executeWithoutResult(
+        s -> {
+          repo.nextSequence(year);
+          s.setRollbackOnly(); // a failed issue gives its number back
+        });
     long b = tx.execute(s -> repo.nextSequence(year));
     assertThat(b).isEqualTo(a + 1);
   }
@@ -269,31 +386,63 @@ class OrderSagaIT {
   void retryStepOnATerminalSagaIs409AndUnknownIs404() throws Exception {
     String orderId = checkout();
     String res = last(ReserveStock.class, orderId).getReservationId();
-    reply("inventory.events.v1", orderId, com.edacommerce.inventory.StockReservationRejected.newBuilder().setEnvelope(Envelopes.placeholder())
-        .setOrderId(orderId).setReservationId(res).setShortages(List.of()).build());
-    mvc.perform(post("/ops/sagas/" + orderId + "/retry-step").header("Idempotency-Key", Ids.newId())).andExpect(status().isConflict());
-    mvc.perform(post("/ops/sagas/nope/retry-step").header("Idempotency-Key", Ids.newId())).andExpect(status().isNotFound());
+    reply(
+        "inventory.events.v1",
+        orderId,
+        com.edacommerce.inventory.StockReservationRejected.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setReservationId(res)
+            .setShortages(List.of())
+            .build());
+    mvc.perform(
+            post("/ops/sagas/" + orderId + "/retry-step").header("Idempotency-Key", Ids.newId()))
+        .andExpect(status().isConflict());
+    mvc.perform(post("/ops/sagas/nope/retry-step").header("Idempotency-Key", Ids.newId()))
+        .andExpect(status().isNotFound());
   }
 
   @Test
   void projectorDropsStaleVersionsAndReplayYieldsTheSameRows() {
     String orderId = checkout();
     String res = last(ReserveStock.class, orderId).getReservationId();
-    reply("inventory.events.v1", orderId, com.edacommerce.inventory.StockReservationRejected.newBuilder().setEnvelope(Envelopes.placeholder())
-        .setOrderId(orderId).setReservationId(res).setShortages(List.of()).build());
-    List<MessageDriver.Published> events = driver.publishedFor(orderId).stream().filter(p -> p.topic().equals("order.events.v1")).toList();
+    reply(
+        "inventory.events.v1",
+        orderId,
+        com.edacommerce.inventory.StockReservationRejected.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setReservationId(res)
+            .setShortages(List.of())
+            .build());
+    List<MessageDriver.Published> events =
+        driver.publishedFor(orderId).stream()
+            .filter(p -> p.topic().equals("order.events.v1"))
+            .toList();
     // Out of order: Cancelled (v2) first is retried until Placed (v1) is there.
     List<MessageDriver.Delivery> deliveries = new java.util.ArrayList<>();
     for (MessageDriver.Published p : events) {
       deliveries.add(projector.deliver(p.topic(), orderId, p.record()));
     }
-    var snapshot1 = jdbc.queryForList("SELECT status, version FROM order_history.order_summary WHERE order_id = ?", orderId);
+    var snapshot1 =
+        jdbc.queryForList(
+            "SELECT status, version FROM order_history.order_summary WHERE order_id = ?", orderId);
     assertThat(snapshot1.get(0).get("status")).isEqualTo("CANCELLED");
     // A stale version (OrderPlaced again with a new eventId) is dropped.
-    projector.deliver("order.events.v1", orderId, OrderPlaced.newBuilder((OrderPlaced) events.get(0).record()).build());
-    assertThat(jdbc.queryForList("SELECT status, version FROM order_history.order_summary WHERE order_id = ?", orderId)).isEqualTo(snapshot1);
+    projector.deliver(
+        "order.events.v1",
+        orderId,
+        OrderPlaced.newBuilder((OrderPlaced) events.get(0).record()).build());
+    assertThat(
+            jdbc.queryForList(
+                "SELECT status, version FROM order_history.order_summary WHERE order_id = ?",
+                orderId))
+        .isEqualTo(snapshot1);
     // Replay from offset 0 into an empty projection gives identical rows.
-    var timeline1 = jdbc.queryForList("SELECT event_id, kind FROM order_history.timeline WHERE order_id = ? ORDER BY event_id", orderId);
+    var timeline1 =
+        jdbc.queryForList(
+            "SELECT event_id, kind FROM order_history.timeline WHERE order_id = ? ORDER BY event_id",
+            orderId);
     jdbc.update("DELETE FROM order_history.timeline WHERE order_id = ?", orderId);
     jdbc.update("DELETE FROM order_history.order_line WHERE order_id = ?", orderId);
     jdbc.update("DELETE FROM order_history.order_summary WHERE order_id = ?", orderId);
@@ -301,8 +450,15 @@ class OrderSagaIT {
     for (MessageDriver.Delivery d : deliveries) {
       projector.redeliver(d);
     }
-    assertThat(jdbc.queryForList("SELECT status, version FROM order_history.order_summary WHERE order_id = ?", orderId)).isEqualTo(snapshot1);
-    assertThat(jdbc.queryForList("SELECT event_id, kind FROM order_history.timeline WHERE order_id = ? ORDER BY event_id", orderId))
+    assertThat(
+            jdbc.queryForList(
+                "SELECT status, version FROM order_history.order_summary WHERE order_id = ?",
+                orderId))
+        .isEqualTo(snapshot1);
+    assertThat(
+            jdbc.queryForList(
+                "SELECT event_id, kind FROM order_history.timeline WHERE order_id = ? ORDER BY event_id",
+                orderId))
         .isEqualTo(timeline1);
     assertThat(Instant.now()).isNotNull();
   }

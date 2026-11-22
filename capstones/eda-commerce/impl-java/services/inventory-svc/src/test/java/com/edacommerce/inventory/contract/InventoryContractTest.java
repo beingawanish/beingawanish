@@ -26,7 +26,8 @@ class InventoryContractTest {
 
   @Test
   void consumedCommandsDecodeFromTheirGoldenBytes() {
-    assertThat(GoldenFixtures.assertSpecificRoundTrip(ReserveStock.class).getTtlSeconds()).isEqualTo(900);
+    assertThat(GoldenFixtures.assertSpecificRoundTrip(ReserveStock.class).getTtlSeconds())
+        .isEqualTo(900);
     GoldenFixtures.assertSpecificRoundTrip(CommitReservation.class);
     GoldenFixtures.assertSpecificRoundTrip(ReleaseReservation.class);
     GoldenFixtures.assertSpecificRoundTrip(RestockItems.class);
@@ -34,10 +35,24 @@ class InventoryContractTest {
 
   @Test
   void everyProducedMessageValidatesAgainstTheBundledSchema() {
-    Reservation r = new Reservation("r1", "o1", ReservationStatus.HELD, List.of(new StockLine("SKU-1", 1)), T, List.of(), null, T, 1);
-    List<Reply> replies = List.of(
-        new Reply.Reserved(r.lines(), T), new Reply.Rejected(List.of(new Shortage("SKU-1", 2, 1))),
-        new Reply.Committed(T), new Reply.Released("x", T), new Reply.Expired(T));
+    Reservation r =
+        new Reservation(
+            "r1",
+            "o1",
+            ReservationStatus.HELD,
+            List.of(new StockLine("SKU-1", 1)),
+            T,
+            List.of(),
+            null,
+            T,
+            1);
+    List<Reply> replies =
+        List.of(
+            new Reply.Reserved(r.lines(), T),
+            new Reply.Rejected(List.of(new Shortage("SKU-1", 2, 1))),
+            new Reply.Committed(T),
+            new Reply.Released("x", T),
+            new Reply.Expired(T));
     for (Reply reply : replies) {
       OutgoingMessage m = InventoryMessages.reply(r, reply);
       assertThat(m.topic()).isEqualTo("inventory.events.v1");
@@ -50,6 +65,8 @@ class InventoryContractTest {
     assertThat(level.aggregateVersion()).isEqualTo(7);
     GoldenFixtures.assertValidAgainstBundled(level.record());
     GoldenFixtures.assertValidAgainstBundled(
-        InventoryMessages.restocked(new Restock("rs", "o1", "ret", List.of(new StockLine("SKU-1", 1)), T)).record());
+        InventoryMessages.restocked(
+                new Restock("rs", "o1", "ret", List.of(new StockLine("SKU-1", 1)), T))
+            .record());
   }
 }

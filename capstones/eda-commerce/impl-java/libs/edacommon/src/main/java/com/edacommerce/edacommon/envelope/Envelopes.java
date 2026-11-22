@@ -11,8 +11,8 @@ public final class Envelopes {
   private Envelopes() {}
 
   /**
-   * The envelope for an outgoing message: {@code type} is the Avro full name, {@code partitionKey} is
-   * the record key, the causation id the triggering eventId, {@code version} the topic's major
+   * The envelope for an outgoing message: {@code type} is the Avro full name, {@code partitionKey}
+   * is the record key, the causation id the triggering eventId, {@code version} the topic's major
    * version.
    */
   public static Envelope build(

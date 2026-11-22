@@ -22,7 +22,8 @@ class ClaimChecksTest {
   void getVerifiesHashAndSizeAndMissingObjectsRetryLater() {
     InMemoryClaimCheckStore store = new InMemoryClaimCheckStore();
     byte[] bytes = "invoice".getBytes(StandardCharsets.UTF_8);
-    ClaimCheck cc = store.put("invoices", "order/2026/11/o1/i1.pdf", bytes, "application/pdf", null);
+    ClaimCheck cc =
+        store.put("invoices", "order/2026/11/o1/i1.pdf", bytes, "application/pdf", null);
     assertThat(cc.getSha256()).isEqualTo(ClaimChecks.sha256(bytes)).hasSize(64);
     assertThat(cc.getSizeBytes()).isEqualTo(bytes.length);
     assertThat(store.get(cc)).isEqualTo(bytes);

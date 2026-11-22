@@ -18,8 +18,8 @@ import com.edacommerce.payment.application.RefundRepository;
 import com.edacommerce.payment.domain.Payment;
 import java.time.Clock;
 import java.time.Duration;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -30,20 +30,40 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /** Composition root of payment-svc. */
 @Configuration(proxyBeanMethods = false)
-@EnableConfigurationProperties({PaymentConfiguration.PspProperties.class, PaymentConfiguration.FakePspProperties.class})
+@EnableConfigurationProperties({
+  PaymentConfiguration.PspProperties.class,
+  PaymentConfiguration.FakePspProperties.class
+})
 public class PaymentConfiguration {
 
   /** PSP_WEBHOOK_SECRET, PSP_WEBHOOK_URL and client settings. */
   @ConfigurationProperties(prefix = "payment.psp")
-  public record PspProperties(String webhookSecret, String webhookUrl, Duration requestTimeout,
-      Duration reconcileInterval, Duration reconcileWindow, Duration pendingCheckAfter) {}
+  public record PspProperties(
+      String webhookSecret,
+      String webhookUrl,
+      Duration requestTimeout,
+      Duration reconcileInterval,
+      Duration reconcileWindow,
+      Duration pendingCheckAfter) {}
 
   /** FAKE_PSP_* (admin.yaml FakePspConfig, upper snake case). */
   @ConfigurationProperties(prefix = "payment.fake-psp")
-  public record FakePspProperties(Double declineRate, Double timeoutRate, Double duplicateWebhookRate,
-      Integer webhookDelayMs, Integer slowWebhookMs, Integer apiLatencyMs) {
+  public record FakePspProperties(
+      Double declineRate,
+      Double timeoutRate,
+      Double duplicateWebhookRate,
+      Integer webhookDelayMs,
+      Integer slowWebhookMs,
+      Integer apiLatencyMs) {
     FakePspConfig toConfig() {
-      return FakePspConfig.DEFAULTS.merge(new FakePspConfig(declineRate, timeoutRate, duplicateWebhookRate, webhookDelayMs, slowWebhookMs, apiLatencyMs));
+      return FakePspConfig.DEFAULTS.merge(
+          new FakePspConfig(
+              declineRate,
+              timeoutRate,
+              duplicateWebhookRate,
+              webhookDelayMs,
+              slowWebhookMs,
+              apiLatencyMs));
     }
   }
 
@@ -59,30 +79,54 @@ public class PaymentConfiguration {
   }
 
   @Bean(destroyMethod = "shutdown")
-  FakePsp fakePsp(FakePspProperties fake, PspWebhookTransport transport, WebhookVerifier verifier, Clock clock, PspProperties p) {
+  FakePsp fakePsp(
+      FakePspProperties fake,
+      PspWebhookTransport transport,
+      WebhookVerifier verifier,
+      Clock clock,
+      PspProperties p) {
     return new FakePsp(fake.toConfig(), transport, verifier, clock, p.requestTimeout());
   }
 
   @Bean
-  PaymentUseCases paymentUseCases(PaymentRepository payments, RefundRepository refunds, FakePsp psp,
-      PspNotifications notifications, OutboxWriter outbox, Clock clock, PspProperties p) {
-    return new PaymentUseCases(payments, refunds, psp, notifications, outbox, clock,
-        new Payment.ReconciliationPolicy(p.reconcileInterval(), p.reconcileWindow(), p.pendingCheckAfter()));
+  PaymentUseCases paymentUseCases(
+      PaymentRepository payments,
+      RefundRepository refunds,
+      FakePsp psp,
+      PspNotifications notifications,
+      OutboxWriter outbox,
+      Clock clock,
+      PspProperties p) {
+    return new PaymentUseCases(
+        payments,
+        refunds,
+        psp,
+        notifications,
+        outbox,
+        clock,
+        new Payment.ReconciliationPolicy(
+            p.reconcileInterval(), p.reconcileWindow(), p.pendingCheckAfter()));
   }
 
   @Bean
-  WebhookReceiver pspWebhookReceiver(WebhookVerifier verifier, Inbox inbox, TransactionTemplate tx, EdaMetrics metrics) {
+  WebhookReceiver pspWebhookReceiver(
+      WebhookVerifier verifier, Inbox inbox, TransactionTemplate tx, EdaMetrics metrics) {
     return new WebhookReceiver("psp", verifier, inbox, tx, metrics);
   }
 
-  /** Applies stored webhooks right after the endpoint answered; the periodic job is the safety net. */
+  /**
+   * Applies stored webhooks right after the endpoint answered; the periodic job is the safety net.
+   */
   @Bean(destroyMethod = "shutdown")
   ExecutorService pspNotificationExecutor() {
-    return Executors.newSingleThreadExecutor(Thread.ofVirtual().name("psp-notifications").factory());
+    return Executors.newSingleThreadExecutor(
+        Thread.ofVirtual().name("psp-notifications").factory());
   }
 
   @Bean
-  Runnable pspNotificationKick(ExecutorService pspNotificationExecutor, PaymentUseCases useCases,
+  Runnable pspNotificationKick(
+      ExecutorService pspNotificationExecutor,
+      PaymentUseCases useCases,
       org.springframework.core.env.Environment env) {
     boolean enabled = env.getProperty("eda.jobs.enabled", Boolean.class, true);
     return () -> {
@@ -95,13 +139,15 @@ public class PaymentConfiguration {
   @Bean
   @ConditionalOnProperty(name = "eda.jobs.enabled", havingValue = "true", matchIfMissing = true)
   PeriodicJob pspNotificationJob(PaymentUseCases useCases) {
-    return new PeriodicJob("psp-notifications", Duration.ofSeconds(1), () -> useCases.processNotifications(50));
+    return new PeriodicJob(
+        "psp-notifications", Duration.ofSeconds(1), () -> useCases.processNotifications(50));
   }
 
   @Bean
   @ConditionalOnProperty(name = "eda.jobs.enabled", havingValue = "true", matchIfMissing = true)
   PeriodicJob reconciliationJob(PaymentUseCases useCases) {
-    return new PeriodicJob("psp-reconciliation", Duration.ofSeconds(5), () -> useCases.reconcileDue(50));
+    return new PeriodicJob(
+        "psp-reconciliation", Duration.ofSeconds(5), () -> useCases.reconcileDue(50));
   }
 
   @Bean

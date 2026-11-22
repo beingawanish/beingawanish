@@ -13,9 +13,16 @@ public interface PspNotifications {
   sealed interface Stored {
     String pspEventId();
 
-    record ForPayment(String pspEventId, String paymentId, Payment.Notification notification) implements Stored {}
+    record ForPayment(String pspEventId, String paymentId, Payment.Notification notification)
+        implements Stored {}
 
-    record ForRefund(String pspEventId, String refundId, boolean succeeded, String pspReference, String failure, boolean retryable)
+    record ForRefund(
+        String pspEventId,
+        String refundId,
+        boolean succeeded,
+        String pspReference,
+        String failure,
+        boolean retryable)
         implements Stored {}
 
     /** Something we do not act on (e.g. void.succeeded, unknown types). */

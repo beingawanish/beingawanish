@@ -61,7 +61,10 @@ class InventoryServiceIT {
   void setUp() throws Exception {
     driver = new MessageDriver(ctx);
     sku = "SKU-" + Ids.newId().substring(24);
-    mvc.perform(put("/admin/stock/" + sku).contentType(MediaType.APPLICATION_JSON).content("{\"onHand\": 3}"))
+    mvc.perform(
+            put("/admin/stock/" + sku)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"onHand\": 3}"))
         .andExpect(status().isOk())
         .andExpect(OpenApiContract.validResponse("admin.yaml"));
   }
@@ -72,8 +75,13 @@ class InventoryServiceIT {
   }
 
   ReserveStock reserve(String orderId, String reservationId, int qty, int ttlSeconds) {
-    return ReserveStock.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId).setReservationId(reservationId)
-        .setLines(List.of(new StockLine(sku, qty))).setTtlSeconds(ttlSeconds).build();
+    return ReserveStock.newBuilder()
+        .setEnvelope(Envelopes.placeholder())
+        .setOrderId(orderId)
+        .setReservationId(reservationId)
+        .setLines(List.of(new StockLine(sku, qty)))
+        .setTtlSeconds(ttlSeconds)
+        .build();
   }
 
   int reserved() {
@@ -100,7 +108,8 @@ class InventoryServiceIT {
   @Test
   void reserveStockRepliesWithEnvelopeAndUpdatesStock() {
     String orderId = Ids.newId();
-    MessageDriver.Delivery d = driver.deliver("inventory.commands.v1", orderId, reserve(orderId, "r-" + orderId, 2, 900));
+    MessageDriver.Delivery d =
+        driver.deliver("inventory.commands.v1", orderId, reserve(orderId, "r-" + orderId, 2, 900));
     assertThat(d.outcome()).isEqualTo(Outcome.SUCCESS);
     assertThat(reserved()).isEqualTo(2);
 
@@ -112,13 +121,16 @@ class InventoryServiceIT {
     assertThat(reply.envelope().getPartitionKey()).isEqualTo(orderId);
     assertThat(reply.envelope().getCausationId()).isEqualTo(d.eventId());
     assertThat(reply.envelope().getCorrelationId()).isEqualTo(orderId);
-    assertThat(driver.published(StockLevelChanged.class, sku)).last().satisfies(l -> assertThat(l.getAvailable()).isEqualTo(1));
+    assertThat(driver.published(StockLevelChanged.class, sku))
+        .last()
+        .satisfies(l -> assertThat(l.getAvailable()).isEqualTo(1));
   }
 
   @Test
   void theSameMessageTwiceHasOneEffectAndOneReply() {
     String orderId = Ids.newId();
-    MessageDriver.Delivery d = driver.deliver("inventory.commands.v1", orderId, reserve(orderId, "r-" + orderId, 1, 900));
+    MessageDriver.Delivery d =
+        driver.deliver("inventory.commands.v1", orderId, reserve(orderId, "r-" + orderId, 1, 900));
     assertThat(driver.redeliver(d).outcome()).isEqualTo(Outcome.DUPLICATE);
     assertThat(reserved()).isEqualTo(1);
     assertThat(driver.published(StockReserved.class, orderId)).hasSize(1);
@@ -142,17 +154,32 @@ class InventoryServiceIT {
     String o2 = Ids.newId();
     CountDownLatch go = new CountDownLatch(1);
     ExecutorService pool = Executors.newFixedThreadPool(2);
-    List<Callable<Object>> calls = List.of(
-        () -> { go.await(); return driver.deliver("inventory.commands.v1", o1, reserve(o1, "r-" + o1, 1, 900)).outcome(); },
-        () -> { go.await(); return driver.deliver("inventory.commands.v1", o2, reserve(o2, "r-" + o2, 1, 900)).outcome(); });
+    List<Callable<Object>> calls =
+        List.of(
+            () -> {
+              go.await();
+              return driver
+                  .deliver("inventory.commands.v1", o1, reserve(o1, "r-" + o1, 1, 900))
+                  .outcome();
+            },
+            () -> {
+              go.await();
+              return driver
+                  .deliver("inventory.commands.v1", o2, reserve(o2, "r-" + o2, 1, 900))
+                  .outcome();
+            });
     List<Future<Object>> futures = calls.stream().map(pool::submit).toList();
     go.countDown();
     for (Future<Object> f : futures) {
       assertThat(f.get()).isEqualTo(Outcome.SUCCESS);
     }
     pool.shutdown();
-    int won = driver.published(StockReserved.class, o1).size() + driver.published(StockReserved.class, o2).size();
-    int lost = driver.published(StockReservationRejected.class, o1).size() + driver.published(StockReservationRejected.class, o2).size();
+    int won =
+        driver.published(StockReserved.class, o1).size()
+            + driver.published(StockReserved.class, o2).size();
+    int lost =
+        driver.published(StockReservationRejected.class, o1).size()
+            + driver.published(StockReservationRejected.class, o2).size();
     assertThat(won).isEqualTo(1);
     assertThat(lost).isEqualTo(1);
     assertThat(reserved()).isEqualTo(1);
@@ -167,10 +194,18 @@ class InventoryServiceIT {
     assertThat(useCases.expireDue(100)).isGreaterThanOrEqualTo(1);
     assertThat(reserved()).isZero();
     assertThat(driver.published(ReservationExpired.class, orderId)).hasSize(1);
-    assertThat(driver.published(StockLevelChanged.class, sku)).last().satisfies(l -> assertThat(l.getAvailable()).isEqualTo(3));
+    assertThat(driver.published(StockLevelChanged.class, sku))
+        .last()
+        .satisfies(l -> assertThat(l.getAvailable()).isEqualTo(3));
 
-    driver.deliver("inventory.commands.v1", orderId, CommitReservation.newBuilder().setEnvelope(Envelopes.placeholder())
-        .setOrderId(orderId).setReservationId("r-" + orderId).build());
+    driver.deliver(
+        "inventory.commands.v1",
+        orderId,
+        CommitReservation.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setReservationId("r-" + orderId)
+            .build());
     assertThat(driver.published(ReservationExpired.class, orderId)).hasSize(2);
     assertThat(driver.published(ReservationCommitted.class, orderId)).isEmpty();
   }
@@ -179,14 +214,26 @@ class InventoryServiceIT {
   void commitAllocatesAndReleaseReturnsTheAllocationOnce() {
     String orderId = Ids.newId();
     driver.deliver("inventory.commands.v1", orderId, reserve(orderId, "r-" + orderId, 2, 900));
-    driver.deliver("inventory.commands.v1", orderId, CommitReservation.newBuilder().setEnvelope(Envelopes.placeholder())
-        .setOrderId(orderId).setReservationId("r-" + orderId).build());
+    driver.deliver(
+        "inventory.commands.v1",
+        orderId,
+        CommitReservation.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setReservationId("r-" + orderId)
+            .build());
     assertThat(onHand()).isEqualTo(1);
     assertThat(reserved()).isZero();
-    ReleaseReservation release = ReleaseReservation.newBuilder().setEnvelope(Envelopes.placeholder())
-        .setOrderId(orderId).setReservationId("r-" + orderId).setReason("fulfilment failed").build();
+    ReleaseReservation release =
+        ReleaseReservation.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setReservationId("r-" + orderId)
+            .setReason("fulfilment failed")
+            .build();
     driver.deliver("inventory.commands.v1", orderId, release);
-    driver.deliver("inventory.commands.v1", orderId, ReleaseReservation.newBuilder(release).build());
+    driver.deliver(
+        "inventory.commands.v1", orderId, ReleaseReservation.newBuilder(release).build());
     assertThat(onHand()).isEqualTo(3);
     assertThat(driver.published(ReservationReleased.class, orderId)).hasSize(2);
   }
@@ -194,8 +241,14 @@ class InventoryServiceIT {
   @Test
   void restockIsIdempotentOnRestockId() {
     String orderId = Ids.newId();
-    RestockItems cmd = RestockItems.newBuilder().setEnvelope(Envelopes.placeholder()).setOrderId(orderId).setReturnId("ret")
-        .setRestockId("rs-" + orderId).setLines(List.of(new StockLine(sku, 2))).build();
+    RestockItems cmd =
+        RestockItems.newBuilder()
+            .setEnvelope(Envelopes.placeholder())
+            .setOrderId(orderId)
+            .setReturnId("ret")
+            .setRestockId("rs-" + orderId)
+            .setLines(List.of(new StockLine(sku, 2)))
+            .build();
     driver.deliver("inventory.commands.v1", orderId, cmd);
     driver.deliver("inventory.commands.v1", orderId, RestockItems.newBuilder(cmd).build());
     assertThat(onHand()).isEqualTo(5);
@@ -204,9 +257,13 @@ class InventoryServiceIT {
 
   @Test
   void unknownTypesOnTheCommandTopicAreIgnored() {
-    ConsumerRecord<String, byte[]> r = new ConsumerRecord<>("inventory.commands.v1", 0, 0L, "o", new byte[] {1});
+    ConsumerRecord<String, byte[]> r =
+        new ConsumerRecord<>("inventory.commands.v1", 0, 0L, "o", new byte[] {1});
     r.headers().add(EdaHeaders.CE_ID, Ids.newId().getBytes(StandardCharsets.UTF_8));
-    r.headers().add(EdaHeaders.CE_TYPE, "com.edacommerce.inventory.SomethingNew".getBytes(StandardCharsets.UTF_8));
+    r.headers()
+        .add(
+            EdaHeaders.CE_TYPE,
+            "com.edacommerce.inventory.SomethingNew".getBytes(StandardCharsets.UTF_8));
     assertThat(driver.processor().process(r)).isEqualTo(Outcome.IGNORED);
   }
 }

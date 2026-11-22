@@ -17,7 +17,8 @@ public interface ClaimCheckStore {
    *
    * @param expiresAt when the bucket's lifecycle rule deletes it; null for legal hold (invoices)
    */
-  ClaimCheck put(String bucket, String key, byte[] bytes, String contentType, @Nullable Instant expiresAt);
+  ClaimCheck put(
+      String bucket, String key, byte[] bytes, String contentType, @Nullable Instant expiresAt);
 
   /**
    * Downloads and verifies size and SHA-256.

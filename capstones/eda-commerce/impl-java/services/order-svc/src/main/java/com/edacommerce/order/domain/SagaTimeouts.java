@@ -16,8 +16,12 @@ public record SagaTimeouts(
   public static final Duration SHIPPED_TIMEOUT = Duration.ofDays(30);
   public static final Duration CAPTURE_RETRY_BACKOFF = Duration.ofMinutes(1);
   public static final Duration RETURN_WINDOW = Duration.ofDays(30);
-  /** Raise attention this long before an authorisation lapses if the parcel has not left (ADR-0015). */
+
+  /**
+   * Raise attention this long before an authorisation lapses if the parcel has not left (ADR-0015).
+   */
   public static final Duration AUTHORIZATION_SAFETY = Duration.ofDays(2);
+
   public static final int RESERVE_RESENDS = 2;
   public static final int AUTHORIZE_RESENDS = 1;
   public static final int MAX_CAPTURE_RETRIES = 5;
@@ -25,7 +29,14 @@ public record SagaTimeouts(
   public static final int RESERVATION_TTL_SECONDS = 900;
 
   public static SagaTimeouts defaults() {
-    return new SagaTimeouts(Duration.ofSeconds(30), Duration.ofSeconds(180), Duration.ofSeconds(30),
-        Duration.ofSeconds(600), 3, Duration.ofHours(24), Duration.ofSeconds(300), Duration.ofSeconds(60));
+    return new SagaTimeouts(
+        Duration.ofSeconds(30),
+        Duration.ofSeconds(180),
+        Duration.ofSeconds(30),
+        Duration.ofSeconds(600),
+        3,
+        Duration.ofHours(24),
+        Duration.ofSeconds(300),
+        Duration.ofSeconds(60));
   }
 }

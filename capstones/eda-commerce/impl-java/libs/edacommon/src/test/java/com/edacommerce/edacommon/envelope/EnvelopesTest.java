@@ -14,7 +14,8 @@ class EnvelopesTest {
     ReserveStock cmd = GoldenFixtures.decode(ReserveStock.class);
     OutgoingMessage msg = OutgoingMessage.of("inventory.commands.v1", "o1", cmd, "Order", "o1", 3);
     Envelope env =
-        Envelopes.build("e2", msg, new Causation("o1", "e1"), "order-svc", Instant.EPOCH, "00-tp", null);
+        Envelopes.build(
+            "e2", msg, new Causation("o1", "e1"), "order-svc", Instant.EPOCH, "00-tp", null);
     assertThat(env.getType()).isEqualTo("com.edacommerce.inventory.ReserveStock");
     assertThat(env.getVersion()).isEqualTo(1);
     assertThat(env.getPartitionKey()).isEqualTo("o1");

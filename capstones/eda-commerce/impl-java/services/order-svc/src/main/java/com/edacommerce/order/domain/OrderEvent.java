@@ -13,14 +13,17 @@ public sealed interface OrderEvent {
 
   record Confirmed(long version) implements OrderEvent {}
 
-  record Cancelled(long version, CancellationReason reason, String detail, boolean paymentVoided) implements OrderEvent {}
+  record Cancelled(long version, CancellationReason reason, String detail, boolean paymentVoided)
+      implements OrderEvent {}
 
   record Shipped(long version) implements OrderEvent {}
 
   /** The application renders and stores the invoice, then publishes InvoiceIssued (claim check). */
   record InvoiceToIssue(long version, String invoiceId) implements OrderEvent {}
 
-  record Delivered(long version, Instant deliveredAt, Instant returnWindowEndsAt) implements OrderEvent {}
+  record Delivered(long version, Instant deliveredAt, Instant returnWindowEndsAt)
+      implements OrderEvent {}
 
-  record RequiresAttention(long version, OrderSagaState state, String issue) implements OrderEvent {}
+  record RequiresAttention(long version, OrderSagaState state, String issue)
+      implements OrderEvent {}
 }

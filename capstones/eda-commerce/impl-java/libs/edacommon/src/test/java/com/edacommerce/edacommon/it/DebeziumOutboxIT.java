@@ -54,13 +54,18 @@ class DebeziumOutboxIT {
 
   @Container
   static final KafkaContainer KAFKA =
-      new KafkaContainer("apache/kafka:3.9.1").withNetwork(NET).withNetworkAliases("kafka")
+      new KafkaContainer("apache/kafka:3.9.1")
+          .withNetwork(NET)
+          .withNetworkAliases("kafka")
           .withListener("kafka:19092");
 
   @Container
   static final PostgreSQLContainer<?> PG =
-      new PostgreSQLContainer<>("postgres:16-alpine").withNetwork(NET).withNetworkAliases("postgres")
-          .withDatabaseName("order_db").withCommand("postgres", "-c", "wal_level=logical");
+      new PostgreSQLContainer<>("postgres:16-alpine")
+          .withNetwork(NET)
+          .withNetworkAliases("postgres")
+          .withDatabaseName("order_db")
+          .withCommand("postgres", "-c", "wal_level=logical");
 
   @Container
   static final GenericContainer<?> CONNECT =
@@ -73,7 +78,8 @@ class DebeziumOutboxIT {
           .withEnv("OFFSET_STORAGE_TOPIC", "connect_offsets")
           .withEnv("STATUS_STORAGE_TOPIC", "connect_statuses")
           .withExposedPorts(8083)
-          .waitingFor(Wait.forHttp("/connectors").forPort(8083).withStartupTimeout(Duration.ofMinutes(3)));
+          .waitingFor(
+              Wait.forHttp("/connectors").forPort(8083).withStartupTimeout(Duration.ofMinutes(3)));
 
   @Test
   void anOutboxRowArrivesOnItsTopicWithTheCloudEventsHeaders() throws Exception {
@@ -85,38 +91,60 @@ class DebeziumOutboxIT {
     jdbc.execute(Contracts.commonTablesSql());
 
     ObjectMapper json = new ObjectMapper();
-    ObjectNode connector = (ObjectNode) json.readTree(
-        Files.readString(Contracts.dir().resolve("../infra/connect/connectors/order-svc-outbox.json")));
+    ObjectNode connector =
+        (ObjectNode)
+            json.readTree(
+                Files.readString(
+                    Contracts.dir().resolve("../infra/connect/connectors/order-svc-outbox.json")));
     ObjectNode config = (ObjectNode) connector.get("config");
     config.put("database.user", PG.getUsername());
     config.put("database.password", PG.getPassword());
-    HttpResponse<String> created = HttpClient.newHttpClient().send(
-        HttpRequest.newBuilder(URI.create("http://" + CONNECT.getHost() + ":" + CONNECT.getMappedPort(8083) + "/connectors"))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(connector.toString()))
-            .build(),
-        HttpResponse.BodyHandlers.ofString());
+    HttpResponse<String> created =
+        HttpClient.newHttpClient()
+            .send(
+                HttpRequest.newBuilder(
+                        URI.create(
+                            "http://"
+                                + CONNECT.getHost()
+                                + ":"
+                                + CONNECT.getMappedPort(8083)
+                                + "/connectors"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(connector.toString()))
+                    .build(),
+                HttpResponse.BodyHandlers.ofString());
     assertThat(created.statusCode()).as(created.body()).isIn(200, 201);
 
     AvroSerde serde = new AvroSerde(new InMemorySchemaRegistry());
-    OutboxWriter outbox = new OutboxWriter(jdbc, serde, Clock.systemUTC(), IdGenerator.uuidV7(), "order-svc");
+    OutboxWriter outbox =
+        new OutboxWriter(jdbc, serde, Clock.systemUTC(), IdGenerator.uuidV7(), "order-svc");
     TransactionTemplate tx = new TransactionTemplate(new DataSourceTransactionManager(ds));
     OrderPlaced e = GoldenFixtures.decode(OrderPlaced.class);
-    String eventId = tx.execute(s -> outbox.append(
-        OutgoingMessage.of("order.events.v1", e.getOrderId(), e, "Order", e.getOrderId(), 1), new Causation(e.getOrderId(), "cause-1")));
+    String eventId =
+        tx.execute(
+            s ->
+                outbox.append(
+                    OutgoingMessage.of(
+                        "order.events.v1", e.getOrderId(), e, "Order", e.getOrderId(), 1),
+                    new Causation(e.getOrderId(), "cause-1")));
     byte[] payload = jdbc.queryForObject("SELECT payload FROM outbox", byte[].class);
 
-    Map<String, Object> props = Map.of(
-        ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
-        ConsumerConfig.GROUP_ID_CONFIG, "debezium-it",
-        ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+    Map<String, Object> props =
+        Map.of(
+            ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+            ConsumerConfig.GROUP_ID_CONFIG, "debezium-it",
+            ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
     List<ConsumerRecord<String, byte[]>> got = new ArrayList<>();
-    try (KafkaConsumer<String, byte[]> c = new KafkaConsumer<>(props, new StringDeserializer(), new ByteArrayDeserializer())) {
+    try (KafkaConsumer<String, byte[]> c =
+        new KafkaConsumer<>(props, new StringDeserializer(), new ByteArrayDeserializer())) {
       c.subscribe(List.of("order.events.v1"));
-      await().atMost(Duration.ofMinutes(2)).until(() -> {
-        c.poll(Duration.ofMillis(500)).forEach(got::add);
-        return !got.isEmpty();
-      });
+      await()
+          .atMost(Duration.ofMinutes(2))
+          .until(
+              () -> {
+                c.poll(Duration.ofMillis(500)).forEach(got::add);
+                return !got.isEmpty();
+              });
     }
     ConsumerRecord<String, byte[]> r = got.get(0);
     assertThat(r.key()).isEqualTo(e.getOrderId());

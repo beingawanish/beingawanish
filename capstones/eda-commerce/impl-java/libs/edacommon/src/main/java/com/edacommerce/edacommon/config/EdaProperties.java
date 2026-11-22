@@ -7,7 +7,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
  * Typed view of the configuration contract (guide §7). The environment variables are mapped onto
- * {@code eda.*} by {@link EdaEnvironmentPostProcessor}, so this class is the only place code reads them.
+ * {@code eda.*} by {@link EdaEnvironmentPostProcessor}, so this class is the only place code reads
+ * them.
  */
 @ConfigurationProperties(prefix = "eda")
 public class EdaProperties {
@@ -249,6 +250,7 @@ public class EdaProperties {
   /** Consumer runtime settings. Topics are declared by each service in its application.yml. */
   public static class Consumer {
     private boolean enabled = true;
+    private boolean autoStartup = true;
     private List<String> topics = new ArrayList<>();
     private int concurrency = 3;
     private int retryConcurrency = 1;
@@ -260,6 +262,15 @@ public class EdaProperties {
 
     public void setEnabled(boolean enabled) {
       this.enabled = enabled;
+    }
+
+    /** False builds the containers without starting them (wiring tests). */
+    public boolean isAutoStartup() {
+      return autoStartup;
+    }
+
+    public void setAutoStartup(boolean autoStartup) {
+      this.autoStartup = autoStartup;
     }
 
     public List<String> getTopics() {

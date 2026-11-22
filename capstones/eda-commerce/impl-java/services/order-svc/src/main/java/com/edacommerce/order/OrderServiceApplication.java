@@ -5,8 +5,8 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 /**
- * order-svc. {@code java -jar order-svc.jar} runs the saga and the Orders API; {@code ... projector}
- * runs the order-history projector from the same image (compose.apps.example.yml).
+ * order-svc. {@code java -jar order-svc.jar} runs the saga and the Orders API; {@code ...
+ * projector} runs the order-history projector from the same image (compose.apps.example.yml).
  */
 @SpringBootApplication
 public class OrderServiceApplication {

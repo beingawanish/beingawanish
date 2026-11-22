@@ -49,7 +49,8 @@ class IdempotencyFilterIT {
     }
 
     @PostMapping("/checkouts")
-    ResponseEntity<Map<String, String>> submit(@RequestBody Map<String, Object> body) throws InterruptedException {
+    ResponseEntity<Map<String, String>> submit(@RequestBody Map<String, Object> body)
+        throws InterruptedException {
       CountDownLatch h = hold;
       if (h != null) {
         h.await(5, TimeUnit.SECONDS);
@@ -69,8 +70,12 @@ class IdempotencyFilterIT {
       MockMvcBuilders.standaloneSetup(new Orders(db.jdbc))
           .addFilters(
               new IdempotencyFilter(
-                  new IdempotencyStore(db.jdbc), db.tx, new Caller(new EdaProperties()), List.of("/checkouts"),
-                  Duration.ofHours(24), Clock.systemUTC()))
+                  new IdempotencyStore(db.jdbc),
+                  db.tx,
+                  new Caller(new EdaProperties()),
+                  List.of("/checkouts"),
+                  Duration.ofHours(24),
+                  Clock.systemUTC()))
           .build();
 
   @AfterEach
@@ -80,7 +85,11 @@ class IdempotencyFilterIT {
   }
 
   MvcResult send(String key, String body) throws Exception {
-    return mvc.perform(post("/checkouts").header("Idempotency-Key", key).contentType(MediaType.APPLICATION_JSON).content(body))
+    return mvc.perform(
+            post("/checkouts")
+                .header("Idempotency-Key", key)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(body))
         .andReturn();
   }
 
@@ -91,18 +100,26 @@ class IdempotencyFilterIT {
     MvcResult again = send("k1", "{ \"n\": 1, \"cartId\": \"c1\" }");
     assertThat(again.getResponse().getStatus()).isEqualTo(202);
     assertThat(again.getResponse().getHeader("Idempotent-Replayed")).isEqualTo("true");
-    assertThat(again.getResponse().getContentAsString()).isEqualTo(first.getResponse().getContentAsString());
-    assertThat(again.getResponse().getHeader("Location")).isEqualTo(first.getResponse().getHeader("Location"));
+    assertThat(again.getResponse().getContentAsString())
+        .isEqualTo(first.getResponse().getContentAsString());
+    assertThat(again.getResponse().getHeader("Location"))
+        .isEqualTo(first.getResponse().getHeader("Location"));
     assertThat(db.count("SELECT count(*) FROM effect")).isEqualTo(1);
-    assertThat(db.count("SELECT count(*) FROM idempotency_key WHERE status = 'COMPLETED'")).isEqualTo(1);
+    assertThat(db.count("SELECT count(*) FROM idempotency_key WHERE status = 'COMPLETED'"))
+        .isEqualTo(1);
   }
 
   @Test
   void sameKeyDifferentBodyIs422() throws Exception {
     send("k2", "{\"cartId\":\"c1\"}");
-    mvc.perform(post("/checkouts").header("Idempotency-Key", "k2").contentType(MediaType.APPLICATION_JSON).content("{\"cartId\":\"c2\"}"))
+    mvc.perform(
+            post("/checkouts")
+                .header("Idempotency-Key", "k2")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"cartId\":\"c2\"}"))
         .andExpect(status().isUnprocessableEntity())
-        .andExpect(jsonPath("$.type").value("https://errors.edacommerce.example/idempotency-key-reused"));
+        .andExpect(
+            jsonPath("$.type").value("https://errors.edacommerce.example/idempotency-key-reused"));
   }
 
   @Test
@@ -124,14 +141,19 @@ class IdempotencyFilterIT {
     hold.countDown();
     assertThat(first.get(10, TimeUnit.SECONDS).getResponse().getStatus()).isEqualTo(202);
     hold = null;
-    assertThat(send("k3", "{\"cartId\":\"c1\"}").getResponse().getHeader("Idempotent-Replayed")).isEqualTo("true");
+    assertThat(send("k3", "{\"cartId\":\"c1\"}").getResponse().getHeader("Idempotent-Replayed"))
+        .isEqualTo("true");
     pool.shutdown();
     assertThat(db.count("SELECT count(*) FROM effect")).isEqualTo(1);
   }
 
   @Test
   void failedRequestsStoreNothingSoTheClientCanRetry() throws Exception {
-    mvc.perform(post("/checkouts").header("Idempotency-Key", "k4").contentType(MediaType.APPLICATION_JSON).content("{\"fail\":true}"))
+    mvc.perform(
+            post("/checkouts")
+                .header("Idempotency-Key", "k4")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"fail\":true}"))
         .andExpect(status().isUnprocessableEntity())
         .andExpect(header().doesNotExist("Idempotent-Replayed"));
     assertThat(db.count("SELECT count(*) FROM idempotency_key")).isZero();

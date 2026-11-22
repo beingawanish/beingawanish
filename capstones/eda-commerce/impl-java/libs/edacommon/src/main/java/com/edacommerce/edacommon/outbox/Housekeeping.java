@@ -21,7 +21,8 @@ public class Housekeeping {
     int inbox = jdbc.update("DELETE FROM inbox WHERE received_at < now() - interval '100 days'");
     int keys = jdbc.update("DELETE FROM idempotency_key WHERE expires_at < now()");
     if (outbox + inbox + keys > 0) {
-      log.info("housekeeping deleted {} outbox, {} inbox, {} idempotency rows", outbox, inbox, keys);
+      log.info(
+          "housekeeping deleted {} outbox, {} inbox, {} idempotency rows", outbox, inbox, keys);
     }
   }
 }

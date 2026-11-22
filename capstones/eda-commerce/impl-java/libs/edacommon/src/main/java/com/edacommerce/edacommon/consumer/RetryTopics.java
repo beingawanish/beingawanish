@@ -5,8 +5,8 @@ import java.time.Duration;
 import java.util.List;
 
 /**
- * Per-consumer-group retry and dead-letter topics (ADR-0007, topics.yaml retryPolicy):
- * {@code G.retry.10s}, {@code G.retry.1m}, {@code G.retry.10m}, {@code G.dlq}.
+ * Per-consumer-group retry and dead-letter topics (ADR-0007, topics.yaml retryPolicy): {@code
+ * G.retry.10s}, {@code G.retry.1m}, {@code G.retry.10m}, {@code G.dlq}.
  */
 public final class RetryTopics {
   private RetryTopics() {}
@@ -31,9 +31,9 @@ public final class RetryTopics {
   }
 
   /**
-   * The next hop: retry topics in order, then the DLQ; non-retryable failures go straight to the DLQ.
-   * Transient failures reach this only after in-place retries are exhausted, and then behave like
-   * RetryLater.
+   * The next hop: retry topics in order, then the DLQ; non-retryable failures go straight to the
+   * DLQ. Transient failures reach this only after in-place retries are exhausted, and then behave
+   * like RetryLater.
    *
    * @param previousAttempt x-retry-attempt of the failed record (0 if it came from a source topic)
    */

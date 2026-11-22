@@ -137,7 +137,11 @@ public class EdaCommonAutoConfiguration {
   @Bean
   @ConditionalOnMissingBean
   SagaEngine edaSagaEngine(
-      SagaRepository repository, OutboxWriter outbox, TransactionTemplate tx, EdaMetrics metrics, Clock clock) {
+      SagaRepository repository,
+      OutboxWriter outbox,
+      TransactionTemplate tx,
+      EdaMetrics metrics,
+      Clock clock) {
     return new SagaEngine(repository, outbox, tx, metrics, clock);
   }
 
@@ -161,7 +165,11 @@ public class EdaCommonAutoConfiguration {
 
   @Bean
   FilterRegistrationBean<IdempotencyFilter> edaIdempotencyFilter(
-      IdempotencyStore store, TransactionTemplate tx, Caller caller, EdaProperties properties, Clock clock) {
+      IdempotencyStore store,
+      TransactionTemplate tx,
+      Caller caller,
+      EdaProperties properties,
+      Clock clock) {
     FilterRegistrationBean<IdempotencyFilter> registration =
         new FilterRegistrationBean<>(
             new IdempotencyFilter(
@@ -231,7 +239,8 @@ public class EdaCommonAutoConfiguration {
 
   @Bean
   @ConditionalOnMissingBean(name = "edaKafkaTemplate")
-  KafkaTemplate<String, byte[]> edaKafkaTemplate(ProducerFactory<String, byte[]> edaProducerFactory) {
+  KafkaTemplate<String, byte[]> edaKafkaTemplate(
+      ProducerFactory<String, byte[]> edaProducerFactory) {
     KafkaTemplate<String, byte[]> template = new KafkaTemplate<>(edaProducerFactory);
     template.setObservationEnabled(false);
     return template;
@@ -246,7 +255,10 @@ public class EdaCommonAutoConfiguration {
   @Bean
   @ConditionalOnProperty(name = "eda.outbox-relay", havingValue = "polling")
   PollingOutboxRelay edaPollingOutboxRelay(
-      JdbcTemplate jdbc, TransactionTemplate tx, KafkaTemplate<String, byte[]> edaKafkaTemplate, EdaMetrics metrics) {
+      JdbcTemplate jdbc,
+      TransactionTemplate tx,
+      KafkaTemplate<String, byte[]> edaKafkaTemplate,
+      EdaMetrics metrics) {
     return new PollingOutboxRelay(jdbc, tx, edaKafkaTemplate, metrics, 100);
   }
 
@@ -257,7 +269,10 @@ public class EdaCommonAutoConfiguration {
   }
 
   @Bean
-  @ConditionalOnProperty(name = "eda.housekeeping.enabled", havingValue = "true", matchIfMissing = true)
+  @ConditionalOnProperty(
+      name = "eda.housekeeping.enabled",
+      havingValue = "true",
+      matchIfMissing = true)
   PeriodicJob edaHousekeepingJob(JdbcTemplate jdbc) {
     Housekeeping housekeeping = new Housekeeping(jdbc);
     return new PeriodicJob("housekeeping", Duration.ofHours(1), housekeeping::run);

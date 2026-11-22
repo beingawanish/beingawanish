@@ -12,10 +12,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * Fires {@code DEADLINE} triggers for due sagas (ADR-0008). Each due saga is locked with
- * {@code FOR UPDATE SKIP LOCKED} and handled in its own transaction, so several replicas sweep in
- * parallel without double work and one failing saga does not block the others. After each pass the
- * {@code eda.saga.overdue} gauge is set to the number of sagas more than 60 s past their deadline.
+ * Fires {@code DEADLINE} triggers for due sagas (ADR-0008). Each due saga is locked with {@code FOR
+ * UPDATE SKIP LOCKED} and handled in its own transaction, so several replicas sweep in parallel
+ * without double work and one failing saga does not block the others. After each pass the {@code
+ * eda.saga.overdue} gauge is set to the number of sagas more than 60 s past their deadline.
  */
 public class DeadlineSweeper {
   private static final Logger log = LoggerFactory.getLogger(DeadlineSweeper.class);
@@ -79,7 +79,8 @@ public class DeadlineSweeper {
       }
       handled++;
     }
-    metrics.sagaOverdue(sagaType, repository.countOverdue(sagaType, clock.instant().minus(OVERDUE_GRACE)));
+    metrics.sagaOverdue(
+        sagaType, repository.countOverdue(sagaType, clock.instant().minus(OVERDUE_GRACE)));
     return handled;
   }
 }

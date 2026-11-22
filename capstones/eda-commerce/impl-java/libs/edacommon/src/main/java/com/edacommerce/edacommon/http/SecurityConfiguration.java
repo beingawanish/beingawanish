@@ -35,7 +35,9 @@ public class SecurityConfiguration {
     if (properties.getAuth().getMode() == EdaProperties.AuthMode.NONE) {
       if (!properties.isLocal()) {
         throw new IllegalStateException(
-            "AUTH_MODE=none is only allowed with ENVIRONMENT=local (current: " + properties.getEnvironment() + ")");
+            "AUTH_MODE=none is only allowed with ENVIRONMENT=local (current: "
+                + properties.getEnvironment()
+                + ")");
       }
       http.authorizeHttpRequests(a -> a.anyRequest().permitAll());
       return http.build();
@@ -66,7 +68,8 @@ public class SecurityConfiguration {
                 : OAuth2TokenValidatorResult.failure(
                     new OAuth2Error("invalid_token", "audience must contain " + audience, null));
     decoder.setJwtValidator(
-        new DelegatingOAuth2TokenValidator<>(JwtValidators.createDefaultWithIssuer(issuer), audienceValidator));
+        new DelegatingOAuth2TokenValidator<>(
+            JwtValidators.createDefaultWithIssuer(issuer), audienceValidator));
     return decoder;
   }
 }

@@ -18,7 +18,8 @@ public class InMemoryClaimCheckStore implements ClaimCheckStore {
   private final Map<String, byte[]> objects = new ConcurrentHashMap<>();
 
   @Override
-  public ClaimCheck put(String bucket, String key, byte[] bytes, String contentType, @Nullable Instant expiresAt) {
+  public ClaimCheck put(
+      String bucket, String key, byte[] bytes, String contentType, @Nullable Instant expiresAt) {
     objects.put(bucket + "/" + key, bytes.clone());
     return ClaimChecks.of(bucket, key, bytes, contentType, expiresAt);
   }
@@ -36,8 +37,12 @@ public class InMemoryClaimCheckStore implements ClaimCheckStore {
   public URL presign(ClaimCheck claimCheck, Duration ttl) {
     try {
       return URI.create(
-              "http://claimcheck.test/" + claimCheck.getBucket() + "/" + claimCheck.getObjectKey()
-                  + "?X-Amz-Expires=" + ttl.toSeconds())
+              "http://claimcheck.test/"
+                  + claimCheck.getBucket()
+                  + "/"
+                  + claimCheck.getObjectKey()
+                  + "?X-Amz-Expires="
+                  + ttl.toSeconds())
           .toURL();
     } catch (MalformedURLException e) {
       throw new IllegalStateException(e);

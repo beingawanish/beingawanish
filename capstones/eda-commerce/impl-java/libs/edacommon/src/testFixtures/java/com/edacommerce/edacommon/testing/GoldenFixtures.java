@@ -35,8 +35,11 @@ public final class GoldenFixtures {
     JsonNode expected = readJson(Contracts.exampleJson(fullName));
     try {
       Object decoded =
-          new GenericDatumReader<>(schema).read(null, DecoderFactory.get().binaryDecoder(bin, null));
-      assertThat(reparse(AvroJson.toPlain(decoded, schema))).as(fullName + " decodes to its .json").isEqualTo(expected);
+          new GenericDatumReader<>(schema)
+              .read(null, DecoderFactory.get().binaryDecoder(bin, null));
+      assertThat(reparse(AvroJson.toPlain(decoded, schema)))
+          .as(fullName + " decodes to its .json")
+          .isEqualTo(expected);
       ByteArrayOutputStream out = new ByteArrayOutputStream();
       BinaryEncoder enc = EncoderFactory.get().binaryEncoder(out, null);
       new GenericDatumWriter<>(schema).write(AvroJson.fromPlain(expected, schema), enc);
@@ -65,10 +68,13 @@ public final class GoldenFixtures {
     T record = decode(type);
     Schema schema = record.getSchema();
     byte[] bin = Contracts.exampleBin(schema.getFullName());
-    assertThat(encode(record)).as(schema.getFullName() + " re-encodes byte for byte").isEqualTo(bin);
+    assertThat(encode(record))
+        .as(schema.getFullName() + " re-encodes byte for byte")
+        .isEqualTo(bin);
     try {
       Object generic =
-          new GenericDatumReader<>(schema).read(null, DecoderFactory.get().binaryDecoder(encode(record), null));
+          new GenericDatumReader<>(schema)
+              .read(null, DecoderFactory.get().binaryDecoder(encode(record), null));
       assertThat(reparse(AvroJson.toPlain(generic, schema)))
           .isEqualTo(readJson(Contracts.exampleJson(schema.getFullName())));
     } catch (IOException e) {
@@ -82,7 +88,8 @@ public final class GoldenFixtures {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
       BinaryEncoder enc = EncoderFactory.get().binaryEncoder(out, null);
-      new SpecificDatumWriter<SpecificRecord>(record.getSchema(), SpecificData.getForSchema(record.getSchema()))
+      new SpecificDatumWriter<SpecificRecord>(
+              record.getSchema(), SpecificData.getForSchema(record.getSchema()))
           .write(record, enc);
       enc.flush();
       return out.toByteArray();
@@ -92,8 +99,8 @@ public final class GoldenFixtures {
   }
 
   /**
-   * A produced record is valid against the bundled (registered) schema: it encodes with the generated
-   * schema and decodes with the bundled one, and the two schemas are the same contract.
+   * A produced record is valid against the bundled (registered) schema: it encodes with the
+   * generated schema and decodes with the bundled one, and the two schemas are the same contract.
    */
   public static void assertValidAgainstBundled(SpecificRecord record) {
     Schema bundled = Contracts.bundledSchema(record.getSchema().getFullName());
@@ -105,7 +112,8 @@ public final class GoldenFixtures {
 
   private static Object toGeneric(SpecificRecord record, Schema bundled) {
     try {
-      return new GenericDatumReader<>(bundled).read(null, DecoderFactory.get().binaryDecoder(encode(record), null));
+      return new GenericDatumReader<>(bundled)
+          .read(null, DecoderFactory.get().binaryDecoder(encode(record), null));
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }

@@ -11,6 +11,8 @@ public interface ReservationRepository {
 
   void save(Reservation reservation);
 
-  /** Ids of HELD reservations past their TTL, locked with SKIP LOCKED (several sweepers may run). */
+  /**
+   * Ids of HELD reservations past their TTL, locked with SKIP LOCKED (several sweepers may run).
+   */
   List<String> lockExpired(Instant now, int limit);
 }

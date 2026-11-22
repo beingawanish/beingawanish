@@ -26,7 +26,8 @@ public class SagaOpsController {
       List<HistoryEntry> history) {}
 
   /** One transition in SagaView.history. */
-  public record HistoryEntry(Instant at, String from, String to, String trigger, @Nullable String eventId) {}
+  public record HistoryEntry(
+      Instant at, String from, String to, String trigger, @Nullable String eventId) {}
 
   private final SagaRepository repository;
   private final SagaOperator operator;
@@ -41,10 +42,19 @@ public class SagaOpsController {
     SagaRow row = repository.find(sagaId).orElseThrow(() -> ApiProblem.notFound("saga " + sagaId));
     List<HistoryEntry> history =
         repository.history(sagaId).stream()
-            .map(t -> new HistoryEntry(t.at(), t.fromState(), t.toState(), t.triggerType(), t.triggerId()))
+            .map(
+                t ->
+                    new HistoryEntry(
+                        t.at(), t.fromState(), t.toState(), t.triggerType(), t.triggerId()))
             .toList();
     return new SagaView(
-        row.sagaId(), row.sagaType(), row.state(), row.version(), row.deadlineAt(), row.stepAttempts(), history);
+        row.sagaId(),
+        row.sagaType(),
+        row.state(),
+        row.version(),
+        row.deadlineAt(),
+        row.stepAttempts(),
+        history);
   }
 
   @PostMapping("/ops/sagas/{sagaId}/retry-step")
@@ -52,10 +62,14 @@ public class SagaOpsController {
     return switch (operator.retryStep(sagaId)) {
       case ACCEPTED -> ResponseEntity.status(HttpStatus.ACCEPTED).build();
       case NOT_FOUND -> throw ApiProblem.notFound("saga " + sagaId);
-      case TERMINAL -> throw ApiProblem.conflict("saga-terminal", "Saga is terminal", "saga " + sagaId + " is terminal");
+      case TERMINAL ->
+          throw ApiProblem.conflict(
+              "saga-terminal", "Saga is terminal", "saga " + sagaId + " is terminal");
       case NOT_APPLICABLE ->
           throw ApiProblem.conflict(
-              "saga-not-retryable", "Nothing to retry", "saga " + sagaId + " has no step an operator can retry");
+              "saga-not-retryable",
+              "Nothing to retry",
+              "saga " + sagaId + " has no step an operator can retry");
     };
   }
 }

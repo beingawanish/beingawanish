@@ -32,8 +32,12 @@ public class PeriodicJob implements SmartLifecycle {
     if (running) {
       return;
     }
-    executor = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name(name).daemon().factory());
-    var unused = executor.scheduleWithFixedDelay(this::runSafely, interval.toMillis(), interval.toMillis(), TimeUnit.MILLISECONDS);
+    executor =
+        Executors.newSingleThreadScheduledExecutor(
+            Thread.ofPlatform().name(name).daemon().factory());
+    var unused =
+        executor.scheduleWithFixedDelay(
+            this::runSafely, interval.toMillis(), interval.toMillis(), TimeUnit.MILLISECONDS);
     running = true;
   }
 

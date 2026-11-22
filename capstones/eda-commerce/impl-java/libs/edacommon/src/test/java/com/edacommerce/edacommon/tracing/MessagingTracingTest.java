@@ -22,7 +22,8 @@ class MessagingTracingTest {
     MessagingTracing tracing = new MessagingTracing(t.openTelemetry());
     RecordHeaders headers = new RecordHeaders();
     headers.add("traceparent", PARENT.getBytes(StandardCharsets.UTF_8));
-    ConsumerRecord<String, byte[]> r = new ConsumerRecord<>("payment.commands.v1", 2, 9L, "o1", new byte[0]);
+    ConsumerRecord<String, byte[]> r =
+        new ConsumerRecord<>("payment.commands.v1", 2, 9L, "o1", new byte[0]);
     r.headers().add(headers.lastHeader("traceparent"));
 
     Context parent = tracing.extract(r.headers());
@@ -40,9 +41,15 @@ class MessagingTracingTest {
     assertThat(d.getParentSpanId()).isEqualTo("00f067aa0ba902b7");
     assertThat(d.getLinks()).hasSize(1);
     assertThat(d.getAttributes().asMap().toString())
-        .contains("messaging.system=kafka", "messaging.destination.name=payment.commands.v1",
-            "messaging.kafka.consumer.group=payment-svc", "messaging.message.id=e1");
-    assertThat(inner).hasSize(55).startsWith("00-4bf92f3577b34da6a3ce929d0e0e4736-").isNotEqualTo(PARENT);
+        .contains(
+            "messaging.system=kafka",
+            "messaging.destination.name=payment.commands.v1",
+            "messaging.kafka.consumer.group=payment-svc",
+            "messaging.message.id=e1");
+    assertThat(inner)
+        .hasSize(55)
+        .startsWith("00-4bf92f3577b34da6a3ce929d0e0e4736-")
+        .isNotEqualTo(PARENT);
   }
 
   @Test

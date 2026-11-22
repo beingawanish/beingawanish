@@ -24,11 +24,24 @@ public record Order(
     Instant placedAt) {
 
   /** One frozen order line. */
-  public record OrderLine(String lineId, String sku, String productName, int quantity, Money unitPrice, Money lineTotal) {}
+  public record OrderLine(
+      String lineId,
+      String sku,
+      String productName,
+      int quantity,
+      Money unitPrice,
+      Money lineTotal) {}
 
   /** A postal address (personal data). */
   public record PostalAddress(
-      String recipientName, String line1, String line2, String city, String region, String postalCode, String countryCode, String phone) {}
+      String recipientName,
+      String line1,
+      String line2,
+      String city,
+      String region,
+      String postalCode,
+      String countryCode,
+      String phone) {}
 
   public int itemCount() {
     return lines.stream().mapToInt(OrderLine::quantity).sum();

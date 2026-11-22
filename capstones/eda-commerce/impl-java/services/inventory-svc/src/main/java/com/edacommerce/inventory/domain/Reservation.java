@@ -26,13 +26,17 @@ public record Reservation(
     long version) {
 
   /** What a command does: the new state, the stock changes to apply, the reply to send. */
-  public record Decision(Reservation reservation, List<StockEffect> effects, Reply reply, boolean changed) {
+  public record Decision(
+      Reservation reservation, List<StockEffect> effects, Reply reply, boolean changed) {
     static Decision replay(Reservation r) {
       return new Decision(r, List.of(), r.currentReply(), false);
     }
   }
 
-  /** Sums quantities per SKU and orders by SKU (the lock order, so concurrent orders never deadlock). */
+  /**
+   * Sums quantities per SKU and orders by SKU (the lock order, so concurrent orders never
+   * deadlock).
+   */
   public static List<StockLine> normalise(List<StockLine> lines) {
     Map<String, Integer> bySku = new TreeMap<>();
     for (StockLine l : lines) {
@@ -74,12 +78,33 @@ public record Reservation(
     }
     if (!shortages.isEmpty()) {
       Reservation r =
-          new Reservation(reservationId, orderId, ReservationStatus.REJECTED, lines, now, List.copyOf(shortages), null, now, 1);
+          new Reservation(
+              reservationId,
+              orderId,
+              ReservationStatus.REJECTED,
+              lines,
+              now,
+              List.copyOf(shortages),
+              null,
+              now,
+              1);
       return new Decision(r, List.of(), r.currentReply(), true);
     }
     Reservation r =
-        new Reservation(reservationId, orderId, ReservationStatus.HELD, lines, now.plus(ttl), List.of(), null, now, 1);
-    List<StockEffect> effects = lines.stream().<StockEffect>map(l -> new StockEffect.Reserve(l.sku(), l.quantity())).toList();
+        new Reservation(
+            reservationId,
+            orderId,
+            ReservationStatus.HELD,
+            lines,
+            now.plus(ttl),
+            List.of(),
+            null,
+            now,
+            1);
+    List<StockEffect> effects =
+        lines.stream()
+            .<StockEffect>map(l -> new StockEffect.Reserve(l.sku(), l.quantity()))
+            .toList();
     return new Decision(r, effects, r.currentReply(), true);
   }
 
@@ -87,9 +112,19 @@ public record Reservation(
    * A release that arrives for a reservation we never saw (it overtook ReserveStock, or the reserve
    * was lost). A RELEASED tombstone makes a late ReserveStock with the same id a no-op.
    */
-  public static Decision releaseUnknown(String reservationId, String orderId, String reason, Instant now) {
+  public static Decision releaseUnknown(
+      String reservationId, String orderId, String reason, Instant now) {
     Reservation r =
-        new Reservation(reservationId, orderId, ReservationStatus.RELEASED, List.of(), now, List.of(), reason, now, 1);
+        new Reservation(
+            reservationId,
+            orderId,
+            ReservationStatus.RELEASED,
+            List.of(),
+            now,
+            List.of(),
+            reason,
+            now,
+            1);
     return new Decision(r, List.of(), r.currentReply(), true);
   }
 
@@ -102,7 +137,12 @@ public record Reservation(
         }
         Reservation r = with(ReservationStatus.COMMITTED, null, now);
         yield new Decision(
-            r, lines.stream().<StockEffect>map(l -> new StockEffect.Allocate(l.sku(), l.quantity())).toList(), r.currentReply(), true);
+            r,
+            lines.stream()
+                .<StockEffect>map(l -> new StockEffect.Allocate(l.sku(), l.quantity()))
+                .toList(),
+            r.currentReply(),
+            true);
       }
       case COMMITTED, EXPIRED, RELEASED, REJECTED -> Decision.replay(this);
     };
@@ -114,16 +154,27 @@ public record Reservation(
       case HELD -> {
         Reservation r = with(ReservationStatus.RELEASED, reason, now);
         yield new Decision(
-            r, lines.stream().<StockEffect>map(l -> new StockEffect.Unreserve(l.sku(), l.quantity())).toList(), r.currentReply(), true);
+            r,
+            lines.stream()
+                .<StockEffect>map(l -> new StockEffect.Unreserve(l.sku(), l.quantity()))
+                .toList(),
+            r.currentReply(),
+            true);
       }
       case COMMITTED -> {
         Reservation r = with(ReservationStatus.RELEASED, reason, now);
         yield new Decision(
-            r, lines.stream().<StockEffect>map(l -> new StockEffect.Return(l.sku(), l.quantity())).toList(), r.currentReply(), true);
+            r,
+            lines.stream()
+                .<StockEffect>map(l -> new StockEffect.Return(l.sku(), l.quantity()))
+                .toList(),
+            r.currentReply(),
+            true);
       }
       case RELEASED -> Decision.replay(this);
       // Nothing is held any more; confirm the compensation so the saga can finish.
-      case EXPIRED, REJECTED -> new Decision(this, List.of(), new Reply.Released(reason, now), false);
+      case EXPIRED, REJECTED ->
+          new Decision(this, List.of(), new Reply.Released(reason, now), false);
     };
   }
 
@@ -134,7 +185,12 @@ public record Reservation(
     }
     Reservation r = with(ReservationStatus.EXPIRED, null, now);
     return new Decision(
-        r, lines.stream().<StockEffect>map(l -> new StockEffect.Unreserve(l.sku(), l.quantity())).toList(), r.currentReply(), true);
+        r,
+        lines.stream()
+            .<StockEffect>map(l -> new StockEffect.Unreserve(l.sku(), l.quantity()))
+            .toList(),
+        r.currentReply(),
+        true);
   }
 
   /** The reply that describes the current state, for resends. */
@@ -143,12 +199,14 @@ public record Reservation(
       case HELD -> new Reply.Reserved(lines, expiresAt);
       case REJECTED -> new Reply.Rejected(shortages);
       case COMMITTED -> new Reply.Committed(changedAt);
-      case RELEASED -> new Reply.Released(releaseReason == null ? "released" : releaseReason, changedAt);
+      case RELEASED ->
+          new Reply.Released(releaseReason == null ? "released" : releaseReason, changedAt);
       case EXPIRED -> new Reply.Expired(changedAt);
     };
   }
 
   private Reservation with(ReservationStatus next, String reason, Instant now) {
-    return new Reservation(reservationId, orderId, next, lines, expiresAt, shortages, reason, now, version + 1);
+    return new Reservation(
+        reservationId, orderId, next, lines, expiresAt, shortages, reason, now, version + 1);
   }
 }

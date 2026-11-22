@@ -35,8 +35,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * <ol>
  *   <li>read {@code ce_type}; no handler: {@code ignored}, never deserialise;
- *   <li>in one transaction: inbox insert (conflict: {@code duplicate}), deserialise with the handler's
- *       reader schema, run the handler inside a consumer span; commit;
+ *   <li>in one transaction: inbox insert (conflict: {@code duplicate}), deserialise with the
+ *       handler's reader schema, run the handler inside a consumer span; commit;
  *   <li>record event age and {@code success} after the commit.
  * </ol>
  *
@@ -139,7 +139,10 @@ public class RecordProcessor {
       Envelope env = envelope.get();
       if (env != null) {
         metrics.eventAge(
-            record.topic(), consumerGroup, type, Duration.between(env.getOccurredAt(), clock.instant()));
+            record.topic(),
+            consumerGroup,
+            type,
+            Duration.between(env.getOccurredAt(), clock.instant()));
       }
       metrics.processed(record.topic(), consumerGroup, type, Outcome.SUCCESS);
       return Outcome.SUCCESS;
@@ -153,7 +156,8 @@ public class RecordProcessor {
   }
 
   @SuppressWarnings("unchecked")
-  private static void invoke(MessageHandler<?> handler, SpecificRecord message, MessageContext ctx) {
+  private static void invoke(
+      MessageHandler<?> handler, SpecificRecord message, MessageContext ctx) {
     ((MessageHandler<SpecificRecord>) handler).handle(message, ctx);
   }
 
