@@ -135,7 +135,9 @@ class Shipments:
     def _attempt(self, s: Shipment, now: datetime) -> None:
         causation = Causation(correlation_id=s.correlation_id, causation_id=s.causation_id)
         try:
-            booking = self.carrier.book(shipment_id=s.shipment_id, direction=s.direction, address=s.address, parcel_count=s.parcel_count)
+            booking = self.carrier.book(
+                shipment_id=s.shipment_id, direction=s.direction, address=s.address, parcel_count=s.parcel_count
+            )
         except CarrierUnavailable as exc:
             attempts = s.booking_attempts + 1
             plan = after_failed_booking(attempts, now)

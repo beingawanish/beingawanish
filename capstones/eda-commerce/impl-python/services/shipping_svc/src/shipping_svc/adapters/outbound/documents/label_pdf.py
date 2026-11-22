@@ -14,7 +14,7 @@ def _latin(v: object) -> str:
 
 class FpdfLabelRenderer:
     def render(self, label: LabelData) -> bytes:
-        pdf = FPDF(format="A6")
+        pdf = FPDF(format=(105, 148))  # A6
         pdf.set_creator("eda-commerce shipping-svc")
         pdf.set_title(f"Label {label.tracking_number}")
         pdf.set_creation_date(label.booked_at)

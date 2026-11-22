@@ -236,7 +236,9 @@ def test_unknown_type_is_ignored(svc: Svc) -> None:
 
 
 def test_fake_wms_admin_api(svc: Svc) -> None:
-    app = create_app(svc.settings, readiness=Readiness(), instrument=False, routers=[fake_wms_router(svc.wms, Authenticator(svc.settings))])
+    app = create_app(
+        svc.settings, readiness=Readiness(), instrument=False, routers=[fake_wms_router(svc.wms, Authenticator(svc.settings))]
+    )
     c = TestClient(app)
     r = c.put("/admin/fakes/wms", json={"dropRequestRate": 0.5, "manifestLines": 10})
     assert r.status_code == 200 and r.json()["dropRequestRate"] == 0.5 and svc.wms.config.manifestLines == 10

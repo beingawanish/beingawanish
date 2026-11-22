@@ -106,7 +106,9 @@ class SqlShipmentRepository:
         values.update(direction=s.direction.value, status=s.status.value, label=_claim_to_json(s.label))
         stmt = pg_insert(ShipmentRow).values(shipment_id=s.shipment_id, created_at=s.created_at or now, updated_at=now, **values)
         self._s.execute(
-            stmt.on_conflict_do_update(index_elements=["shipment_id"], set_={k: stmt.excluded[k] for k in [*values, "updated_at"]})
+            stmt.on_conflict_do_update(
+                index_elements=["shipment_id"], set_={k: stmt.excluded[k] for k in [*values, "updated_at"]}
+            )
         )
 
     def due_bookings(self, now: datetime, limit: int) -> list[Shipment]:
@@ -168,7 +170,9 @@ class TrackingEventStore:
     def history(self, tracking_number: str) -> list[TrackingEventRow]:
         return list(
             self._s.execute(
-                select(TrackingEventRow).where(TrackingEventRow.tracking_number == tracking_number).order_by(TrackingEventRow.occurred_at)
+                select(TrackingEventRow)
+                .where(TrackingEventRow.tracking_number == tracking_number)
+                .order_by(TrackingEventRow.occurred_at)
             ).scalars()
         )
 

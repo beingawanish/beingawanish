@@ -154,7 +154,11 @@ class FakeCarrier:
                 return False
             now = self._mono()
             target = next(
-                (p for p in sorted(t.planned, key=lambda p: PLAN_ORDER.get(p.body["status"], 9)) if not p.sent and (to_status is None or p.body["status"] == to_status)),
+                (
+                    p
+                    for p in sorted(t.planned, key=lambda p: PLAN_ORDER.get(p.body["status"], 9))
+                    if not p.sent and (to_status is None or p.body["status"] == to_status)
+                ),
                 None,
             )
             if target is None:
@@ -182,7 +186,11 @@ class FakeCarrier:
 
     def deliver(self, raw: bytes) -> None:
         ts = str(int(self._wall().timestamp()))
-        headers = {"Content-Type": "application/json", "X-Webhook-Timestamp": ts, "X-Carrier-Signature": sign(self._secret, ts, raw)}
+        headers = {
+            "Content-Type": "application/json",
+            "X-Webhook-Timestamp": ts,
+            "X-Carrier-Signature": sign(self._secret, ts, raw),
+        }
         self._send(self._url, headers, raw)
 
     def flush(self) -> int:

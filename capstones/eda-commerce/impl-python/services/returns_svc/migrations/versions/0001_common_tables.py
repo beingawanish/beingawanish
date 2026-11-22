@@ -1,4 +1,4 @@
-"""Shared tables of contracts/sql/common-tables.sql (outbox + publication, inbox, idempotency_key, saga_instance, saga_transition).
+"""Shared tables of contracts/sql/common-tables.sql (outbox, inbox, idempotency_key, saga_instance, saga_transition).
 
 Revision ID: 0001
 """

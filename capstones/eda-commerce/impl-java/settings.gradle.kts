@@ -21,10 +21,13 @@ include(":libs:contracts-java")
 include(":libs:edacommon")
 include(":libs:kernel")
 
-// Wave 1 services. Wave 2 adds fulfilment-svc, shipping-svc, notification-svc and returns-svc
-// with the same layout (copy services/inventory-svc as the participant template, order-svc for an orchestrator).
+// Wave 1 services.
 include(":services:catalog-svc")
 include(":services:checkout-svc")
 include(":services:order-svc")
 include(":services:inventory-svc")
 include(":services:payment-svc")
+
+// Wave 2 services, same layout (inventory-svc is the participant template, order-svc the orchestrator).
+include(":services:fulfilment-svc")
+include(":services:shipping-svc")
