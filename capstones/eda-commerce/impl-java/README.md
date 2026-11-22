@@ -2,7 +2,21 @@
 
 This is the Java implementation of the eda-commerce design in `../docs/` and `../contracts/`. It is meant to be forked as a template, so the shared library is complete and every service follows one layout.
 
-Wave 1 contains the shared library and five services: catalog-svc, checkout-svc, order-svc (the order saga orchestrator and the order-history projector), inventory-svc and payment-svc (with the fake PSP). Wave 2 adds fulfilment-svc, shipping-svc, notification-svc and returns-svc using the same pattern (see "Adding a service").
+The build contains the shared library and all nine services of architecture §3:
+
+| Service | Port | Role | README |
+|---|---|---|---|
+| catalog-svc | 8101 | products, prices, browse API | `services/catalog-svc` |
+| checkout-svc | 8102 | carts, checkout submit (mints orderId) | `services/checkout-svc` |
+| order-svc | 8103 | order saga orchestrator, invoices, order-history projector | `services/order-svc` |
+| payment-svc | 8104 | authorise/capture/void/refund, fake PSP, webhooks | `services/payment-svc` |
+| inventory-svc | 8105 | stock, reservations with TTL, restocks | `services/inventory-svc` |
+| fulfilment-svc | 8106 | pick/pack/dispatch, packing manifest by claim check, returns intake, fake WMS | `services/fulfilment-svc` |
+| shipping-svc | 8107 | carrier bookings, labels by claim check, carrier webhook normalisation, fake carrier | `services/shipping-svc` |
+| notification-svc | 8108 | customer emails as choreographed reactions, attachments, contact details | `services/notification-svc` |
+| returns-svc | 8109 | return eligibility, RMA, returns saga (forward recovery) | `services/returns-svc` |
+
+Wave 1 built the library and the first five; wave 2 added the last four with the same pattern (see "Adding a service"). order-svc needed no change for wave 2: its saga already consumes FulfilmentAccepted, OrderPacked, OrderDispatched, FulfilmentFailed/Cancelled and ShipmentCreated/Delivered/Exception and sends RequestFulfilment and CapturePayment.
 
 ## Layout
 
@@ -52,7 +66,7 @@ OUTBOX_RELAY=polling ...                          # without Kafka Connect
 java -jar services/order-svc/build/libs/order-svc.jar projector   # the order-history projector
 ```
 
-All configuration is the environment variables of guide §7 (`infra/compose.apps.example.yml`). `EdaEnvironmentPostProcessor` maps them onto Spring properties in one place, with the documented defaults (`<context>_db`, `<context>_svc`, port 8101–8105, 2 s pool timeout). `AUTH_MODE=none` is refused unless `ENVIRONMENT=local`; with it, `X-Local-Customer-Id` may name the caller (default `local-customer`). Logs are JSON (`ts`, `level`, `service`, `impl`, `msg`, `trace_id`, `span_id`, `correlation_id`, `event_id`, `event_type`, `order_id`, `error.*`); `LOG_FORMAT=plain` switches to text.
+All configuration is the environment variables of guide §7 (`infra/compose.apps.example.yml`). `EdaEnvironmentPostProcessor` maps them onto Spring properties in one place, with the documented defaults (`<context>_db`, `<context>_svc`, port 8101–8109, 2 s pool timeout). `AUTH_MODE=none` is refused unless `ENVIRONMENT=local`; with it, `X-Local-Customer-Id` may name the caller (default `local-customer`). Logs are JSON (`ts`, `level`, `service`, `impl`, `msg`, `trace_id`, `span_id`, `correlation_id`, `event_id`, `event_type`, `order_id`, `error.*`); `LOG_FORMAT=plain` switches to text.
 
 ## How the code maps to the design
 
@@ -68,8 +82,11 @@ All configuration is the environment variables of guide §7 (`infra/compose.apps
 | Observability (ADR-0011, guide §8) | `EdaMetrics` (every instrument with the contract's names, units, attributes and bucket advice), `MessagingTracing` (W3C only, consumer span with parent + link), `logback-spring.xml`, `PiiRedactor` |
 | HTTP (guide §6) | `ProblemHandler` (RFC 9457, `https://errors.edacommerce.example/…`, 503 + Retry-After for transient failures), `HealthController` (`/health/live`, `/health/ready`), `SecurityConfiguration` |
 | Order saga (architecture §5) | `services/order-svc/.../domain/OrderSaga.java`: a pure transition function over the state table, with early events recorded in `data.pending` |
+| Returns saga (architecture §6) | `services/returns-svc/.../domain/ReturnSaga.java` on the same `SagaEngine`: forward recovery with a refund retry schedule and REFUND_REVIEW; transient states passed through in one transaction |
+| Choreography (ADR-0001) | fulfilment-svc OrderPacked -> shipping-svc ShipmentCreated -> fulfilment-svc OrderDispatched; notification-svc reacts to facts with a `template:businessId` dedupe key |
+| Fakes (admin.yaml) | `FakePsp`, `FakeWms`, `FakeCarrier`, `FakeMailGateway` behind their ports in `adapters/out/<external>/fake`; WMS and carrier are driven by a tick on the service clock, so tests are deterministic |
 
-## Adding a service (wave 2 pattern)
+## Adding a service
 
 1. Copy `services/inventory-svc` (a participant) or `services/order-svc` (an orchestrator), rename the package `com.edacommerce.<context>` and add it to `settings.gradle.kts`.
 2. `build.gradle.kts`: `plugins { id("eda.spring-service") }`. Migration V1 (the shared tables) is copied from `contracts/sql` by the build; put private tables in `V2__<context>.sql`.
@@ -80,6 +97,8 @@ All configuration is the environment variables of guide §7 (`infra/compose.apps
 ## Deviations and decisions specific to this build
 
 - **Confluent serializer not used.** `packages.confluent.io` was not reachable from the build environment, so `kafka-avro-serializer` could not be resolved. `AvroSerde` implements the same wire format and registry semantics (`auto.register.schemas=false`, `normalize.schemas=true`, TopicRecordNameStrategy, schema-id cache, reader-schema resolution) on the registry's REST API. Swapping in `KafkaAvroSerializer` is local to `edacommon.serde`.
-- **Persistence.** inventory-svc, payment-svc and order-svc map their aggregates with Spring Data JPA; hot-path conditional updates (stock), shared tables (outbox, inbox, saga, idempotency) and the version-guarded projections (catalog view, order history, stock levels) use `JdbcTemplate` in the same transaction, because those statements are clearer as SQL.
+- **Persistence.** inventory-svc, payment-svc and order-svc map their aggregates with Spring Data JPA; the wave 2 services use JdbcTemplate with jsonb value columns (their aggregates are read and written whole, and the SQL stays visible); hot-path conditional updates (stock), shared tables (outbox, inbox, saga, idempotency) and the version-guarded projections (catalog view, order history, stock levels) use `JdbcTemplate` in the same transaction, because those statements are clearer as SQL.
 - **PSP calls inside the consumer transaction.** They are idempotent on paymentId/refundId and bounded by the 5 s timeout; see `services/payment-svc/README.md`.
+- **Claim-check keys** follow ADR-0009 `<context>/<yyyy>/<mm>/<aggregateId>/<documentId>.<ext>`: `order/…/<orderId>/<invoiceId>.pdf` (bucket `invoices`), `fulfilment/…/<orderId>/<fulfilmentId>.json` (`packing-manifests`, 90 days), `shipping/…/<orderId>/<shipmentId>.pdf` (`shipping-labels`, 30 days), the same as the Python build.
+- **OpenAPI 3.1 `oneOf: [X, {type: 'null'}]`** (returns.yaml `refundAmount`, catalog.yaml `salePrice`) is matched twice by the response validator for any value; `OpenApiContract.validResponse(doc, ignoredRules...)` lets a test switch off that one rule.
 - **Unspecified details, aligned with the Python build:** `x-*` timestamps are RFC 3339 UTC with milliseconds (`2026-11-22T09:15:00.123Z`); null header values (Debezium's for a null `causation_id`/`tracestate`) are tolerated and reproduced by the polling relay; CheckoutSubmitted's `aggregateId` is the checkoutId; a transition emitting n order events advances the order's `aggregateVersion` by n; the empty request body canonicalises to the empty string for the idempotency hash.

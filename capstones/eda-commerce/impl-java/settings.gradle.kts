@@ -31,3 +31,5 @@ include(":services:payment-svc")
 // Wave 2 services, same layout (inventory-svc is the participant template, order-svc the orchestrator).
 include(":services:fulfilment-svc")
 include(":services:shipping-svc")
+include(":services:notification-svc")
+include(":services:returns-svc")

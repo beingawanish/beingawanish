@@ -20,7 +20,6 @@ public sealed interface ShipmentEvent {
   /**
    * @param code ADDRESS_ISSUE, DAMAGED, LOST, DELAYED, BOOKING_FAILED or UNKNOWN
    */
-  record Problem(
-      long version, String code, String detail, String carrierEventId, Instant raisedAt)
+  record Problem(long version, String code, String detail, String carrierEventId, Instant raisedAt)
       implements ShipmentEvent {}
 }
