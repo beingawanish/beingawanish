@@ -1,0 +1,202 @@
+<h2 id=dd-readthrough-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson reduces read-through to one idea: the cache owns the miss path. That is true, but "the cache" can mean very different things. It might be a library inside each server's memory, a framework layer in your ORM, a separate service your team runs, or a managed product. These differ in where the loader runs, how far coalescing reaches, and what happens when the cache itself is the thing that breaks.</p>
+
+<h3 id=dd-readthrough-loader-contract level=3>The loader contract</h3>
+<p>Every read-through implementation asks you for the same thing: a function from key to value. The details of that contract decide most of the behaviour.</p>
+<ul>
+<li><strong>Load one.</strong> <code>load(key)</code> returns the value, or signals "not found", or throws. The cache stores the result and hands it to every waiting caller.</li>
+<li><strong>Load many.</strong> Most libraries also accept a bulk loader, <code>loadAll(keys)</code>. Without it, a page that asks for 50 products triggers 50 single-row queries on a cold cache. With it, the cache can turn those misses into one <code>WHERE id IN (…)</code>.</li>
+<li><strong>Not found.</strong> Libraries differ here, and it matters. In Caffeine, a loader that returns <code>null</code> means "store nothing", so the next caller loads again. If you want to remember absence, return an explicit empty value, such as an <code>Optional</code>, and give it a short lifetime.</li>
+<li><strong>Errors.</strong> A loader that throws usually stores nothing. Every waiting caller gets the exception, and the next caller tries again. That is usually right, but see the failure modes for what it does under a database outage.</li>
+</ul>
+<p>A typical Caffeine configuration looks like this:</p>
+<pre><code>LoadingCache&lt;Long, Optional&lt;Product&gt;&gt; products = Caffeine.newBuilder()
+    .maximumSize(100_000)                       // bound memory per server
+    .expireAfterWrite(Duration.ofMinutes(10))   // hard limit on staleness
+    .refreshAfterWrite(Duration.ofMinutes(1))   // reload hot keys in the background
+    .recordStats()                              // hit ratio, load time, load failures
+    .build(new CacheLoader&lt;&gt;() {
+        public Optional&lt;Product&gt; load(Long id) {
+            return productRepo.findById(id);    // empty Optional = cached "not found"
+        }
+        public Map&lt;Long, Optional&lt;Product&gt;&gt; loadAll(Set&lt;? extends Long&gt; ids) {
+            return productRepo.findAllById(ids);  // one IN query for a batch of misses
+        }
+    });</code></pre>
+<p>The JCache standard (JSR-107) expresses the same idea with configuration: <code>setReadThrough(true)</code> plus a <code>CacheLoader</code> factory. Ehcache, Hazelcast and other JCache providers then call your loader on a miss. Hazelcast's own API calls the loader a <code>MapLoader</code>, and it runs on the cluster member that owns the key.</p>
+
+<h3 id=dd-readthrough-coalescing level=3>How coalescing actually works</h3>
+<p>Coalescing is the main reason to choose read-through, so it is worth knowing what happens inside.</p>
+<p>A loading cache keeps a map from key to either a value or an <em>in-progress load</em>. When a caller misses, the cache atomically installs a placeholder for that key and runs the loader. A second caller for the same key finds the placeholder and waits on it, instead of starting its own load. When the load finishes, every waiter gets the same result.</p>
+<p>Caffeine's synchronous cache does this with per-key atomic computation on top of a concurrent hash map: the first thread computes, and the others block until it finishes. Its asynchronous cache stores a future in the map instead. Waiters then attach to the future and do not block a thread at all. Go's <code>singleflight</code> package does the same job as a standalone tool: concurrent calls with the same key share one execution and one result. Spring's <code>@Cacheable</code> does <em>not</em> coalesce by default. Setting <code>sync = true</code> adds per-key locking, within one JVM.</p>
+<p>The key phrase is "within one process". A library cache coalesces only the callers in its own memory. Forty servers with their own Caffeine caches send up to forty loads for one hot key, one each. That is still far better than 600, but it is not one.</p>
+<p>Getting to one load across the fleet takes one of two designs.</p>
+<ul>
+<li><strong>Route each key to an owner.</strong> groupcache, an open-source Go library that came out of Google, hashes each key to one peer in the fleet. Every server asks the owner, and the owner coalesces with singleflight. One load per key per fleet, by design. groupcache deliberately has no expiry or invalidation; it suits immutable data like versioned blobs.</li>
+<li><strong>A distributed lock around the load.</strong> The first server to miss takes a short lock in the shared cache, for example <code>SET lock:product:8412 &lt;token&gt; NX PX 5000</code>. Others see the lock and either wait briefly and re-read, or serve a stale value if one exists. This is the bridge to <a href="#cache-stampede-prevention">Cache Stampede Prevention</a>.</li>
+</ul>
+
+<h3 id=dd-readthrough-refresh level=3>Expire versus refresh</h3>
+<p>A loading cache usually offers two clocks, and confusing them causes real outages.</p>
+<ul>
+<li><strong>Expire</strong> (<code>expireAfterWrite</code>) removes the entry. The next caller blocks on a fresh load. This is a hard upper bound on staleness.</li>
+<li><strong>Refresh</strong> (<code>refreshAfterWrite</code>) marks the entry as due. The next caller still gets the current value immediately, and a reload runs in the background. If the reload fails, Caffeine keeps the old value and logs the error.</li>
+</ul>
+<p>Refresh removes blocking misses on hot keys entirely, because nobody ever waits for a load. Two details are easy to miss. Refresh is triggered by a read, so a key that nobody reads is never refreshed; it just sits there until it expires or is evicted. And because a failed refresh keeps the old value, refresh without expire can serve the same stale value for as long as the database is unhappy, possibly days. Use both: refresh at the freshness you want, expire at the staleness you can tolerate.</p>
+
+<h3 id=dd-readthrough-eviction level=3>Eviction inside a library cache</h3>
+<p>An in-process cache has a hard memory budget: the server's heap. Caffeine evicts with an algorithm called W-TinyLFU. New entries land in a small "window" area. To move into the main area, a candidate must beat the entry it would replace on estimated access frequency. Caffeine tracks frequency in a compact probabilistic sketch rather than a counter per key. The effect is that a one-off scan of cold keys cannot flush the hot set, which plain LRU allows. Guava's cache uses an LRU-like policy per segment, and generally gets lower hit ratios on skewed workloads.</p>
+
+<h3 id=dd-readthrough-orm-and-managed level=3>ORM caches and managed read-through</h3>
+<p><strong>Hibernate's second-level cache</strong> sits under the ORM's session. It has separate regions for entities, collections and query results, each with a concurrency strategy. <code>READ_ONLY</code> is for data that never changes. <code>NONSTRICT_READ_WRITE</code> allows short staleness. <code>READ_WRITE</code> uses soft locks so a reader does not cache a row that a transaction is changing. The entity cache behaves well. The query cache is subtler: Hibernate invalidates every cached query result touching a table whenever that table is written through Hibernate. On a table with steady writes, the query cache hit ratio collapses, and it costs more than it saves.</p>
+<p><strong>DynamoDB Accelerator (DAX)</strong> is a managed read-through and write-through cache in front of DynamoDB. The client talks to DAX with the DynamoDB API. DAX keeps an <em>item cache</em> for <code>GetItem</code> and <code>BatchGetItem</code> and a separate <em>query cache</em> for <code>Query</code> and <code>Scan</code>. Each has a TTL, five minutes by default. Writes through DAX update the item cache, but they do not update the query cache, so a query can return results older than the item you just wrote. Strongly consistent reads skip the cache and go to DynamoDB. And writes made directly to DynamoDB, not through DAX, are invisible to DAX until its entries expire.</p>
+
+<h3 id=dd-readthrough-recursion level=3>A loader must not call its own cache</h3>
+<p>One more mechanical rule. A loader for key A must not read key B from the same loading cache. Inside a per-key atomic computation, a nested computation on the same map can deadlock or fail. Caffeine documents this; the underlying Java map can throw <code>IllegalStateException</code> with "Recursive update". If loading a product needs its seller, load the seller from a different cache, or directly from the database inside the loader.</p>
+
+<h2 id=dd-readthrough-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The running numbers: the bookstore fleet has 40 application servers, the catalog has 2,000,000 products of about 2 KB each, and a database load takes 15 ms on a calm day.</p>
+
+<h3 id=dd-readthrough-coalescing-math level=3>What coalescing saves, and at what scope</h3>
+<p>Take a hot key at 20,000 reads per second across the fleet. That is 500 per second on each of 40 servers. The key expires, and its reload takes L seconds. During that window, requests keep arriving.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Design<th>Loads per expiry, L = 15 ms<th>Loads per expiry, L = 500 ms (database stressed)<tbody><tr><td>Cache-aside, no coalescing<td>20,000 × 0.015 = 300<td>20,000 × 0.5 = 10,000<tr><td>Per-process loading cache<td>Up to 40 (one per server)<td>40<tr><td>Fleet-wide coalescing (owner routing or lock)<td>1<td>1<tr><td>Refresh-ahead on a hot key<td>0 blocking loads; 1 background load per server per refresh<td>Same; callers keep getting the old value</table></div></div>
+<p>The right-hand column is what matters. Uncoordinated misses scale with load time, and load time grows exactly when the database is struggling. That is a feedback loop: slower database, more duplicate queries, slower database. Coalescing breaks the loop, because the number of loads stops depending on load time.</p>
+
+<h3 id=dd-readthrough-waiter-math level=3>The cost of waiting</h3>
+<p>Coalesced callers do not query the database, but they do wait. By Little's law, the number of callers waiting at once equals the arrival rate times the wait. Per server, for that 500-per-second key:</p>
+<ul>
+<li>Normal load time, 15 ms: 500 × 0.015 ≈ 8 waiting requests. Harmless.</li>
+<li>Database in trouble, 2 s per load: 500 × 2 = 1,000 waiting requests. With a synchronous cache, each one holds a thread. A server with a 200-thread request pool is now stuck, and every other endpoint on it stops too.</li>
+</ul>
+<p>That is why a synchronous loading cache needs a timeout on the loader that is shorter than the caller's own deadline, and why high-traffic services prefer the asynchronous form. Waiting on a future costs memory, not a thread. Refresh-ahead avoids the problem for hot keys, because nobody waits at all.</p>
+
+<h3 id=dd-readthrough-local-memory level=3>Memory per server, and the fleet multiplier</h3>
+<p>A local cache of the 100,000 hottest products holds 100,000 × 2 KB = 200 MB of serialised data. Deserialised objects on a JVM are often larger than their serialised bytes, frequently by 1.5–3×, so budget 300–600 MB of heap per server. Measure it with a heap dump. That memory also adds work for the garbage collector, because a large, long-lived cache lives in the old generation and gets rescanned.</p>
+<p>Multiply by the fleet: 40 servers × 200 MB = 8 GB of data, all duplicates. Background refresh multiplies too. Suppose 10,000 hot keys refresh every 60 seconds:</p>
+<ul>
+<li>One shared cache: 10,000 / 60 ≈ 170 loads per second.</li>
+<li>Forty local caches refreshing independently: 40 × 170 ≈ 6,700 loads per second.</li>
+</ul>
+<p>The second number is more than half of the bookstore's original 12,000 reads per second, created by the cache itself. Local read-through scales its load with fleet size. A two-tier design fixes this: the local cache's loader reads from a shared cache, and only the shared tier talks to the database.</p>
+
+<h3 id=dd-readthrough-cold-fleet level=3>Cold starts on every deploy</h3>
+<p>Local caches start empty on every restart. A rolling deploy of 40 servers, five at a time, restarts each batch cold. If each server's working set is the 100,000 hot products and its own hit rate is 1,500 reads per second, a cold server sends most of its 1,500 reads to the database for its first few minutes. Five cold servers send around 7,500 per second. Coalescing does not help much here, because these are different keys, not one hot one. Bulk loading, a warm-up step before the server takes traffic, or a shared L2 tier underneath all reduce the hit.</p>
+
+<h3 id=dd-readthrough-dax-math level=3>A managed example: what DAX saves in read capacity</h3>
+<p>DynamoDB charges reads in read capacity units. One eventually consistent read of an item up to 4 KB costs half a unit. The bookstore's 12,000 product reads per second of 2 KB items cost 12,000 × 0.5 = 6,000 units per second. Behind a read-through cache with a 99% hit ratio, DynamoDB sees 120 reads per second: 60 units. The cache cluster has its own cost, priced per node-hour, so the saving depends on your read rate and hit ratio. Run this calculation with current prices before assuming the cache pays for itself.</p>
+
+<h2 id=dd-readthrough-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-readthrough-fm-shared-fate level=3>1. One slow query fails 600 requests</h3>
+<p><strong>Symptom.</strong> Error rate spikes in sharp bursts. Each burst is hundreds of timeouts for the same product at the same moment, followed by quiet.</p>
+<p><strong>Mechanism.</strong> Coalescing means shared fate. One loader call hit a slow query plan or a lock, and took 3 seconds. Every caller attached to that load waited for it, and all of them crossed their 1-second deadline together. When they retried, the retries found no value and started a new load, which joined the same slow query.</p>
+<p><strong>Detect.</strong> Loader latency and loader failures as metrics (Caffeine's <code>recordStats()</code> gives load time and load failure counts). Timeouts grouped by cache key in traces.</p>
+<p><strong>Fix.</strong> Bound the loader with a timeout shorter than the callers' deadline. Serve the previous value on load failure where staleness is acceptable (refresh-ahead does this for you). And use jittered backoff on retries, so a burst of failures does not become a burst of retries; see <a href="#retry-with-exponential-backoff">Retry with Exponential Backoff</a>.</p>
+
+<h3 id=dd-readthrough-fm-tier-outage level=3>2. The cache tier went down, and took the data with it</h3>
+<p><strong>Symptom.</strong> A shared read-through cache service is redeployed or loses a node. Every product read fails, even though the database is healthy.</p>
+<p><strong>Mechanism.</strong> With cache-aside, a dead cache means slow but correct reads, because the application can still go to the database. With a read-through <em>service</em>, the application has no path to the database. The cache is the only door. Its availability is now the data's availability.</p>
+<p><strong>Detect.</strong> This one is found in design review or in a game day, before production does it for you. Ask: "if this service returns 503 for ten minutes, what do product pages show?"</p>
+<p><strong>Fix.</strong> Run the read-through tier with the same availability standards as the database: several replicas, spread across zones, deployed gradually. Or give clients a fallback path that reads the database directly, rate-limited, when the cache tier is unreachable. That fallback is cache-aside in an emergency, and it needs its own capacity plan.</p>
+
+<h3 id=dd-readthrough-fm-stale-forever level=3>3. The price that never updated</h3>
+<p><strong>Symptom.</strong> A product shows a price from four days ago on some servers. Restarting the server fixes it.</p>
+<p><strong>Mechanism.</strong> The cache used <code>refreshAfterWrite</code> without <code>expireAfterWrite</code>. A schema change broke the loader for a subset of products, so every refresh failed. On a failed refresh, the cache keeps the old value. Nothing ever forced the entry out, so it was served for days, with errors only in a log nobody watched.</p>
+<p><strong>Detect.</strong> Alert on loader failure rate, not just on request errors. Export entry age, or the age of the value's <code>updated_at</code>, for sampled keys.</p>
+<p><strong>Fix.</strong> Always pair refresh with an expire that is the true staleness limit. Treat repeated refresh failures as an alert.</p>
+
+<h3 id=dd-readthrough-fm-not-found level=3>4. The missing-key storm</h3>
+<p><strong>Symptom.</strong> Database queries per second double. Cache hit ratio drops. The new queries all return zero rows.</p>
+<p><strong>Mechanism.</strong> The loader returns <code>null</code> for missing products, and the library treats <code>null</code> as "store nothing". A crawler walking through product IDs, or a stale link from a partner feed, hits non-existent keys over and over. Each one becomes a load. Coalescing only helps when the same missing key is requested concurrently.</p>
+<p><strong>Detect.</strong> Loader calls that return empty, as a separate counter. Miss ratio split by "found" and "not found".</p>
+<p><strong>Fix.</strong> Return an explicit empty value and cache it briefly (seconds to a minute). Some managed caches do this for you; DAX, for example, caches negative <code>GetItem</code> results. For huge ID spaces, check a Bloom filter of valid IDs before loading.</p>
+
+<h3 id=dd-readthrough-fm-fleet-growth level=3>5. Autoscaling made the database busier</h3>
+<p><strong>Symptom.</strong> Traffic rises, the autoscaler doubles the fleet from 40 to 80 servers, and database load rises faster than traffic did. Page latency gets worse after scaling out.</p>
+<p><strong>Mechanism.</strong> Each new server starts with an empty local cache and misses heavily for its first minutes. Background refresh also doubles, because each server refreshes its own hot keys. Per-process coalescing limits duplicate loads to one per server, so doubling servers doubles the load floor.</p>
+<p><strong>Detect.</strong> Database queries per second plotted against fleet size. Per-server hit ratio by server age; new servers stand out.</p>
+<p><strong>Fix.</strong> Put a shared tier under the local caches, so new servers warm from Redis instead of the database. Warm new servers before they enter the load balancer. Count database load per server in the capacity model, not only per request.</p>
+
+<h3 id=dd-readthrough-fm-flip-flop level=3>6. The price that changes on every refresh of the page</h3>
+<p><strong>Symptom.</strong> A customer reloads a product page and sees $45, then $40, then $45. Support cannot reproduce it.</p>
+<p><strong>Mechanism.</strong> Each server's local cache loaded the product at a different time. After a price change, some servers hold the new value and others hold the old one until they expire or refresh. The load balancer sends each request to a different server, so the customer sees each server's version in turn.</p>
+<p><strong>Detect.</strong> Sampled comparison of the same key across servers. Customer reports that mention "flickering" are a strong hint.</p>
+<p><strong>Fix.</strong> Broadcast invalidations to every server (pub/sub, or Redis client-side tracking), and keep local TTLs short as a backstop for missed messages. For data where flip-flopping is unacceptable, skip the local tier and read only from a shared cache. Sticky routing per user hides the symptom but does not fix it.</p>
+
+<h3 id=dd-readthrough-fm-query-cache level=3>7. The query cache that either lies or never hits</h3>
+<p><strong>Symptom.</strong> Two opposite reports from two teams. On Hibernate, the query cache shows a hit ratio near zero and adds latency. On DAX, a listing query returns a product that was deleted minutes ago.</p>
+<p><strong>Mechanism.</strong> Caching a query result is harder than caching an item, because any write might change it. Hibernate chose correctness: any write to a table invalidates every cached query on that table, so a table with steady writes keeps its query cache empty. DAX chose speed: writes update the item cache but not the query cache, so query results stay until their TTL.</p>
+<p><strong>Detect.</strong> Per-region hit ratios (Hibernate's statistics expose them). For DAX, compare query results against strongly consistent reads in a canary.</p>
+<p><strong>Fix.</strong> Cache items, not queries, wherever you can. Cache the list of IDs a query returns with a short TTL, then read each item through the item cache. If you do cache queries, use them only on tables that rarely change, or with TTLs short enough that the staleness is acceptable.</p>
+
+<h2 id=dd-readthrough-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-readthrough-choose-host level=3>Where the loader runs</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Variant<th>Coalescing scope<th>Invalidation<th>If the cache fails<th>Fits<tbody><tr><td>In-process library (Caffeine, Guava, singleflight)<td>One process<td>Hard: every server's copy<td>Process restarts cold; database takes the load<td>One service, hot read-mostly data, staleness of seconds is fine<tr><td>Two tiers: local loader reads a shared cache, shared tier loads from the database<td>One process for L1, fleet-wide if L2 uses a lock<td>Delete in L2, broadcast or short TTL for L1<td>L1 survives L2 loss for a while<td>High read rates, large fleets<tr><td>Shared read-through service (your own API)<td>Fleet-wide, inside the service<td>One place<td>Data outage unless clients have a fallback<td>Many services and languages reading the same entities<tr><td>Owner-routed peers (groupcache)<td>Exactly one load per key per fleet<td>None by design<td>Keys on a lost peer reload from elsewhere<td>Immutable or versioned data<tr><td>ORM second-level cache (Hibernate)<td>One process, or a cluster with a distributed provider<td>Automatic for writes through the ORM<td>Falls back to the database<td>Entity reads in an ORM-heavy service<tr><td>Managed (DAX)<td>Within the cache cluster<td>Item cache updated by writes through it; query cache by TTL only<td>Clients fail unless they fall back to the table<td>DynamoDB workloads with read-heavy, eventually consistent access</table></div></div>
+<p>The first choice is about scope. If one service reads the data, an in-process loading cache with refresh is cheap and very fast. If many services read it, a shared tier stops each from reinventing the loader. The lesson's forty-service catalog is the classic case.</p>
+<p>The second choice is about failure. A library or ORM cache degrades to the database when it is empty. A separate service does not, unless you build that path. Choose a separate service only if you are ready to run it like a database.</p>
+
+<h3 id=dd-readthrough-choose-freshness level=3>How entries stay fresh</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach<th>Caller latency on a hot key<th>Staleness bound<th>Extra database load<th>Watch out for<tbody><tr><td>Expire only<td>One blocking load per expiry<td>The expire time<td>One load per key per expiry<td>Hot-key stampede within each process<tr><td>Refresh only<td>Never blocks<td>None: a failing refresh keeps old data<td>One load per key per refresh interval, per process<td>Stale-forever on loader failure<tr><td>Refresh plus expire<td>Never blocks for hot keys; cold keys block on expiry<td>The expire time<td>As above<td>Refresh load multiplied by fleet size<tr><td>Explicit invalidation plus expire<td>One blocking load after each write<td>Message delay, then the expire time<td>One load per write that is read again<td>Lost invalidation messages</table></div></div>
+<p>A good default for hot, read-mostly data: refresh at the freshness you would like, expire at the staleness you can tolerate, and invalidate on write if the data's owner can publish change events.</p>
+
+<h3 id=dd-readthrough-choose-sync level=3>Synchronous or asynchronous loading</h3>
+<p>A synchronous cache blocks a thread per waiting caller. It is simple and fine for low-concurrency services or fast loaders. An asynchronous cache returns a future and lets waiters attach without blocking, which is safer under a slow database. Choose async when the service handles high concurrency on a thread-per-request model, or when the loader calls a network service that can stall. Choose sync when the code is simpler that way and the waiter math in the sizing section stays small.</p>
+
+<h2 id=dd-readthrough-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Where does the loader run: in each process, in a shared tier, or in a managed service? What is the coalescing scope as a result?</li>
+<li>If the cache tier is unavailable, what do callers do? Is there a fallback path to the database, and can the database handle it?</li>
+<li>Does the loader have a timeout shorter than the callers' deadlines? What happens to all the waiters when one load fails?</li>
+<li>Is there an expire time on every entry, separate from any refresh interval, so a failing loader cannot serve stale data forever?</li>
+<li>How is "not found" represented and cached, and for how long?</li>
+<li>Is there a bulk loader, so a page with 50 misses makes one query, not 50?</li>
+<li>For local caches: how much heap per server, how many duplicate copies across the fleet, and what refresh load does the fleet generate in total?</li>
+<li>How do writes reach the cache: invalidation from the write path, change events, or TTL only? Where is that written down?</li>
+<li>If several servers hold local copies, can a user see different values on consecutive requests? Is that acceptable for this data?</li>
+<li>Does any loader read from its own cache, directly or indirectly?</li>
+<li>Are query results cached, or only items? If queries, how are they invalidated?</li>
+<li>Which metrics exist: hit ratio, load time, load failures, eviction count, entry age, waiters per key?</li>
+</ol>
+
+<h2 id=dd-readthrough-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"You said read-through coalesces misses. Across 40 servers, how many database queries happen when a hot key expires?"</summary>
+<p>With an in-process loading cache, up to 40: one per server that sees a request during the load. That is coalescing per process, not per fleet. Getting to one load per fleet takes more. You can route each key to an owner peer that coalesces for everyone, which is the groupcache design. Or you can take a short lock in the shared cache, so only the first server loads while the others wait or serve the stale value. Refresh-ahead also helps: hot keys reload in the background, so no caller blocks at all.</p>
+</details>
+
+<details>
+<summary>"Coalescing sounds strictly better. What does it cost?"</summary>
+<p>Shared fate. Every waiter depends on one load. If that load is slow, all of them are slow; if it fails, all of them fail together. With a synchronous cache, each waiter also holds a thread, so a 2-second load at 500 requests per second ties up about 1,000 threads on one server. So the loader needs a timeout below the callers' deadline, failures should fall back to the previous value where possible, and high-concurrency services should use the async form.</p>
+</details>
+
+<details>
+<summary>"What's the difference between refreshAfterWrite and expireAfterWrite, and why would you set both?"</summary>
+<p>Expire removes the entry, so the next caller blocks on a load. Refresh keeps serving the current value and reloads in the background on the next read after the interval. Refresh alone has no staleness bound: a failing loader leaves the old value in place indefinitely, and a key that is never read is never refreshed. Setting both gives non-blocking reads for hot keys and a hard limit on how old any value can be.</p>
+</details>
+
+<details>
+<summary>"Your company builds a shared read-through product cache service for 40 teams. What's the biggest risk?"</summary>
+<p>That it becomes the single point of failure for product data. With cache-aside, a cache outage means slow reads; with a read-through service, it means no reads, because clients have no direct path to the database. It needs database-grade availability: replicas across zones, careful rollouts, load shedding. And either clients get a rate-limited fallback to the database or the team accepts that the service's SLO caps every consumer's SLO. The second risk is coupling: the service now owns query logic and schema knowledge for data other teams write.</p>
+</details>
+
+<details>
+<summary>"Does read-through give you read-your-writes consistency?"</summary>
+<p>Not by itself. Read-through only defines the miss path. If a user saves a change and the write goes straight to the database, the cache still holds the old value until it is invalidated or expires, so the user's next read can show the old data. You get read-your-writes by invalidating on write, by pairing it with write-through so the write updates the cache, or by routing that user's next read past the cache. With local caches on many servers, invalidation must reach every server, or the user can land on one that has not heard.</p>
+</details>
+
+<details>
+<summary>"A loader for products needs the seller's name. Can it call sellers.get() on the same cache?"</summary>
+<p>Not on the same loading cache. The product load runs inside a per-key atomic computation, and starting another computation on the same map from inside it can deadlock or throw. Load the seller from a separate cache, or fetch it in the same database query. It is also worth asking whether the seller's name belongs inside the cached product at all, since a change to the seller then requires invalidating every product they sell.</p>
+</details>
+
+<details>
+<summary>"When would you turn off the Hibernate query cache?"</summary>
+<p>On any table with steady writes. Hibernate invalidates every cached query result for a table whenever that table changes through it, so writes keep the query cache nearly empty while you still pay to store and check it. Keep the entity cache, which invalidates per row. If a list query is hot, cache the list of IDs with a short TTL and fetch each entity through the entity cache.</p>
+</details>
+
+<details>
+<summary>"When does read-through stop being worth it compared to a cache-aside helper?"</summary>
+<p>When the cached thing is not a single entity by key: a dashboard composed from three databases, a personalised feed, a search result. A per-key loader cannot express those naturally. It also stops paying off when there is one small service, since a helper function already centralises the code, or when your cache is a plain shared store with nowhere to run a loader. Read-through earns its keep at organisational scale, on hot entity reads, where one implementation and coalescing protect a shared database.</p>
+</details>

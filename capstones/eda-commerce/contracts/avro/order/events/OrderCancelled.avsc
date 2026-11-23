@@ -1,0 +1,57 @@
+{
+  "type": "record",
+  "name": "OrderCancelled",
+  "namespace": "com.edacommerce.order",
+  "doc": "The saga ended without shipping. All compensations have been issued.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "reason",
+      "type": {
+        "type": "enum",
+        "name": "CancellationReason",
+        "namespace": "com.edacommerce.order",
+        "doc": "Why an order was cancelled. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+        "symbols": [
+          "OUT_OF_STOCK",
+          "PAYMENT_DECLINED",
+          "RESERVATION_EXPIRED",
+          "FULFILMENT_FAILED",
+          "CUSTOMER_REQUESTED",
+          "SAGA_TIMEOUT",
+          "UNKNOWN"
+        ],
+        "default": "UNKNOWN"
+      }
+    },
+    {
+      "name": "detail",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "paymentVoided",
+      "type": "boolean",
+      "doc": "True if an authorisation existed and a VoidPayment was sent.",
+      "default": false
+    },
+    {
+      "name": "cancelledAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

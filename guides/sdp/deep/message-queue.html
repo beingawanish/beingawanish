@@ -1,0 +1,254 @@
+<h2 id=dd-message-queue-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's four mechanics (save before confirming, ack after finishing, competing consumers, depth as a signal) hold for every broker. How each broker implements them differs a lot, and the differences decide your failure modes. Three brokers cover most real systems: RabbitMQ, SQS and Kafka.</p>
+
+<h3 id=dd-message-queue-lifecycle level=3>One message's life</h3>
+<p>Every queue tracks each message through the same few states. The names change by broker, but the shape is the same.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-message-queue-svg-title dd-message-queue-svg-desc" viewBox="0 0 720 270" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-message-queue-svg-title">The life of one message in a queue</title>
+<desc id="dd-message-queue-svg-desc">A message is stored and becomes Ready. A consumer receives it, and it becomes In flight, hidden from other consumers. An ack deletes it. A timeout or a nack returns it to Ready and increases its delivery count. When the delivery count passes a limit, the message moves to the dead letter queue instead.</desc>
+<defs><marker id="dd-message-queue-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="270" fill="#ffffff"/>
+<rect x="20" y="60" width="120" height="56" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="80" y="85" font-size="14" fill="#1c2430" text-anchor="middle">Stored</text>
+<text x="80" y="104" font-size="12" fill="#5c6b7c" text-anchor="middle">fsync / replicated</text>
+<rect x="200" y="60" width="120" height="56" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="260" y="85" font-size="14" fill="#1c2430" text-anchor="middle">Ready</text>
+<text x="260" y="104" font-size="12" fill="#5c6b7c" text-anchor="middle">visible</text>
+<rect x="390" y="60" width="140" height="56" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="460" y="85" font-size="14" fill="#1c2430" text-anchor="middle">In flight</text>
+<text x="460" y="104" font-size="12" fill="#5c6b7c" text-anchor="middle">unacked / invisible</text>
+<rect x="590" y="60" width="110" height="56" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="645" y="92" font-size="14" fill="#1c2430" text-anchor="middle">Deleted</text>
+<rect x="390" y="190" width="140" height="56" rx="8" fill="#f8ebee" stroke="#c898a4"/>
+<text x="460" y="215" font-size="14" fill="#1c2430" text-anchor="middle">Dead letter queue</text>
+<text x="460" y="234" font-size="12" fill="#5c6b7c" text-anchor="middle">for people to inspect</text>
+<line x1="140" y1="88" x2="196" y2="88" stroke="#1c2430" marker-end="url(#dd-message-queue-arrow)"/>
+<line x1="320" y1="80" x2="386" y2="80" stroke="#1c2430" marker-end="url(#dd-message-queue-arrow)"/>
+<text x="353" y="72" font-size="12" fill="#1c2430" text-anchor="middle">deliver</text>
+<line x1="530" y1="88" x2="586" y2="88" stroke="#1c2430" marker-end="url(#dd-message-queue-arrow)"/>
+<text x="558" y="80" font-size="12" fill="#1c2430" text-anchor="middle">ack</text>
+<path d="M410,116 C400,150 300,150 270,120" fill="none" stroke="#1c2430" marker-end="url(#dd-message-queue-arrow)"/>
+<text x="335" y="160" font-size="12" fill="#1c2430" text-anchor="middle">timeout or nack: count + 1</text>
+<line x1="490" y1="116" x2="490" y2="186" stroke="#c898a4" stroke-width="2" marker-end="url(#dd-message-queue-arrow)"/>
+<text x="500" y="160" font-size="12" fill="#1c2430">count &gt; limit</text>
+</svg>
+<figcaption>Every broker below is a variation on these five states. The delivery count is what separates a retry from a poison loop.</figcaption>
+</figure>
+
+<h3 id=dd-message-queue-rabbitmq level=3>RabbitMQ: pushes, prefetch and quorum queues</h3>
+<p>RabbitMQ <strong>pushes</strong> messages to consumers. A consumer opens a channel (a lightweight session inside one TCP connection), subscribes with <code>basic.consume</code>, and receives messages tagged with a per-channel <strong>delivery tag</strong>. It then answers each one:</p>
+<ul>
+<li><code>basic.ack</code>: done, delete it.</li>
+<li><code>basic.nack</code> or <code>basic.reject</code> with <code>requeue=true</code>: put it back. On a classic queue, RabbitMQ requeues it at or near its original position, which is usually the head of the queue. Quorum queues have handled returned messages differently across versions, so check yours.</li>
+<li>Same with <code>requeue=false</code>: drop it, or route it to the queue's dead-letter exchange if one is set.</li>
+</ul>
+<p>If the channel or connection closes, every unacked message on it goes back to Ready. That is the crash-redelivery mechanism. RabbitMQ also enforces a <strong>consumer timeout</strong> (30 minutes by default in recent versions): a delivery held unacked longer than that closes the channel, so a stuck consumer cannot hold messages forever.</p>
+<p>The key knob is <strong>prefetch</strong>, set with <code>basic.qos</code>. It caps how many unacked messages a consumer may hold at once.</p>
+<ul>
+<li><strong>Prefetch 1</strong> is perfectly fair: a consumer gets the next message only after acking the last. But every message pays a network round trip of idle time between ack and next delivery.</li>
+<li><strong>High prefetch</strong> (hundreds) keeps consumers busy, but one consumer can grab a large batch while others sit idle. When that consumer crashes, its whole batch is redelivered at once.</li>
+<li><strong>No prefetch limit</strong>, the default when you never call <code>basic.qos</code>, sends everything to whoever subscribes first. One consumer's memory then holds the whole backlog.</li>
+</ul>
+<p>The sizing section shows how to pick a value. And note that <code>auto-ack</code> mode turns RabbitMQ into an at-most-once system.</p>
+<p>On the producer side, <strong>publisher confirms</strong> are the "saved before confirming" step. Without them, a publish that hits a broker restart can vanish with no error.</p>
+<p>For durability, use <strong>quorum queues</strong>. A quorum queue is replicated across an odd number of nodes, usually three or five, using the Raft consensus protocol. A publish is confirmed once a majority has written it, so three nodes survive the loss of one. Quorum queues also count deliveries per message (the <code>x-delivery-count</code> header) and enforce a <strong>delivery limit</strong>. In RabbitMQ 4.0 and later that limit defaults to 20; past it, the message is dead-lettered or dropped. Mirrored classic queues were removed in 4.0.</p>
+
+<h3 id=dd-message-queue-sqs level=3>SQS: pulls, visibility timeouts and redrive</h3>
+<p>SQS is <strong>pull</strong>-based and has no connections or channels. A consumer calls <code>ReceiveMessage</code>, which returns up to 10 messages. Each comes with a <strong>receipt handle</strong>, a token for that particular delivery. The consumer later calls <code>DeleteMessage</code> with the handle. That is the ack.</p>
+<ul>
+<li><strong>Visibility timeout.</strong> Received messages stay hidden for this long: 30 seconds by default, up to 12 hours. If not deleted by then, they reappear. A long job extends its own timeout with <code>ChangeMessageVisibility</code>, acting as a heartbeat.</li>
+<li><strong>Long polling.</strong> Set <code>WaitTimeSeconds</code> up to 20 so an empty queue holds the request open instead of returning nothing. Short polling an empty queue burns API calls (and money) for no work.</li>
+<li><strong>Receive count and redrive.</strong> SQS tracks <code>ApproximateReceiveCount</code> per message. A <strong>redrive policy</strong> on the source queue names a dead letter queue and a <code>maxReceiveCount</code>. After that many receives without a delete, the message moves to the DLQ. SQS can later move messages back from the DLQ to the source queue (DLQ redrive) once the bug is fixed.</li>
+<li><strong>Retention.</strong> 4 days by default, 14 at most. Give the DLQ a long retention, so someone has time to look.</li>
+</ul>
+<p>A redrive policy in its actual form:</p>
+<pre><code>{
+  "deadLetterTargetArn": "arn:aws:sqs:us-east-1:123456789012:orders-dlq",
+  "maxReceiveCount": "5"
+}</code></pre>
+<p><strong>Standard queues</strong> give at-least-once delivery and best-effort ordering with very high throughput. <strong>FIFO queues</strong> add strict ordering within a <code>MessageGroupId</code> and deduplicate sends that reuse a <code>MessageDeduplicationId</code> within a five-minute window. FIFO trades throughput for that; its per-queue limits are much lower than standard's, with a high-throughput mode that raises them. Check the current quotas rather than relying on remembered numbers. Both kinds also cap in-flight (received but not deleted) messages per queue, on the order of 100,000; the exact figures have changed over time. A huge fleet with long visibility timeouts can hit that ceiling.</p>
+<p>FIFO ordering has a sharp edge. While any message in a group is in flight, SQS will not deliver the next message of that group. A slow or failing message blocks its whole group until it is deleted or moves to the DLQ.</p>
+
+<h3 id=dd-message-queue-kafka level=3>Kafka as a queue: offsets, not acks</h3>
+<p>Kafka stores messages in <strong>partitions</strong>, each an append-only log. A message's position in the log is its <strong>offset</strong>. A <strong>consumer group</strong> shares the partitions of a topic: each partition goes to exactly one consumer in the group. That makes the group behave like competing consumers, with three differences that matter:</p>
+<ul>
+<li><strong>Parallelism is capped by partition count.</strong> A topic with 12 partitions can keep at most 12 consumers in one group busy. Consumer 13 sits idle.</li>
+<li><strong>There is no per-message ack.</strong> A consumer commits one offset per partition, meaning "everything before this is done." If message 1,000 fails and 1,001 succeeds, you cannot ack 1,001 alone. Either the partition waits on 1,000, or the application moves 1,000 aside itself (to a retry or DLQ topic) and commits past it. Kafka has no built-in dead letter queue for consumers.</li>
+<li><strong>Deletion is by retention, not by ack.</strong> Messages stay for the configured retention (<code>retention.ms</code>, 7 days by default) whether consumed or not. That is what lets consumers replay. It also means lag in Kafka is a position, not a count of stored messages.</li>
+</ul>
+<p>Consumer liveness has two timers. <code>session.timeout.ms</code> (45 s by default in current versions) detects a dead process through heartbeats. <code>max.poll.interval.ms</code> (5 minutes by default) detects a live but stuck one: if the consumer does not call <code>poll()</code> again within that window, it is removed from the group and its partitions are reassigned. <code>max.poll.records</code> (500 by default) controls how many messages each poll returns. Those three settings together cause the rebalance storm in failure mode 3.</p>
+<p>Offsets commit automatically every 5 seconds by default (<code>enable.auto.commit=true</code>). That can commit messages you have not finished, which loses them on a crash. For a queue workload, turn it off and commit after processing.</p>
+<p>Two newer pieces are worth knowing. The <strong>cooperative sticky assignor</strong> and <strong>static membership</strong> (<code>group.instance.id</code>) make rebalances incremental, so a deploy does not stop every consumer. And Kafka's <strong>share groups</strong> (KIP-932, early access in Kafka 4.0) add per-message acknowledgment, delivery counts and more consumers than partitions. This is Kafka growing real queue semantics. Check its maturity in your version before depending on it.</p>
+
+<h3 id=dd-message-queue-semantics level=3>What delivery semantics really mean</h3>
+<p>Delivery guarantees come from <em>where</em> the ack sits relative to the work:</p>
+<ul>
+<li><strong>At-most-once:</strong> ack before processing (or auto-ack). A crash loses the message. Acceptable for metrics samples, never for orders.</li>
+<li><strong>At-least-once:</strong> ack after processing. A crash between the work and the ack repeats the work. This is the default for every serious queue.</li>
+<li><strong>Exactly-once effect:</strong> at-least-once delivery plus a consumer that makes repeats harmless. The repeat still arrives; it just changes nothing.</li>
+</ul>
+<p>Kafka's "exactly-once" is real but narrow: it covers Kafka-to-Kafka pipelines only (more in the follow-ups below). The <a href="#exactlyonce-semantics">Exactly-Once Semantics</a> lesson goes further.</p>
+<p>The producer side has its own guarantee. In Kafka, durability needs <code>acks=all</code>, a replication factor of 3, and <code>min.insync.replicas=2</code>, so a write is confirmed only after two replicas have it. Idempotent producers (<code>enable.idempotence</code>, on by default since Kafka 3.0) stop producer retries from writing duplicates into the log.</p>
+
+<h3 id=dd-message-queue-outbox level=3>The outbox pattern: getting messages in reliably</h3>
+<p>The lesson's API "validates, adds a message, and confirms." In practice the API also writes the order to its database. Now there are two writes to two systems, and no transaction covers both. This is the <strong>dual write</strong> problem.</p>
+<ul>
+<li>Commit the database, then publish: if the process dies in between, the order exists but no worker ever hears of it.</li>
+<li>Publish, then commit: if the commit fails, a worker fulfills an order that does not exist.</li>
+</ul>
+<p>The <strong>transactional outbox</strong> removes the second system from the request. The API writes the order row and an <code>outbox</code> row (event ID, aggregate ID, payload) in the same database transaction. Either both exist or neither does. A separate <strong>relay</strong> then reads the outbox and publishes to the broker, marking rows sent after the broker confirms.</p>
+<p>A <strong>polling relay</strong> selects unsent rows on a short interval: simple, but it adds query load and delay. A <strong>log-tailing relay</strong> uses <a href="#change-data-capture">change data capture</a> (for example, Debezium reading the Postgres WAL): lower latency, but another system to run. The <a href="#eventdriven-architecture">Event-Driven Architecture</a> lesson goes deeper on both relays.</p>
+<p>Either way the relay can publish a row and crash before marking it sent, so the outbox is at-least-once too. The consumer still needs idempotency.</p>
+<p>The mirror image on the consumer side is the <strong>inbox</strong>: record each processed message ID in the same transaction as the work.</p>
+<pre><code>import sqlite3
+
+def handle(db: sqlite3.Connection, msg_id: str, order_id: str):
+    """Apply a 'reserve inventory' message exactly once in effect."""
+    with db:  # one transaction: inbox row and the effect commit together
+        try:
+            db.execute("INSERT INTO inbox(msg_id) VALUES (?)", (msg_id,))
+        except sqlite3.IntegrityError:
+            return "duplicate, skipped"          # already processed: ack and move on
+        db.execute("UPDATE stock SET reserved = reserved + 1 "
+                   "WHERE sku = (SELECT sku FROM orders WHERE id = ?)", (order_id,))
+    return "applied"                             # ack only after the commit</code></pre>
+<p>The primary key on <code>inbox.msg_id</code> does the deduplication. Prune old inbox rows on a schedule longer than the broker's maximum redelivery window.</p>
+
+<h2 id=dd-message-queue-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-message-queue-backlog-storage level=3>Backlog storage and drain time</h3>
+<p>From the lesson: the flash sale leaves a backlog of 552,000 messages. Assume each order message is 1 KB.</p>
+<ul>
+<li><strong>Storage:</strong> 552,000 x 1 KB, about 552 MB. On a quorum queue with three replicas, about 1.7 GB of disk across the cluster. Trivial.</li>
+<li><strong>Drain time</strong> = backlog / (processing rate − arrival rate). After the sale, orders drop back to 200 per second, so the backlog drains at 400 − 200 = 200 per second, not 400. That is 552,000 / 200 = 2,760 s, or about 46 minutes. The lesson's 23 minutes assumes arrivals stop entirely.</li>
+</ul>
+<p>"Shipping today" survives 46 minutes. "Ships within 30 minutes" does not.</p>
+
+<h3 id=dd-message-queue-worker-math level=3>How many workers, and where the real ceiling is</h3>
+<p>Say the business wants the backlog cleared within 10 minutes of the sale ending. Processing must reach 552,000 / 600 + 200 = 1,120 orders per second. If each worker handles 20 orders per second (50 ms each), that is 56 workers.</p>
+<p>But the original pipeline topped out at 400 per second because of the database, not the workers. Fifty-six workers would push 1,120 writes per second into a database that handles 400. They would time out and get redelivered. The queue lets you choose the drain time, but only up to the slowest downstream resource. To drain faster you must raise that ceiling (batch the writes, shard, add capacity). Adding consumers past it only adds contention.</p>
+<p>Write the worker cap into the autoscaler as a maximum, derived from the downstream limit: at 20 per second per worker and a 400-per-second database, cap at 20 workers.</p>
+
+<h3 id=dd-message-queue-prefetch-math level=3>Picking a RabbitMQ prefetch</h3>
+<p>Each consumer is idle for one network round trip between sending an ack and receiving the next message, unless more messages are already buffered. With processing time P and round trip R, prefetch 1 gives utilization P / (P + R).</p>
+<ul>
+<li>P = 50 ms, R = 1 ms: 98% utilization at prefetch 1. Fine.</li>
+<li>P = 2 ms, R = 1 ms: 67% at prefetch 1. One third of the fleet is waiting on the network.</li>
+</ul>
+<p>A prefetch of roughly R / P + 1, plus a little headroom, removes the idle gap. For the 2 ms case that is about 2 to 5. Going far higher buys nothing and makes crashes and imbalance worse. Fast, uniform jobs want a moderate prefetch, perhaps tens. Slow or uneven jobs (an image resize that takes 50 ms or 20 s) want prefetch 1, so a slow message does not trap others behind it on one consumer.</p>
+
+<h3 id=dd-message-queue-timeout-math level=3>Sizing visibility timeouts and poll intervals</h3>
+<p><strong>SQS.</strong> Set the visibility timeout above the job's worst normal duration. If p99.9 processing is 40 s, a 30-second default guarantees duplicates. A rule of thumb is several times the p99.9, or a heartbeat that extends the timeout every third of its length. Too long has its own cost: a crashed worker's message waits the full timeout before anyone retries it.</p>
+<p><strong>Kafka.</strong> The rule is max.poll.records x worst-case time per record &lt; max.poll.interval.ms. With 500 records per poll at 1 s each, one batch takes 500 s, which exceeds the 300 s default. The consumer gets evicted mid-batch every time. Either cut <code>max.poll.records</code> to 100 (100 s per batch) or process asynchronously and keep polling.</p>
+
+<h3 id=dd-message-queue-partition-math level=3>Kafka partitions for a queue workload</h3>
+<p>Partitions cap consumer parallelism, and you cannot easily lower the count later. Adding partitions also remaps keys to different partitions, which breaks per-key ordering during the change. So size up front:</p>
+<p>partitions ≥ peak throughput / per-consumer throughput</p>
+<p>At 1,120 orders per second and 20 per consumer, you need 56 partitions. Leave room to grow, say 64 to 96, but not thousands: each partition costs broker metadata, open files and rebalance work.</p>
+
+<h3 id=dd-message-queue-age-math level=3>Scaling on backlog age</h3>
+<p>Depth says how much work is waiting. Age says how long the oldest has waited, which is what users feel. By Little's law, expected wait ≈ depth / processing rate. The same depth of 10,000 means 25 seconds of delay at 400 per second, but 8 minutes at 20 per second when workers slow down. Depth alone would not notice the difference.</p>
+<p>A sound policy targets age with a ceiling and hysteresis:</p>
+<ul>
+<li>Scale out when age of oldest message exceeds, say, 60 s for 2 minutes. On SQS that metric is <code>ApproximateAgeOfOldestMessage</code>. On Kafka, convert consumer lag into time lag.</li>
+<li>Desired workers ≈ (arrival rate + backlog / target drain time) / per-worker rate, capped at the downstream limit.</li>
+<li>Scale in slowly, for example only after 10 minutes with age under 10 s, so the fleet does not flap.</li>
+</ul>
+<p>KEDA and similar tools implement this for SQS, RabbitMQ and Kafka. One trap: a poison message inflates age with no real backlog (failure mode 6).</p>
+
+<h2 id=dd-message-queue-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-message-queue-fm-poison-loop level=3>1. The poison message loop</h3>
+<p><strong>Symptom.</strong> Consumer CPU at 100%, throughput near zero, depth climbing. The logs repeat the same exception, thousands of times per minute.</p>
+<p><strong>Mechanism.</strong> One message has a field the code cannot parse. The consumer throws, catches it, and nacks with <code>requeue=true</code>. RabbitMQ puts the message back at the head of the queue, and it is redelivered immediately. On a classic queue nothing counts deliveries, so the loop never ends. With prefetch 1, every consumer ends up spinning on poison messages instead of real work.</p>
+<p><strong>Detect.</strong> The redelivery rate (RabbitMQ's <code>redeliver</code> counter) is close to the delivery rate. The same message ID appears again and again in error logs.</p>
+<p><strong>Fix.</strong> Use quorum queues with a delivery limit and a dead-letter exchange, or on SQS a redrive policy. Separate error types in code. A <em>permanent</em> error (bad schema, missing record) is rejected without requeue straight to the DLQ. A <em>transient</em> error (timeout, 503) is retried with delay. Alert on DLQ depth above zero; see <a href="#dead-letter-queue">Dead Letter Queue</a>.</p>
+
+<h3 id=dd-message-queue-fm-visibility level=3>2. The backlog that never drains</h3>
+<p><strong>Symptom.</strong> Workers are busy and the fleet is scaled out, yet depth will not fall. Downstream sees each order processed two or three times.</p>
+<p><strong>Mechanism.</strong> A new step made jobs slower. p99 processing went from 10 s to 45 s, but the visibility timeout stayed at 30 s. Slow messages reappear while their first worker is still on them, and a second worker picks them up. Work multiplies, workers slow further, and more messages pass the timeout. Capacity goes to duplicates.</p>
+<p><strong>Detect.</strong> <code>NumberOfMessagesReceived</code> well above <code>NumberOfMessagesDeleted</code> for the same period. Many messages with <code>ApproximateReceiveCount</code> above 1. Delete calls failing because the receipt handle is stale.</p>
+<p><strong>Fix.</strong> Heartbeat with <code>ChangeMessageVisibility</code> during long jobs, or set the timeout from measured p99.9. Idempotent consumers make the duplicates harmless, but they do not give back the wasted capacity.</p>
+
+<h3 id=dd-message-queue-fm-rebalance-storm level=3>3. Kafka rebalance storm</h3>
+<p><strong>Symptom.</strong> Lag rises in a sawtooth. Consumers keep logging that they left and rejoined the group. Throughput drops to a fraction of normal, and the same messages are processed repeatedly.</p>
+<p><strong>Mechanism.</strong> A downstream slowdown pushes one batch past <code>max.poll.interval.ms</code>. The consumer is evicted and its partitions move to others, which now have even more work and also miss the deadline. With the older eager assignment, every rebalance pauses <em>all</em> consumers. Uncommitted work from the evicted consumer is redone by its replacement.</p>
+<p><strong>Detect.</strong> Consumer logs: "consumer poll timeout has expired." Group coordinator metrics show a high rebalance rate. Lag graphs show the sawtooth.</p>
+<p><strong>Fix.</strong> Keep batch time well below the poll interval (fewer records per poll). Commit after each batch. Use the cooperative sticky assignor and static membership so rolling deploys do not trigger full rebalances. For truly slow jobs, pause the partition, process on a worker thread, and keep calling <code>poll()</code>.</p>
+
+<h3 id=dd-message-queue-fm-ordering level=3>4. Ordering breaks on retry</h3>
+<p><strong>Symptom.</strong> The lesson's refund-before-charge bug comes back, even after partitioning by customer ID.</p>
+<p><strong>Mechanism.</strong> The charge failed once with a transient error. To avoid blocking the partition, the consumer sent it to a retry topic with a 5-minute delay and moved on. The refund behind it processed right away. Any retry path that takes a message out of line breaks per-key order. The same happens with SQS standard queues, with RabbitMQ requeue on multiple consumers, and with prefetch above 1 across several consumers.</p>
+<p><strong>Detect.</strong> Downstream state checks: a negative balance, a "refund for unknown charge" error, a version conflict on write. Logs keyed by customer show events out of sequence.</p>
+<p><strong>Fix.</strong> Decide per stream whether order is required. If it is, a failing message must block its key: retry in place, and park the whole key (not just the message) when it gives up. Make consumers order-tolerant where possible, with sequence numbers and version checks that reject or defer stale updates. RabbitMQ's single active consumer, SQS FIFO groups and Kafka partition keys each give per-key order, but only if retries respect it. The <a href="#partitioned-consumption">Partitioned Consumption</a> lesson covers hot keys.</p>
+
+<h3 id=dd-message-queue-fm-dual-write level=3>5. The order with no fulfillment</h3>
+<p><strong>Symptom.</strong> Every few days, support finds a paid order that was never shipped. No error was logged anywhere.</p>
+<p><strong>Mechanism.</strong> A dual write. The API committed the order, then the publish to the broker failed during a broker failover, or the pod was killed between the two calls. The code logged nothing because the process was gone.</p>
+<p><strong>Detect.</strong> Only a reconciliation job finds it: compare orders in the database with orders the fulfillment system has seen, for the last 24 hours. Build that job before you need it.</p>
+<p><strong>Fix.</strong> The transactional outbox, with idempotent consumers. Keep the reconciliation job anyway, as a safety net that proves the outbox works.</p>
+
+<h3 id=dd-message-queue-fm-scaling level=3>6. The autoscaler that makes it worse</h3>
+<p><strong>Symptom.</strong> One of two variants. Either the worker fleet scales to its maximum at 3 a.m. while orders are near zero, or it scales to 60 workers during a spike and the database falls over.</p>
+<p><strong>Mechanism.</strong> In the first case, a single poison message stuck in the queue makes the age of the oldest message climb forever. The age-based scaler reads that as an ever-growing delay. In the second case, the scaler has no ceiling tied to the downstream limit, and the extra workers overload the shared database. On Kafka there is a third variant: scaling consumers past the partition count adds pods that receive nothing.</p>
+<p><strong>Detect.</strong> Worker count high while throughput is flat. Age is high but depth is tiny. Database connections or CPU saturated right after a scale-out. On Kafka, idle consumers with no assigned partitions.</p>
+<p><strong>Fix.</strong> Bound redeliveries so poison messages leave for the DLQ within minutes. Scale on age <em>and</em> depth together (both must be high). Cap the fleet from the downstream limit and the partition count. And watch completions per second, not just worker count.</p>
+
+<h2 id=dd-message-queue-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-message-queue-choose-broker level=3>Choosing a broker</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th>RabbitMQ (quorum queues)<th>SQS<th>Kafka (consumer groups)<th>Redis Streams<tbody><tr><td>Delivery model<td>Push, with prefetch<td>Pull, long polling<td>Pull, batches by partition<td>Pull, consumer groups<tr><td>Ack granularity<td>Per message<td>Per message (delete)<td>Offset per partition<td>Per message (XACK)<tr><td>Redelivery trigger<td>Channel closes, nack, consumer timeout<td>Visibility timeout<td>Rebalance, then restart from committed offset<td>Manual claim of stale pending entries<tr><td>Poison handling<td>Delivery limit + dead-letter exchange<td>Redrive policy + DLQ<td>Application builds retry and DLQ topics<td>Application checks delivery count<tr><td>Ordering<td>Per queue with one consumer; single active consumer<td>Best effort (standard); per group (FIFO)<td>Per partition<td>Per stream with one consumer<tr><td>Max parallelism<td>Number of consumers<td>Number of consumers<td>Number of partitions<td>Number of consumers<tr><td>Replay<td>No (streams feature aside)<td>No<td>Yes, by offset, within retention<td>Yes, within stream length<tr><td>Operations<td>You run a cluster<td>Fully managed<td>You run a cluster, or buy managed<td>You run Redis<tr><td>Best fit<td>Task queues with routing needs<td>Task queues on AWS with little ops<td>High-volume streams, replay, many readers<td>Moderate volume, already on Redis</table></div></div>
+<p>The short version: for a pure task queue, pick SQS on AWS or RabbitMQ quorum queues elsewhere. Pick Kafka when you also need replay, several independent consumer groups reading the same data, or very high throughput, and accept that you will build per-message retry and DLQ handling yourself. Do not choose Kafka for a job queue just because the company already runs it. Slow, uneven jobs fit badly with head-of-partition blocking.</p>
+
+<h3 id=dd-message-queue-choose-publish level=3>Getting the message in: dual write, outbox, CDC</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach<th>Loses messages?<th>Phantom messages?<th>Added latency<th>Added parts<tbody><tr><td>Dual write (commit, then publish)<td>Yes, on crash between steps<td>No<td>None<td>None<tr><td>Publish, then commit<td>No<td>Yes, if commit fails<td>None<td>None<tr><td>Outbox + polling relay<td>No<td>No<td>Poll interval (typically sub-second to seconds)<td>Outbox table, relay process<tr><td>Outbox + CDC relay<td>No<td>No<td>Low<td>CDC connector, often Kafka Connect<tr><td>Broker as source of truth (publish only; consumers write the database)<td>No<td>No<td>Order not visible until consumed<td>Read-your-writes problems for the API</table></div></div>
+<p>If a database write and a message must agree, use an outbox. Dual writes are acceptable only when losing the occasional message is harmless, such as a cache-warming hint.</p>
+
+<h2 id=dd-message-queue-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Is the producer confirmed only after the broker has durably stored (and replicated) the message: publisher confirms, <code>acks=all</code> with <code>min.insync.replicas</code>, or a successful SQS send?</li>
+<li>If the producer also writes a database, how is the dual write avoided? Is there an outbox, and what cleans it up?</li>
+<li>Where exactly is the ack: after the side effect commits, never before?</li>
+<li>How is each consumer idempotent? What is the dedupe key, and how long is it remembered compared with the maximum redelivery window?</li>
+<li>Is there a bounded delivery count, a DLQ, an alert on DLQ depth, and a written procedure for redriving it?</li>
+<li>Is the visibility timeout, consumer timeout or <code>max.poll.interval.ms</code> set from measured p99.9 job time, with a heartbeat for long jobs?</li>
+<li>Which streams need ordering, by which key, and what happens to a key's later messages when one fails?</li>
+<li>What does the autoscaler watch (age and depth), and what caps it: the downstream limit, the partition count, or both?</li>
+<li>What is the drain time for the worst expected spike, given arrivals do not stop afterward, and does it meet the product's promise?</li>
+<li>How will someone find a lost message: is there a reconciliation job between the source of truth and the consumer's results?</li>
+</ol>
+
+<h2 id=dd-message-queue-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Kafka says it supports exactly-once. Why do your consumers still need idempotency?"</summary>
+<p>Kafka's exactly-once covers reading from Kafka and writing back to Kafka, where the output records and the offset commit land in one transaction. Charging a card, sending an email or writing to Postgres is outside that transaction. A consumer can do the side effect and crash before committing, and the replacement does it again. So delivery is still at-least-once from the outside world's view, and the consumer must make repeats harmless, for example with an inbox table in the same database transaction as the effect.</p>
+</details>
+
+<details>
+<summary>"How do you choose an SQS visibility timeout for a job that usually takes 5 s but sometimes 10 minutes?"</summary>
+<p>Do not set one fixed number for both. Set a modest timeout, say 60 s, and have the worker extend it with <code>ChangeMessageVisibility</code> every 20 s while it is still working. A crashed worker's message then reappears within about a minute, while a slow but healthy job keeps its claim. A single 10-minute timeout would make every crash cost 10 minutes of delay. A 30-second timeout would duplicate every long job.</p>
+</details>
+
+<details>
+<summary>"You have 12 partitions and lag is growing. You add 10 more consumers. What happens?"</summary>
+<p>If the group already had 12 consumers, nothing good. Each partition goes to at most one consumer in a group, so the new consumers sit idle, and the group pays for a rebalance on top. To add parallelism, either increase partitions (which remaps keys and briefly breaks per-key ordering), or increase work per consumer: process records concurrently inside a consumer while keeping per-key order, or batch downstream writes. First check whether the real bottleneck is downstream; more consumers will not fix a saturated database.</p>
+</details>
+
+<details>
+<summary>"Why scale on the age of the oldest message instead of queue depth?"</summary>
+<p>Because age is what users feel and depth is not. By Little's law, wait ≈ depth / throughput. The same 10,000 messages mean 25 seconds of delay with healthy workers and minutes when they slow down. Age tracks that directly. Its weakness is a single stuck message, which inflates age without real backlog, so pair it with depth and make sure poison messages leave for the DLQ quickly.</p>
+</details>
+
+<details>
+<summary>"Walk me through the outbox pattern's failure cases."</summary>
+<p>The order and outbox rows commit together, so the database and the intent to publish always agree. The relay can then fail in two places. If it crashes before publishing, the row stays unsent and is published on restart: a delay, not a loss. If it crashes after publishing but before marking the row sent, the message is published twice. So consumers must deduplicate on the event ID. Also watch the outbox's size: a stuck relay shows up as rising unsent rows, which is your alert. And per-aggregate order holds only if the relay publishes in commit order per key.</p>
+</details>
+
+<details>
+<summary>"Your consumers need strict per-customer ordering, and one message for a customer keeps failing. What do you do?"</summary>
+<p>You cannot skip it without breaking that customer's order, so you hold the key, not the queue. Retry in place with backoff a few times. If it still fails, park that customer: move the failing message and every later message for the same key to a holding area, and keep processing other customers. Alert a human, fix the cause, then replay the parked messages in order. If the domain allows it, the better long-term fix is consumers that tolerate disorder through version numbers.</p>
+</details>
+

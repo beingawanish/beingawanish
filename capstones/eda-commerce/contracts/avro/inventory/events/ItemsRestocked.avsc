@@ -1,0 +1,39 @@
+{
+  "type": "record",
+  "name": "ItemsRestocked",
+  "namespace": "com.edacommerce.inventory",
+  "doc": "Reply to RestockItems.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": "string"
+    },
+    {
+      "name": "restockId",
+      "type": "string"
+    },
+    {
+      "name": "lines",
+      "type": {
+        "type": "array",
+        "items": "com.edacommerce.common.StockLine"
+      }
+    },
+    {
+      "name": "restockedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

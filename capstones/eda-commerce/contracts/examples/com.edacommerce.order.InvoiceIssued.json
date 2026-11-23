@@ -1,0 +1,36 @@
+{
+  "envelope": {
+    "eventId": "a071b614-7082-57fe-a0ec-6bf812a86a3a",
+    "type": "com.edacommerce.order.InvoiceIssued",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "60635d31-b2a6-5094-acbb-ebdb13eeee67",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "order-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Order",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "invoiceId": "862ccd01-fc12-5110-a65b-45f4b006d2a6",
+  "invoiceNumber": "INV-2026-000123",
+  "total": {
+    "amountMinor": 1999,
+    "currency": "EUR"
+  },
+  "document": {
+    "store": "s3",
+    "bucket": "invoices",
+    "objectKey": "order/2026/11/6ed9d0ed-127a-524b-b079-a06e34f3ec73/invoice.pdf",
+    "contentType": "application/pdf",
+    "sizeBytes": 48213,
+    "sha256": "50d858e0985ecc7f60418aaf0cc5ab587f42c2570a884095a9e8ccacd0f6545c",
+    "expiresAt": 1795000000000
+  },
+  "issuedAt": 1795000000000
+}

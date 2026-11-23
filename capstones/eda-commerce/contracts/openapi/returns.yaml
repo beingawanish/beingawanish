@@ -1,0 +1,202 @@
+openapi: 3.1.0
+info:
+  title: eda-commerce Returns API
+  version: 1.0.0
+  description: |
+    Returns and refunds. Served by returns-svc (port 8109).
+
+    Eligibility (delivered, inside the 30-day window, quantities not already returned) is checked
+    synchronously against returns-svc's own projection of order events, so the customer gets a clear
+    yes or no at once. Everything after that (label, parcel, inspection, restock, refund) is the
+    reverse saga and is reported through GET /returns/{returnId}.
+servers:
+  - url: http://localhost:8109
+    description: local
+security:
+  - oidc: [shop]
+tags:
+  - name: returns
+  - name: returns-ops
+paths:
+  /returns:
+    post:
+      tags: [returns]
+      operationId: requestReturn
+      summary: Ask to return lines of a delivered order
+      parameters:
+        - $ref: './common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: './common.yaml#/components/parameters/TraceParent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReturnRequest'}
+      responses:
+        '202':
+          description: Accepted. The reverse saga has started.
+          headers:
+            Location: {$ref: './common.yaml#/components/headers/Location'}
+            Idempotent-Replayed: {$ref: './common.yaml#/components/headers/IdempotentReplayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Return'}
+        '400': {$ref: './common.yaml#/components/responses/BadRequest'}
+        '401': {$ref: './common.yaml#/components/responses/Unauthorized'}
+        '404': {$ref: './common.yaml#/components/responses/NotFound'}
+        '409': {$ref: './common.yaml#/components/responses/IdempotencyConflict'}
+        '422':
+          description: Not eligible (not delivered yet, window closed, quantity exceeds what is left to return), or Idempotency-Key reuse with another body.
+          content:
+            application/problem+json:
+              schema: {$ref: './common.yaml#/components/schemas/Problem'}
+  /returns/{returnId}:
+    parameters:
+      - $ref: '#/components/parameters/ReturnId'
+    get:
+      tags: [returns]
+      operationId: getReturn
+      summary: Status of a return
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Return'}
+        '401': {$ref: './common.yaml#/components/responses/Unauthorized'}
+        '404': {$ref: './common.yaml#/components/responses/NotFound'}
+  /returns/{returnId}/label:
+    parameters:
+      - $ref: '#/components/parameters/ReturnId'
+    get:
+      tags: [returns]
+      operationId: getReturnLabel
+      summary: Redirect to a pre-signed URL for the return label PDF
+      responses:
+        '302':
+          description: Redirect to a pre-signed URL valid for 5 minutes.
+          headers:
+            Location: {$ref: './common.yaml#/components/headers/Location'}
+        '404':
+          description: No label yet (shipping-svc has not booked it) or no such return.
+          content:
+            application/problem+json:
+              schema: {$ref: './common.yaml#/components/schemas/Problem'}
+  /orders/{orderId}/returns:
+    parameters:
+      - $ref: './common.yaml#/components/parameters/OrderId'
+    get:
+      tags: [returns]
+      operationId: listReturnsForOrder
+      summary: All returns of an order, and what can still be returned
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [returns, returnable]
+                properties:
+                  returns:
+                    type: array
+                    items: {$ref: '#/components/schemas/Return'}
+                  returnable:
+                    type: array
+                    items:
+                      type: object
+                      required: [lineId, sku, quantity]
+                      properties:
+                        lineId: {type: string}
+                        sku: {type: string}
+                        quantity: {type: integer}
+                  windowEndsAt: {type: [string, 'null'], format: date-time}
+        '404': {$ref: './common.yaml#/components/responses/NotFound'}
+  /ops/returns/{returnId}/decision:
+    parameters:
+      - $ref: '#/components/parameters/ReturnId'
+    post:
+      tags: [returns-ops]
+      operationId: decideReturn
+      summary: Staff decision for returns held for manual review (high value, or refund failed repeatedly)
+      security:
+        - oidc: [ops]
+      parameters:
+        - $ref: './common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: {type: string, enum: [APPROVE, REJECT, RETRY_REFUND, CLOSE_WITHOUT_REFUND]}
+                note: {type: string, maxLength: 1000}
+      responses:
+        '202':
+          description: Decision recorded; the saga continues.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Return'}
+        '403': {$ref: './common.yaml#/components/responses/Forbidden'}
+        '404': {$ref: './common.yaml#/components/responses/NotFound'}
+        '409':
+          description: The return is not waiting for a decision.
+          content:
+            application/problem+json:
+              schema: {$ref: './common.yaml#/components/schemas/Problem'}
+components:
+  parameters:
+    ReturnId:
+      name: returnId
+      in: path
+      required: true
+      schema: {$ref: './common.yaml#/components/schemas/Uuid'}
+  schemas:
+    ReturnRequest:
+      type: object
+      required: [orderId, lines, reason]
+      properties:
+        orderId: {$ref: './common.yaml#/components/schemas/Uuid'}
+        lines:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [lineId, quantity]
+            properties:
+              lineId: {type: string}
+              quantity: {type: integer, minimum: 1}
+        reason: {type: string, enum: [DAMAGED, WRONG_ITEM, NOT_AS_DESCRIBED, CHANGED_MIND, OTHER]}
+        comment: {type: string, maxLength: 1000}
+      additionalProperties: false
+    Return:
+      type: object
+      required: [returnId, orderId, status, lines, requestedAt]
+      properties:
+        returnId: {$ref: './common.yaml#/components/schemas/Uuid'}
+        orderId: {$ref: './common.yaml#/components/schemas/Uuid'}
+        rmaNumber: {type: [string, 'null']}
+        status:
+          type: string
+          enum: [REQUESTED, AUTHORIZED, AWAITING_PARCEL, RECEIVED, INSPECTED, REFUNDING, MANUAL_REVIEW, REFUNDED, PARTIALLY_REFUNDED, REJECTED, EXPIRED]
+        lines:
+          type: array
+          items:
+            type: object
+            required: [lineId, sku, quantity]
+            properties:
+              lineId: {type: string}
+              sku: {type: string}
+              quantity: {type: integer}
+              inspectionOutcome: {type: [string, 'null'], enum: [RESTOCKABLE, DAMAGED, MISSING, null]}
+        refundAmount:
+          oneOf:
+            - $ref: './common.yaml#/components/schemas/Money'
+            - type: 'null'
+        labelAvailable: {type: boolean}
+        parcelDueBy: {type: [string, 'null'], format: date-time}
+        requestedAt: {type: string, format: date-time}
+  securitySchemes:
+    oidc:
+      $ref: './common.yaml#/components/securitySchemes/oidc'

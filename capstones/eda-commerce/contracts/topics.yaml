@@ -1,0 +1,284 @@
+# Topic catalogue: the single source of truth for every Kafka topic in the system.
+#
+# Generated from this file (never edit the outputs by hand):
+#   contracts/asyncapi/asyncapi.yaml   python contracts/tools/contracts.py asyncapi
+#   infra/topics.conf                  python contracts/tools/contracts.py topics-conf
+#
+# Rules (see ADR-005 and ADR-007):
+#   - Name:        <context>.<stream>.v<major>. A breaking change gets a new topic, never an in-place edit.
+#   - Key:         orderId for everything in the order and returns flows; sku for compacted state topics.
+#   - Partitions:  fixed at creation. Changing the count re-maps keys to partitions and breaks per-key ordering.
+#   - Messages:    paths are relative to contracts/avro and name the Avro record (TopicRecordNameStrategy).
+
+defaults:
+  replicationFactor: 3        # production value; local compose overrides to 1 via RF env var
+  minInsyncReplicas: 2
+  schemaSubjectStrategy: TopicRecordNameStrategy
+  compatibility: FULL_TRANSITIVE
+
+retryPolicy:
+  # Every consumer group gets these topics: <group>.retry.10s, <group>.retry.1m, <group>.retry.10m, <group>.dlq
+  delays: [10s, 1m, 10m]
+  retryPartitions: 6
+  retryRetention: 7d
+  dlqPartitions: 3
+  dlqRetention: 30d
+
+consumerGroups:
+  - catalog-svc
+  - checkout-svc
+  - order-svc
+  - order-history-projector
+  - payment-svc
+  - inventory-svc
+  - fulfilment-svc
+  - shipping-svc
+  - notification-svc
+  - returns-svc
+
+topics:
+  # ---------------------------------------------------------------- state (compacted)
+  - name: catalog.product.v1
+    kind: state
+    aggregate: Product
+    description: Latest snapshot of every product. Consumers rebuild a full catalog read model by reading from offset 0.
+    key: sku
+    partitions: 6
+    cleanupPolicy: compact
+    retention: forever
+    ordering: Per sku. Latest value wins after compaction.
+    producers: [catalog-svc]
+    consumers: [checkout-svc]
+    messages: [catalog/events/ProductUpserted]
+
+  - name: catalog.price.v1
+    kind: state
+    aggregate: Price
+    description: Current price per SKU in the default price list.
+    key: sku
+    partitions: 6
+    cleanupPolicy: compact
+    retention: forever
+    ordering: Per sku. Latest value wins after compaction.
+    producers: [catalog-svc]
+    consumers: [checkout-svc]
+    messages: [catalog/events/PriceChanged]
+
+  - name: inventory.stock-level.v1
+    kind: state
+    aggregate: StockLevel
+    description: Network-wide availability per SKU, for product pages and cart validation. Advisory only; the reservation is the real check.
+    key: sku
+    partitions: 6
+    cleanupPolicy: compact
+    retention: forever
+    ordering: Per sku. Latest value wins after compaction.
+    producers: [inventory-svc]
+    consumers: [catalog-svc, checkout-svc]
+    messages: [inventory/events/StockLevelChanged]
+
+  # ---------------------------------------------------------------- order flow events
+  - name: checkout.events.v1
+    kind: events
+    aggregate: Checkout
+    description: Facts from the checkout context. CheckoutSubmitted starts the order saga.
+    key: orderId
+    partitions: 12
+    cleanupPolicy: delete
+    retention: 7d
+    ordering: Per orderId.
+    producers: [checkout-svc]
+    consumers: [order-svc]
+    messages: [checkout/events/CheckoutSubmitted]
+
+  - name: order.events.v1
+    kind: events
+    aggregate: Order
+    description: Lifecycle of the order aggregate. The public story of an order.
+    key: orderId
+    partitions: 12
+    cleanupPolicy: delete
+    retention: 90d
+    ordering: Per orderId. aggregateVersion is strictly increasing per order.
+    producers: [order-svc]
+    consumers: [order-history-projector, notification-svc, returns-svc, checkout-svc]
+    messages:
+      - order/events/OrderPlaced
+      - order/events/OrderConfirmed
+      - order/events/OrderCancelled
+      - order/events/OrderShipped
+      - order/events/OrderDelivered
+      - order/events/InvoiceIssued
+      - order/events/OrderRequiresAttention
+
+  - name: payment.events.v1
+    kind: events
+    aggregate: Payment
+    description: Replies from payment-svc to authorise, capture, void and refund commands.
+    key: orderId
+    partitions: 12
+    cleanupPolicy: delete
+    retention: 30d
+    ordering: Per orderId.
+    producers: [payment-svc]
+    consumers: [order-svc, returns-svc, order-history-projector, notification-svc]
+    messages:
+      - payment/events/PaymentAuthorized
+      - payment/events/PaymentDeclined
+      - payment/events/PaymentCaptured
+      - payment/events/PaymentCaptureFailed
+      - payment/events/PaymentVoided
+      - payment/events/RefundSucceeded
+      - payment/events/RefundFailed
+
+  - name: inventory.events.v1
+    kind: events
+    aggregate: Reservation
+    description: Reservation lifecycle and restocks.
+    key: orderId
+    partitions: 12
+    cleanupPolicy: delete
+    retention: 7d
+    ordering: Per orderId.
+    producers: [inventory-svc]
+    consumers: [order-svc, returns-svc]
+    messages:
+      - inventory/events/StockReserved
+      - inventory/events/StockReservationRejected
+      - inventory/events/ReservationCommitted
+      - inventory/events/ReservationReleased
+      - inventory/events/ReservationExpired
+      - inventory/events/ItemsRestocked
+
+  - name: fulfilment.events.v1
+    kind: events
+    aggregate: Fulfilment
+    description: Warehouse progress for outbound orders and inbound returns.
+    key: orderId
+    partitions: 12
+    cleanupPolicy: delete
+    retention: 30d
+    ordering: Per orderId.
+    producers: [fulfilment-svc]
+    consumers: [order-svc, shipping-svc, returns-svc, order-history-projector]
+    messages:
+      - fulfilment/events/FulfilmentAccepted
+      - fulfilment/events/OrderPicked
+      - fulfilment/events/OrderPacked
+      - fulfilment/events/OrderDispatched
+      - fulfilment/events/FulfilmentCancelled
+      - fulfilment/events/FulfilmentFailed
+      - fulfilment/events/ReturnReceived
+      - fulfilment/events/ReturnInspected
+
+  - name: shipping.events.v1
+    kind: events
+    aggregate: Shipment
+    description: Carrier bookings and normalised carrier webhooks, both directions.
+    key: orderId
+    partitions: 12
+    cleanupPolicy: delete
+    retention: 30d
+    ordering: Per orderId after shipping-svc has de-duplicated and re-ordered carrier webhooks.
+    producers: [shipping-svc]
+    consumers: [order-svc, fulfilment-svc, returns-svc, notification-svc, order-history-projector]
+    messages:
+      - shipping/events/ShipmentCreated
+      - shipping/events/ShipmentInTransit
+      - shipping/events/ShipmentDelivered
+      - shipping/events/ShipmentException
+
+  - name: returns.events.v1
+    kind: events
+    aggregate: Return
+    description: Lifecycle of a return (reverse saga).
+    key: orderId
+    partitions: 12
+    cleanupPolicy: delete
+    retention: 90d
+    ordering: Per orderId, which also orders several returns of the same order.
+    producers: [returns-svc]
+    consumers: [order-history-projector, notification-svc]
+    messages:
+      - returns/events/ReturnRequested
+      - returns/events/ReturnAuthorized
+      - returns/events/ReturnRejected
+      - returns/events/ReturnRefunded
+      - returns/events/ReturnClosed
+
+  - name: notification.events.v1
+    kind: events
+    aggregate: Notification
+    description: Audit trail of customer messages, shown on the order timeline.
+    key: orderId
+    partitions: 6
+    cleanupPolicy: delete
+    retention: 30d
+    ordering: Per orderId. Notifications without an order use customerId as key.
+    producers: [notification-svc]
+    consumers: [order-history-projector]
+    messages: [notification/events/NotificationSent]
+
+  # ---------------------------------------------------------------- commands (point to point)
+  - name: payment.commands.v1
+    kind: commands
+    aggregate: Payment
+    description: Commands to payment-svc. Only payment-svc consumes this topic.
+    key: orderId
+    partitions: 12
+    cleanupPolicy: delete
+    retention: 7d
+    ordering: Per orderId, so Authorize is always seen before Capture or Void for the same order.
+    producers: [order-svc, returns-svc]
+    consumers: [payment-svc]
+    messages:
+      - payment/commands/AuthorizePayment
+      - payment/commands/CapturePayment
+      - payment/commands/VoidPayment
+      - payment/commands/RefundPayment
+
+  - name: inventory.commands.v1
+    kind: commands
+    aggregate: Reservation
+    description: Commands to inventory-svc.
+    key: orderId
+    partitions: 12
+    cleanupPolicy: delete
+    retention: 7d
+    ordering: Per orderId.
+    producers: [order-svc, returns-svc]
+    consumers: [inventory-svc]
+    messages:
+      - inventory/commands/ReserveStock
+      - inventory/commands/CommitReservation
+      - inventory/commands/ReleaseReservation
+      - inventory/commands/RestockItems
+
+  - name: fulfilment.commands.v1
+    kind: commands
+    aggregate: Fulfilment
+    description: Commands to fulfilment-svc.
+    key: orderId
+    partitions: 12
+    cleanupPolicy: delete
+    retention: 7d
+    ordering: Per orderId.
+    producers: [order-svc, returns-svc]
+    consumers: [fulfilment-svc]
+    messages:
+      - fulfilment/commands/RequestFulfilment
+      - fulfilment/commands/CancelFulfilment
+      - fulfilment/commands/ExpectReturn
+
+  - name: shipping.commands.v1
+    kind: commands
+    aggregate: Shipment
+    description: Commands to shipping-svc.
+    key: orderId
+    partitions: 6
+    cleanupPolicy: delete
+    retention: 7d
+    ordering: Per orderId.
+    producers: [returns-svc]
+    consumers: [shipping-svc]
+    messages: [shipping/commands/IssueReturnLabel]

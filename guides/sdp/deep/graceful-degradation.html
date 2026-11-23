@@ -1,0 +1,205 @@
+<h2 id=dd-graceful-degradation-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's core is a meeting and a fallback ladder. Both are right, and neither tells you where the code goes. A design review will ask four concrete questions. Where is the fallback decision made? Where does the stale copy come from? Who decides what to shed under overload? And how does the rest of the system know that a response is degraded? This section answers each at implementation level.</p>
+
+<h3 id=dd-graceful-degradation-fanout level=3>The page as a fan-out with a deadline</h3>
+<p>The homepage in the lesson calls 12 services. The robust way to build it is to treat it as a scatter-gather with a single deadline. Start all fragment calls in parallel. Give the whole page a budget, say 300 ms for the fragment phase. When the budget expires, render with whatever arrived. Each missing fragment drops to its fallback step. Catalog is the only fragment allowed to fail the page.</p>
+<p>That design changes the fallback trigger. In the lesson, a fallback runs when a breaker is open or a call errors. In a deadline design, it also runs when a call is merely <em>slow</em>. That matters, because slowness is far more common than outright failure, and a slow optional fragment is what usually drags a page's tail latency. Here is the shape in Python's asyncio:</p>
+<pre><code>import asyncio
+
+FRAGMENTS = {
+    # name: (fetch coroutine function, tier, fallback chain)
+    "catalog":         (fetch_catalog,  "critical",  []),
+    "recommendations": (fetch_recs,     "optional",  [recs_from_cache, popular_this_week]),
+    "price_detail":    (fetch_pricing,  "important", [price_from_cache_if_fresh]),
+    "recently_viewed": (fetch_recent,   "optional",  []),  # empty chain: hide it
+}
+
+async def render_home(user, budget=0.30):
+    tasks = {n: asyncio.create_task(f(user)) for n, (f, _, _) in FRAGMENTS.items()}
+    done, pending = await asyncio.wait(tasks.values(), timeout=budget)
+    for t in pending:
+        t.cancel()                                   # stop paying for late work
+    page, degraded = {}, []
+    for name, task in tasks.items():
+        _, tier, chain = FRAGMENTS[name]
+        if task in done and task.exception() is None:
+            page[name] = task.result()
+            continue
+        if tier == "critical":
+            raise PageUnavailable(name)              # fail loudly, on purpose
+        for step in chain:                           # local, fast steps only
+            value = step(user)
+            if value is not None:
+                page[name] = value
+                degraded.append(f"{name}:{step.__name__}")
+                break
+        else:
+            degraded.append(f"{name}:hidden")
+    metrics.count("degraded_fragments", len(degraded))
+    return page, degraded</code></pre>
+<p>Two choices in that code are deliberate. Fallback steps are <em>local</em> functions: an in-process cache lookup or a static list, never another network call. And late tasks are cancelled, so the page stops spending downstream capacity on answers it will not use. Failure modes 1 and 2 below show what happens without each.</p>
+
+<h3 id=dd-graceful-degradation-stale level=3>Where the stale copy comes from</h3>
+<p>The second rung of the ladder is "cached or slightly stale copy". There are four places to keep it, and they differ in what they survive:</p>
+<ul>
+<li><strong>The HTTP cache, with stale-if-error.</strong> RFC 5861 defines <code>Cache-Control: stale-while-revalidate=60, stale-if-error=86400</code>. The first lets a cache serve a stale copy while it fetches a fresh one in the background. The second lets it serve a copy up to a day old if the origin returns an error. CDNs and proxies implement this in their own terms. Varnish and Fastly call it <em>grace</em>. nginx does it with <code>proxy_cache_use_stale</code>.</li>
+<li><strong>A last-known-good store in the service.</strong> Every successful response for a key also writes a copy with its timestamp, in memory or in Redis. The fallback reads it and checks age against a maximum the business approved. This survives the dependency being down. It does not survive a cold start, and it is only as good as the hit rate on that key.</li>
+<li><strong>A precomputed artefact.</strong> "Popular this week" is computed by a batch job and written to object storage, then loaded into every instance's memory at startup and refreshed hourly. It survives almost everything, because it lives in the process that serves it.</li>
+<li><strong>The client.</strong> A mobile app that keeps the last successful homepage can render it offline. That survives your whole backend being unreachable, at the cost of serving data you cannot invalidate.</li>
+</ul>
+<p>Here is the edge version, for nginx in front of the product page service:</p>
+<pre><code>proxy_cache_path /var/cache/nginx keys_zone=pages:100m max_size=10g inactive=7d;
+
+location /product/ {
+    proxy_cache pages;
+    proxy_cache_valid 200 60s;                       # fresh for one minute
+    proxy_cache_use_stale error timeout updating
+                          http_500 http_502 http_503 http_504;
+    proxy_cache_background_update on;                # refresh without blocking users
+    proxy_cache_lock on;                             # one refresh per key, not a stampede
+    add_header X-Cache-Status $upstream_cache_status;  # STALE / UPDATING are visible
+    proxy_pass http://product_service;
+}</code></pre>
+<p>The <code>inactive=7d</code> setting is the real staleness limit here. A cached entry that nobody requests for 7 days is evicted, so the edge can serve a product page that is up to a week old. For a product description that may be fine. For a price it is almost certainly not, which is why the important tier needs an explicit maximum age checked in the service, not a cache eviction setting at the edge.</p>
+
+<h3 id=dd-graceful-degradation-shedding level=3>Priority shedding: classify at the edge, honour everywhere</h3>
+<p>Priority shedding needs three things: every request carries a priority, every overloaded component knows its own load, and the priority survives the hops between services.</p>
+<p>Google's SRE book describes a request <em>criticality</em> with four values: <code>CRITICAL_PLUS</code>, <code>CRITICAL</code>, <code>SHEDDABLE_PLUS</code> and <code>SHEDDABLE</code>. It is set by the first service that receives the request and propagated automatically on every downstream RPC. A backend under load rejects sheddable work first. Netflix has written about the same idea at its edge gateway, where requests are bucketed by priority (user-initiated playback above prefetch and logging) and shed lowest first as load rises.</p>
+<p>Two implementation details decide whether this works:</p>
+<ul>
+<li><strong>Propagation.</strong> If checkout calls inventory, and inventory does not know the call came from checkout, it sheds checkout's call like any other. The priority must be in the request context: a header such as <code>x-request-priority</code>, or gRPC metadata, copied by the client library on every outbound call.</li>
+<li><strong>The load signal.</strong> Shedding on CPU is late and noisy. Better signals are concurrency (the bulkhead's occupancy) or <em>queueing delay</em>. Facebook's "Fail at Scale" paper describes CoDel-style shedding. If the queue has not been empty at any point in the last 100 ms, it counts as a standing queue. The server then drops requests that have waited longer than a short limit, around 5 ms. Under overload it also serves the queue newest-first (adaptive LIFO), because the oldest requests are the ones whose users have already given up.</li>
+</ul>
+
+<h3 id=dd-graceful-degradation-switches level=3>Operator switches and degradation levels</h3>
+<p>Automatic fallbacks handle one dependency failing. Big incidents need decisions a human makes for the whole system: turn off recommendations everywhere to save database capacity, or go read-only. Prepare those decisions in advance as <strong>kill switches</strong> in a dynamic configuration or <a href="#feature-flags">feature flag</a> system. Test them, and document them as levels:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Level<th>What turns off<th>Saves<th>Who may flip it<tbody>
+<tr><td>0<td>Nothing<td>-<td>-
+<tr><td>1<td>Personalised recommendations, recently viewed, review summaries<td>About 30% of database read load (measure yours)<td>On-call engineer
+<tr><td>2<td>Search filters and facets; product pages served from edge cache only<td>Search cluster load; origin traffic<td>On-call engineer, with incident lead
+<tr><td>3<td>Writes other than checkout (reviews, wishlists, profile edits)<td>Primary database write load<td>Incident lead
+<tr><td>4<td>Read-only mode; checkout queues orders for later<td>All synchronous writes<td>Incident lead and product owner
+</tbody></table></div></div>
+<p>Two properties make switches safe. They propagate fast (seconds, not a deploy), and they <em>expire</em>. A switch set during an incident should turn itself off after a set time, say 4 hours, unless someone renews it. Otherwise the masking hazard from the lesson becomes a configuration value that nobody remembers setting.</p>
+
+<h3 id=dd-graceful-degradation-signal level=3>Marking a response as degraded</h3>
+<p>Degraded mode must be visible inside the system, and the lesson says so. Concretely, that means three signals:</p>
+<ul>
+<li>A metric per feature and per step: <code>fallback_served_total{feature="recommendations", step="popular_this_week"}</code>. Alert on the ratio to total requests, by feature.</li>
+<li>A span attribute in the trace (<code>degraded=recommendations:popular</code>), so a slow or odd page can be explained from its trace.</li>
+<li>A field in the response the client can read, so the UI can label it ("Showing popular items") and downstream caches do not store a degraded page as if it were the real one. Send degraded responses with a short or <code>no-store</code> cache lifetime.</li>
+</ul>
+
+<h3 id=dd-graceful-degradation-brownout level=3>Dimmers instead of switches</h3>
+<p>A binary switch drops a feature completely. A <em>brownout</em> controller (from research by Klein and colleagues) treats optional content as a dimmer instead. It serves the optional part to a fraction of requests and adjusts that fraction continuously to keep latency at a target. At 70% capacity, everyone gets recommendations. At 95%, perhaps 40% do. That uses the capacity you have instead of throwing away the whole feature at a threshold, and it avoids the flapping that a hard threshold causes. The cost is that behaviour depends on load, so testing and explaining it to product is harder.</p>
+
+<h2 id=dd-graceful-degradation-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-graceful-degradation-sizing-availability level=3>Availability with fallbacks that can fail too</h3>
+<p>The lesson's math assumes fallbacks always work. They do not. If a feature's primary is 99.9% available and its fallback is independently 99.5% available, the feature is missing only when both fail: 0.001 x 0.005 = 0.000005. That is 99.9995%. But "independently" is doing a lot of work. A fallback cache that runs in the same Redis cluster as the primary's data, or in the same availability zone, fails at the same time. Then the combined figure falls back towards 99.9%.</p>
+<p>The page number is now driven by the critical set alone. Catalog at 99.9% gives about 8.8 hours of hard downtime a year. If a review decides that the cart badge is critical after all, the page becomes 0.999 x 0.999 ≈ 99.8%, about 17.5 hours. Every promotion to the critical tier has a price in hours, so state it in the meeting.</p>
+
+<h3 id=dd-graceful-degradation-sizing-tail level=3>Fan-out tails: why deadlines degrade more often than failures do</h3>
+<p>Suppose each of the 11 optional fragments has a p99 latency of 200 ms and the fragment budget is 200 ms. The chance that a given page has at least one fragment over budget is 1 − 0.99<sup>11</sup> ≈ 10.5%. So about one page in ten shows <em>some</em> fallback, on a perfectly healthy day. That is the "tail at scale" effect from fan-out, and it surprises teams who expected degradation to be rare.</p>
+<p>You have three levers. Raise the budget: at a 300 ms budget where each fragment's p99.9 sits, the rate falls to about 1 − 0.999<sup>11</sup> ≈ 1.1%. Reduce the number of fragments in the critical rendering path, for example by loading two optional fragments client-side after the page appears. Or send a hedged request: after a fragment's p95, send a duplicate to another replica and take whichever answers first. Hedging costs about 5% extra fragment traffic and cuts the tail sharply, but only for idempotent reads. Decide the acceptable degraded-page rate with product, the same way you decide error budgets.</p>
+
+<h3 id=dd-graceful-degradation-sizing-fallback-capacity level=3>Sizing the fallback path for 100% of traffic</h3>
+<p>The fallback must survive the moment it is needed, which is the moment it receives <em>all</em> the traffic. Take recommendations at 2,000 requests per second. Normally the last-known-good Redis lookup sees only misses and errors, say 2% of traffic, 40 per second. When the recommendation service dies, it sees 2,000. If that Redis cluster was sized for 40 per second, the fallback falls over at the same moment as the thing it backs up.</p>
+<p>The storage side matters too. A per-user last-known-good copy for 50 million users at 2 KB each is 100 GB, a real Redis cluster with real failure modes. "Popular this week" per region is 20 regions x 50 KB = 1 MB, held in every process's memory. The cheaper fallback is also the more reliable one. That is a common pattern: the best fallbacks are boring, precomputed and local.</p>
+
+<h3 id=dd-graceful-degradation-sizing-shedding level=3>How much load shedding buys</h3>
+<p>Assume the service can serve 10,000 requests per second, and 40% of normal traffic is sheddable (prefetch, recommendations, analytics beacons). A promotion pushes traffic to 14,000. Without priorities, the overloaded service fails a random 29% of everything, checkout included. With priority shedding, it drops 4,000 sheddable requests and serves every critical one. Critical traffic is untouched until total load reaches 10,000 / 0.6 ≈ 16,700. Shedding, in this case, extends the safe range by 67% without one new server.</p>
+<p>Shedding has a cost of its own: rejecting a request is not free. If a rejection costs 2% of a full request, then 4,000 rejections a second use 80 requests' worth of capacity. That is fine. If rejection happens after the request has been parsed, authenticated and logged, it can cost 20%. Shed as early as possible, at the edge or before expensive work starts.</p>
+
+<h3 id=dd-graceful-degradation-sizing-queue-writes level=3>Queue-writes mode: the backlog and the drain</h3>
+<p>The lesson's 20-minute payments database incident, at 50 orders per second, queues 60,000 orders. When the database returns, the drain rate is the spare write capacity. If the database normally handles 50 orders per second and can take 200, the spare is 150 per second, so the backlog drains in 400 seconds, about 7 minutes. During those 7 minutes, the queued orders compete with live ones. Drain at a controlled rate, and keep the confirmation emails honest ("we've received your order and will confirm shortly"). Size the queue's storage for the longest outage you want to ride out, not the average.</p>
+
+<h3 id=dd-graceful-degradation-sizing-cost level=3>Pricing degradation for the meeting</h3>
+<p>The tiering meeting goes better with money on the table. Suppose the store makes $40,000 an hour, and personalised recommendations lift conversion by 3%. Losing them costs about $1,200 an hour, against $40,000 an hour for losing the page. That ratio is the case for the optional tier. A cached price that is 10 minutes stale, meanwhile, might be wrong on 0.5% of products during a sale. If the store must honour displayed prices, that exposure needs an owner who signs off on the number. The lesson's "staleness risk with an owner" is a finance conversation, not an engineering one.</p>
+
+<h2 id=dd-graceful-degradation-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-graceful-degradation-fm-fallback-stampede level=3>1. The fallback falls over with the primary</h3>
+<p><strong>Symptom:</strong> the recommendation service fails, then a minute later the product database slows, and checkout suffers. <strong>Mechanism:</strong> the fallback for recommendations was "query the products table for top sellers". It ran on 2% of requests normally and on 100% during the outage. The fallback load was a heavy query on a shared, critical database. The degradation path took down a critical feature. <strong>Detect:</strong> load test the fallback at full traffic; in production, watch fallback-source latency and load as soon as <code>fallback_served_total</code> rises. <strong>Fix:</strong> fallbacks should be precomputed and local, or have their own capacity sized for 100% of traffic. Never let an optional feature's fallback touch a critical resource.</p>
+
+<h3 id=dd-graceful-degradation-fm-slow-fallback level=3>2. The fallback is slower than the failure</h3>
+<p><strong>Symptom:</strong> during an outage, pages render, but p99 latency jumps from 400 ms to 2.5 s. <strong>Mechanism:</strong> the primary call times out at 500 ms. Then the fallback calls a second remote service with its own 1 s timeout, which is also struggling, and then a third step. The ladder ran down, rung by rung, with a network call and timeout on each. <strong>Detect:</strong> traces of degraded requests; the distribution of time spent in fallback code. <strong>Fix:</strong> one deadline for the whole request, passed into every step. The fallback steps after the first should be local and take microseconds. If a remote fallback is unavoidable, start it in parallel with the primary (a hedge), not after it fails.</p>
+
+<h3 id=dd-graceful-degradation-fm-poisoned-cache level=3>3. The last-known-good copy is bad</h3>
+<p><strong>Symptom:</strong> during a recommendations outage, every user sees an empty row, or an error message rendered inside the recommendations box. <strong>Mechanism:</strong> the last-known-good cache was written on every response, including a 200 with an empty list during a partial failure, or an error body the client mistook for data. When the fallback ran, it faithfully served the bad copy. For HTTP caches, a common cause is caching error responses because <code>proxy_cache_valid any</code> was set. <strong>Detect:</strong> validate fallback content in a synthetic check (non-empty, schema-valid, age within limits). <strong>Fix:</strong> write last-known-good only after validating the response is good: right status, non-empty where emptiness is suspicious, schema check passes. Enforce maximum age at read time, and keep the previous good copy until the new one validates.</p>
+
+<h3 id=dd-graceful-degradation-fm-rot level=3>4. Fallback rot: the branch that never ran</h3>
+<p><strong>Symptom:</strong> the first real outage in eight months triggers the recommendations fallback, and it throws a <code>KeyError</code>. The page fails anyway. <strong>Mechanism:</strong> the response schema changed in March. The happy path was updated and tested. The fallback, which reads the precomputed file in the old format, was not, because no test or traffic ever ran it. <strong>Detect:</strong> coverage of fallback code in tests; a synthetic or real fraction of traffic exercised through each fallback continuously. <strong>Fix:</strong> route a small share of real requests (0.1% to 1%) through each fallback step all the time, with the result discarded or served. Run the lesson's game days on a schedule. Treat "fallback code path errors" as a page-worthy metric even when the primary is healthy.</p>
+
+<h3 id=dd-graceful-degradation-fm-client level=3>5. The degraded response crashes old clients</h3>
+<p><strong>Symptom:</strong> the server degrades correctly, and crash reports from version 4.2 of the mobile app spike. <strong>Mechanism:</strong> the degraded response omits the <code>recommendations</code> field instead of sending an empty list. App version 4.2 assumed the field was always present. Servers can be fixed in minutes; old app versions stay installed for years. <strong>Detect:</strong> client crash rate by app version, correlated with degraded-mode metrics; contract tests that run degraded responses against each supported client version. <strong>Fix:</strong> keep degraded responses inside the schema (empty list, explicit <code>degraded: true</code>), never a missing field or a different shape. Make "every optional field may be absent" part of the client contract from day one.</p>
+
+<h3 id=dd-graceful-degradation-fm-flap level=3>6. Degraded mode flaps, or stays on forever</h3>
+<p><strong>Symptom:</strong> users see recommendations appear and disappear every few seconds. Or, months after an incident, the homepage still shows "popular this week" to everyone. <strong>Mechanism:</strong> flapping happens when degradation follows a threshold with no hysteresis. The breaker closes, load returns, the dependency fails again, and the cycle repeats. "On forever" is a kill switch left set after an incident, or a breaker stuck open because its probe goes to a path that still fails. <strong>Detect:</strong> degraded-mode transitions per hour, and time spent in each degraded state, by feature. <strong>Fix:</strong> hysteresis (degrade at one threshold, recover at a lower one, with a minimum time in each state). Expiry on every manual switch. An alert on any degraded state that lasts longer than, say, 4 hours, routed to the feature owner.</p>
+
+<h3 id=dd-graceful-degradation-fm-invariant level=3>7. The fallback breaks a rule the primary enforced</h3>
+<p><strong>Symptom:</strong> during a search outage, the fallback list of popular products shows items that are out of stock, restricted in the user's country, or age-restricted. <strong>Mechanism:</strong> the primary search service applied filters for stock, region and policy. The fallback list was built without them, because the people who built it thought of it as a "simple default". The degraded answer is not just less good. It is wrong in a way that may have legal consequences. <strong>Detect:</strong> run the same policy checks on fallback output in tests and in synthetic monitoring. <strong>Fix:</strong> list the invariants each feature enforces (legal, safety, stock, price), and make every fallback step enforce them too, or fail closed. A fallback that cannot apply a compliance filter belongs in the fail-closed column from the lesson's section 6.</p>
+
+<h2 id=dd-graceful-degradation-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Fallback source<td>Precomputed static default, in memory<td>Per-key last-known-good cache<td>The feature can live with a generic answer (popular items). Choose per-key cache when the generic answer is useless (a user's own cart), and size the cache for full traffic.
+<tr><td>Trigger<td>Automatic (error, open breaker, deadline)<td>Operator kill switch<td>The failure is one dependency and the fallback is cheap. Choose switches for system-wide trade-offs, such as freeing database capacity, which need a human's judgment.
+<tr><td>Granularity<td>Per fragment (partial response)<td>Whole page (serve the cached page)<td>Fragments are independent and the page has a few critical parts. Choose whole-page cache for mostly static pages, where an edge copy is simpler and survives the origin being down.
+<tr><td>Where it lives<td>Server-side<td>Client-side (app cache, offline mode)<td>You need control and fast changes. Add client-side for mobile, where the network itself is the most common failure.
+<tr><td>Shape<td>Binary switch<td>Brownout dimmer (serve optional parts to a fraction)<td>The feature is either useful or not. Choose a dimmer for expensive optional content under load, where partial service is better than none.
+<tr><td>Writes during outage<td>Read-only mode<td>Queue writes for later<td>The writes need an immediate answer (a reservation, an inventory hold). Choose queueing when the write can be accepted now and confirmed later, the consumer is idempotent, and the user is told the truth.
+<tr><td>Shedding point<td>At the edge<td>At each service<td>Priorities are known from the route. Add per-service shedding when internal fan-out makes downstream services the first to overload, and propagate priority with every call.
+</tbody></table></div></div>
+<p>Two calls deserve an opinion.</p>
+<p><strong>Prefer boring fallbacks.</strong> Teams like clever fallbacks: a smaller recommendation model, a secondary search cluster, a rule-based engine. Each of those is another service with its own outages, deploys and capacity. The lesson's ladder puts static defaults one rung above "hide" for a reason. They almost never fail. Build the clever rung only when the boring one measurably costs real money, and give it its own fallback.</p>
+<p><strong>Fail open or closed is decided per check, not per system.</strong> A rate limiter whose Redis is down should usually fail open: letting a few extra requests through is cheaper than refusing everyone. A fraud check whose model is down might fail open for small orders from established customers and closed for large first-time orders. Auth fails closed. Write the choice next to each dependency, with the owner who approved it. "We fail open" or "we fail closed" as a global policy is always wrong for something.</p>
+
+<h2 id=dd-graceful-degradation-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Is there a written tier for every feature on this page or flow, and which product owner signed it? Which features are in the critical set, and what is the resulting availability in hours per year?</li>
+<li>For each non-critical feature, what are the fallback steps, and is every step after the first local and fast?</li>
+<li>Is there one deadline for the whole request, passed into fallback steps, and are late calls cancelled?</li>
+<li>Can every fallback source take 100% of the feature's traffic? Does any optional fallback touch a critical resource?</li>
+<li>What is the maximum staleness of each cached rung, who approved it, and is it enforced at read time?</li>
+<li>Which invariants (legal, stock, price, safety) does the primary enforce, and does every fallback enforce them too?</li>
+<li>How does a client see that a response is degraded? Does the degraded response stay inside the schema for all supported client versions?</li>
+<li>What metrics and alerts show each degraded state, and what alerts on degraded states that last too long?</li>
+<li>How are fallbacks exercised: continuous traffic, game days, chaos tests? When did each last run in production?</li>
+<li>What are the operator switches and levels? Who may flip each one, how fast does it propagate, and does it expire?</li>
+<li>Under overload, which traffic is shed first, where, and is priority propagated through every downstream call?</li>
+<li>Which operations fail closed, and what does the user see when they do?</li>
+</ol>
+
+<h2 id=dd-graceful-degradation-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Your fallback for recommendations is a database query for top sellers. Any concerns?"</summary>
+<p>Yes. It runs on 100% of traffic exactly when the primary fails, and it hits a shared database that critical features use. The fallback could cause the bigger outage. I'd precompute top sellers into a file each hour, load it into every instance's memory, and serve that. It is cheaper, it cannot fail with the database, and it gives the same answer.</p>
+</details>
+<details>
+<summary>"Twelve fragments in parallel, each with a 200 ms p99, and a 200 ms page budget. How often does a user see a degraded page?"</summary>
+<p>About 1 − 0.99<sup>11</sup> ≈ 10% for the 11 optional fragments, even when everything is healthy, because fan-out makes some fragment slow on most pages sooner or later. If that is too much, raise the budget toward the fragments' p99.9, move some fragments to load after the page, or hedge the slowest reads. And agree the acceptable degraded-page rate with product, since it is a product number.</p>
+</details>
+<details>
+<summary>"How do you make sure a sheddable request isn't shed when it's part of a checkout?"</summary>
+<p>Priority belongs to the user's action, not to the endpoint. The edge assigns it from the route or the client, and every service copies it onto outbound calls through request context, as gRPC metadata or a header. Then inventory sees "critical, from checkout" and keeps it, even though the same inventory endpoint serves sheddable traffic too. Without propagation, each service guesses, and checkout gets shed somewhere deep in the call graph.</p>
+</details>
+<details>
+<summary>"What's the difference between graceful degradation and just catching exceptions?"</summary>
+<p>A decision. A <code>try/except</code> that returns null treats every feature the same and decides nothing. Degradation starts with a ranked list of features and an explicit, approved answer for each failure. That includes deciding which features may not degrade and must fail loudly. It also has things a catch block does not: fallbacks sized for full traffic, staleness limits, metrics and alerts per degraded state, and tests that run the fallback.</p>
+</details>
+<details>
+<summary>"Your read-only mode works. What else breaks when you turn it on?"</summary>
+<p>Anything that writes as a side effect. Sessions stored in the database stop being refreshed, so users may be logged out. Login itself may write a last-seen timestamp and fail. Analytics, rate-limiter counters and audit logs may write to the same primary. Read-only mode needs an inventory of every write path, including incidental ones. Each gets a decision: redirect to another store, buffer, or drop. And replicas lag, so users may see older data than they just wrote.</p>
+</details>
+<details>
+<summary>"Should a rate limiter fail open or closed when its Redis is down?"</summary>
+<p>Usually open, with a local fallback. Refusing every request because the counter store is down turns a minor outage into a total one. A good middle step is a per-instance in-memory limit, coarser but still a limit. Fail closed only where the limiter is a security control, like login attempts or an expensive API that could be abused for cost. That is a per-check decision, written down with an owner.</p>
+</details>
+<details>
+<summary>"How do you stop a degraded mode from becoming permanent?"</summary>
+<p>Make it impossible to forget. Each degraded state has a metric, an owner and an alert on duration: if recommendations have been on the fallback for 4 hours, the owning team gets paged. Manual switches carry an expiry and turn themselves off unless renewed. And the weekly reliability review lists every degraded state that occurred, with how long it lasted. A degraded mode with no alert is a product change that nobody decided to make.</p>
+</details>
+<details>
+<summary>"In an LLM product, the primary model is down. What does the fallback ladder look like, and what must not degrade?"</summary>
+<p>The ladder: the primary model at a second provider or region, then a smaller model through the <a href="#llm-gateway">LLM gateway</a>, then a <a href="#semantic-caching">semantic cache</a> hit for common questions, then an honest "try again shortly". Safety filtering must not degrade. If the moderation model is down, outputs should not be released unfiltered. And a smaller model's answers should be labelled if the difference matters, for the same reason the lesson labels "sources unavailable".</p>
+</details>

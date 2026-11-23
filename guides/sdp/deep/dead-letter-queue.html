@@ -1,0 +1,183 @@
+<h2 id=dd-dead-letter-queue-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson describes a DLQ as four pieces: an attempt limit, failure notes, an alarm and a path back. Every broker implements those pieces differently, and the differences decide whether your DLQ is safe. Some brokers count deliveries for you. Some count only if you pick the right queue type. Kafka counts nothing. This section goes broker by broker, then covers what should travel in the envelope and how a redrive really works.</p>
+
+<h3 id=dd-dead-letter-queue-sqs level=3>Amazon SQS: receive counts, visibility timeouts and a retention trap</h3>
+<p>SQS never pushes messages. A consumer calls <code>ReceiveMessage</code>, and the message becomes invisible to other consumers for the <strong>visibility timeout</strong> (default 30 seconds, maximum 12 hours). If the consumer calls <code>DeleteMessage</code> before the timeout, the message is gone. If it does not, the message becomes visible again and its <code>ApproximateReceiveCount</code> goes up by one. There is no "nack". Failure is simply the absence of a delete.</p>
+<p>The redrive policy is a small JSON attribute on the source queue:</p>
+<pre><code>{
+  "deadLetterTargetArn": "arn:aws:sqs:eu-west-1:123456789012:order-fulfillment-dlq",
+  "maxReceiveCount": "5"
+}</code></pre>
+<p>When a receive would push the count past <code>maxReceiveCount</code>, SQS moves the message to the DLQ instead. A <em>redrive allow policy</em> on the DLQ says which source queues may use it. Redrive back is an API call (<code>StartMessageMoveTask</code>) with an optional rate limit in messages per second, and the console's redrive button calls it for you.</p>
+<p>Three details bite people:</p>
+<ul>
+<li><strong>Crash and nack cost different amounts of time.</strong> A consumer that catches the exception can call <code>ChangeMessageVisibility</code> with a timeout of a few seconds, so the retry comes quickly. That call is also how you build backoff, because SQS has no native per-message exponential backoff. A consumer that crashes waits out the full visibility timeout on every attempt. With a 30-second timeout and 5 attempts, a crash-looping poison message blocks its slot for 2.5 minutes, not the lesson's 30 seconds.</li>
+<li><strong>Retention starts at the original enqueue time</strong> for standard queues. Moving a message to the DLQ does not reset its clock. If the source queue keeps messages for 4 days (the default) and a message dead-letters on day 3, it can expire from the DLQ soon after, whatever the DLQ's own retention says. AWS's advice is to give the DLQ a longer retention than the source. Set it to the maximum, 14 days, and keep the source shorter. FIFO queues reset the timestamp on the move, so they do not have this trap.</li>
+<li><strong>FIFO queues block per message group.</strong> In a FIFO queue, a failing message holds up every later message with the same <code>MessageGroupId</code> until it is deleted or dead-lettered. So dead-lettering in FIFO <em>does</em> break per-group order. Choose the group key with the lesson's section 6 in mind.</li>
+</ul>
+<p>When Lambda consumes SQS, a batch either succeeds or fails as a whole, unless you turn on <code>ReportBatchItemFailures</code> and return the IDs that failed. Without it, one poison message in a batch of 10 makes all 10 visible again, and 9 healthy messages walk toward the DLQ alongside it.</p>
+
+<h3 id=dd-dead-letter-queue-rabbitmq level=3>RabbitMQ: dead-letter exchanges and the x-death header</h3>
+<p>RabbitMQ dead-letters a message from a queue that has a <code>x-dead-letter-exchange</code> argument (and optionally <code>x-dead-letter-routing-key</code>) for four reasons: the consumer rejected it with <code>requeue=false</code>, its TTL expired, the queue hit its length limit, or it exceeded the delivery limit. Each dead-lettering appends an entry to the message's <code>x-death</code> header: the queue, the reason, the exchange, a count and a timestamp. That header is your failure note, written by the broker.</p>
+<p>The delivery limit is where queue type matters:</p>
+<ul>
+<li><strong>Classic queues do not count deliveries.</strong> A consumer that nacks with <code>requeue=true</code>, or crashes, puts the message back at the head with only a <code>redelivered</code> flag. Nothing ever stops the loop. With classic queues, your consumer must decide to reject with <code>requeue=false</code>, which means the consumer is routing poison. The lesson says that should be the broker's job.</li>
+<li><strong>Quorum queues count.</strong> They track delivery attempts and support <code>x-delivery-limit</code>. Once the count passes the limit, the message is dead-lettered (or dropped, if no dead-letter exchange is set). Since RabbitMQ 4.0, quorum queues default to a delivery limit of 20.</li>
+<li><strong>Dead-lettering itself can lose messages.</strong> By default RabbitMQ dead-letters at most once: if the target is unavailable, the message is gone. Quorum queues offer <code>dead-letter-strategy: at-least-once</code>, which keeps the message until the target confirms it. It requires <code>overflow: reject-publish</code> on the source queue.</li>
+</ul>
+<p>Retry tiers in RabbitMQ are built from the same parts. A "wait 5 minutes" queue has no consumers, a <code>x-message-ttl</code> of 300,000 ms, and a dead-letter exchange that points back to the main queue. Messages sit there until they expire, then flow back. Use one TTL per wait queue. Per-message TTLs are only checked at the head of the queue, so a 1-hour message at the head holds up a 5-minute message behind it.</p>
+
+<h3 id=dd-dead-letter-queue-kafka level=3>Kafka: a log has no "move", so the consumer does it</h3>
+<p>Kafka has no message-level acknowledgement and no delivery count. A consumer group commits an <em>offset</em> per partition, meaning "everything before here is done". A poison record at offset 5,012 is a wall. If you never commit past it, the partition stops. If you commit past it, it is skipped. There is no third broker-side option. A Kafka DLQ is therefore always consumer code: catch the failure, publish the record to a dead-letter topic, wait for that publish to be acknowledged, and only then commit the offset.</p>
+<p>That order matters. Commit first and crash before the DLT publish lands, and the record is lost. Publish first and crash before committing, and you get a duplicate in the DLT, which is harmless. Use <code>acks=all</code> on the DLT producer.</p>
+<p>The common frameworks:</p>
+<ul>
+<li><strong>Spring Kafka</strong> combines a <code>DefaultErrorHandler</code> with a <code>DeadLetterPublishingRecoverer</code>. The default back-off is 9 retries with no delay, so 10 attempts in quick succession, held on the consumer thread. The recoverer writes the record to <code>&lt;topic&gt;.DLT</code> (newer versions use <code>-dlt</code>) and adds headers such as <code>kafka_dlt-original-topic</code>, <code>kafka_dlt-original-partition</code>, <code>kafka_dlt-original-offset</code> and <code>kafka_dlt-exception-fqcn</code>. <code>@RetryableTopic</code> adds non-blocking retry topics (<code>-retry-0</code>, <code>-retry-1</code> and so on) in front of the DLT.</li>
+<li><strong>Kafka Connect</strong> sink connectors take <code>errors.tolerance=all</code>, <code>errors.deadletterqueue.topic.name</code> and <code>errors.deadletterqueue.context.headers.enable=true</code>. This covers failures in conversion and transforms. Failures inside the sink's own write go through the errant record reporter only if the connector uses it, so check your connector.</li>
+<li><strong>Deserialization</strong> is a special case. If the bytes cannot be deserialized, the failure happens inside <code>poll()</code>, before your handler runs, and the consumer loops on it. Spring's <code>ErrorHandlingDeserializer</code> wraps the real deserializer so the failure reaches the error handler as a normal record.</li>
+</ul>
+<p>Note what blocking retry costs in Kafka. While the consumer retries record 5,012 in place, it processes nothing else on that partition. Ten quick retries are fine. Ten retries with exponential backoff up to a minute stall the partition for minutes, and a long enough stall exceeds <code>max.poll.interval.ms</code> (5 minutes by default). The group then rebalances and hands the poison record to another consumer, which starts the same loop.</p>
+
+<h3 id=dd-dead-letter-queue-pubsub level=3>Google Cloud Pub/Sub</h3>
+<p>A subscription's <code>deadLetterPolicy</code> names a dead-letter topic and <code>maxDeliveryAttempts</code> (5 to 100). Pub/Sub tracks the attempt count, which subscribers can read as an approximate delivery-attempt field. A separate retry policy sets exponential backoff between redeliveries, between <code>minimumBackoff</code> (default 10 seconds) and <code>maximumBackoff</code> (default 600 seconds). One setup detail fails silently: Pub/Sub's own service account needs permission to publish to the dead-letter topic and to acknowledge on the source subscription. Without that, messages are not forwarded. Also attach a subscription to the dead-letter topic, because messages published to a topic with no subscription are not kept.</p>
+
+<h3 id=dd-dead-letter-queue-envelope level=3>The envelope: what a dead letter must carry</h3>
+<p>The lesson lists the failure notes. Here is the full set a senior reviewer expects, and why each field is there:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Field<th>Why it is needed<tbody>
+<tr><td>Original payload, as raw bytes<td>A re-serialised copy may hide the very bug (bad encoding, an unknown field) you need to see.
+<tr><td>Original headers and message ID<td>Idempotency on redrive keys on the original ID. Trace IDs link the failure to its request.
+<tr><td>Source queue or topic, partition and offset<td>Redrive needs to know where it came from. Offset lets you find neighbours in the log.
+<tr><td>Consumer group and code version (commit hash)<td>"Fails on v412, passes on v413" is the fastest diagnosis there is.
+<tr><td>Exception class, message, and a stack fingerprint<td>Group thousands of dead letters into five bugs. Store a hash of the top frames, not the full stack, which can exceed size limits.
+<tr><td>Attempt count, first and last failure time<td>Tells poison (fast, repeated) from outage casualties (spread out, all at the same minute).
+<tr><td>Redrive count<td>Lets the redrive tool refuse to bounce a message back for the fifth time.
+</tbody></table></div></div>
+<p>Large or sensitive payloads should not be copied into the DLQ at all. Use a <strong>claim check</strong>: store the payload in an object store with its own encryption and retention, and put a pointer in the dead letter. That keeps the envelope under the broker's message size limit after you add headers. It also means personal data has one retention policy, not two.</p>
+
+<h3 id=dd-dead-letter-queue-redrive level=3>Redrive is a deployment, not a button</h3>
+<p>Treat a redrive like a small release. A safe redrive has five steps:</p>
+<ol>
+<li><strong>Group</strong> the DLQ by fingerprint. Decide per group: redrive, fix the data first, or discard with a recorded reason.</li>
+<li><strong>Confirm the fix is live</strong> on every consumer instance. Redriving to a half-deployed fleet sends some messages straight back.</li>
+<li><strong>Canary.</strong> Redrive 10 messages from the group and watch them succeed.</li>
+<li><strong>Rate-limit the rest.</strong> Redrive at a rate the consumer's spare capacity can absorb (next section), with the redrive count header incremented.</li>
+<li><strong>Re-validate on arrival.</strong> The consumer must check current state, not trust the old event. An <code>order.paid</code> from Tuesday redriven on Thursday may belong to an order that was cancelled on Wednesday.</li>
+</ol>
+
+<h2 id=dd-dead-letter-queue-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions for this section: the fulfillment queue from the lesson, 200 messages per second at peak, 2 KB average message, consumer capacity 400 per second, 5 attempts before dead-lettering.</p>
+
+<h3 id=dd-dead-letter-queue-sizing-time level=3>Time to dead-letter, and what a poison message costs</h3>
+<p>Time to dead-letter is the sum of the gaps between attempts plus the processing time of each attempt. It depends on how attempts fail:</p>
+<ul>
+<li><strong>Fast failure with backoff</strong> (consumer catches and nacks): gaps of 1, 2, 4 and 8 seconds plus a few milliseconds of processing, about 15 seconds. The lesson's 30 seconds assumes somewhat longer gaps.</li>
+<li><strong>Crash on every attempt</strong> (SQS, 30-second visibility timeout): 5 x 30 s = 2.5 minutes, plus process restart time each time. In Kubernetes, a crash loop also adds CrashLoopBackOff delays that grow to minutes.</li>
+<li><strong>Kafka blocking retry</strong>: the partition stalls for the whole sequence. Ten instant retries cost milliseconds. Backoff that adds up to 2 minutes stalls 1/N of your traffic for 2 minutes per poison record.</li>
+</ul>
+<p>For an ordered consumer, the backlog a poison message creates is rate x time to dead-letter. At 200 per second, 15 seconds is 3,000 messages and 2.5 minutes is 30,000. Clearing a backlog takes backlog / (capacity − arrival rate). With 200 per second of spare capacity, 30,000 messages clear in 150 seconds. Add the two and a crash-looping poison message costs about 5 minutes of fulfillment delay. A fast-nacking one costs about 30 seconds. That difference is a strong argument for catching exceptions in the consumer even though the broker owns the limit.</p>
+
+<h3 id=dd-dead-letter-queue-sizing-outage level=3>How many healthy messages an outage dead-letters</h3>
+<p>The lesson's Check Yourself Q2 describes the problem. Here is the number. Say a dependency is down for D seconds, and the retry window (time to dead-letter) is W. Every message that arrives in the first D − W seconds of the outage uses up all its attempts while the dependency is still down. So about rate x (D − W) healthy messages are dead-lettered.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Outage D<th>Retry window W<th>Healthy messages dead-lettered at 200/s<tbody>
+<tr><td>10 min<td>30 s<td>200 x 570 = 114,000
+<tr><td>10 min<td>15 min (retry tier)<td>0
+<tr><td>2 h<td>15 min<td>200 x 6,300 = 1,260,000
+<tr><td>2 h<td>3 h (retry tiers 5 min, 1 h, 2 h)<td>0
+</tbody></table></div></div>
+<p>The rule that falls out: choose W longer than the outages you expect to ride out, or put a <a href="#circuit-breaker">circuit breaker</a> on the consumer so it stops consuming during an outage instead of burning attempts. The breaker is cheaper. Retry tiers are the backstop for when the breaker does not trip, for example on partial failure.</p>
+
+<h3 id=dd-dead-letter-queue-sizing-storage level=3>Storage for retry tiers and the DLQ</h3>
+<p>Retry tiers hold messages during an outage, so size them for the worst outage. A 2-hour outage at 200 per second is 1.44 million messages at 2 KB, about 2.9 GB. That is fine for Kafka and for SQS, which bills per request rather than for storage. It is a real concern for RabbitMQ, where large queues use memory and disk on the broker and can trigger memory alarms that block publishers.</p>
+<p>The DLQ itself is small in a healthy system. A useful budget is "under 0.01% of traffic", so at 17 million messages a day, fewer than 1,700. In Kafka, a few partitions are enough for the DLT, since order rarely matters there. Set <code>retention.ms</code> to at least your longest plausible response time; 30 days is common. Never enable compaction, which would drop dead letters that share a key.</p>
+
+<h3 id=dd-dead-letter-queue-sizing-redrive level=3>Redrive throughput</h3>
+<p>Redrive competes with live traffic. Spare consumer capacity at peak is 400 − 200 = 200 per second. Redriving the 114,000 outage casualties at 150 per second takes about 13 minutes and leaves margin. Redriving at the broker's maximum speed would push the consumer, and the downstream service that just recovered, past capacity. That is how a redrive restarts the incident. SQS's move task takes a <code>MaxNumberOfMessagesPerSecond</code> for this reason. With hand-written redrive scripts, the rate limit is your job.</p>
+
+<h3 id=dd-dead-letter-queue-sizing-alarm level=3>Alarm latency</h3>
+<p>The alarm is part of the pattern, so its delay is part of the design. SQS publishes queue metrics to CloudWatch once a minute. An alarm on <code>ApproximateNumberOfMessagesVisible</code> &gt; 0 for one datapoint fires within a couple of minutes. For a critical queue that is fine. Two refinements help. Alarm on <em>inflow</em> (messages sent to the DLQ per minute) as well as depth, because a depth alarm stays red once it fires and hides the second incident. And alarm on the <em>age of the oldest message</em> against the retention period, so "nobody has looked at this for 10 days" pages someone before day 14 deletes it.</p>
+
+<h2 id=dd-dead-letter-queue-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-dead-letter-queue-fm-crash-loop level=3>1. The poison message that never reaches the DLQ</h3>
+<p><strong>Symptom:</strong> a consumer restarts every 40 seconds. Lag grows on one partition or queue. The DLQ is empty, so everyone assumes the DLQ cannot be involved. <strong>Mechanism:</strong> the message kills the process: out of memory on a 200 MB payload, a native-library segfault, a stack overflow on deeply nested JSON. In Kafka, the process dies before it commits or publishes to the DLT, restarts, and reads the same offset. In a RabbitMQ classic queue, the message is requeued with no counter. The broker-side limit never triggers, or does not exist. <strong>Detect:</strong> container restart count, consumer lag flat on exactly one partition, and the same offset or message ID in the last log line before each crash. <strong>Fix:</strong> cap message size at the producer and the consumer. In Kafka, record attempts outside the process, keyed by topic, partition and offset, and check the count <em>before</em> processing, so attempt N+1 goes straight to the DLT. In RabbitMQ, use quorum queues with a delivery limit.</p>
+
+<h3 id=dd-dead-letter-queue-fm-deser level=3>2. A deserialization error loops inside poll</h3>
+<p><strong>Symptom:</strong> a Kafka consumer logs the same <code>SerializationException</code> thousands of times a second. CPU is high, throughput is zero, and your error handler's metrics show nothing. <strong>Mechanism:</strong> a producer shipped a schema change, or a tool wrote non-Avro bytes to the topic. Deserialization fails inside <code>poll()</code>, before your handler runs, so neither retries nor the DLT recoverer ever see the record. <strong>Detect:</strong> log rate of deserialization errors; lag growing on partitions the bad producer wrote to. <strong>Fix:</strong> wrap deserializers (Spring's <code>ErrorHandlingDeserializer</code> or your own) so a bad record becomes a normal failure that the error handler dead-letters with its raw bytes. Enforce compatibility in the schema registry so the bad schema cannot be registered.</p>
+
+<h3 id=dd-dead-letter-queue-fm-retention level=3>3. Dead letters expire sooner than the DLQ's retention says</h3>
+<p><strong>Symptom:</strong> the team responds to a DLQ alarm within a week, as their runbook allows. Some messages are already gone, though the DLQ retention is 14 days. <strong>Mechanism:</strong> SQS standard queues keep the original enqueue timestamp when a message moves. A message that spent 3 days in a 4-day source queue before dead-lettering expires a day later. A similar trap exists in Kafka: a DLT that inherits a 7-day broker default retention. <strong>Detect:</strong> compare the oldest-message age in the DLQ with the expected retention; count messages that disappear without being redriven or deleted. <strong>Fix:</strong> DLQ retention at the maximum and longer than the source. Alarm on oldest message age well before expiry. For anything financial, copy dead letters to durable storage (a table or object store) on arrival. The broker is not an archive.</p>
+
+<h3 id=dd-dead-letter-queue-fm-redrive-loop level=3>4. The redrive that sends everything back</h3>
+<p><strong>Symptom:</strong> after a redrive of 50,000 messages, the DLQ fills again within minutes. Or the consumer's downstream service falls over during the redrive. <strong>Mechanism:</strong> the fix was not on every instance yet, or it fixed one fingerprint while the group held three. Or the redrive ran at full speed into a dependency that had just recovered and was still cold. <strong>Detect:</strong> message IDs that appear in the DLQ a second time (the redrive count header makes this a one-line query); downstream latency during the redrive window. <strong>Fix:</strong> the five-step redrive above: group by fingerprint, confirm the deploy, canary 10 messages, rate-limit, and refuse messages whose redrive count exceeds 2 so they go to a human.</p>
+
+<h3 id=dd-dead-letter-queue-fm-stale-redrive level=3>5. A redriven event overwrites newer state</h3>
+<p><strong>Symptom:</strong> after Thursday's redrive, a warehouse ships an order that the customer cancelled on Wednesday. <strong>Mechanism:</strong> the redriven <code>order.paid</code> is processed as if it were new. Everything after it for that order, the cancellation included, has already been processed. Section 6 of the lesson warns about this for strictly ordered streams. It also happens on streams that are "mostly independent" but still have a lifecycle per entity. <strong>Detect:</strong> in a test, redrive an event for an entity whose state has moved on; in production, count redriven events whose entity version is older than the stored version. <strong>Fix:</strong> consumers compare an entity version or sequence number and ignore stale events. Or they fetch current state ("is this order still payable and not cancelled?") before acting. Redrive tools can also park messages <em>per key</em>, which the next section covers.</p>
+
+<h3 id=dd-dead-letter-queue-fm-commit-order level=3>6. Messages vanish between the DLT publish and the commit</h3>
+<p><strong>Symptom:</strong> the audit finds orders that are in neither the main topic's processed records nor the DLT. <strong>Mechanism:</strong> the consumer committed offsets on a timer (<code>enable.auto.commit=true</code>, every 5 seconds by default) while the DLT publish was still in flight. Or the DLT producer used <code>acks=1</code>, the leader failed before replicating, and the record was lost. Or the DLT topic did not exist, auto-creation was disabled, and the publish error was logged and swallowed. <strong>Detect:</strong> reconcile counts: records consumed = records processed + records dead-lettered, per partition, per hour. Alert on DLT producer errors. <strong>Fix:</strong> manual commits after the DLT publish is acknowledged, <code>acks=all</code> on the DLT producer, DLT topics created by infrastructure code with the main topic, and a failed DLT publish treated as a failed record (stop the partition rather than skip).</p>
+
+<h3 id=dd-dead-letter-queue-fm-envelope-size level=3>7. The envelope is bigger than the message limit</h3>
+<p><strong>Symptom:</strong> large messages fail to dead-letter. The consumer logs "message too large" from the DLQ publish, and the record either loops or is dropped. <strong>Mechanism:</strong> the payload was just under the broker's size limit (SQS caps message size; Kafka's default <code>max.message.bytes</code> is about 1 MB). The envelope added a full Java stack trace in a header, which pushed it over. <strong>Detect:</strong> DLQ publish errors by type; test with a payload at the size limit. <strong>Fix:</strong> store a stack fingerprint and a truncated message, not a full trace. For large payloads use the claim-check pattern, so the dead letter carries a pointer and stays small.</p>
+
+<h2 id=dd-dead-letter-queue-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Who counts attempts<td>Broker-native (SQS, quorum queues, Pub/Sub)<td>Consumer-managed (Kafka, classic queues)<td>The broker supports it. It survives consumer crashes by design. With Kafka you have no choice, so store the count outside the process.
+<tr><td>Retry style<td>Blocking, in place<td>Non-blocking retry topics or queues<td>Failures clear in seconds, or per-key order matters. Choose retry topics when failures last minutes to hours and order across messages does not matter, since a retried message falls behind later ones.
+<tr><td>On poison, for ordered streams<td>Pause the partition or group<td>Park the key (divert all later messages for that key)<td>Almost everything in the partition is related (a ledger). Parking the key keeps other keys moving. Keep a "blocked keys" set, divert later messages for a blocked key to the DLQ in order, and redrive them together.
+<tr><td>DLQ granularity<td>One DLQ per consumer (per subscription)<td>One shared DLQ for many queues<td>Almost always A. Ownership, alarms and redrive targets are per consumer. A shared DLQ makes "whose message is this?" the first question of every incident.
+<tr><td>Payload<td>Full copy in the DLQ<td>Claim check: pointer to object storage<td>Messages are small and hold no sensitive data. Choose claim check when payloads are large or regulated, so they have one retention and access policy.
+<tr><td>Redrive<td>Manual, after a human fix<td>Automatic, on a schedule<td>The DLQ holds real poison. Automatic redrive suits only outage casualties, and only behind a circuit breaker; otherwise it is an infinite retry with extra steps.
+<tr><td>Business failures<td>Explicit flow (a "declined" event, a review queue)<td>DLQ<td>Always A for expected outcomes. Keep the DLQ for the unexpected, so its alarm keeps meaning "a bug".
+</tbody></table></div></div>
+<p>The key-parking option deserves a sketch, because it is the honest middle ground between the lesson's two choices for ordered streams. Pausing a whole partition stops thousands of unrelated customers. Skipping one message corrupts one customer's sequence. Parking the key does neither. When the event for account 42 fails, put 42 in a blocked set (in a database, keyed by consumer group). Every later event for 42 goes to the DLQ behind the first, in order. Other accounts keep flowing. When the fix ships, redrive account 42's events as a sequence and remove it from the set. The cost is a lookup per message and a redrive tool that understands sequences. Uber described a design along these lines for Kafka reprocessing.</p>
+<p>The other call that reviews argue about is <strong>how many attempts</strong>. Too few and transient errors become tickets. Too many and a poison message blocks longer. A sound default for broker-counted queues is 3 to 5 attempts with backoff, after a circuit breaker has ruled out a downstream outage. Spring Kafka's default of 10 instant attempts is too many to be useful against transient errors (they are back-to-back) and too few to ride out an outage. Set it deliberately.</p>
+
+<h2 id=dd-dead-letter-queue-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Who counts delivery attempts, and does the count survive the consumer crashing on the message?</li>
+<li>What is the time to dead-letter, both for fast failures and for crash loops? What backlog does that create at peak?</li>
+<li>What outage length does the retry window cover, and is there a circuit breaker so an outage does not dead-letter healthy messages?</li>
+<li>Does ordering matter per key? If so, what happens to later messages for a key whose message was dead-lettered?</li>
+<li>What fields does the envelope carry? Is the payload kept as raw bytes, and does the envelope stay under the size limit?</li>
+<li>What is the DLQ's effective retention (including SQS's enqueue-timestamp rule), and is there an alarm on oldest-message age before expiry?</li>
+<li>Who owns the DLQ, what alarm pages them, and where is the inspect, fix and redrive runbook?</li>
+<li>In Kafka, is the DLT publish acknowledged with <code>acks=all</code> before the offset commit? Are deserialization failures routed to the DLT?</li>
+<li>Is redrive rate-limited, canaried, and capped per message? Does the consumer re-validate current state on redriven events?</li>
+<li>Are consumers idempotent on the original message ID, so redrive cannot double-ship or double-charge?</li>
+<li>Where do personal data in dead letters live, for how long, and who can read them?</li>
+<li>Which failures are business outcomes that need their own flow, so they never reach the DLQ?</li>
+</ol>
+
+<h2 id=dd-dead-letter-queue-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Kafka doesn't have DLQs. How do you build one without losing messages?"</summary>
+<p>In the consumer. On a final failure, publish the record with its error headers to a dead-letter topic using <code>acks=all</code>, wait for the acknowledgement, then commit the offset. Commit only after the publish. A crash in between gives a duplicate in the DLT, never a loss. Turn off auto-commit, create the DLT with the topic, and route deserialization failures through a wrapping deserializer so they reach the handler too.</p>
+</details>
+<details>
+<summary>"Your consumer crashes on a message before it can do anything. Where does that message end up?"</summary>
+<p>It depends on who counts. SQS increments the receive count on each receive, so the message reaches the DLQ after <code>maxReceiveCount</code>, slowly, one visibility timeout per attempt. RabbitMQ quorum queues count deliveries and dead-letter it. A classic queue or a Kafka partition loops forever, because nothing counts. The fix there is an attempt counter stored outside the process and checked before processing.</p>
+</details>
+<details>
+<summary>"A ten-minute outage put 100,000 messages in the DLQ. How do you handle it, and how do you stop it happening again?"</summary>
+<p>First, group by fingerprint. The outage casualties share one error and one time window, and real poison stands out against them. Redrive the casualties after confirming the dependency is healthy, rate-limited to the consumer's spare capacity, perhaps 150 per second. Then fix the cause. The retry window was shorter than the outage. Add a circuit breaker around the downstream call so the consumer pauses during an outage, and possibly retry tiers so the window exceeds realistic outages.</p>
+</details>
+<details>
+<summary>"Events are ordered per customer, but customers are independent. Do you pause the whole partition?"</summary>
+<p>No, that stops thousands of unrelated customers for one bad event. I'd park the key. The failed customer's ID goes into a blocked set. Their later events are diverted to the DLQ in order, and every other customer keeps flowing. After the fix, redrive that customer's events as a sequence and unblock the key. It costs a lookup per message, which is cheap next to a stalled partition.</p>
+</details>
+<details>
+<summary>"Why not just retry the message forever with exponential backoff, capped at an hour?"</summary>
+<p>Because time does not fix deterministic failures. A malformed payload fails at attempt 1,000 as surely as at attempt 1. Infinite retry hides the bug and keeps a copy of it circulating forever. In an ordered consumer it also blocks everything behind it. Long retries are right for outages. A bounded attempt count and a DLQ are right for poison. Good designs use both: retry tiers for time-shaped failures, then the DLQ.</p>
+</details>
+<details>
+<summary>"You redrive a message from last week. What could go wrong even if the bug is fixed?"</summary>
+<p>The world moved on. The order might have been cancelled, the address updated, or the item discontinued. A consumer that trusts the old event acts on stale facts. Redriven events need the same defences as any late event: a version or sequence check, or a fetch of current state before acting. And the consumer must be idempotent on the original ID, in case part of the work ran before the failure.</p>
+</details>
+<details>
+<summary>"What metrics would you put on a DLQ dashboard?"</summary>
+<p>Inflow per minute by fingerprint, current depth, age of the oldest message against its retention, redrive count and redrive success rate, and messages that were dead-lettered more than once. Inflow catches new incidents even while depth is already nonzero. Oldest-message age catches neglect before retention deletes the evidence. A depth graph alone tells you that something is wrong, not what or since when.</p>
+</details>
+<details>
+<summary>"Should an LLM pipeline's 'model returned invalid JSON' go to the DLQ?"</summary>
+<p>Not on the first failure. Model output is non-deterministic, so a retry with the same input can succeed, unlike a malformed payload. I'd retry a couple of times, perhaps with a stricter prompt or a structured-output mode, and dead-letter after that with the prompt, the raw output and the model version in the envelope. Inputs that fail every time, like a corrupt PDF, are true poison and should go straight to the DLQ for human review.</p>
+</details>

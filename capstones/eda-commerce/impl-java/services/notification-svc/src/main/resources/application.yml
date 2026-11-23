@@ -1,0 +1,13 @@
+# notification-svc. Infrastructure variables (guide §7) are mapped by edacommon; only defaults and
+# service-specific settings live here.
+eda:
+  service-name: notification-svc
+  consumer:
+    topics: [order.events.v1, payment.events.v1, shipping.events.v1, returns.events.v1]
+  idempotency:
+    paths: [/ops/dlq/replay]
+server:
+  port: 8108
+notification:
+  contact-retention: 400d
+  retention-sweep-interval: 1h

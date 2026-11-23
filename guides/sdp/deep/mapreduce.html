@@ -1,0 +1,264 @@
+<h2 id=dd-mapreduce-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson describes MapReduce as two functions plus a framework. This section opens the framework. Most of what makes a batch job fast, slow, correct or quietly wrong happens in four places: how the input is split, what the map side does with its output, how the shuffle moves it, and how results are committed. The names below are Hadoop's, because Hadoop exposed every step as a setting. Spark and the warehouses do the same steps with different names.</p>
+
+<h3 id=dd-mapreduce-splits level=3>Splits, tasks and waves</h3>
+<p>The framework never sees "2 TB of orders". It sees a list of <strong>input splits</strong>. A split is a byte range of one file that one map task will read. By default a split is one storage block, and the HDFS block size has been 128 MB since Hadoop 2. On object storage there are no blocks, so the framework picks a split size, usually in the same range.</p>
+<p>Each split becomes one <strong>map task</strong>. The scheduler, which is the ApplicationMaster on YARN, places tasks on machines with free slots. It prefers a machine that holds a replica of the split, then one on the same rack, then anything. That preference is the "move compute to the data" property in practice. On cloud object storage every read crosses the network anyway, so locality means "same region", and the network is the bottleneck you size for.</p>
+<p>A cluster rarely has a slot for every task at once. With 8,000 tasks and 3,200 slots, tasks run in <strong>waves</strong>: about two and a half waves here. Waves matter for two reasons. The job's end time is set by the slowest task of the last wave. And a partial last wave wastes capacity, because most slots sit idle while a few tasks finish.</p>
+<p>Line-based formats need one more detail. A split boundary usually lands in the middle of a row. The convention is that each reader skips the partial first line (unless it starts at byte zero) and reads past its end to finish the last line. Every row is then read exactly once. Compressed files that cannot be split, such as a single large gzip file, become one task no matter how big they are. That is a common cause of one task running for an hour.</p>
+
+<h3 id=dd-mapreduce-map-side level=3>The map side: buffer, partition, sort, spill</h3>
+<p>A mapper does not send records over the network as it emits them. It writes them into an in-memory ring buffer, 100 MB by default (<code>mapreduce.task.io.sort.mb</code>). When the buffer is 80% full (<code>mapreduce.map.sort.spill.percent</code>), a background thread <strong>spills</strong> it to local disk. Each spill does three things in order:</p>
+<ol>
+<li><strong>Partition.</strong> Every record gets a reducer number, by default <code>hash(key) mod R</code>, where R is the number of reducers. This is the step that decides which reducer owns "electronics".</li>
+<li><strong>Sort.</strong> Records are sorted by partition, then by key within each partition.</li>
+<li><strong>Combine.</strong> If a combiner is set, it runs over each sorted run of equal keys before the bytes hit disk.</li>
+</ol>
+<p>When the map finishes, its spill files are merged into one sorted, partitioned file plus an index that says where each reducer's segment starts. The merge reads at most 10 files at a time (<code>mapreduce.task.io.sort.factor</code>), so a mapper that spilled 40 times pays for extra merge passes. The combiner may run again during this merge.</p>
+<p>That last point is a contract, not an accident. <strong>The framework may run the combiner zero, one or many times</strong> on any subset of a key's values. A combiner must therefore be associative and commutative, and its output type must match its input type. Summing passes. Averaging does not, which is the lesson's Q1. A combiner that counts how often it ran is wrong in a way no test will catch on small data.</p>
+<p>Map output goes to the local disk of the machine that ran the map, not to the distributed file system. This choice saves a replicated write for data that lives only minutes. It also means a machine that dies <em>after</em> its maps finished takes their output with it. The failure modes section comes back to this.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-mapreduce-svg-title dd-mapreduce-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-mapreduce-svg-title">The map side and the shuffle</title>
+<desc id="dd-mapreduce-svg-desc">A map task reads one input split and writes records into an in-memory buffer. When the buffer fills it spills to local disk: each spill is partitioned by hash of key, sorted, and combined. Spills are merged into one partitioned file. Each reducer fetches its own segment from every map task's file over the network, merges the sorted segments, and runs reduce, writing to a temporary directory that is committed at the end.</desc>
+<defs><marker id="dd-mapreduce-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="300" fill="#ffffff"/>
+<text x="20" y="26" font-size="13" font-weight="700" fill="#1c2430">Map task (one per split)</text>
+<text x="470" y="26" font-size="13" font-weight="700" fill="#1c2430">Reduce task (one per partition)</text>
+<rect x="20" y="44" width="100" height="50" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="70" y="66" font-size="13" fill="#1c2430" text-anchor="middle">Input split</text>
+<text x="70" y="84" font-size="11" fill="#5c6b7c" text-anchor="middle">~128 MB</text>
+<rect x="150" y="44" width="110" height="50" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="205" y="66" font-size="13" fill="#1c2430" text-anchor="middle">map() → buffer</text>
+<text x="205" y="84" font-size="11" fill="#5c6b7c" text-anchor="middle">100 MB ring</text>
+<rect x="150" y="124" width="110" height="74" rx="8" fill="#fbf3e4" stroke="#c4ae86"/>
+<text x="205" y="146" font-size="13" fill="#1c2430" text-anchor="middle">Spill at 80%</text>
+<text x="205" y="164" font-size="11" fill="#5c6b7c" text-anchor="middle">partition: hash mod R</text>
+<text x="205" y="179" font-size="11" fill="#5c6b7c" text-anchor="middle">sort by key</text>
+<text x="205" y="193" font-size="11" fill="#5c6b7c" text-anchor="middle">combine</text>
+<rect x="290" y="124" width="120" height="74" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="350" y="146" font-size="13" fill="#1c2430" text-anchor="middle">Merged file</text>
+<text x="350" y="164" font-size="11" fill="#5c6b7c" text-anchor="middle">local disk</text>
+<rect x="302" y="172" width="30" height="16" fill="#c8dcef" stroke="#7ea4c8"/><text x="317" y="184" font-size="10" fill="#1c2430" text-anchor="middle">p0</text>
+<rect x="335" y="172" width="30" height="16" fill="#c8dcef" stroke="#7ea4c8"/><text x="350" y="184" font-size="10" fill="#1c2430" text-anchor="middle">p1</text>
+<rect x="368" y="172" width="30" height="16" fill="#c8dcef" stroke="#7ea4c8"/><text x="383" y="184" font-size="10" fill="#1c2430" text-anchor="middle">p2</text>
+<line x1="120" y1="69" x2="146" y2="69" stroke="#1c2430" marker-end="url(#dd-mapreduce-arrow)"/>
+<line x1="205" y1="94" x2="205" y2="120" stroke="#1c2430" marker-end="url(#dd-mapreduce-arrow)"/>
+<line x1="260" y1="161" x2="286" y2="161" stroke="#1c2430" marker-end="url(#dd-mapreduce-arrow)"/>
+<rect x="470" y="124" width="110" height="74" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="525" y="146" font-size="13" fill="#1c2430" text-anchor="middle">Fetch + merge</text>
+<text x="525" y="164" font-size="11" fill="#5c6b7c" text-anchor="middle">segment p1 from</text>
+<text x="525" y="179" font-size="11" fill="#5c6b7c" text-anchor="middle">every map task</text>
+<rect x="610" y="124" width="95" height="74" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="657" y="152" font-size="13" fill="#1c2430" text-anchor="middle">reduce()</text>
+<text x="657" y="170" font-size="11" fill="#5c6b7c" text-anchor="middle">one key at a time</text>
+<line x1="410" y1="180" x2="466" y2="166" stroke="#1f5f99" stroke-width="2" marker-end="url(#dd-mapreduce-arrow)"/>
+<text x="438" y="214" font-size="11" fill="#1c2430" text-anchor="middle">shuffle: M × R fetches</text>
+<line x1="580" y1="161" x2="606" y2="161" stroke="#1c2430" marker-end="url(#dd-mapreduce-arrow)"/>
+<rect x="590" y="236" width="115" height="48" rx="8" fill="#f8ebee" stroke="#c898a4"/>
+<text x="647" y="256" font-size="12" fill="#1c2430" text-anchor="middle">attempt dir</text>
+<text x="647" y="273" font-size="11" fill="#5c6b7c" text-anchor="middle">commit on success</text>
+<line x1="657" y1="198" x2="657" y2="232" stroke="#1c2430" marker-end="url(#dd-mapreduce-arrow)"/>
+<text x="20" y="250" font-size="12" fill="#5c6b7c">The combiner may run 0, 1 or many times per key.</text>
+<text x="20" y="268" font-size="12" fill="#5c6b7c">Map output lives on the mapper's own disk: lose the machine, rerun its maps.</text>
+</svg>
+<figcaption>Partitioning happens on the map side, long before any reducer starts. That is why a hot key is decided by the hash, not by the reducer.</figcaption>
+</figure>
+
+<h3 id=dd-mapreduce-shuffle level=3>The shuffle, from the reducer's side</h3>
+<p>Each reducer owns one partition. It learns from the ApplicationMaster which maps have finished and fetches its segment from each one over HTTP, served by a shuffle handler that runs on every node. Five fetches run in parallel by default (<code>mapreduce.reduce.shuffle.parallelcopies</code>). Small segments are merged in memory; larger ones go to the reducer's disk and are merged there.</p>
+<p>The count of fetches is the hidden cost. With M map tasks and R reducers, the shuffle is <strong>M × R</strong> separate transfers. 8,000 maps and 400 reducers is 3.2 million fetches. With combiners, most of those segments are a few hundred bytes. The job is then bound by request overhead and disk seeks, not bandwidth. Too many reducers hurts in a way that never shows up as "bytes shuffled".</p>
+<p>Reducers start <em>copying</em> early: by default once 5% of maps have finished (<code>mapreduce.job.reduce.slowstart.completedmaps</code>). But <code>reduce()</code> itself cannot run until every map is done. The last map could still emit a value for any key. That barrier is the structural reason a batch job has a latency floor, and why the slowest map holds up the whole job.</p>
+<p>Inside the reducer, values arrive grouped and sorted by key. The framework hands <code>reduce()</code> an iterator, so a reducer that sums values streams through them in constant memory. A reducer that copies values into a list, to sort them or pick the top ten, holds the whole key in memory. That is fine for a normal key and fatal for a hot one.</p>
+
+<h3 id=dd-mapreduce-commit level=3>Committing output: why reruns are safe</h3>
+<p>The lesson says reruns are safe because tasks are pure. That is half the story. The other half is the <strong>output committer</strong>. Each task attempt writes into its own temporary directory, such as <code>_temporary/attempt_…_r_000042_1</code>. Only when the framework decides that attempt is the winner does it commit, by renaming the files into place. A losing speculative copy, or a failed attempt, is deleted. When the whole job succeeds, a <code>_SUCCESS</code> marker is written.</p>
+<p>So the guarantee is: <strong>one committed output per task, no matter how many attempts ran</strong>. That only holds for output that goes through the committer. If a map task writes rows to a database or calls an API as a side effect, every attempt does it. Speculative execution then doubles those writes, and a retry triples them.</p>
+<p>Object storage complicates the commit. On HDFS a rename is a cheap metadata operation. On S3 a "rename" is a copy and a delete, file by file, and is not atomic. A job that commits 10,000 files by renaming can take a long time at the end and can leave partial output if the driver dies mid-commit. This is why Hadoop added S3-specific committers (the S3A "magic" and staging committers), and why table formats such as Iceberg, Delta Lake and Hudi commit by atomically swapping a metadata pointer instead of moving files.</p>
+
+<h3 id=dd-mapreduce-recovery level=3>Who detects failure, and what reruns</h3>
+<ul>
+<li><strong>A map task fails</strong> (exception, out of memory, spot reclaim). It is retried, by default up to 4 attempts (<code>mapreduce.map.maxattempts</code>), preferably on another node. After that the job fails, unless the job allows a percentage of failed tasks.</li>
+<li><strong>A node is lost after its maps finished.</strong> The maps succeeded, but their output was on that node's disk. Reducers report fetch failures. Once enough reports arrive, the framework marks those maps as lost and reruns them. This is the most surprising rule in the system: <em>completed</em> work can be undone.</li>
+<li><strong>A reduce task fails.</strong> It reruns and fetches all its segments again. The map outputs are still there, so this is cheap unless the reducer was a hot key that took an hour.</li>
+<li><strong>The ApplicationMaster fails.</strong> YARN restarts it, and it can recover the state of completed tasks from its job history so the job does not start over. In the 2004 Google design the master was a single point of failure, and the paper simply aborted the job if it died.</li>
+<li><strong>A task is slow.</strong> Speculative execution launches a backup copy once the framework sees a task well behind its peers, near the end of a phase. The 2004 paper reported that a sort benchmark took 44% longer with backup tasks disabled.</li>
+</ul>
+
+<h3 id=dd-mapreduce-spark level=3>The same machinery in Spark</h3>
+<p>Spark keeps the structure and changes the plumbing. A job is a DAG of <strong>stages</strong>, and a stage boundary is exactly a shuffle: any operation that needs data grouped by key across partitions (<code>groupBy</code>, <code>join</code>, <code>repartition</code>). Within a stage, operations are pipelined in memory with no intermediate files. That is where the 10–100x speedup on multi-step jobs comes from.</p>
+<p>At a stage boundary, Spark does what Hadoop did. The upstream tasks write sorted, partitioned shuffle files to local disk, and downstream tasks fetch them. A lost shuffle file causes a <code>FetchFailedException</code> and a rerun of the parent stage's affected tasks, which is lineage recovery in practice. An external shuffle service keeps those files available when an executor exits, which matters for dynamic allocation.</p>
+<p>The knobs worth knowing:</p>
+<ul>
+<li><code>spark.sql.shuffle.partitions</code> is the R of Spark SQL. It defaults to 200, which is too many for small jobs and far too few for terabyte shuffles.</li>
+<li><strong>Adaptive query execution</strong> (on by default since Spark 3.2) measures shuffle output at runtime. It coalesces tiny partitions, splits skewed join partitions, and can switch a join to a broadcast join once it sees the real sizes.</li>
+<li><code>spark.sql.autoBroadcastJoinThreshold</code> (10 MB by default) decides when a small table is copied to every executor instead of shuffled. Broadcast joins skip the shuffle for the big side entirely.</li>
+<li><code>spark.speculation</code> is off by default. Turn it on only when your output path is safe against duplicate attempts.</li>
+</ul>
+<p>Spark SQL also builds the combiner for you. A <code>SUM … GROUP BY</code> plan shows a partial aggregate before the exchange and a final aggregate after it. Look for that pair in <code>EXPLAIN</code> output. If it is missing, as with some user-defined aggregates, your shuffle is moving raw rows.</p>
+
+<h3 id=dd-mapreduce-columnar level=3>The input format matters more than the cluster</h3>
+<p>The lesson's arithmetic assumes the job reads all 2 TB. A row format such as CSV or JSON forces that. A columnar format such as Parquet or ORC stores each column separately, compressed, with min/max statistics per row group. The revenue query needs two columns, <code>category</code> and <code>amount</code>. If orders have 20 columns of similar width, the job reads about a tenth of the bytes, and dictionary-encoded categories compress far below that.</p>
+<p>Two more effects follow. <strong>Column pruning</strong> skips columns the query never mentions. <strong>Predicate pushdown</strong> uses those statistics to skip row groups that cannot match a filter, such as <code>WHERE order_date &gt;= '2026-01-01'</code> on data sorted by date. Partitioning the files by date in the directory layout skips whole files. Together these often cut a scan by 10–100x. No amount of extra machines does that.</p>
+
+<h2 id=dd-mapreduce-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>All numbers here use the lesson's job: 5 billion order rows, 2 TB as stored, 200 machines. Assumptions are stated each time. Swap in your own.</p>
+
+<h3 id=dd-mapreduce-size-tasks level=3>How many tasks, and how big</h3>
+<p>Assume 256 MB splits. 2 TB / 256 MB ≈ <strong>8,000 map tasks</strong>. With 16 task slots per machine, the cluster runs 3,200 at once, so the map phase takes 2.5 waves.</p>
+<p>How long is one task? At 100 MB/s per task from object storage, 256 MB takes about 2.5 s to read. That is too short. Per-task overhead (scheduling, starting a JVM in Hadoop, opening the file) is roughly a second or more, so overhead would be a large share of the job. A common target is tasks that run from half a minute to a few minutes. Here that argues for larger splits, around 1–2 GB, which gives 1,000–2,000 tasks.</p>
+<p>The opposite limit is failure cost. When a task fails, the work lost averages half a task. A 2-minute task loses about a minute per failure. A 2-hour task loses an hour, and on spot instances that will happen. Choose task size between these two forces:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Split size<th>Map tasks<th>Read time per task<th>Waves on 3,200 slots<th>Main risk<tbody><tr><td>16 MB<td>125,000<td>0.16 s<td>39<td>Overhead dominates; scheduler load<tr><td>256 MB<td>8,000<td>2.5 s<td>2.5<td>Still overhead-heavy<tr><td>1 GB<td>2,000<td>10 s (plus CPU)<td>0.6<td>A good fit; one wave<tr><td>20 GB<td>100<td>200 s<td>0.03<td>Most slots idle; costly reruns</table></div></div>
+<p>Note the last row. With 100 tasks on 3,200 slots, 97% of the cluster has nothing to do. Too few tasks wastes a cluster just as surely as too many.</p>
+
+<h3 id=dd-mapreduce-size-shuffle level=3>Shuffle volume, with and without a combiner</h3>
+<p>Assume each emitted record is about 30 bytes after serialization: a category string plus an amount, plus framing.</p>
+<ul>
+<li><strong>Without a combiner:</strong> 5 × 10<sup>9</sup> records × 30 B = <strong>150 GB</strong> shuffled. Each of 200 machines sends and receives about 750 MB. The bytes are written to map-side disk, read back, sent, written to reducer disk and merged. Expect minutes, not seconds, and heavy disk I/O.</li>
+<li><strong>With a combiner:</strong> each of 2,000 tasks emits one record per category. With 50 categories, that is 2,000 × 50 × 30 B = <strong>3 MB</strong> in total. The shuffle disappears as a cost.</li>
+</ul>
+<p>The ratio is the number of input rows per distinct key per task. That ratio is huge for "revenue by category" and close to 1 for "revenue by order ID". A combiner helps only when keys repeat <em>within</em> a task. If they do not, it costs CPU and saves nothing.</p>
+
+<h3 id=dd-mapreduce-size-reducers level=3>How many reducers</h3>
+<p>Size reducers from the shuffle bytes, not the machine count. A workable target is 100 MB to 1 GB of input per reduce task. Spark's AQE defaults aim at about 64 MB per coalesced partition, which leans small.</p>
+<ul>
+<li>150 GB without a combiner, at 500 MB each: about <strong>300 reducers</strong>.</li>
+<li>3 MB with a combiner: <strong>one reducer is plenty</strong>. Using 400 would create 2,000 × 400 = 800,000 fetches of nearly empty segments.</li>
+</ul>
+<p>Output files follow reducers. 400 reducers writing into 30 date partitions can produce 12,000 small files, and the next job pays for them. Plan the output layout at the same time as R.</p>
+
+<h3 id=dd-mapreduce-size-skew level=3>Skew, in numbers</h3>
+<p>Take the lesson's Q3 case without a combiner: "electronics" is 40% of the 150 GB, so one reducer receives 60 GB. If a reducer merges and processes about 100 MB/s, that is 600 s of work, while the other 299 reducers finish in about 3 s each. The job's reduce phase is 600 s, set by one task.</p>
+<p>Salting splits the key into 16 sub-keys: 60 GB / 16 = 3.75 GB each, about 38 s. A second, tiny stage adds the 16 partial sums. The reduce phase drops from 600 s to about 40 s.</p>
+<p>Speculative execution does not help here. A backup copy of the hot reducer gets the same 60 GB and runs just as long. Speculation fixes slow machines, not heavy keys.</p>
+
+<h3 id=dd-mapreduce-size-failure level=3>Failure arithmetic</h3>
+<p>Assume each machine fails independently about once a month, which is roughly 1 in 720 per hour. For a 10-minute job on 200 machines, the expected number of failures is 200 × (10 / 60) / 720 ≈ <strong>0.05</strong>. Failure is rare at this scale. Run the same cluster for a 6-hour job and it is 200 × 6 / 720 ≈ <strong>1.7</strong> expected failures. Now failure is routine, and the framework's reruns are the difference between finishing and not.</p>
+<p>Spot instances change the inputs, not the method. If reclaims run at a few percent of machines per hour, a large cluster loses a machine every few minutes. The job still finishes, but only if tasks are short. Each reclaim costs about half a task's duration for every task that was running on that machine.</p>
+
+<h3 id=dd-mapreduce-size-cost level=3>Cost, and the single-machine comparison</h3>
+<p>200 machines for 10 minutes is about 33 machine-hours. At an assumed $0.50 per machine-hour, the run costs around $17, plus a few minutes of cluster startup on both ends.</p>
+<p>Now try one large machine. Suppose the 2 TB is Parquet, and the two needed columns are 5% of it: 100 GB. A machine with fast local NVMe or a high-bandwidth link to object storage might scan 2–3 GB/s. That is 35–50 seconds of I/O, and a vectorized engine (DuckDB, Polars, DataFusion) can usually aggregate two columns at that speed. The single machine plausibly wins on time <em>and</em> on cost.</p>
+<p>The cluster wins when the bytes you must actually read, after pruning, are many terabytes, or when the job needs a large shuffle that will not fit in one machine's memory and disk. Do the pruning arithmetic first. It decides more architecture reviews than any other number in this lesson.</p>
+
+<h2 id=dd-mapreduce-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-mapreduce-fm-null-key level=3>1. The join that stalls at 99%</h3>
+<p><strong>Symptom.</strong> A join of orders to customers reaches 199 of 200 tasks in four minutes. The last task runs for three hours, then fails out of memory. The input data looks healthy.</p>
+<p><strong>Mechanism.</strong> Guest checkouts have <code>customer_id = NULL</code>, and they are 25% of orders. In a shuffle join, every NULL hashes to the same partition. One reducer receives a quarter of all orders, and the join tries to match them all to each other's side. This is skew, but it hides well: nobody thinks of NULL as a hot key.</p>
+<p><strong>Detect.</strong> In the Spark UI, the stage's task-duration and shuffle-read distributions show one huge max next to a small median. In Hadoop, one reducer's "reduce input records" counter dwarfs the rest. Then run a quick <code>GROUP BY join_key ORDER BY count DESC LIMIT 10</code> on the input.</p>
+<p><strong>Fix.</strong> Filter NULL keys out before the join and union them back afterwards; they cannot match an inner join anyway. For real hot keys, salt them, or broadcast the small side. Spark's AQE skew-join handling splits oversized partitions automatically if it is on and the plan qualifies. Do not rely on that for keys that are a quarter of the data.</p>
+
+<h3 id=dd-mapreduce-fm-side-effects level=3>2. The job that charged twice</h3>
+<p><strong>Symptom.</strong> A nightly batch sends a "your loyalty points" email from inside a map task. Some customers get two emails, a few get three. The job reports success.</p>
+<p><strong>Mechanism.</strong> The email is a side effect, outside the output committer. Speculative execution launched backup copies of slow tasks, and a spot reclaim forced a few retries. Every attempt sent its emails. The framework's "rerun is safe" promise covers committed output only. Here the task was not pure, so the promise did not apply.</p>
+<p><strong>Detect.</strong> Count sends per customer per run in the email provider's logs. In the job history, look for tasks with more than one attempt (speculative or failed) and check whether those customers match.</p>
+<p><strong>Fix.</strong> Make the batch job produce a <em>file</em> of emails to send, committed like any other output. A separate sender then reads it and deduplicates on (customer, run ID) with an <a href="#idempotency">idempotency</a> key. As a rule, a batch job's only side effect should be its committed output.</p>
+
+<h3 id=dd-mapreduce-fm-nondeterminism level=3>3. Different answers on a rerun</h3>
+<p><strong>Symptom.</strong> A data-sampling job that keeps "a random 1% of users" produces a training set with some users duplicated and others missing. It happens only on runs where an executor was lost.</p>
+<p><strong>Mechanism.</strong> The task used an unseeded random number, or a round-robin <code>repartition()</code> whose output depends on the order rows arrive in. When an executor died, Spark recomputed its lost partitions from lineage. The recomputed tasks made different choices than the originals, but downstream tasks had already consumed some of the original output. The result mixes two inconsistent runs. Spark has had real bugs in this area with round-robin repartitioning, and later versions added safeguards; the lesson for your own code still stands.</p>
+<p><strong>Detect.</strong> Hard after the fact. Check that the job is deterministic: run it twice on the same input and diff the output, including a run where you kill an executor mid-stage. Look for <code>rand()</code>, <code>now()</code>, <code>uuid()</code>, or iteration over unordered collections in task code.</p>
+<p><strong>Fix.</strong> Derive randomness from the data: sample by <code>hash(user_id) mod 100 = 0</code>, which picks the same users every time. Pass the run's logical time in as a parameter instead of calling <code>now()</code>. Partition by a key, not round-robin, when the downstream result depends on placement.</p>
+
+<h3 id=dd-mapreduce-fm-lost-shuffle level=3>4. The cascade of fetch failures</h3>
+<p><strong>Symptom.</strong> A 40-minute job takes two hours. The logs fill with fetch failures, map stages rerun repeatedly, and the job sometimes fails at the very end with "too many fetch failures".</p>
+<p><strong>Mechanism.</strong> One node's local shuffle disk filled up, or the node kept losing its network. Its completed map outputs became unreadable, so reducers reported fetch failures, and the framework reran those maps elsewhere. If the reruns landed back on the bad node, or the node flapped, the cycle repeated. On autoscaled Spark clusters, a similar effect happens when executors are removed while they still hold shuffle files and no external shuffle service keeps them.</p>
+<p><strong>Detect.</strong> Fetch-failure counts per source host: one host at the top of the list is the tell. Node-level disk usage on the shuffle directories. Stage attempt numbers above 0 in the Spark UI.</p>
+<p><strong>Fix.</strong> Exclude bad nodes (Spark's exclude-on-failure settings, YARN node health checks with a disk-usage threshold). Give shuffle directories their own disks with headroom. Use an external or remote shuffle service with dynamic allocation. Most of all, reduce what you shuffle, since every byte shuffled is a byte at risk.</p>
+
+<h3 id=dd-mapreduce-fm-partial-input level=3>5. The report that was missing Tuesday's last hour</h3>
+<p><strong>Symptom.</strong> Monthly revenue is 0.4% below finance's number. Rerunning the job later gives the right answer.</p>
+<p><strong>Mechanism.</strong> The batch job started at 02:00 and listed the input directory. The upstream export that writes Tuesday's files was still running because it had been delayed. The job read the files that existed at listing time and finished cleanly. Batch frameworks process exactly what they are given. They have no idea that input was incomplete.</p>
+<p><strong>Detect.</strong> Row counts per input partition compared against the source system's own count. A data-quality check that compares today's totals with a trailing average and alerts on a gap.</p>
+<p><strong>Fix.</strong> Never start on a directory listing. Start on a completion signal: the upstream job's <code>_SUCCESS</code> marker, an orchestrator dependency (an Airflow sensor, a dbt source freshness check), or a table snapshot ID from Iceberg or Delta that pins exactly which files belong to the input. Record the snapshot ID with the output, so the result is reproducible.</p>
+
+<h3 id=dd-mapreduce-fm-small-files level=3>6. The job that is slower on a bigger cluster</h3>
+<p><strong>Symptom.</strong> A job over one day of click logs takes 25 minutes. Doubling the cluster makes no difference. The driver or ApplicationMaster sits at 100% CPU while executors are mostly idle.</p>
+<p><strong>Mechanism.</strong> The upstream streaming writer flushed a file every few seconds per partition, so one day is 1.5 million files of about 1 MB each. Each file becomes at least one task. Listing them takes minutes on object storage, and scheduling 1.5 million tasks takes longer than processing them. On HDFS, the NameNode holds metadata for every file in memory, so small files also strain the cluster for everyone.</p>
+<p><strong>Detect.</strong> Average input file size (total bytes divided by file count). Task count far above "data size / 1 GB". Long gaps before the first task starts, which is listing and planning time.</p>
+<p><strong>Fix.</strong> Compact upstream: a scheduled job that rewrites small files into 256 MB–1 GB files. Table formats such as Iceberg and Delta have built-in compaction operations. Readers can also combine many small files into one split (Spark does this with <code>spark.sql.files.maxPartitionBytes</code> and its file-open cost estimate). And limit the files the writer produces in the first place.</p>
+
+<h3 id=dd-mapreduce-fm-reducer-oom level=3>7. The reducer that dies on one customer</h3>
+<p><strong>Symptom.</strong> A "build each customer's full order history" job fails every night with an out-of-memory error, always in the same reduce task, after hours of garbage-collection pauses.</p>
+<p><strong>Mechanism.</strong> The reducer collects each customer's orders into a list so it can sort them by date. One customer is a reseller account with 30 million orders. The reducer holds all 30 million in memory. Streaming reducers are safe at any key size. Collecting reducers are safe only up to the largest key you will ever see.</p>
+<p><strong>Detect.</strong> GC time as a share of task time, visible in the Spark UI and in Hadoop task counters. The max-records-per-key from a quick count query.</p>
+<p><strong>Fix.</strong> Push the sort into the shuffle instead of the reducer. Hadoop's <strong>secondary sort</strong> uses a composite key (customer, date) with a partitioner and grouping comparator on customer only, so values arrive already sorted. In Spark, a window function or <code>repartition</code> plus <code>sortWithinPartitions</code> does the same. Cap or special-case the outlier keys if the output per key must be bounded.</p>
+
+<h2 id=dd-mapreduce-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-mapreduce-choose-engine level=3>Choosing the engine</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th>Single machine (DuckDB, Polars)<th>Warehouse SQL (BigQuery, Snowflake, Redshift)<th>Spark / Databricks<th>Hadoop MapReduce<th>Beam / Dataflow (batch)<tbody><tr><td>Sweet spot<td>Up to a few TB after pruning<td>Analytics on managed tables<td>Large ETL, ML data prep, custom code<td>Legacy jobs<td>One pipeline for batch and stream<tr><td>Startup cost<td>None<td>Seconds<td>Tens of seconds to minutes<td>Minutes<td>Minutes<tr><td>Shuffle<td>In memory, spills to disk<td>Managed, invisible<td>Sort-based, local disk or remote service<td>Sort-based, local disk<td>Managed by the runner<tr><td>Custom code<td>SQL, Python<td>SQL, limited UDFs<td>SQL, Python, Scala, Java<td>Java<td>Java, Python, Go<tr><td>Fault tolerance<td>Rerun the query<td>Managed<td>Lineage and stage retry<td>Task retry<td>Managed by the runner<tr><td>Operations<td>None<td>None (pay per query or slot)<td>Clusters or a managed platform<td>Clusters<td>Managed service</table></div></div>
+<p>Start at the left and move right only when the numbers force you. If the question is SQL over tables the company already has, a warehouse is the default. Reach for Spark when you need code that SQL cannot express well, such as tokenizing documents or calling a model per row, or when the warehouse bill for a heavy recurring job exceeds a cluster's cost. New Hadoop MapReduce code is hard to justify today.</p>
+
+<h3 id=dd-mapreduce-choose-join level=3>Choosing the join strategy</h3>
+<p>Joins are where batch jobs spend most of their shuffle budget. The engine usually picks, but you should know what it picked and why.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Strategy<th>How it works<th>Shuffle<th>Use when<th>Breaks when<tbody><tr><td>Broadcast hash join<td>Copy the small table to every task; stream the big one past it<td>None for the big side<td>One side fits comfortably in memory (MBs to low GBs)<td>The "small" side grows; executors run out of memory<tr><td>Sort-merge join<td>Shuffle both sides by key, sort, merge<td>Both sides<td>Both sides are large; the general default<td>A hot key lands on one task<tr><td>Shuffle hash join<td>Shuffle both, build a hash table per partition from the smaller side<td>Both sides<td>One side is much smaller per partition<td>A partition's build side exceeds memory<tr><td>Bucketed join<td>Both tables pre-written in the same buckets by key<td>None at query time<td>The same large join runs every day<td>Bucket counts differ or a writer ignores bucketing<tr><td>Salted join<td>Split hot keys into N sub-keys; replicate the other side N times for those keys<td>Both, slightly more<td>A few known keys dominate<td>Too many hot keys to list</table></div></div>
+
+<h3 id=dd-mapreduce-choose-partitioner level=3>Hash or range partitioning</h3>
+<p><strong>Hash partitioning</strong> is the default. It spreads keys evenly and needs no knowledge of the data. Its output is sorted only within each partition.</p>
+<p><strong>Range partitioning</strong> assigns key ranges to reducers, so the concatenated output is globally sorted. The framework must first <em>sample</em> the input to choose boundaries that give each reducer a similar amount of data. Hadoop's TeraSort benchmark works this way, and so does Spark's <code>orderBy</code>. Use it when the output must be globally ordered, such as files sorted by date for fast range reads later. Watch the sample: if it misses a hot range, one reducer gets far more than its share.</p>
+
+<h3 id=dd-mapreduce-choose-incremental level=3>Full recompute or incremental</h3>
+<p>The lesson's job recomputes "all time" from scratch every run. That is simple, and it self-heals, because yesterday's bug disappears on today's run. But the cost grows with history: ten years of data scanned every night to add one day.</p>
+<p>The alternative is <strong>incremental</strong> batch: compute today's partial sums, then merge them into a stored running total. It is cheap, but it no longer self-heals. A bad day is baked in until someone runs a backfill for that date. Late-arriving rows for past days also need a rule: either reprocess the last N days every run, or track which past partitions changed.</p>
+<p>A sound middle ground is to partition the output by day, recompute only the days whose input changed, and keep a tested full-rebuild path. That rebuild path is the batch layer of <a href="#lambda-and-kappa">Lambda</a>, so it pays to keep it working.</p>
+
+<h2 id=dd-mapreduce-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>How many bytes must the job read after column pruning and partition filters? Has someone checked whether one machine can do it?</li>
+<li>Is the input a columnar format, partitioned by the field most queries filter on? What is the average file size?</li>
+<li>What starts the job: a completion marker, an orchestrator dependency, or a table snapshot? Or a clock and a directory listing?</li>
+<li>Where is the combiner or partial aggregation? Does <code>EXPLAIN</code> show a partial aggregate before every exchange?</li>
+<li>What are the ten largest keys for every group-by and join, including NULL? What happens to the task that gets the largest?</li>
+<li>How were the reducer count and output file count chosen? What file sizes will the next job read?</li>
+<li>Is every task deterministic? Is there any <code>rand()</code>, <code>now()</code>, or external call whose result can differ on a rerun?</li>
+<li>Does any task have a side effect outside the committed output: database writes, emails, API calls? If so, how are duplicate attempts handled?</li>
+<li>How is output committed on this storage? Can a reader ever see half of a run's output?</li>
+<li>How long is the longest task, and what does one failure of it cost? Is the job on spot capacity, and does the task size suit that?</li>
+<li>How is a past day reprocessed after a bug fix: is there a tested backfill command, and does it overwrite cleanly?</li>
+<li>Which data-quality checks run on the output before anyone reads it: row counts, totals compared to a trailing average, NULL rates?</li>
+</ol>
+
+<h2 id=dd-mapreduce-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Why is map output written to local disk instead of the distributed file system? What does that cost you?"</summary>
+<p>Map output is temporary. It lives only until the reducers have fetched it. Writing it to HDFS would replicate it, usually three times, for data that is deleted minutes later. Local disk is much cheaper. The cost is that the output now dies with its machine. If a node is lost after its maps finished, reducers get fetch failures and those completed maps must rerun. So completed work is not durable until the stage that consumes it has finished. Spark makes the same trade with its shuffle files, and remote shuffle services exist to buy back durability when executors come and go.</p>
+</details>
+
+<details>
+<summary>"You enabled speculative execution and the job's output now has duplicate rows. How is that possible if the framework only commits one attempt?"</summary>
+<p>Only output that goes through the committer is protected. Three things break it. First, a task that writes directly to an external system such as a database or a queue; each attempt writes. Second, a committer that is not safe on the storage, such as rename-based commits on object storage, where a slow cleanup or a partial rename can leave a losing attempt's files in place. Third, a custom output format that writes to the final location instead of the attempt directory. The fix is to route everything through a committer that is correct for that storage, or a table format with atomic commits, and to keep tasks free of external side effects.</p>
+</details>
+
+<details>
+<summary>"A combiner made the job wrong. Give an example and the rule it broke."</summary>
+<p>A combiner that computes an average, or one that emits <code>count + 1</code> to record that it ran. The framework may call the combiner zero, one or many times on any subset of a key's values, so the function must be associative and commutative, with the same input and output type. Sums, counts, min and max qualify. Averages qualify only if you carry (sum, count) and divide at the very end. Distinct counts qualify only through mergeable sketches such as HyperLogLog, which trade exactness for that property.</p>
+</details>
+
+<details>
+<summary>"Your job's reduce phase has one task running 40x longer than the median. Walk me through the diagnosis."</summary>
+<p>First, is it the machine or the data? Compare that task's input bytes and records with the median. If the input is similar, it is a slow node: check its disk and GC, and speculation will usually fix it. If the input is much larger, it is skew. Find the key with a count by key. NULL and default values such as 0 or "unknown" are common culprits. Then choose a fix by cause: filter keys that cannot match, broadcast the small side of a join, add or check the combiner, or salt the hot key and merge in a second stage. Speculation does nothing for skew, because the backup gets the same data.</p>
+</details>
+
+<details>
+<summary>"Why can't reduce() start until every map has finished, and what does that imply for latency?"</summary>
+<p>Any map task can still emit a value for any key, so no key's final value is known until the last map is done. Reducers can fetch and merge early, but they cannot call <code>reduce()</code>. That barrier means the job's time is the sum of its phases' slowest tasks, plus scheduling. It is the structural reason batch has a latency floor. Streaming removes the barrier by giving up on "final" in the absolute sense: windows plus watermarks decide when a partial answer is good enough to emit. That is the jump to <a href="#stream-processing">Stream Processing</a>.</p>
+</details>
+
+<details>
+<summary>"The 2 TB job takes 10 minutes on 200 machines. Someone proposes DuckDB on one large box. How do you decide?"</summary>
+<p>Compute the bytes the query actually reads. If the data is Parquet and the query touches two of twenty columns, the scan may be 100 GB or less. One machine with fast NVMe or a fast network link can read that in under a minute, and vectorized engines aggregate at that speed. Then check the shuffle: a group-by with few keys has almost none, but a large join may need more memory and disk than one box has. Also weigh what the cluster gives you that the box does not, such as concurrent jobs, shared scheduling, and tolerance of one node failing. For a single recurring aggregation, the single box often wins on both time and cost.</p>
+</details>
+
+<details>
+<summary>"How would you make a nightly all-time aggregation cheaper without losing its ability to self-heal?"</summary>
+<p>Partition the output by day. Each night, recompute only the days whose input changed: today, plus the last few days that can still receive late rows. Merge those into the stored totals. Keep a tested full-rebuild command and run it on a schedule, perhaps weekly, and after any logic change. The incremental run is cheap. The periodic full rebuild is what limits the lifetime of any incremental bug. That is the Lambda overwrite idea applied inside a single batch system.</p>
+</details>
+
+<details>
+<summary>"In Spark, an executor dies in the middle of the last stage. What exactly gets recomputed?"</summary>
+<p>The tasks that were running on that executor rerun. If the executor also held shuffle files from an earlier stage, and no external shuffle service serves them, downstream tasks hit fetch failures. Spark then marks those map outputs as lost and reruns the parent stage's tasks that produced them, and only those. Lineage tells Spark exactly which partitions to rebuild. If the parent was cached data that is also gone, Spark walks further back. The recompute is correct only if those tasks are deterministic, which is why nondeterministic partitioning is dangerous.</p>
+</details>

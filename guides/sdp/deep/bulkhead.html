@@ -1,0 +1,236 @@
+<h2 id=dd-bulkhead-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson names three kinds of wall: counters, separate pools, and physical separation. In a design review you need one level lower. What state does each wall keep? When does a slot get taken and given back? And what does the wall actually protect, as opposed to what people assume it protects? This section walks through the walls you will meet in real systems, from a few lines of code up to the platform.</p>
+
+<h3 id=dd-bulkhead-semaphore level=3>The semaphore bulkhead: one counter, two operations</h3>
+<p>A semaphore bulkhead is an integer and a rule. Before the protected call, try to take a permit. If one is free, run the call on the <em>caller's own thread</em>. When the call ends, by success, exception or cancellation, give the permit back. If no permit is free, either reject at once or wait a bounded time for one.</p>
+<p>Resilience4j's <code>SemaphoreBulkhead</code> exposes exactly these two knobs: <code>maxConcurrentCalls</code> (the permit count) and <code>maxWaitDuration</code> (how long a caller may wait for a permit; the default is zero, so it rejects immediately). Go code does the same with a buffered channel or <code>golang.org/x/sync/semaphore</code>. Python's <code>asyncio.Semaphore</code> and <code>threading.BoundedSemaphore</code> are the same idea.</p>
+<p>Two facts about the semaphore matter more than its simplicity:</p>
+<ul>
+<li><strong>It limits concurrency, not time.</strong> The call runs on the caller's thread, so a hung call holds both the permit and the caller's thread. The bulkhead caps how many threads can be stuck in order history at 40, but those 40 stay stuck until something else ends the call. That something is the <a href="#timeout">timeout</a> on the client. A semaphore bulkhead without a timeout is a wall that fills and never drains.</li>
+<li><strong>Release must be unconditional.</strong> Every code path that took a permit must give it back, including cancellation and the path where the response body is streamed after the call "returns". A missing <code>finally</code> leaks one permit per bad path. The compartment shrinks quietly over days. Failure mode 1 below is this bug.</li>
+</ul>
+<p>Here is the core in Python. It also adds the lesson's reserve, so a full compartment can borrow a slot from a shared pool before it rejects:</p>
+<pre><code>import threading
+
+class Bulkhead:
+    """Guaranteed slots per compartment, plus a capped share of a common reserve."""
+    def __init__(self, guaranteed, reserve, max_borrow):
+        self.own = {name: threading.BoundedSemaphore(n) for name, n in guaranteed.items()}
+        self.reserve = threading.BoundedSemaphore(reserve)
+        self.max_borrow = max_borrow           # per compartment
+        self.borrowed = {name: 0 for name in guaranteed}
+        self.lock = threading.Lock()
+
+    def acquire(self, name):
+        if self.own[name].acquire(blocking=False):
+            return "own"
+        with self.lock:
+            if self.borrowed[name] &gt;= self.max_borrow[name]:
+                return None                    # wall holds: reject fast
+            if not self.reserve.acquire(blocking=False):
+                return None
+            self.borrowed[name] += 1
+            return "reserve"
+
+    def release(self, name, slot):
+        if slot == "own":
+            self.own[name].release()
+        else:
+            with self.lock:
+                self.borrowed[name] -= 1
+            self.reserve.release()
+
+# usage: always release in finally, even on cancellation
+# slot = bh.acquire("order_history")
+# if slot is None: return busy_response()
+# try: return query_order_history()
+# finally: bh.release("order_history", slot)</code></pre>
+<p>The <code>max_borrow</code> cap is the important line. Without it the reserve is just a smaller shared pool, and order history takes all 20 reserve slots on the first spike. With it, say a cap of 10, one feature can borrow some headroom but never all of it. Kubernetes uses the same shape: a pod's <em>request</em> is guaranteed, and its <em>limit</em> is how far above that it may burst.</p>
+
+<h3 id=dd-bulkhead-threadpool level=3>The thread-pool bulkhead: a queue, a pool, and a handoff</h3>
+<p>A thread-pool bulkhead hands the call to a dedicated pool and waits for the result. The state is richer: a set of worker threads, a work queue in front of them, and a rejection policy for when both are full. Hystrix made this famous. Its defaults per dependency were a core size of 10 threads and no real queue (<code>maxQueueSize = -1</code> means a direct handoff, so the 11th concurrent call is rejected). Resilience4j's <code>ThreadPoolBulkhead</code> has <code>coreThreadPoolSize</code>, <code>maxThreadPoolSize</code> and <code>queueCapacity</code>, and its default queue capacity is 100.</p>
+<p>That queue deserves suspicion. A queue of 100 in front of 10 threads doing 500 ms calls means the last item waits 100 / 10 x 0.5 s = 5 seconds before it even starts. If the caller's own deadline is 2 seconds, those queued items are already dead. They will still run, and they still cost the dependency a query. Size the queue from the deadline: queue length at most (deadline − call time) x throughput, which is often close to zero.</p>
+<p>What the thread pool buys over a semaphore is that the <em>caller</em> can stop waiting. The caller thread can return a fallback at its deadline while the worker is still blocked. That is real protection for the caller's pool. But look at what happens to the worker. It is still blocked on the socket. Hystrix tried to interrupt it on timeout, and blocking I/O often ignores interrupts. So the compartment's threads still fill with abandoned calls. The difference is that they fill <em>its</em> threads, not the request threads. That is exactly the point of the wall. It is also why the client needs its own socket timeouts underneath.</p>
+<p>The costs are concrete. Every call pays a thread handoff and a context switch, usually microseconds, which matters only on very hot paths. Thread-local state does not follow the call: trace context, security context, MDC log fields and transaction scope all have to be copied across explicitly, or the trace breaks at the bulkhead. And each platform thread reserves a stack (on 64-bit Linux the JVM default is 1 MB of virtual address space, committed as it is touched), so 50 dependencies with 20 threads each is 1,000 extra threads to schedule.</p>
+
+<h3 id=dd-bulkhead-runtimes level=3>What changes in async runtimes and with virtual threads</h3>
+<p>In Node.js, Python asyncio or a Netty service, a thread is not the scarce resource. A slow call does not hold a thread; it holds a pending promise, a socket and some buffered memory. You can have 50,000 of those. So the "200 threads" in the lesson become something else: open sockets to the database, a client connection pool, memory for buffered responses, or downstream capacity. The bulkhead becomes a concurrency limit on in-flight operations per feature. That is the semaphore, applied to whatever is actually scarce.</p>
+<p>Two traps follow. First, an event loop is itself a shared resource that no in-process bulkhead can split. One CPU-heavy request (a big JSON parse, a regex with catastrophic backtracking) stalls every request on that loop, whatever compartment it belongs to. The only wall against that is a separate process. Second, Java's virtual threads make thread pools cheap enough that teams delete the thread-pool bulkheads. That is fine. But the scarce thing was never the thread. It was the 100 database connections. If you remove the thread limit without adding a semaphore on the connection, order history can now open 1,500 concurrent waits on the connection pool instead of 200.</p>
+
+<h3 id=dd-bulkhead-connection-pools level=3>Connection-pool bulkheads, and why per-pod limits do not add up</h3>
+<p>The cheapest high-value bulkhead in most services is splitting the database connection pool. With HikariCP you create two <code>DataSource</code>s: one with <code>maximumPoolSize=30</code> for checkout, one with <code>maximumPoolSize=15</code> for order history. One knob there needs changing straight away. <code>connectionTimeout</code>, the time a caller waits for a free connection, defaults to 30 seconds. A bulkhead that makes callers queue for 30 seconds is not failing fast. Set it to tens or a few hundred milliseconds for interactive pools.</p>
+<p>Now multiply. Those numbers are <em>per process</em>. Ten pods with 30 + 15 + 20 connections each is 650 connections, and Postgres defaults <code>max_connections</code> to 100. Worse, the order-history cap that protected the database is now 10 x 15 = 150 concurrent expensive queries. If the autoscaler adds pods during the spike (because order history's rejections raised CPU or latency), the cap grows with it: 30 pods means 450. A per-pod wall is not a wall on the shared resource.</p>
+<p>The fix is a second wall at the shared resource, enforced by the resource or by a proxy in front of it:</p>
+<ul>
+<li><strong>PgBouncer</strong> keeps a server-side pool per (database, user) pair. Give each workload its own database user, and set <code>pool_size</code> per user (the global default is <code>default_pool_size = 20</code>). <code>reserve_pool_size</code> and <code>reserve_pool_timeout</code> give a small burst pool. In transaction pooling mode, many client connections share few server connections, so the per-pod limits no longer multiply into Postgres backends.</li>
+<li><strong>Postgres itself</strong> can cap a role with <code>ALTER ROLE order_history CONNECTION LIMIT 40</code> and bound each query with a role-level <code>statement_timeout</code>. That second one is a timeout on the slot, which the lesson's Related Patterns says every bulkhead needs.</li>
+</ul>
+
+<h3 id=dd-bulkhead-proxy level=3>Proxy and platform walls</h3>
+<p>Envoy enforces bulkheads per upstream cluster, outside your code, through its <code>circuit_breakers</code> block. Despite the name, these are concurrency limits, not failure-rate breakers:</p>
+<pre><code>clusters:
+- name: order_history_db_api
+  circuit_breakers:
+    thresholds:
+    - priority: DEFAULT
+      max_connections: 64        # TCP connections to this upstream
+      max_pending_requests: 16   # waiting for a connection (the queue)
+      max_requests: 40           # concurrent requests (the compartment)
+      max_retries: 3             # concurrent retries in flight (a retry bulkhead)
+    - priority: HIGH
+      max_requests: 80           # separate limits for high-priority routes</code></pre>
+<p>The defaults are 1024 for the first three and 3 for retries. 1024 is high enough that you should assume "not configured" means "no wall". Overflows show up as counters such as <code>upstream_rq_pending_overflow</code> and <code>upstream_rq_retry_overflow</code>, which give you the per-compartment rejection metric for free. The <code>max_retries</code> threshold is easy to overlook and quietly valuable. It is a bulkhead on retries, which stops a retry storm from eating the whole compartment.</p>
+<p>Kubernetes provides the heaviest walls. Container CPU <code>limits</code> are enforced by the kernel's CFS quota: the container gets a fixed slice of CPU time per period (100 ms by default) and is throttled when it uses it up. Memory limits are enforced by the OOM killer. A <code>ResourceQuota</code> caps a namespace. Separate node pools with taints keep batch jobs off the machines that serve checkout. These are the only walls that isolate CPU, memory, kernel resources and crashes. They are also the coarsest, and they are slow to resize.</p>
+
+<figure>
+<svg role="img" aria-labelledby="dd-bulkhead-svg-title dd-bulkhead-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-bulkhead-svg-title">Bulkhead walls at three layers on one request path</title>
+<desc id="dd-bulkhead-svg-desc">A request enters a pod. In the pod, a semaphore per feature limits concurrent calls: checkout 80, search 60, order history 40, with a reserve of 20 that each feature may borrow up to 10 from. Below that, per-pod connection pools feed a shared PgBouncer, which enforces a global per-user pool size in front of Postgres. Per-pod limits multiply with the number of pods; only the PgBouncer limit is global.</desc>
+<rect x="10" y="10" width="460" height="170" rx="8" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="20" y="30" style="fill:var(--muted,#5c6b7c)">One pod (x N pods: these limits multiply)</text>
+<rect x="20" y="42" width="140" height="50" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="90" y="63" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">checkout: 80</text>
+<text x="90" y="81" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">semaphore</text>
+<rect x="170" y="42" width="120" height="50" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="230" y="63" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">search: 60</text>
+<text x="230" y="81" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">semaphore</text>
+<rect x="300" y="42" width="160" height="50" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="380" y="63" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">order history: 40</text>
+<text x="380" y="81" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">full: rejects in &lt;1 ms</text>
+<rect x="20" y="102" width="440" height="26" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8);stroke-dasharray:4 3"/>
+<text x="240" y="120" text-anchor="middle" style="fill:var(--ink,#1c2430)">shared reserve: 20 slots, at most 10 borrowed per feature</text>
+<rect x="20" y="138" width="440" height="32" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="240" y="159" text-anchor="middle" style="fill:var(--ink,#1c2430)">per-pod DB pools: checkout 30 / search 20 / order history 15</text>
+<path d="M240 180 V215" style="stroke:var(--ink,#1c2430);fill:none"/>
+<rect x="110" y="215" width="260" height="34" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="240" y="237" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">PgBouncer: pool_size per DB user</text>
+<path d="M240 249 V268" style="stroke:var(--ink,#1c2430);fill:none"/>
+<rect x="160" y="268" width="160" height="26" rx="6" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="240" y="286" text-anchor="middle" style="fill:var(--ink,#1c2430)">Postgres</text>
+<rect x="490" y="42" width="220" height="128" rx="8" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="600" y="64" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Why two layers</text>
+<text x="500" y="88" style="fill:var(--muted,#5c6b7c)">10 pods x 15 = 150 OH queries</text>
+<text x="500" y="108" style="fill:var(--muted,#5c6b7c)">30 pods x 15 = 450 OH queries</text>
+<text x="500" y="132" style="fill:var(--ink,#1c2430)">Only the PgBouncer limit</text>
+<text x="500" y="150" style="fill:var(--ink,#1c2430)">stays fixed as pods scale.</text>
+<rect x="490" y="215" width="220" height="34" rx="6" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="600" y="237" text-anchor="middle" style="fill:var(--ink,#1c2430)">order_history: pool_size = 40</text>
+<path d="M370 232 H490" style="stroke:var(--muted,#5c6b7c);fill:none;stroke-dasharray:4 3"/>
+</svg>
+</figure>
+
+<h2 id=dd-bulkhead-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The lesson sizes each compartment with rate x duration plus headroom. That formula gives the <em>average</em> number of requests in flight. The interesting question in a review is how much headroom, and the answer comes from how much the in-flight count wanders around its average.</p>
+
+<h3 id=dd-bulkhead-sizing-variance level=3>Headroom is a square root, not a constant</h3>
+<p>When requests arrive independently, the number in flight at any instant is roughly Poisson distributed, with mean L = rate x duration. A Poisson count has a standard deviation of √L. So a compartment of exactly L slots is full about half the time, and a sensible size is L + 3√L, which covers all but roughly the busiest tenth of a percent of moments.</p>
+<p>Redo checkout with this. L = 300 x 0.25 = 75 and √75 ≈ 8.7. The lesson's 80 slots is only about 0.6 standard deviations above the mean. Checkout would hit its wall in a meaningful fraction of seconds even on a normal day, roughly a quarter of instants by the Poisson tail. A size of 75 + 3 x 8.7 ≈ 101 puts rejections on a normal day near zero. That is close to the 100 that the <a href="#e-hardening-a-payment-flow">payment capstone</a> chose for checkout.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Compartment<th>Rate x duration (mean in flight)<th>√L<th>Size at L + 3√L<th>Headroom as % of mean<tbody>
+<tr><td>Checkout<td>300/s x 0.25 s = 75<td>8.7<td>101<td>35%
+<tr><td>Search<td>200/s x 0.1 s = 20<td>4.5<td>34<td>68%
+<tr><td>Order history (normal day)<td>50/s x 0.5 s = 25<td>5<td>40<td>60%
+<tr><td>A tiny compartment<td>10/s x 0.4 s = 4<td>2<td>10<td>150%
+</tbody></table></div></div>
+<p>The last column explains the lesson's warning about tiny pools. Small compartments need proportionally far more headroom, because randomness is large relative to the mean. A pool of 5 for a mean of 4 is full more than 20% of the time on a perfectly ordinary day.</p>
+
+<h3 id=dd-bulkhead-sizing-tax level=3>The isolation tax, in threads</h3>
+<p>The same square root prices isolation. Suppose four features each average 25 in flight. Walled separately, each needs 25 + 3 x 5 = 40, so 160 slots. Pooled, the total averages 100 and needs 100 + 3 x 10 = 130. The walls cost 30 slots, about 23% more capacity for the same rejection rate. That is the "idle capacity you cannot lend" from the lesson, as a number you can put in a review. The tax shrinks as compartments get larger and grows as they get smaller. That is the quantitative case against over-partitioning.</p>
+<p>The reserve-with-borrowing design above recovers part of the tax. Each feature gets a guaranteed share near its mean plus a bit, and the bursts draw on a common reserve that is sized for the <em>combined</em> variance, which is smaller.</p>
+
+<h3 id=dd-bulkhead-sizing-latency level=3>Size for slow days, and let the timeout cap the worst case</h3>
+<p>Rate x duration has two inputs, and duration is the one that moves. If checkout's database slows from 250 ms to 600 ms, in-flight checkout requests go from 75 to 180 at the same traffic. A compartment of 100 then rejects 44% of checkouts. That is the bulkhead doing its job, but against the feature you meant to protect.</p>
+<p>Two numbers frame the decision. The <strong>normal size</strong> is L + 3√L at healthy latency. The <strong>ceiling</strong> is rate x timeout, the most a compartment can ever hold, because the timeout ends every call. Checkout at 300/s with a 1 s timeout can never exceed 300. Somewhere between the two is the size you pick. Critical compartments lean toward the ceiling. Low-priority ones sit at the normal size and reject early when latency rises.</p>
+
+<h3 id=dd-bulkhead-sizing-db level=3>Working back from the shared resource</h3>
+<p>Size from the bottom up as well as top down. Start from what the shared resource can take, then divide it. If Postgres stays healthy up to about 80 concurrent active queries on this hardware, and checkout needs 30 of them at peak, then every other workload together gets 50, globally, whatever the pod count. Per pod, divide by the maximum pod count the autoscaler can reach, not the current count. Say order history's global share is 15 of those 50. With a maximum of 20 pods, its per-pod connection pool is 15 / 20, rounded up to 1. That is absurd, and the absurdity is the lesson. Large fleets cannot enforce shared-resource walls per pod. They need the pooler or a global limiter.</p>
+
+<h3 id=dd-bulkhead-sizing-cost level=3>What the walls cost in money</h3>
+<p>Put a price on the idle capacity so the "merge the pools" debate from Check Yourself has numbers. Suppose each pod runs 200 request threads and the isolation tax is 23%. At 10 pods, that is roughly 2.3 pods of capacity held back. At, say, $150 per pod-month, the walls cost about $350 a month. One hour of checkout outage on a store doing $40,000 an hour costs more than nine years of that tax. That ratio is why critical paths get walls even though most of the time the walls are idle.</p>
+
+<h2 id=dd-bulkhead-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-bulkhead-fm-leak level=3>1. The compartment shrinks by itself</h3>
+<p><strong>Symptom:</strong> weeks after a deploy, order history starts rejecting at a traffic level it used to handle. A restart fixes it for a few days. <strong>Mechanism:</strong> a permit leak. One code path takes a permit and never releases it: a cancelled request, an exception thrown after acquire but before the <code>try</code>, or a streamed response whose body the client abandons. Each occurrence removes one slot for good, until the process restarts. <strong>Detect:</strong> plot available permits at quiet hours. In-flight count at 3 AM should be near zero. A floor that climbs over days (2, then 7, then 19 "busy" permits at 3 AM) is a leak. <strong>Fix:</strong> acquire and release in one construct (<code>try/finally</code>, <code>with</code>, a decorator), never split across callbacks. Add a test that cancels a request mid-call and checks that the permit came back.</p>
+
+<h3 id=dd-bulkhead-fm-stuck level=3>2. A full compartment that never drains</h3>
+<p><strong>Symptom:</strong> order history is 100% full and serving zero requests per second, not the 80 per second it should serve when full. <strong>Mechanism:</strong> the calls inside have no deadline. The downstream service is hanging, so every slot holds a call that will never complete. The wall works, since checkout is fine, but the compartment is a brick. <strong>Detect:</strong> compartment occupancy at 100% together with completions near zero, and active-call age equal to time since the incident started. <strong>Fix:</strong> a timeout shorter than the caller's deadline on every call inside a compartment, at the socket level as well as the request level. Then put a <a href="#circuit-breaker">circuit breaker</a> on the dependency so it stops even trying. The lesson says bulkheads without timeouts fill and stay full. This is what that looks like on a dashboard.</p>
+
+<h3 id=dd-bulkhead-fm-abandoned level=3>3. The caller gave up, but the worker did not</h3>
+<p><strong>Symptom:</strong> with a thread-pool bulkhead, callers time out quickly and serve fallbacks, which looks healthy. But the compartment's pool stays full long after the spike, and the dependency's load does not fall. <strong>Mechanism:</strong> the caller's timeout abandoned the <em>wait</em>, not the <em>work</em>. The worker thread is still blocked on the socket. Thread interruption does not unblock classic blocking socket reads. The dependency still runs every abandoned query to completion. <strong>Detect:</strong> compartment occupancy that stays high while caller-side latency is low; downstream query counts that exceed completed upstream requests. <strong>Fix:</strong> set read timeouts on the client inside the pool, not only on the future. Propagate the deadline to the dependency (gRPC deadlines, a <code>statement_timeout</code>), so the work itself is cancelled.</p>
+
+<h3 id=dd-bulkhead-fm-autoscale level=3>4. Autoscaling dissolves the database wall</h3>
+<p><strong>Symptom:</strong> during the marketing spike, the autoscaler doubles the API fleet. Shortly after, checkout starts failing with <code>FATAL: sorry, too many clients already</code> from Postgres, or with connection waits. <strong>Mechanism:</strong> the bulkheads were per pod. Order history's per-pod cap of 15 connections was safe at 10 pods and is now 300 concurrent expensive queries at 20 pods. The database saturates and checkout, which shares it, suffers. The wall was in the wrong layer. <strong>Detect:</strong> database active connections or backends by role (<code>pg_stat_activity</code> grouped by <code>usename</code>) rising with pod count. <strong>Fix:</strong> enforce the shared-resource share globally, with PgBouncer per-user pools, role <code>CONNECTION LIMIT</code>, or a separate read replica for order history. Cap the autoscaler's maximum, and size per-pod pools from that maximum.</p>
+
+<h3 id=dd-bulkhead-fm-hidden-shared level=3>5. A shared resource under the wall</h3>
+<p><strong>Symptom:</strong> order history fills its compartment, and checkout slows down anyway, even though checkout's compartment is half empty. <strong>Mechanism:</strong> the walls split the threads, but something further down is still shared. Common culprits: one HTTP client connection pool for all outbound calls (Apache HttpClient's pooling manager defaults to 2 connections per route and 20 in total, which is a tiny shared pool), one database pool, one log appender with a synchronous lock, the JVM heap and its garbage collector, or the CPU. <strong>Detect:</strong> traces. Look at where checkout's extra latency is spent. Time spent waiting to acquire a connection, a lock or the CPU is the shared resource showing itself. <strong>Fix:</strong> list every resource a request touches, top to bottom, and decide for each whether it is walled, sized for the sum, or accepted as shared. A bulkhead is as strong as its leakiest layer.</p>
+
+<h3 id=dd-bulkhead-fm-stale-split level=3>6. The split goes stale and the team causes the outage</h3>
+<p><strong>Symptom:</strong> six months after launch, search rejects 8% of requests at peak while checkout's compartment is 40% idle. Total capacity looks fine. <strong>Mechanism:</strong> traffic mix moved. A new search feature doubled search latency, or mobile traffic shifted the ratio, and the walls were sized for last year. <strong>Detect:</strong> the key dashboard is per-compartment rejection rate next to per-compartment peak occupancy. Rejections in one compartment while another has sustained slack is the signal. Alert on sustained rejections (say over 1% for 10 minutes), not on single spikes. <strong>Fix:</strong> recompute sizes quarterly and after any latency change, from measured rate and p99 duration. Consider guaranteed-plus-borrow, or adaptive limits (see the next section) for the compartments where sizing keeps drifting.</p>
+
+<h3 id=dd-bulkhead-fm-rejection-amplify level=3>7. Rejections trip the breaker or trigger a retry storm</h3>
+<p><strong>Symptom:</strong> order history's bulkhead rejects overflow, and a minute later the circuit breaker on the order history <em>dependency</em> opens. Now nobody gets order history, not even the 80 per second the compartment could serve. Or the rejected clients come back with three times the traffic. <strong>Mechanism:</strong> two misconfigurations. First, the breaker records the bulkhead's "full" exception as a dependency failure. Resilience4j's breaker records all exceptions by default unless told otherwise. Second, clients and intermediate layers retry 503s immediately, without backoff or a <code>Retry-After</code>. <strong>Detect:</strong> breaker transitions that coincide with bulkhead rejections and not with dependency errors; inbound request rate that rises when the rejection rate rises. <strong>Fix:</strong> exclude bulkhead-full exceptions from the breaker's failure count. Answer rejections with a status and header that tell clients to back off (<code>503</code> with <code>Retry-After</code>, or <code>429</code> when the limit is per client). Make sure only one layer retries.</p>
+
+<h2 id=dd-bulkhead-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Wall type in process<td>Semaphore<td>Dedicated thread pool<td>Calls have reliable client timeouts and you want minimal overhead, or the runtime is async. Choose a pool when the caller must be able to walk away from a call that may not honour its timeout, and accept the context-propagation work.
+<tr><td>When full<td>Reject immediately<td>Wait in a bounded queue<td>The caller has a fallback or a client that retries with backoff. A short wait (tens of ms) is fine for bursty traffic, but never longer than the caller's remaining deadline.
+<tr><td>Limits<td>Static, sized by rate x duration<td>Adaptive (concurrency adjusted from observed latency)<td>Traffic and latency are stable and you want predictability. Choose adaptive (Netflix's concurrency-limits library, Envoy's adaptive concurrency filter) when latency drifts and static sizes keep going stale, and you can tolerate a limit that moves.
+<tr><td>Scope<td>Per process<td>Global, at the shared resource<td>The protected resource is local (threads, memory). For a shared database or downstream API, the wall must be global (pooler, proxy, or a distributed limiter), because per-pod limits multiply.
+<tr><td>Partition key<td>By feature or dependency<td>By tenant or tenant tier<td>Load differs by what is being done. Choose tenant walls when one customer's behaviour is the risk. Large systems usually need both, nested.
+<tr><td>Sharing<td>Hard walls<td>Guaranteed share plus capped borrowing<td>Workloads differ sharply in importance and you want no surprises. Borrowing recovers most of the isolation tax and suits several mid-priority features of similar size.
+<tr><td>Physical isolation<td>Dedicated pools or clusters per workload<td>Cells or shuffle sharding<td>There are a few big workloads (batch vs interactive). With many tenants, shuffle sharding gives each tenant a random subset of workers, so one bad tenant hurts only the few tenants that share its exact subset.
+</tbody></table></div></div>
+<p>Two of these deserve more than a table row.</p>
+<p><strong>Shuffle sharding</strong> is the answer to "500 tenants, and I can't give each one a pool". Say you have 8 workers and assign each tenant a random pair. There are 28 distinct pairs. A tenant that sends poison traffic takes down its 2 workers. Any other tenant whose pair overlaps by one worker still has its other worker. Only tenants with the <em>identical</em> pair, about 1 in 28 of them, lose everything. With 100 workers and 5 per tenant, the number of combinations runs into the tens of millions, so a full overlap is vanishingly rare. AWS has written about using this for Route 53. It is a bulkhead per tenant that costs no more hardware than a shared fleet. The price is that clients must retry on their other workers, so it needs a client that knows its shard.</p>
+<p><strong>Adaptive limits</strong> are tempting because they promise to end the sizing chore. They work by watching latency. When latency rises above a baseline, the limit shrinks, in the style of TCP congestion control. They solve stale sizing well. They do not decide priority. An adaptive limit on a shared pool will happily shrink checkout along with order history. Use them <em>inside</em> walls, to size each compartment, not instead of walls.</p>
+<p>A rule of thumb for where the walls go: put a wall wherever two workloads of different importance meet a resource that one of them can fill. Usually that means three places. One is per dependency in process. The next is per workload at the shared database. The last is between batch and interactive at the platform layer. Everything else is optional until a dashboard says otherwise.</p>
+
+<h2 id=dd-bulkhead-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Which resources does a request on this path hold, from thread to connection to downstream capacity? Which of them are walled, and which are still shared?</li>
+<li>For each compartment, what rate and duration produced its size, and how much headroom above the mean does it have? Was the duration a healthy p99 or a degraded one?</li>
+<li>What is the ceiling (rate x timeout) for each compartment, and does every call inside a compartment have a timeout shorter than the caller's deadline?</li>
+<li>Are limits on shared resources (database, downstream API) enforced globally, or per pod? What happens to them at the autoscaler's maximum pod count?</li>
+<li>When a compartment is full, does the caller reject or wait? If it waits, is the wait shorter than the remaining request deadline?</li>
+<li>What does a rejected request turn into for the user (fallback, honest busy response), and what status and <code>Retry-After</code> does a client see?</li>
+<li>Is the bulkhead-full exception excluded from the circuit breaker's failure count? Which single layer is allowed to retry rejections?</li>
+<li>Are there per-compartment metrics for occupancy, rejection rate and wait time, and an alert on sustained rejections while other compartments sit idle?</li>
+<li>How is permit release guaranteed on cancellation and streaming paths, and is there a test for it?</li>
+<li>If thread pools are used, how are trace and security context propagated across the handoff?</li>
+<li>Does any workload bypass the walls: a cron job using its own connection string, an admin endpoint, a migration?</li>
+<li>When were the sizes last recomputed, and what event triggers recomputing them?</li>
+</ol>
+
+<h2 id=dd-bulkhead-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"You gave checkout 80 threads because it needs 75. Is that enough?"</summary>
+<p>Probably not. Rate x duration is the mean in flight. Arrivals are random, so the count wanders with a standard deviation around √75 ≈ 9. At 80 slots, checkout would hit its own wall on an ordinary day. I would size near L + 3√L, about 100, and sanity-check it against the ceiling, rate x timeout. Then I would watch the rejection metric and adjust.</p>
+</details>
+<details>
+<summary>"We're moving to Java virtual threads. Can we delete the bulkheads?"</summary>
+<p>You can delete the <em>thread-pool</em> bulkheads, because threads stop being scarce. You cannot delete the isolation. The scarce things are still database connections, downstream capacity and memory. Without a limit, a spike now creates thousands of virtual threads all waiting on the same 100 connections. Replace thread pools with semaphores on the resources that are actually limited.</p>
+</details>
+<details>
+<summary>"Your per-pod connection limits look right. Why did the database still fall over during the spike?"</summary>
+<p>Because the limits multiply with pod count. Fifteen connections per pod at 10 pods is 150, and the autoscaler took it to 20 pods. A wall on a shared resource has to be global. I'd put PgBouncer in front of Postgres with a database user per workload and a per-user pool size, add role-level <code>CONNECTION LIMIT</code> and <code>statement_timeout</code>, and size per-pod pools from the autoscaler's maximum.</p>
+</details>
+<details>
+<summary>"In what order do you stack bulkhead, timeout, retry and circuit breaker around one call?"</summary>
+<p>Retry outermost, then the breaker, then the timeout, then the bulkhead closest to the call. Resilience4j's default aspect order is Retry(CircuitBreaker(RateLimiter(TimeLimiter(Bulkhead(call))))). The breaker sees retry-level attempts and can stop them. The bulkhead limits concurrent attempts, so retries cannot multiply occupancy past the wall. Then I'd check two details: bulkhead rejections must not count as breaker failures, and retries must respect the overall request deadline.</p>
+</details>
+<details>
+<summary>"You have 5,000 tenants on one cluster. How do you bulkhead them?"</summary>
+<p>Not with 5,000 pools. That is over-partitioning, with each pool too small for a normal burst. I'd layer it. At the edge, per-tenant concurrency caps and rate limits, held in a shared counter store. Inside, walls per tenant tier, so free-tier load cannot displace paid. Then dedicated capacity for the handful of largest tenants. For infrastructure isolation, shuffle sharding: each tenant gets a random subset of workers, so a bad tenant fully overlaps with only a tiny fraction of others.</p>
+</details>
+<details>
+<summary>"A compartment is full. Should the request wait or be rejected?"</summary>
+<p>Reject, unless a short wait clearly helps. Waiting converts overload into latency, and latency is usually worse because callers time out anyway after doing the work. A short bounded wait, a few tens of milliseconds, smooths micro-bursts. The hard rule is that the wait must be shorter than the caller's remaining deadline. HikariCP's default 30-second connection timeout breaks that rule, and it is the first thing I'd change.</p>
+</details>
+<details>
+<summary>"How is a bulkhead different from rate limiting a feature to 80 requests per second?"</summary>
+<p>A rate limit caps arrivals per second. A bulkhead caps work in progress. They match only while duration stays constant. If order history's query slows from 500 ms to 5 s, 80 requests per second means 400 in flight, and the rate limit lets the feature take everything. The bulkhead still caps it at 40. Occupancy is what starves other features, so occupancy is what you limit.</p>
+</details>
+<details>
+<summary>"How would you prove the bulkhead works before an incident does?"</summary>
+<p>Load test one compartment past its limit while running steady traffic on the others, and assert that the protected features' p99 and error rate do not move. Then inject latency into the dependency behind one compartment and check that its occupancy hits the wall, its rejections rise, and nothing else moves. Repeat after every capacity change. A wall you have never seen hold is a hypothesis.</p>
+</details>

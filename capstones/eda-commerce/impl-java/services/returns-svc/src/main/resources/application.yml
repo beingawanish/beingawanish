@@ -1,0 +1,16 @@
+# returns-svc. Infrastructure variables (guide §7) are mapped by edacommon; only defaults and
+# service-specific settings live here.
+eda:
+  service-name: returns-svc
+  consumer:
+    topics: [order.events.v1, payment.events.v1, inventory.events.v1, fulfilment.events.v1, shipping.events.v1]
+  idempotency:
+    paths: [/returns, /ops/returns/*/decision, /ops/dlq/replay, /ops/sagas/*/retry-step]
+server:
+  port: 8109
+returns:
+  window-days: ${RETURN_WINDOW_DAYS:30}
+  auto-approve-limit-minor: ${RETURN_AUTO_APPROVE_LIMIT_MINOR:50000}
+  parcel-due-days: ${RETURN_PARCEL_DUE_DAYS:14}
+  default-warehouse-id: wh-berlin-1
+  sweep-interval: 5s

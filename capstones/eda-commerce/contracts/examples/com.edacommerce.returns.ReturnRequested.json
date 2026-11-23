@@ -1,0 +1,32 @@
+{
+  "envelope": {
+    "eventId": "c674aa52-eb3a-5079-adce-d7be9e9a64c7",
+    "type": "com.edacommerce.returns.ReturnRequested",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "232a4301-29d8-5c69-baed-e26cbf139803",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "returns-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Return",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "returnId": "f103f819-6e23-582d-865f-d645dbd92167",
+  "customerId": "cf5e0500-71a6-5159-92f2-c1e2c232ca78",
+  "lines": [
+    {
+      "lineId": "91d59ffe-531e-558a-9855-b32ea191ceb0",
+      "sku": "SKU-1001",
+      "quantity": 2
+    }
+  ],
+  "reason": "DAMAGED",
+  "comment": "example-comment",
+  "requestedAt": 1795000000000
+}

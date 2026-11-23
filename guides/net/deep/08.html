@@ -1,0 +1,410 @@
+<h2 id="d08-deep-dive">Deep dive: VLANs and spanning tree as the switch actually runs them</h2>
+<p>Painted ports are the right first picture. They hide the part that explains every VLAN bug: a VLAN isn't a property of a cable or a port. It's a number the switch attaches to each frame on the way in, and it becomes half the key of every forwarding-table lookup. Get the per-port rules for attaching and removing that number wrong, and frames quietly change color.</p>
+<p>The fire marshal hides something too. Spanning tree isn't a person walking the building. It's a distributed algorithm. Every switch compares small vectors of numbers it hears in BPDUs, keeps the best one per port, and gates forwarding on the result. Its convergence time falls straight out of its timers, and its failure modes come from the cases where a switch stops hearing BPDUs it should hear.</p>
+<p>The last section explains why most new data centers don't run either one between switches anymore.</p>
+<h2 id="d08-mental-model">Deep dive: the real mental model — a lookup keyed by (VLAN, MAC)</h2>
+<h3 id="d08-port-config">Three settings per port</h3>
+<p>IEEE 802.1Q describes a VLAN-aware bridge port with three pieces of configuration. Vendors hide them behind "access" and "trunk," but every switch implements them:</p>
+<ul>
+<li><strong>PVID (port VLAN ID).</strong> The VLAN given to an <em>untagged</em> frame that arrives on this port. On an access port, this is "the port's VLAN." On a trunk, it's the native VLAN.</li>
+<li><strong>Acceptable frame types.</strong> Admit all frames, only tagged frames, or only untagged and priority-tagged frames. An access port should admit only untagged. Many don't enforce it, which matters for VLAN hopping.</li>
+<li><strong>Member set, split into tagged and untagged.</strong> The VLANs this port may send, and for each one whether it leaves with a tag or without. An access port is untagged in one VLAN. A trunk is tagged in many and untagged in, at most, its native VLAN.</li>
+</ul>
+<p>"Native VLAN" is therefore not a special mechanism. It is just "PVID = N, and N is in the untagged egress set." A native-VLAN mismatch is two switches with different PVIDs on the two ends of one cable.</p>
+<h3 id="d08-pipeline">The pipeline every frame goes through</h3>
+<p>Inside the switch ASIC, every frame passes the same stages:</p>
+<ol type="1">
+<li><strong>Ingress classification.</strong> If the frame carries an 802.1Q tag, its VID comes from the tag. If not, the VID is the port's PVID. If the port isn't a member of that VID, the frame is dropped (ingress filtering).</li>
+<li><strong>Spanning-tree gate.</strong> The port's STP state, for the spanning-tree instance that owns this VID, decides what happens next. <em>Discarding</em>: drop the frame, but still read BPDUs. <em>Learning</em>: learn the source address, don't forward. <em>Forwarding</em>: both.</li>
+<li><strong>Learning.</strong> Write <code>FDB[(VID, source MAC)] = ingress port</code>, and reset that entry's age. The default aging time is 300 seconds (802.1D's recommended value; configurable on every switch).</li>
+<li><strong>Lookup.</strong> Read <code>FDB[(VID, destination MAC)]</code>. A hit gives one egress port. A miss, a broadcast or an unknown multicast floods to every port in the VID's member set, except the one it came in on.</li>
+<li><strong>Egress.</strong> For each output port, look up whether this VID is tagged or untagged on that port. Add or keep the tag, or strip it, and recompute the FCS.</li>
+</ol>
+<p>The VID is half the key in steps 3 and 4. The same MAC address in VLAN 20 and VLAN 310 is two independent entries. Most switches work this way, which 802.1Q calls independent VLAN learning. That is what isolation means mechanically: a frame classified into VLAN 20 can only ever match VLAN 20's entries and flood to VLAN 20's member ports. Nothing reads the color sticker again until egress.</p>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 450" role="img" aria-labelledby="d08-pipe-title d08-pipe-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
+<title id="d08-pipe-title">Inside a VLAN-aware switch: the five-stage forwarding pipeline</title>
+<desc id="d08-pipe-desc">Five stages left to right: ingress classification assigns a VLAN ID from the tag or the port's PVID; the spanning-tree gate checks the port's state for that VLAN's instance; learning writes the VLAN and source MAC into the forwarding table; lookup reads the VLAN and destination MAC, flooding to the VLAN's member ports on a miss; egress strips or keeps the tag per port. Below, a table of three ports with their PVID, tagged and untagged sets and STP state, and three forwarding-table entries keyed by VLAN and MAC.</desc>
+<text x="24" y="38" font-family="Georgia,serif" font-size="22" fill="#2d3142">What the switch does with every frame</text>
+<text x="24" y="62" font-family="system-ui,sans-serif" font-size="13" fill="#6b6f7e">the VLAN is attached on the way in, used as half of every lookup, and removed or kept on the way out</text>
+<g font-family="system-ui,sans-serif">
+<!-- stage boxes -->
+<rect x="24" y="84" width="140" height="132" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5" rx="6"/>
+<rect x="182" y="84" width="140" height="132" fill="#f5f5f5" stroke="#bf4520" stroke-width="1.5" rx="6"/>
+<rect x="340" y="84" width="140" height="132" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5" rx="6"/>
+<rect x="498" y="84" width="140" height="132" fill="#2d3142" rx="6"/>
+<rect x="656" y="84" width="140" height="132" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5" rx="6"/>
+<text x="94" y="106" text-anchor="middle" font-size="13" font-weight="600" fill="#2d3142">1 · Classify</text>
+<text x="252" y="106" text-anchor="middle" font-size="13" font-weight="600" fill="#bf4520">2 · STP gate</text>
+<text x="410" y="106" text-anchor="middle" font-size="13" font-weight="600" fill="#2d3142">3 · Learn</text>
+<text x="568" y="106" text-anchor="middle" font-size="13" font-weight="600" fill="#f5f5f5">4 · Lookup</text>
+<text x="726" y="106" text-anchor="middle" font-size="13" font-weight="600" fill="#2d3142">5 · Egress</text>
+<g xml:space="preserve" style="white-space:pre" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#2d3142">
+<text x="34" y="130">tagged:</text>
+<text x="34" y="144">  VID = tag</text>
+<text x="34" y="160">untagged:</text>
+<text x="34" y="174">  VID = PVID</text>
+<text x="34" y="196" fill="#6b6f7e">VID not a member</text>
+<text x="34" y="208" fill="#6b6f7e">  → drop</text>
+<text x="192" y="130">per (port, instance)</text>
+<text x="192" y="150">discarding:</text>
+<text x="192" y="164">  drop, read BPDUs</text>
+<text x="192" y="180">learning: learn only</text>
+<text x="192" y="196">forwarding: both</text>
+<text x="350" y="130">FDB[(VID, src)]</text>
+<text x="350" y="144">  = ingress port</text>
+<text x="350" y="166" fill="#6b6f7e">age reset to 0</text>
+<text x="350" y="180" fill="#6b6f7e">expire at 300 s</text>
+<text x="508" y="130" fill="#f5f5f5">FDB[(VID, dst)]</text>
+<text x="508" y="150" fill="#f5f5f5">hit → one port</text>
+<text x="508" y="166" fill="#f5f5f5">miss / bcast →</text>
+<text x="508" y="180" fill="#f5f5f5">  flood to VID's</text>
+<text x="508" y="194" fill="#f5f5f5">  member ports</text>
+<text x="666" y="130">per port, per VID:</text>
+<text x="666" y="150">untagged set</text>
+<text x="666" y="164">  → strip tag</text>
+<text x="666" y="180">tagged set</text>
+<text x="666" y="194">  → keep tag</text>
+<text x="666" y="208" fill="#6b6f7e">recompute FCS</text>
+</g>
+<!-- arrows -->
+<g fill="#6b6f7e" stroke="#6b6f7e" stroke-width="1.5">
+<line x1="164" y1="150" x2="176" y2="150"/><polygon points="182,150 175,146 175,154" stroke="none"/>
+<line x1="322" y1="150" x2="334" y2="150"/><polygon points="340,150 333,146 333,154" stroke="none"/>
+<line x1="480" y1="150" x2="492" y2="150"/><polygon points="498,150 491,146 491,154" stroke="none"/>
+<line x1="638" y1="150" x2="650" y2="150"/><polygon points="656,150 649,146 649,154" stroke="none"/>
+</g>
+<!-- port table -->
+<text x="24" y="246" font-size="13" font-weight="600" fill="#2d3142">Port configuration (what "access" and "trunk" really set)</text>
+<g xml:space="preserve" style="white-space:pre" font-family="ui-monospace,Menlo,monospace" font-size="11">
+<text x="24" y="268" fill="#6b6f7e">port      mode    PVID  tagged   untagged  STP state (instance for VLAN 310)</text>
+<text x="24" y="286" fill="#2d3142">Gi1/0/7   access  310   —        310       forwarding (edge)</text>
+<text x="24" y="304" fill="#2d3142">Te1/1/1   trunk   999   20,310   999       forwarding (root port)</text>
+<text x="24" y="322" fill="#bf4520">Te1/1/2   trunk   999   20,310   999       discarding (alternate)</text>
+</g>
+<text x="24" y="352" font-size="13" font-weight="600" fill="#2d3142">Forwarding table, keyed by (VLAN, MAC)</text>
+<g xml:space="preserve" style="white-space:pre" font-family="ui-monospace,Menlo,monospace" font-size="11" fill="#2d3142">
+<text x="24" y="374">(310, 3a:1f:9c:52:07:e4) → Gi1/0/7</text>
+<text x="24" y="392">(310, f0:2f:74:1b:c4:20) → Te1/1/1</text>
+<text x="24" y="410">( 20, 3a:1f:9c:52:07:e4) → Te1/1/1   <tspan fill="#6b6f7e">same MAC, other VLAN: a separate entry</tspan></text>
+</g>
+<text x="24" y="438" font-size="12" fill="#bf4520">Native VLAN = PVID + untagged egress. A mismatch: the far end files your untagged frames under its own PVID.</text>
+</g>
+</svg>
+<h3 id="d08-priority-vector">Spanning tree is a comparison of priority vectors</h3>
+<p>Every BPDU carries a <em>priority vector</em>: root bridge ID, root path cost, sender's bridge ID, sender's port ID. (The receiving port's own ID is the final tiebreaker.) Each switch keeps the best vector it has heard on each port. "Best" means lowest, compared field by field from left to right, like a tuple compare in Python.</p>
+<p>From those stored vectors, everything follows:</p>
+<ul>
+<li>The <strong>root bridge</strong> is the lowest root ID anyone has heard.</li>
+<li>A switch's <strong>root port</strong> is the port holding the best vector after adding that port's own path cost.</li>
+<li>On each link, the port that would send the best vector is <strong>designated</strong> for that link.</li>
+<li>Every other port is <strong>alternate</strong> (a backup path to the root) or <strong>backup</strong> (a second port onto a link this switch already serves). Both discard.</li>
+</ul>
+<p>The <strong>bridge ID</strong> is 8 bytes. In practice, the top 4 bits are the configurable priority, so priority comes in steps of 4096. The next 12 bits are the <em>extended system ID</em>, which per-VLAN implementations set to the VLAN number. The last 48 bits are a MAC address. That's why a switch configured with priority 32768 shows "32778" in VLAN 10's spanning tree: 32768 + 10.</p>
+<p><strong>Path cost</strong> comes from link speed. 802.1D-1998 used 16-bit costs (1G = 4, 10G = 2), which ran out of room above 10G. 802.1D-2004 adopted 32-bit "long" costs from 802.1t: 20,000,000,000 divided by the speed in kbit/s, so 1G = 20,000, 10G = 2,000, 100G = 200. Some vendors still default to short costs. Mix the two methods in one network and the "shortest" path becomes nonsense, so check which one each platform uses.</p>
+<p><strong>Instances.</strong> 802.1Q's MSTP runs several trees and maps groups of VLANs to each one. Cisco's PVST+ and Rapid-PVST+ (vendor protocols) run one tree per VLAN, which costs a BPDU stream per VLAN per trunk. Either way, the STP gate in step 2 is per (port, instance), so a port can forward VLAN 20 while it blocks VLAN 310.</p>
+<h2 id="d08-wire">Deep dive: what the wire actually shows</h2>
+<p>The frames below were built byte for byte with Python's <code>struct</code> and decoded with <code>tcpdump 4.99.4 -nn -e -v</code>. The decode is real tcpdump output.</p>
+<h3 id="d08-wire-tags">One ping, tagged and untagged</h3>
+<p>The same ICMP echo request, seen on the access port, then on the trunk, then marked as voice, then inside a provider's QinQ tag, and finally crafted for a VLAN-hopping attempt:</p>
+<pre><code>09:02:11.000000 3a:1f:9c:52:07:e4 &gt; f0:2f:74:1b:c4:20, ethertype IPv4 (0x0800), length 98: (tos 0x0, ttl 64, id 7471, offset 0, flags [none], proto ICMP (1), length 84)
+    10.20.7.144 &gt; 10.20.7.200: ICMP echo request, id 20931, seq 1, length 64
+09:02:11.000004 3a:1f:9c:52:07:e4 &gt; f0:2f:74:1b:c4:20, ethertype 802.1Q (0x8100), length 102: vlan 310, p 0, ethertype IPv4 (0x0800), (tos 0x0, ttl 64, id 7471, offset 0, flags [none], proto ICMP (1), length 84)
+    10.20.7.144 &gt; 10.20.7.200: ICMP echo request, id 20931, seq 1, length 64
+09:02:11.000100 3a:1f:9c:52:07:e4 &gt; f0:2f:74:1b:c4:20, ethertype 802.1Q (0x8100), length 102: vlan 20, p 5, ethertype IPv4 (0x0800), (tos 0x0, ttl 64, id 7471, offset 0, flags [none], proto ICMP (1), length 84)
+    10.20.7.144 &gt; 10.20.7.200: ICMP echo request, id 20931, seq 1, length 64
+09:02:11.000200 3a:1f:9c:52:07:e4 &gt; f0:2f:74:1b:c4:20, ethertype 802.1Q-QinQ (0x88a8), length 106: vlan 1001, p 0, ethertype 802.1Q (0x8100), vlan 310, p 0, ethertype IPv4 (0x0800), (tos 0x0, ttl 64, id 7471, offset 0, flags [none], proto ICMP (1), length 84)
+    10.20.7.144 &gt; 10.20.7.200: ICMP echo request, id 20931, seq 1, length 64
+09:02:11.000300 3a:1f:9c:52:07:e4 &gt; f0:2f:74:1b:c4:20, ethertype 802.1Q (0x8100), length 106: vlan 1, p 0, ethertype 802.1Q (0x8100), vlan 20, p 0, ethertype IPv4 (0x0800), (tos 0x0, ttl 64, id 7471, offset 0, flags [none], proto ICMP (1), length 84)
+    10.20.7.144 &gt; 10.20.7.200: ICMP echo request, id 20931, seq 1, length 64</code></pre>
+<ul>
+<li><strong>98 → 102 → 106.</strong> A capture length excludes the 4-byte FCS. On the wire these frames are 102, 106 and 110 bytes. Each tag adds exactly 4 bytes, and nothing above Layer 2 changes. The IP header, TTL and ID are identical in every line.</li>
+<li><strong>Size limits move with the tag.</strong> 802.3 allows a 1518-byte untagged frame and a 1522-byte tagged one (the "baby giant" allowance from 802.3ac). Going the other way, a minimum 64-byte tagged frame becomes 60 bytes when its tag is stripped on egress. That's below the Ethernet minimum, so the switch must pad it back to 64.</li>
+<li><strong><code>p 5</code></strong> is the PCP field. It's the only QoS marking Ethernet carries. It exists only while the frame is tagged, so a switch that strips the tag toward an access port also strips the priority. That's why phones are put on a <em>tagged</em> voice VLAN even though the PC behind them stays untagged.</li>
+<li><strong><code>0x88a8</code> then <code>0x8100</code></strong> is QinQ: provider S-tag 1001 outside, customer C-tag 310 inside.</li>
+<li><strong>The last frame</strong> has two <code>0x8100</code> tags: VLAN 1 outside, VLAN 20 inside. It's the double-tagging attack, covered in failure modes. A frame like this should never arrive from a host.</li>
+</ul>
+<p>To see tags yourself: run on your Mac — your output will differ.</p>
+<div class="sourceCode" id="d08-cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d08-cb2-1"><a href="#d08-cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># macOS: create a tagged sub-interface for VLAN 310 on en0 (needs a trunk on the other end)</span></span>
+<span id="d08-cb2-2"><a href="#d08-cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ifconfig vlan310 create</span>
+<span id="d08-cb2-3"><a href="#d08-cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ifconfig vlan310 vlan 310 vlandev en0</span>
+<span id="d08-cb2-4"><a href="#d08-cb2-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ifconfig</span> vlan310                      <span class="co"># shows &quot;vlan: 310 parent interface: en0&quot;</span></span>
+<span id="d08-cb2-5"><a href="#d08-cb2-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ifconfig vlan310 destroy         <span class="co"># clean up</span></span>
+<span id="d08-cb2-6"><a href="#d08-cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb2-7"><a href="#d08-cb2-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Linux equivalent, and a capture that shows the tags</span></span>
+<span id="d08-cb2-8"><a href="#d08-cb2-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ip link add link eth0 name eth0.310 type vlan id 310</span>
+<span id="d08-cb2-9"><a href="#d08-cb2-9" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-d</span> link show eth0.310              <span class="co"># &quot;vlan protocol 802.1Q id 310&quot;</span></span>
+<span id="d08-cb2-10"><a href="#d08-cb2-10" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tcpdump <span class="at">-nn</span> <span class="at">-e</span> <span class="at">-i</span> eth0 vlan      <span class="co"># -e prints the Ethernet header, including the tag</span></span></code></pre></div>
+<p>A Linux subtlety: most NICs strip the tag in hardware on receive (<code>ethtool -k eth0 | grep vlan</code> shows <code>rx-vlan-offload</code>). The kernel keeps the VID as packet metadata, and libpcap reinserts it, so tcpdump on the parent interface still shows the tag. If you ever see tags missing from a capture, offload is the first suspect.</p>
+<h3 id="d08-wire-rstp">RSTP proposal and agreement</h3>
+<p>A new 1G link comes up between <code>dist-1</code> (the root, priority 4096) and <code>acc-3</code> (priority 32768). Four BPDUs later it's forwarding:</p>
+<pre><code>09:02:11.000000 00:11:22:33:44:81 &gt; 01:80:c2:00:00:00, 802.3, length 39: LLC, dsap STP (0x42) Individual, ssap STP (0x42) Command, ctrl 0x03: STP 802.1w, Rapid STP, Flags [Proposal], bridge-id 1000.00:11:22:33:44:01.8018, length 36
+    message-age 0.00s, max-age 20.00s, hello-time 2.00s, forwarding-delay 15.00s
+    root-id 1000.00:11:22:33:44:01, root-pathcost 0, port-role Designated
+09:02:11.000412 00:11:22:33:44:a1 &gt; 01:80:c2:00:00:00, 802.3, length 39: LLC, dsap STP (0x42) Individual, ssap STP (0x42) Command, ctrl 0x03: STP 802.1w, Rapid STP, Flags [Learn, Forward, Agreement], bridge-id 8000.00:11:22:33:44:04.8031, length 36
+    message-age 0.00s, max-age 20.00s, hello-time 2.00s, forwarding-delay 15.00s
+    root-id 1000.00:11:22:33:44:01, root-pathcost 20000, port-role Root
+09:02:11.000655 00:11:22:33:44:81 &gt; 01:80:c2:00:00:00, 802.3, length 39: LLC, dsap STP (0x42) Individual, ssap STP (0x42) Command, ctrl 0x03: STP 802.1w, Rapid STP, Flags [Learn, Forward], bridge-id 1000.00:11:22:33:44:01.8018, length 36
+    message-age 0.00s, max-age 20.00s, hello-time 2.00s, forwarding-delay 15.00s
+    root-id 1000.00:11:22:33:44:01, root-pathcost 0, port-role Designated
+09:02:11.000901 00:11:22:33:44:a1 &gt; 01:80:c2:00:00:00, 802.3, length 39: LLC, dsap STP (0x42) Individual, ssap STP (0x42) Command, ctrl 0x03: STP 802.1w, Rapid STP, Flags [Topology change, Learn, Forward], bridge-id 8000.00:11:22:33:44:04.8031, length 36
+    message-age 0.00s, max-age 20.00s, hello-time 2.00s, forwarding-delay 15.00s
+    root-id 1000.00:11:22:33:44:01, root-pathcost 20000, port-role Root</code></pre>
+<ul>
+<li><strong>Not even EtherType.</strong> BPDUs are 802.3 frames with a length field (39) and an LLC header (DSAP/SSAP <code>0x42</code>), sent to <code>01:80:c2:00:00:00</code>. Switches never forward that address; every bridge consumes it. The 39 bytes are 3 of LLC plus a 36-byte RSTP BPDU, padded to the 60-byte minimum on the wire.</li>
+<li><strong>Bridge IDs are hex.</strong> <code>1000</code> is 4096 and <code>8000</code> is 32768. The trailing <code>.8018</code> is the port ID: port priority 128 (<code>0x80</code>) and port number 24 (<code>0x18</code>).</li>
+<li><strong><code>root-pathcost 20000</code>.</strong> <code>acc-3</code> adds its 1G long-format cost to the root's 0. That's the cost it advertises downstream.</li>
+<li><strong>Proposal → Agreement in 412 µs.</strong> <code>dist-1</code> proposes that its port be designated. Before agreeing, <code>acc-3</code> runs <em>sync</em>: it puts every non-edge designated port of its own into discarding, so the new path can't create a loop downstream. Then it answers with Agreement on its new root port. <code>dist-1</code> can forward at once. No 15-second timer was involved. The handshake ripples outward one switch at a time, so convergence time scales with hops times BPDU processing, not with timers.</li>
+<li><strong><code>Topology change</code>.</strong> As soon as <code>acc-3</code>'s root port began forwarding, it sent TC. In RSTP only a non-edge port moving to forwarding triggers a TC. Each switch that receives it flushes the MAC entries learned on its other non-edge ports and passes the TC on. That flush is why a topology change causes a burst of unicast flooding, even when the change itself was harmless.</li>
+</ul>
+<h2 id="d08-numbers">Deep dive: by the numbers</h2>
+<h3 id="d08-numbers-stp">Where 50 seconds comes from, and where it doesn't</h3>
+<p>The module adds 20 + 15 + 15 to get classic STP's ~50 seconds. That sum is the worst case, the <em>indirect</em> failure. A port that simply comes up skips max-age and takes 30 seconds. The breakdown:</p>
+<div class="sourceCode" id="d08-cb4"><pre class="sourceCode python"><code class="sourceCode python"><span id="d08-cb4-1"><a href="#d08-cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Classic STP vs RSTP convergence, from the 802.1D timers.&quot;&quot;&quot;</span></span>
+<span id="d08-cb4-2"><a href="#d08-cb4-2" aria-hidden="true" tabindex="-1"></a>hello, max_age, fwd_delay <span class="op">=</span> <span class="dv">2</span>, <span class="dv">20</span>, <span class="dv">15</span>          <span class="co"># 802.1D defaults (seconds)</span></span>
+<span id="d08-cb4-3"><a href="#d08-cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb4-4"><a href="#d08-cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 802.1D&#39;s sanity rule for the three timers</span></span>
+<span id="d08-cb4-5"><a href="#d08-cb4-5" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> <span class="dv">2</span> <span class="op">*</span> (fwd_delay <span class="op">-</span> <span class="dv">1</span>) <span class="op">&gt;=</span> max_age <span class="op">&gt;=</span> <span class="dv">2</span> <span class="op">*</span> (hello <span class="op">+</span> <span class="dv">1</span>)</span>
+<span id="d08-cb4-6"><a href="#d08-cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb4-7"><a href="#d08-cb4-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Where 20 and 15 come from (simplified formulas Cisco publishes, assuming diameter 7)</span></span>
+<span id="d08-cb4-8"><a href="#d08-cb4-8" aria-hidden="true" tabindex="-1"></a>dia <span class="op">=</span> <span class="dv">7</span></span>
+<span id="d08-cb4-9"><a href="#d08-cb4-9" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;derived max_age   =&quot;</span>, <span class="dv">4</span> <span class="op">*</span> hello <span class="op">+</span> <span class="dv">2</span> <span class="op">*</span> dia <span class="op">-</span> <span class="dv">2</span>)</span>
+<span id="d08-cb4-10"><a href="#d08-cb4-10" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;derived fwd_delay =&quot;</span>, (<span class="dv">4</span> <span class="op">*</span> hello <span class="op">+</span> <span class="dv">3</span> <span class="op">*</span> dia) <span class="op">/</span> <span class="dv">2</span>, <span class="st">&quot;-&gt; rounded to&quot;</span>, fwd_delay)</span>
+<span id="d08-cb4-11"><a href="#d08-cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb4-12"><a href="#d08-cb4-12" aria-hidden="true" tabindex="-1"></a>cases <span class="op">=</span> {</span>
+<span id="d08-cb4-13"><a href="#d08-cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;802.1D, port comes up (non-edge)&quot;</span>:           <span class="dv">2</span> <span class="op">*</span> fwd_delay,             <span class="co"># listening + learning</span></span>
+<span id="d08-cb4-14"><a href="#d08-cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;802.1D, root port link goes down (direct)&quot;</span>:  <span class="dv">2</span> <span class="op">*</span> fwd_delay,             <span class="co"># blocked port must listen+learn</span></span>
+<span id="d08-cb4-15"><a href="#d08-cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;802.1D, upstream failure (indirect)&quot;</span>:        max_age <span class="op">+</span> <span class="dv">2</span> <span class="op">*</span> fwd_delay,   <span class="co"># wait for stored BPDU to age out</span></span>
+<span id="d08-cb4-16"><a href="#d08-cb4-16" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="d08-cb4-17"><a href="#d08-cb4-17" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> name, secs <span class="kw">in</span> cases.items():</span>
+<span id="d08-cb4-18"><a href="#d08-cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">:45s}</span><span class="ss"> </span><span class="sc">{</span>secs<span class="sc">:&gt;3}</span><span class="ss"> s&quot;</span>)</span>
+<span id="d08-cb4-19"><a href="#d08-cb4-19" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;RSTP, root port link down, alternate ready&#39;</span><span class="sc">:45s}</span><span class="ss">  &lt;1 s (no timer: alternate becomes root port)&quot;</span>)</span>
+<span id="d08-cb4-20"><a href="#d08-cb4-20" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;RSTP, upstream failure (indirect)&#39;</span><span class="sc">:45s}</span><span class="ss"> </span><span class="sc">{</span><span class="dv">3</span> <span class="op">*</span> hello<span class="sc">:&gt;3}</span><span class="ss"> s to detect (3 missed hellos), then handshake&quot;</span>)</span>
+<span id="d08-cb4-21"><a href="#d08-cb4-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb4-22"><a href="#d08-cb4-22" aria-hidden="true" tabindex="-1"></a><span class="co"># MAC table flushing after a topology change</span></span>
+<span id="d08-cb4-23"><a href="#d08-cb4-23" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;802.1D TC: aging cut from 300 s to&quot;</span>, fwd_delay, <span class="st">&quot;s for&quot;</span>, max_age <span class="op">+</span> fwd_delay, <span class="st">&quot;s&quot;</span>)</span>
+<span id="d08-cb4-24"><a href="#d08-cb4-24" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;RSTP TC: non-edge ports flushed at once; TC flag sent for&quot;</span>, <span class="dv">2</span> <span class="op">*</span> hello, <span class="st">&quot;s (tcWhile)&quot;</span>)</span></code></pre></div>
+<p>Real output (Python 3.13):</p>
+<pre><code>derived max_age   = 20
+derived fwd_delay = 14.5 -&gt; rounded to 15
+802.1D, port comes up (non-edge)               30 s
+802.1D, root port link goes down (direct)      30 s
+802.1D, upstream failure (indirect)            50 s
+RSTP, root port link down, alternate ready     &lt;1 s (no timer: alternate becomes root port)
+RSTP, upstream failure (indirect)               6 s to detect (3 missed hellos), then handshake
+802.1D TC: aging cut from 300 s to 15 s for 35 s
+RSTP TC: non-edge ports flushed at once; TC flag sent for 4 s (tcWhile)</code></pre>
+<p>The timers are not arbitrary. They come from assumptions about the network's <em>diameter</em>, the maximum number of bridges between any two hosts, which 802.1D assumed was 7. Max-age has to outlast the time for a BPDU to cross the whole network. Forward delay has to outlast the time for the news of a change to propagate everywhere, so that no port forwards while another still holds a stale view. That's also why "just lower the timers" is dangerous on classic STP: shrink them below what your real diameter needs and you get transient loops.</p>
+<p>The 6 seconds for RSTP's indirect case is the slow path. It applies only when a neighbor goes silent without the link going down: a hung control plane, or a media converter that keeps light up. When the link goes down, detection is immediate and the alternate port takes over in milliseconds.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Value</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Hello / max age / forward delay</td>
+<td>2 s / 20 s / 15 s</td>
+<td>802.1D defaults; leave them alone with RSTP</td>
+</tr>
+<tr class="even">
+<td>Path cost, long (802.1D-2004)</td>
+<td>10M 2,000,000 · 100M 200,000 · 1G 20,000 · 10G 2,000 · 100G 200</td>
+<td>20 Tbit/s ÷ link speed</td>
+</tr>
+<tr class="odd">
+<td>Path cost, short (802.1D-1998)</td>
+<td>10M 100 · 100M 19 · 1G 4 · 10G 2</td>
+<td>still a default on some platforms</td>
+</tr>
+<tr class="even">
+<td>Bridge priority</td>
+<td>0–61440 in steps of 4096; default 32768</td>
+<td>low 12 bits = VLAN (extended system ID)</td>
+</tr>
+<tr class="odd">
+<td>MAC aging</td>
+<td>300 s default</td>
+<td>802.1D recommended value; configurable</td>
+</tr>
+<tr class="even">
+<td>MSTP max hops</td>
+<td>20</td>
+<td>per region; replaces message age as the hop limit inside a region</td>
+</tr>
+<tr class="odd">
+<td>802.1Q usable VIDs</td>
+<td>1–4094</td>
+<td>0 = priority-tagged, 4095 reserved</td>
+</tr>
+<tr class="even">
+<td>Frame size</td>
+<td>1518 untagged / 1522 tagged (incl. FCS)</td>
+<td>jumbo frames are vendor-defined, often 9216</td>
+</tr>
+</tbody>
+</table>
+<h3 id="d08-numbers-storm">How fast a loop eats a link</h3>
+<p>"Broadcasts multiply exponentially" is true for some loops and false for others. Whether frames multiply depends on how many looped ports each switch has:</p>
+<div class="sourceCode" id="d08-cb6"><pre class="sourceCode python"><code class="sourceCode python"><span id="d08-cb6-1"><a href="#d08-cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;How fast a Layer-2 loop fills a 10G link.&quot;&quot;&quot;</span></span>
+<span id="d08-cb6-2"><a href="#d08-cb6-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb6-3"><a href="#d08-cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> copies_after(adj: <span class="bu">dict</span>[<span class="bu">str</span>, <span class="bu">list</span>[<span class="bu">str</span>]], start: <span class="bu">str</span>, hops: <span class="bu">int</span>) <span class="op">-&gt;</span> <span class="bu">list</span>[<span class="bu">int</span>]:</span>
+<span id="d08-cb6-4"><a href="#d08-cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;Flood one broadcast: every switch sends it out every loop port except the one it came in on.&quot;&quot;&quot;</span></span>
+<span id="d08-cb6-5"><a href="#d08-cb6-5" aria-hidden="true" tabindex="-1"></a>    inflight <span class="op">=</span> [(start, n) <span class="cf">for</span> n <span class="kw">in</span> adj[start]]              <span class="co"># (from, to) pairs on the wire</span></span>
+<span id="d08-cb6-6"><a href="#d08-cb6-6" aria-hidden="true" tabindex="-1"></a>    counts <span class="op">=</span> [<span class="bu">len</span>(inflight)]</span>
+<span id="d08-cb6-7"><a href="#d08-cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(hops):</span>
+<span id="d08-cb6-8"><a href="#d08-cb6-8" aria-hidden="true" tabindex="-1"></a>        inflight <span class="op">=</span> [(to, n) <span class="cf">for</span> frm, to <span class="kw">in</span> inflight <span class="cf">for</span> n <span class="kw">in</span> adj[to] <span class="cf">if</span> n <span class="op">!=</span> frm]</span>
+<span id="d08-cb6-9"><a href="#d08-cb6-9" aria-hidden="true" tabindex="-1"></a>        counts.append(<span class="bu">len</span>(inflight))</span>
+<span id="d08-cb6-10"><a href="#d08-cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> counts</span>
+<span id="d08-cb6-11"><a href="#d08-cb6-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb6-12"><a href="#d08-cb6-12" aria-hidden="true" tabindex="-1"></a>ring <span class="op">=</span> {<span class="st">&quot;A&quot;</span>: [<span class="st">&quot;B&quot;</span>, <span class="st">&quot;C&quot;</span>], <span class="st">&quot;B&quot;</span>: [<span class="st">&quot;A&quot;</span>, <span class="st">&quot;C&quot;</span>], <span class="st">&quot;C&quot;</span>: [<span class="st">&quot;A&quot;</span>, <span class="st">&quot;B&quot;</span>]}</span>
+<span id="d08-cb6-13"><a href="#d08-cb6-13" aria-hidden="true" tabindex="-1"></a>mesh <span class="op">=</span> {s: [t <span class="cf">for</span> t <span class="kw">in</span> <span class="st">&quot;ABCD&quot;</span> <span class="cf">if</span> t <span class="op">!=</span> s] <span class="cf">for</span> s <span class="kw">in</span> <span class="st">&quot;ABCD&quot;</span>}</span>
+<span id="d08-cb6-14"><a href="#d08-cb6-14" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;triangle, copies in flight per hop:&quot;</span>, copies_after(ring, <span class="st">&quot;A&quot;</span>, <span class="dv">8</span>))</span>
+<span id="d08-cb6-15"><a href="#d08-cb6-15" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;4-switch mesh, copies per hop:     &quot;</span>, copies_after(mesh, <span class="st">&quot;A&quot;</span>, <span class="dv">8</span>))</span>
+<span id="d08-cb6-16"><a href="#d08-cb6-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb6-17"><a href="#d08-cb6-17" aria-hidden="true" tabindex="-1"></a><span class="co"># Line-rate math for a minimum-size broadcast (an ARP request: 64 bytes incl. FCS)</span></span>
+<span id="d08-cb6-18"><a href="#d08-cb6-18" aria-hidden="true" tabindex="-1"></a>wire_bytes <span class="op">=</span> <span class="dv">64</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">12</span>                    <span class="co"># + preamble/SFD + inter-frame gap</span></span>
+<span id="d08-cb6-19"><a href="#d08-cb6-19" aria-hidden="true" tabindex="-1"></a>pps_10g <span class="op">=</span> <span class="fl">10e9</span> <span class="op">/</span> (wire_bytes <span class="op">*</span> <span class="dv">8</span>)</span>
+<span id="d08-cb6-20"><a href="#d08-cb6-20" aria-hidden="true" tabindex="-1"></a>hop_s <span class="op">=</span> wire_bytes <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> <span class="fl">10e9</span> <span class="op">+</span> <span class="fl">1e-6</span>        <span class="co"># serialization + ~1 us store-and-forward switch latency</span></span>
+<span id="d08-cb6-21"><a href="#d08-cb6-21" aria-hidden="true" tabindex="-1"></a>lap_s <span class="op">=</span> <span class="dv">3</span> <span class="op">*</span> hop_s                           <span class="co"># once around the triangle</span></span>
+<span id="d08-cb6-22"><a href="#d08-cb6-22" aria-hidden="true" tabindex="-1"></a>per_copy <span class="op">=</span> <span class="dv">1</span> <span class="op">/</span> lap_s                        <span class="co"># times per second one looping copy crosses each link</span></span>
+<span id="d08-cb6-23"><a href="#d08-cb6-23" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;10G line rate, 64 B frames: </span><span class="sc">{</span>pps_10g <span class="op">/</span> <span class="fl">1e6</span><span class="sc">:.2f}</span><span class="ss"> Mpps&quot;</span>)</span>
+<span id="d08-cb6-24"><a href="#d08-cb6-24" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;one looping copy crosses each link </span><span class="sc">{</span>per_copy <span class="op">/</span> <span class="fl">1e3</span><span class="sc">:.0f}</span><span class="ss">k times/s&quot;</span>)</span>
+<span id="d08-cb6-25"><a href="#d08-cb6-25" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;looping broadcasts that fill each direction of each link: </span><span class="sc">{</span>pps_10g <span class="op">/</span> per_copy<span class="sc">:.0f}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+<p>Real output:</p>
+<pre><code>triangle, copies in flight per hop: [2, 2, 2, 2, 2, 2, 2, 2, 2]
+4-switch mesh, copies per hop:      [3, 6, 12, 24, 48, 96, 192, 384, 768]
+10G line rate, 64 B frames: 14.88 Mpps
+one looping copy crosses each link 312k times/s
+looping broadcasts that fill each direction of each link: 48</code></pre>
+<p>In a simple ring, each broadcast becomes two immortal copies going opposite ways. That's linear, not exponential. But each copy passes every switch about 312,000 times a second, and every pass floods it to every host port in the VLAN. So 48 ordinary ARP requests, a few seconds of normal chatter on a busy VLAN, are enough to fill a 10G link. Every host's NIC then receives hundreds of thousands of broadcasts per second, and the switches' CPUs drown in the copies they must inspect. Add a switch with three looped ports and growth turns exponential, doubling every hop: saturation within microseconds. Either way, the outcome is the same within seconds. The ring just takes a moment longer.</p>
+<h2 id="d08-failures">Deep dive: production failure modes</h2>
+<h3 id="d08-fail-native">Native VLAN mismatch</h3>
+<p><strong>Symptom.</strong> Intermittent, one-directional leaks. A device on VLAN 1 on one side gets a DHCP address from VLAN 10's scope on the other. Some flows work, some don't.</p>
+<p><strong>Mechanism.</strong> Switch A sends VLAN 1 untagged because its PVID is 1. Switch B classifies every untagged frame into <em>its</em> PVID, 10. Tagged VLANs are unaffected, which is why the trunk "mostly works."</p>
+<p><strong>Prove it.</strong> Compare PVIDs on both ends: <code>show interfaces trunk</code> on Cisco (vendor), or <code>bridge vlan show</code> on a Linux bridge, where <code>PVID Egress Untagged</code> marks the native VLAN. Neighbor-discovery protocols often catch it first. CDP logs a native VLAN mismatch, and Rapid-PVST+ puts the port into a "PVID inconsistent" blocking state because its BPDUs carry the sender's VLAN (both vendor behaviours). LLDP can carry the port VLAN ID too (802.1 TLV), so <code>lldpctl</code> on Linux shows the neighbor's PVID.</p>
+<p><strong>Fix.</strong> Same native VLAN on both ends, set to an unused ID that carries no hosts. Better, tag the native VLAN too (Cisco <code>vlan dot1q tag native</code>, vendor), so nothing crosses the trunk untagged at all.</p>
+<h3 id="d08-fail-hopping">VLAN hopping: double tagging and switch spoofing</h3>
+<p><strong>Double tagging.</strong> An attacker on an access port whose VLAN equals the trunk's native VLAN (VLAN 1 in the capture) sends the double-tagged frame shown above. The first switch classifies it into VLAN 1 (either by its outer tag, or by the port's PVID if it accepts tagged frames there). It sends it out the trunk <em>untagged</em>, because VLAN 1 is native, so the outer tag disappears. The next switch sees the inner tag, VLAN 20, and delivers the frame into the victim VLAN. It's one-way, since replies won't come back, but one-way is enough for a UDP exploit or a spoofed packet. The fixes are the native-VLAN rules above. On top of them, set access ports to admit only untagged frames.</p>
+<p><strong>Switch spoofing.</strong> Cisco's DTP (vendor) lets a port negotiate trunking. A port left in "dynamic desirable" or "dynamic auto" will become a trunk if a laptop speaks DTP to it, and then the laptop is on every VLAN. Fix: hard-code access ports as access and disable negotiation (<code>switchport nonegotiate</code>).</p>
+<h3 id="d08-fail-loop">The loop that STP didn't catch</h3>
+<p><strong>Symptom.</strong> Everything in one VLAN or more is down at once. Switch CPUs are at 100%. Interface counters show broadcast and multicast rates in the hundreds of thousands per second. Logs fill with MAC-move (MAC-flap) messages: the same MAC learned on alternating ports. Exact message text is vendor-specific.</p>
+<p><strong>Mechanism.</strong> STP only stops loops it can see, and it sees them only through BPDUs. The usual ways BPDUs disappear:</p>
+<ul>
+<li><strong>A unidirectional link.</strong> One fiber strand fails, or a transceiver half-dies. The alternate port at the far end stops receiving BPDUs, decides the path is gone, and moves to forwarding while traffic still flows the other way. Loop.</li>
+<li><strong>A device that drops BPDUs</strong> but forwards data: some unmanaged switches, some hypervisor vSwitches, a misconfigured bridge on a server.</li>
+<li><strong>BPDU filter</strong> configured on a port that later got patched to another switch.</li>
+</ul>
+<p><strong>Prove it.</strong> From a host in the VLAN, watch the broadcast rate and look for the same frame repeating:</p>
+<div class="sourceCode" id="d08-cb8"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d08-cb8-1"><a href="#d08-cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Run on your Mac: packets per second on en0 (a storm shows 10^5+)</span></span>
+<span id="d08-cb8-2"><a href="#d08-cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">netstat</span> <span class="at">-I</span> en0 <span class="at">-w</span> 1</span>
+<span id="d08-cb8-3"><a href="#d08-cb8-3" aria-hidden="true" tabindex="-1"></a><span class="co"># A sample of broadcasts: a loop shows the same ARP request over and over</span></span>
+<span id="d08-cb8-4"><a href="#d08-cb8-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tcpdump <span class="at">-nn</span> <span class="at">-e</span> <span class="at">-t</span> <span class="at">-i</span> en0 <span class="at">-c</span> 200 ether broadcast <span class="kw">|</span> <span class="fu">sort</span> <span class="kw">|</span> <span class="fu">uniq</span> <span class="at">-c</span> <span class="kw">|</span> <span class="fu">sort</span> <span class="at">-rn</span> <span class="kw">|</span> <span class="fu">head</span></span>
+<span id="d08-cb8-5"><a href="#d08-cb8-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Linux equivalents</span></span>
+<span id="d08-cb8-6"><a href="#d08-cb8-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-s</span> link show eth0          <span class="co"># RX broadcast/multicast counters</span></span>
+<span id="d08-cb8-7"><a href="#d08-cb8-7" aria-hidden="true" tabindex="-1"></a><span class="ex">sar</span> <span class="at">-n</span> DEV 1                  <span class="co"># rxpck/s per interface (sysstat package)</span></span></code></pre></div>
+<p>(<code>-t</code> drops timestamps so identical frames print identical lines.) On the switches, follow the MAC-move messages. The two ports a MAC flaps between bracket the loop.</p>
+<p><strong>Fix.</strong> Do it in layers. Edge ports with BPDU guard on every host port. <strong>Loop guard</strong> on root and alternate ports, which puts a port that stops hearing BPDUs into a "loop-inconsistent" discarding state instead of forwarding. <strong>UDLD</strong> (vendor) or a bidirectional detection protocol on fiber. <strong>Storm control</strong> on access ports, which caps broadcast and multicast at a percentage of line rate, so a loop degrades a VLAN instead of killing a building. And <strong>root guard</strong> on ports where a better root should never appear.</p>
+<h3 id="d08-fail-tc">Topology-change storms</h3>
+<p><strong>Symptom.</strong> Periodic bursts of unicast flooding. Hosts see traffic not meant for them, and links run hot for a few seconds at a time, without any loop.</p>
+<p><strong>Mechanism.</strong> Every topology change flushes MAC tables, and until addresses are relearned, unicast floods. A host port that isn't configured as an edge port generates a TC every time a laptop docks or a server reboots. On a 48-port access layer, that can be a TC every few seconds.</p>
+<p><strong>Prove it.</strong> Spanning-tree detail on the switches shows the TC count and the port that last sent one (vendor command; on Cisco, <code>show spanning-tree detail</code> includes "occurred X ago from Gi1/0/12"). Follow that port.</p>
+<p><strong>Fix.</strong> Mark every host port as edge. Edge ports don't generate TCs.</p>
+<h3 id="d08-fail-flood">Unicast flooding from mismatched timers</h3>
+<p><strong>Symptom.</strong> A steady flood of one server's traffic out every port in the VLAN, with no loop and no topology change. Often found by someone running a capture who sees backup traffic that isn't theirs.</p>
+<p><strong>Mechanism.</strong> Asymmetric routing. Router R1 sends traffic <em>to</em> the server, but the server replies via R2. R1's ARP entry for the server lives for hours (Cisco IOS's default ARP timeout is 4 hours; vendor value), so R1 keeps sending frames to the server's MAC. But the server never sends a frame that passes the switch ports on R1's side, so the switch's MAC entry for it ages out after 300 seconds. From then on, every frame to that MAC is an unknown unicast and floods.</p>
+<p><strong>Fix.</strong> Make the ARP timeout shorter than the MAC aging time (or lengthen MAC aging), or fix the asymmetry.</p>
+<h2 id="d08-2026">Deep dive: 2026 context — why data centers stopped bridging</h2>
+<h3 id="d08-2026-why">What spanning tree costs at data-center scale</h3>
+<p>Campus access layers in 2026 still run VLANs with RSTP or MSTP, and that's fine. Data centers moved away for reasons that are all visible in this module:</p>
+<ul>
+<li><strong>Blocked bandwidth.</strong> A tree uses one path. Every redundant uplink is idle until something fails. MSTP spreads VLANs across trees but still blocks per instance.</li>
+<li><strong>Failure domain.</strong> A VLAN is a broadcast domain. One loop or one chatty host affects every port in it, and a VLAN stretched across a whole data center makes every rack share the risk.</li>
+<li><strong>Flooding and table scale.</strong> Every unknown unicast, broadcast and multicast floods the whole VLAN. And every switch in a Layer-2 domain must learn every MAC in it. Thousands of VMs or containers per rack can exceed a top-of-rack switch's MAC table.</li>
+<li><strong>Convergence that depends on everybody.</strong> RSTP is fast on point-to-point links, but its failure modes (unidirectional links, devices that drop BPDUs) end in loops. A routing protocol's failure modes end in dropped packets, which TTL bounds.</li>
+</ul>
+<p>The replacement is a routed <strong>leaf-spine</strong> (Clos) fabric. Every leaf connects to every spine. Every link is a routed point-to-point link running BGP or OSPF (eBGP per RFC 7938 is the common choice), and traffic between two leaves spreads across all spines with ECMP. Failure detection uses BFD, typically 3 missed packets at 50–300 ms intervals, so routes withdraw in well under a second. No link is ever blocked.</p>
+<h3 id="d08-2026-sizing">Sizing a fabric</h3>
+<div class="sourceCode" id="d08-cb9"><pre class="sourceCode python"><code class="sourceCode python"><span id="d08-cb9-1"><a href="#d08-cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Leaf-spine sizing, VXLAN MTU budget, and ECMP spread from the VXLAN source port.&quot;&quot;&quot;</span></span>
+<span id="d08-cb9-2"><a href="#d08-cb9-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="d08-cb9-3"><a href="#d08-cb9-3" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> collections <span class="im">import</span> Counter</span>
+<span id="d08-cb9-4"><a href="#d08-cb9-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb9-5"><a href="#d08-cb9-5" aria-hidden="true" tabindex="-1"></a><span class="co"># A common leaf: 48 x 25G down to servers, 8 x 100G up (one per spine). Spine: 64 x 100G.</span></span>
+<span id="d08-cb9-6"><a href="#d08-cb9-6" aria-hidden="true" tabindex="-1"></a>down, up, spines, spine_ports <span class="op">=</span> <span class="dv">48</span> <span class="op">*</span> <span class="dv">25</span>, <span class="dv">8</span> <span class="op">*</span> <span class="dv">100</span>, <span class="dv">8</span>, <span class="dv">64</span></span>
+<span id="d08-cb9-7"><a href="#d08-cb9-7" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;leaf oversubscription </span><span class="sc">{</span>down<span class="sc">}</span><span class="ss">G : </span><span class="sc">{</span>up<span class="sc">}</span><span class="ss">G = </span><span class="sc">{</span>down <span class="op">/</span> up<span class="sc">:.1f}</span><span class="ss">:1&quot;</span>)</span>
+<span id="d08-cb9-8"><a href="#d08-cb9-8" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;max leaves = spine ports = </span><span class="sc">{</span>spine_ports<span class="sc">}</span><span class="ss">; server ports = </span><span class="sc">{</span>spine_ports <span class="op">*</span> <span class="dv">48</span><span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d08-cb9-9"><a href="#d08-cb9-9" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;any leaf-to-leaf path: 2 hops; equal-cost paths between two leaves: </span><span class="sc">{</span>spines<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d08-cb9-10"><a href="#d08-cb9-10" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;losing one spine removes </span><span class="sc">{</span><span class="dv">100</span> <span class="op">/</span> spines<span class="sc">:.1f}</span><span class="ss">% of fabric capacity&quot;</span>)</span>
+<span id="d08-cb9-11"><a href="#d08-cb9-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb9-12"><a href="#d08-cb9-12" aria-hidden="true" tabindex="-1"></a><span class="co"># VXLAN overhead (RFC 7348): outer Ethernet + IP + UDP + VXLAN header</span></span>
+<span id="d08-cb9-13"><a href="#d08-cb9-13" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> name, ip_hdr <span class="kw">in</span> ((<span class="st">&quot;IPv4&quot;</span>, <span class="dv">20</span>), (<span class="st">&quot;IPv6&quot;</span>, <span class="dv">40</span>)):</span>
+<span id="d08-cb9-14"><a href="#d08-cb9-14" aria-hidden="true" tabindex="-1"></a>    overhead <span class="op">=</span> <span class="dv">14</span> <span class="op">+</span> ip_hdr <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">8</span></span>
+<span id="d08-cb9-15"><a href="#d08-cb9-15" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;VXLAN over </span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">: +</span><span class="sc">{</span>overhead<span class="sc">}</span><span class="ss"> B; a 1500-byte inner IP packet needs underlay IP MTU &gt;= &quot;</span></span>
+<span id="d08-cb9-16"><a href="#d08-cb9-16" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;</span><span class="sc">{</span><span class="dv">1500</span> <span class="op">+</span> <span class="dv">14</span> <span class="op">+</span> ip_hdr <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">8</span><span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d08-cb9-17"><a href="#d08-cb9-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb9-18"><a href="#d08-cb9-18" aria-hidden="true" tabindex="-1"></a><span class="co"># The VTEP hashes the inner flow into the outer UDP source port so spines can ECMP on it.</span></span>
+<span id="d08-cb9-19"><a href="#d08-cb9-19" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> src_port(flow: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:</span>
+<span id="d08-cb9-20"><a href="#d08-cb9-20" aria-hidden="true" tabindex="-1"></a>    h <span class="op">=</span> <span class="bu">int</span>.from_bytes(hashlib.sha256(flow.encode()).digest()[:<span class="dv">4</span>])</span>
+<span id="d08-cb9-21"><a href="#d08-cb9-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">49152</span> <span class="op">+</span> h <span class="op">%</span> <span class="dv">16384</span>                  <span class="co"># RFC 7348 suggests the dynamic range 49152-65535</span></span>
+<span id="d08-cb9-22"><a href="#d08-cb9-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb9-23"><a href="#d08-cb9-23" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> spine_for(sport: <span class="bu">int</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:             <span class="co"># stand-in for the spine-facing ECMP hash</span></span>
+<span id="d08-cb9-24"><a href="#d08-cb9-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">int</span>.from_bytes(hashlib.sha256(<span class="ss">f&quot;10.0.0.11&gt;10.0.0.12:</span><span class="sc">{</span>sport<span class="sc">}</span><span class="ss">&gt;4789&quot;</span>.encode()).digest()[:<span class="dv">2</span>]) <span class="op">%</span> spines</span>
+<span id="d08-cb9-25"><a href="#d08-cb9-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d08-cb9-26"><a href="#d08-cb9-26" aria-hidden="true" tabindex="-1"></a>flows <span class="op">=</span> [<span class="ss">f&quot;10.20.7.</span><span class="sc">{</span>h<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>p<span class="sc">}</span><span class="ss">&gt;10.20.9.20:443/tcp&quot;</span> <span class="cf">for</span> h <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1</span>, <span class="dv">101</span>) <span class="cf">for</span> p <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">40000</span>, <span class="dv">40100</span>)]</span>
+<span id="d08-cb9-27"><a href="#d08-cb9-27" aria-hidden="true" tabindex="-1"></a>spread <span class="op">=</span> Counter(spine_for(src_port(f)) <span class="cf">for</span> f <span class="kw">in</span> flows)</span>
+<span id="d08-cb9-28"><a href="#d08-cb9-28" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span><span class="bu">len</span>(flows)<span class="sc">}</span><span class="ss"> inner flows over </span><span class="sc">{</span>spines<span class="sc">}</span><span class="ss"> spines:&quot;</span>, <span class="bu">sorted</span>(spread.values()))</span>
+<span id="d08-cb9-29"><a href="#d08-cb9-29" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;same flows with a constant source port:&quot;</span>, Counter(spine_for(<span class="dv">4789</span>) <span class="cf">for</span> _ <span class="kw">in</span> flows))</span></code></pre></div>
+<p>Real output:</p>
+<pre><code>leaf oversubscription 1200G : 800G = 1.5:1
+max leaves = spine ports = 64; server ports = 3072
+any leaf-to-leaf path: 2 hops; equal-cost paths between two leaves: 8
+losing one spine removes 12.5% of fabric capacity
+VXLAN over IPv4: +50 B; a 1500-byte inner IP packet needs underlay IP MTU &gt;= 1550
+VXLAN over IPv6: +70 B; a 1500-byte inner IP packet needs underlay IP MTU &gt;= 1570
+10000 inner flows over 8 spines: [1222, 1227, 1231, 1239, 1247, 1259, 1278, 1297]
+same flows with a constant source port: Counter({2: 10000})</code></pre>
+<p>Notice the properties. Every pair of servers is the same distance apart. Capacity grows by adding spines (more bandwidth) or leaves (more ports). A spine failure costs one-eighth of capacity, not a reconvergence. The last line shows why VXLAN puts a hash of the inner flow in the outer UDP source port. Without that entropy, every tunneled packet between two leaves would look like one flow and pin to one spine.</p>
+<h3 id="d08-2026-vxlan">VXLAN on the wire</h3>
+<p>The fabric is routed, but applications still sometimes need Layer 2: VM live migration, legacy clusters that use broadcast heartbeats, appliances that insist on a shared subnet. VXLAN (RFC 7348) carries the Ethernet frame inside UDP across the routed fabric. Here is the same ping from the start of this section, bridged from leaf 11 to leaf 12:</p>
+<pre><code>09:02:11.000000 00:1c:73:11:00:01 &gt; 00:1c:73:5f:00:01, ethertype IPv4 (0x0800), length 148: (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto UDP (17), length 134)
+    10.0.0.11.53211 &gt; 10.0.0.12.4789: VXLAN, flags [I] (0x08), vni 10310
+3a:1f:9c:52:07:e4 &gt; f0:2f:74:1b:c4:20, ethertype IPv4 (0x0800), length 98: (tos 0x0, ttl 64, id 7471, offset 0, flags [none], proto ICMP (1), length 84)
+    10.20.7.144 &gt; 10.20.7.200: ICMP echo request, id 20931, seq 1, length 64</code></pre>
+<ul>
+<li><strong>98 + 50 = 148.</strong> The inner frame (98 bytes, without its FCS) gains 8 bytes of VXLAN header, 8 of UDP, 20 of IP and 14 of outer Ethernet. The outer IP length, 134, is 98 + 8 + 8 + 20.</li>
+<li><strong><code>vni 10310</code>.</strong> The VXLAN Network Identifier is 24 bits, so about 16 million segments instead of 4094 VLANs. The inner frame carries no 802.1Q tag. The leaf mapped the access port's VLAN 310 to VNI 10310 on the way in and will map it back on the way out. VLAN numbers are now only locally significant, per leaf port.</li>
+<li><strong><code>flags [DF]</code>.</strong> Tunnel endpoints (VTEPs) must not fragment. If the underlay MTU is below 1550, large inner frames are silently dropped: the classic "ping works, SSH hangs at key exchange" overlay symptom. Fabrics run the underlay at a jumbo MTU, commonly 9216, for exactly this reason.</li>
+<li><strong>Source port 53211</strong> is the flow hash from the sizing script. Destination 4789 is VXLAN's IANA port. Linux's kernel <code>vxlan</code> driver historically defaulted to 8472, and Flannel in Kubernetes still uses 8472, so check both when a firewall "blocks VXLAN."</li>
+</ul>
+<h3 id="d08-2026-evpn">EVPN: a control plane instead of flooding</h3>
+<p>Plain VXLAN still learns like a switch: flood unknown destinations to every VTEP, learn source MACs from what comes back. <strong>EVPN</strong> (BGP EVPN, RFC 7432, applied to VXLAN by RFC 8365) replaces flood-and-learn with BGP advertisements:</p>
+<ul>
+<li><strong>Route type 2 (MAC/IP advertisement).</strong> When a leaf learns a local host, it advertises "MAC <code>3a:1f:…</code>, IP <code>10.20.7.144</code>, VNI 10310, behind VTEP <code>10.0.0.11</code>." Every other leaf installs that directly, so there's no flooding for known hosts. Because the leaves know IP-to-MAC bindings, they can also answer ARP locally (<em>ARP suppression</em>), and broadcast ARP stops crossing the fabric.</li>
+<li><strong>Route type 3 (inclusive multicast).</strong> Each leaf announces which VNIs it serves, building the list of VTEPs that must receive the remaining broadcast, unknown unicast and multicast (BUM) traffic, usually by ingress replication.</li>
+<li><strong>Route type 5 (IP prefix, RFC 9136)</strong> carries routed prefixes, for traffic between subnets and to the outside.</li>
+<li><strong>Multihoming with Ethernet segments</strong> (route types 1 and 4) lets a server attach to two leaves, all links active, without vendor MLAG.</li>
+<li><strong>Distributed anycast gateway.</strong> Every leaf owns the same gateway IP and MAC for each subnet, so a host's first hop is always its own leaf, and a migrated VM keeps working without re-ARPing.</li>
+</ul>
+<p>The net result is Layer-2 service with Layer-3 machinery underneath: no spanning tree between switches, BGP convergence, ECMP everywhere, and floods confined to what really must flood. You can build a tiny VTEP on Linux to see the moving parts: <code>sudo ip link add vxlan10310 type vxlan id 10310 dstport 4789 local 10.0.0.11 nolearning</code>. FRR adds the EVPN control plane.</p>
+<h3 id="d08-2026-cloud">Clouds and Kubernetes went further</h3>
+<p>Public-cloud VPCs don't expose Layer 2 at all. There's no broadcast or multicast between instances, ARP is answered by the hypervisor's virtual network, and every packet is encapsulated by the host and routed through a mapping service that knows where each address lives. The cloud runs EVPN's idea at planetary scale: a control plane that knows every endpoint, so nothing needs to flood. Some of those overlays use Geneve (RFC 8926), VXLAN's extensible successor, which is also what OVN and AWS Gateway Load Balancer speak.</p>
+<p>Kubernetes networking follows the same split. A CNI either routes pod CIDRs natively (Calico or Cilium announcing routes over BGP, cloud VPC routes) or runs an overlay: VXLAN in Flannel, Calico and Cilium; Geneve in OVN-Kubernetes and as a Cilium option. Spanning tree has no role anywhere in that picture. The leftover Layer 2 in a 2026 data center is the single link between a server and its leaf.</p>
+<h2 id="d08-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1. An access port receives a frame that already carries an 802.1Q tag. What happens?</strong></p>
+<p>It depends on the port's acceptable-frame-types setting, and that's the point of the question. A strict port admits only untagged frames and drops it. A permissive one may accept it, classify it by its tag or by its PVID, and forward it. That permissiveness is what makes double-tag VLAN hopping work. On a correctly configured network, access ports drop tagged frames, except for an explicitly configured voice VLAN.</p>
+<p><strong>Q2. Why does the same MAC address on two VLANs not confuse the switch?</strong></p>
+<p>Because the forwarding table is keyed on (VLAN, MAC), not on MAC alone, under independent VLAN learning. The two addresses are separate entries that never meet. On a switch with shared VLAN learning the MAC would collide, which is one reason almost all modern switches use independent learning.</p>
+<p><strong>Q3. Classic STP takes 30 seconds when a port comes up, but the textbook says 50. Which is right?</strong></p>
+<p>Both, for different events. A port coming up goes listening (15 s) then learning (15 s): 30 s. An <em>indirect</em> failure, where a switch loses its root path but its own links stay up, first waits for the stored BPDU to age out (max age, 20 s), then listens and learns: 50 s. RSTP removes the timers from both. An alternate port takes over immediately on link-down, and indirect failures are detected after 3 missed hellos (6 s) and then resolved by handshake.</p>
+<p><strong>Q4. What does RSTP's sync step do, and why is it necessary?</strong></p>
+<p>Before a switch agrees to a proposal on its new root port, it puts all its non-edge designated ports into discarding. Otherwise the new forwarding path could join up with the switch's old downstream forwarding ports and create a momentary loop. Downstream switches then get their own proposals, and the agreement ripples outward one hop at a time. That's how RSTP gets sub-second convergence without timers and still never forwards into a loop.</p>
+<p><strong>Q5. A switch shows bridge priority 32778. What is it configured to?</strong></p>
+<p>Priority 32768 on VLAN 10. The 16-bit priority field is really a 4-bit priority (in steps of 4096) followed by a 12-bit extended system ID, which per-VLAN spanning tree sets to the VLAN number.</p>
+<p><strong>Q6. How can an STP-protected network still loop?</strong></p>
+<p>STP can't see a loop if BPDUs don't flow around it. Unidirectional links let a blocked port stop hearing BPDUs and start forwarding while traffic still flows the other way. Devices that forward data but drop BPDUs hide a loop completely. BPDU filtering on the wrong port does the same. Defences: loop guard, UDLD or equivalent on fiber, BPDU guard on edge ports, storm control as the last line.</p>
+<p><strong>Q7. Why do modern data centers use VXLAN's UDP source port for anything?</strong></p>
+<p>Spines balance traffic with ECMP by hashing the outer headers. Between two VTEPs the outer IPs and destination port are constant, so the only entropy is the source port. VTEPs set it from a hash of the inner flow, so different inner flows take different spines and the same flow stays on one path. If every packet had the same source port, the fabric would collapse onto one spine.</p>
+<p><strong>Q8. You're asked to stretch a VLAN between two data centers for VM migration. What do you push back on, and what would you build?</strong></p>
+<p>A stretched VLAN is a shared broadcast and failure domain across a WAN. A loop or a broadcast storm in one site takes out both, and a split between sites can leave both halves thinking they own the gateway. If Layer 2 is truly required, carry it over a routed interconnect with EVPN-VXLAN: no spanning tree across the WAN, ARP suppression, BUM traffic controlled, an anycast gateway in each site. Then question the requirement itself, because most applications that "need Layer 2" really need a stable IP, which routing and DNS can provide.</p>

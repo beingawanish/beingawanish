@@ -1,0 +1,245 @@
+<h2 id=dd-writethrough-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's sequence is: database first, then the cache, then the ack. That is right, and it answers the two single-write failures. A real design review asks harder questions. What if two writes to the same key overlap? What if the database times out and nobody knows whether it committed? What if the cache's own replica loses the update? The lesson's claim that the cache is "never stale" for data written through it holds only if the cache layer handles each of these.</p>
+
+<h3 id=dd-writethrough-sequence level=3>The write path, step by step</h3>
+<p>Here is the full sequence for one price change, with the decisions at each step.</p>
+<ol>
+<li><strong>Receive the write.</strong> The cache layer gets <code>put(product:8412, price=$45)</code>.</li>
+<li><strong>Write the database.</strong> It runs the <code>UPDATE</code> and waits for the commit. Ideally the statement also returns a version, for example <code>UPDATE … SET price = 45, version = version + 1 WHERE id = 8412 RETURNING version</code> on Postgres.</li>
+<li><strong>Branch on the result.</strong>
+<ul>
+<li>Committed: continue to step 4.</li>
+<li>Rejected (constraint, conflict): change nothing in the cache, return the error.</li>
+<li>Unknown (timeout, dropped connection): <em>invalidate</em> the key, then return an error that says the outcome is unknown. Never write the new value into the cache, and never leave the old one.</li>
+</ul></li>
+<li><strong>Update the cache.</strong> Store the new value with its version and a TTL.</li>
+<li><strong>Branch again.</strong> If the cache update fails, invalidate. If the invalidation also fails, record the key for repair (more on that below).</li>
+<li><strong>Acknowledge.</strong> Return success once the database has committed, whatever happened to the cache.</li>
+</ol>
+<p>Step 3's "unknown" case is the one teams forget. A commit that times out may have landed. If the cache keeps the old value, it is now stale. If the cache takes the new value, it may hold a value the database never stored. Deleting is the only safe move, because the next read goes to the database and finds whichever answer is true.</p>
+
+<h3 id=dd-writethrough-order level=3>Why the database goes first</h3>
+<p>Some designs update the cache first, then the database. It feels faster, because readers see the new value sooner. It is a trap. If the database write then fails, the cache holds a value that does not exist anywhere else. Readers see a price that was never saved, and the TTL is the only thing that eventually removes it.</p>
+<p>The same trap appears in a subtler form: updating the cache <em>inside</em> the database transaction, before <code>COMMIT</code>. If the commit fails or the transaction rolls back, the cache already has the new value. Readers can also see it before other database readers do. The cache update belongs after the commit returns, never before.</p>
+
+<h3 id=dd-writethrough-race level=3>Concurrent writes still race</h3>
+<p>The cache-aside lesson rejected "update the cache on write" because two concurrent writes can reach the cache in the opposite order from their commits. Write-through updates the cache on write. So, by default, it has the same race.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-writethrough-svg-title dd-writethrough-svg-desc" viewBox="0 0 720 340" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-writethrough-svg-title">Two write-through writes reaching the cache out of order</title>
+<desc id="dd-writethrough-svg-desc">Four lifelines: writer A, database, cache and writer B. Writer A commits a price of 40 dollars. Writer B then commits 45 dollars. Writer B's cache update arrives first and stores 45. Writer A's cache update arrives second and stores 40. The database says 45 and the cache says 40. A version check on the cache update would reject writer A's older value.</desc>
+<defs><marker id="dd-writethrough-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="340" fill="#ffffff"/>
+<rect x="40" y="16" width="120" height="36" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="100" y="39" font-size="14" fill="#1c2430" text-anchor="middle">Writer A</text>
+<rect x="240" y="16" width="120" height="36" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="300" y="39" font-size="14" fill="#1c2430" text-anchor="middle">Database</text>
+<rect x="420" y="16" width="120" height="36" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="480" y="39" font-size="14" fill="#1c2430" text-anchor="middle">Cache</text>
+<rect x="580" y="16" width="120" height="36" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="640" y="39" font-size="14" fill="#1c2430" text-anchor="middle">Writer B</text>
+<line x1="100" y1="52" x2="100" y2="320" stroke="#d5dee8" stroke-width="2"/>
+<line x1="300" y1="52" x2="300" y2="320" stroke="#d5dee8" stroke-width="2"/>
+<line x1="480" y1="52" x2="480" y2="320" stroke="#d5dee8" stroke-width="2"/>
+<line x1="640" y1="52" x2="640" y2="320" stroke="#d5dee8" stroke-width="2"/>
+<line x1="100" y1="84" x2="296" y2="84" stroke="#1c2430" marker-end="url(#dd-writethrough-arrow)"/>
+<text x="200" y="76" font-size="12" fill="#1c2430" text-anchor="middle">1. UPDATE $40 → v7</text>
+<line x1="640" y1="124" x2="304" y2="124" stroke="#1c2430" marker-end="url(#dd-writethrough-arrow)"/>
+<text x="560" y="116" font-size="12" fill="#1c2430" text-anchor="middle">2. UPDATE $45 → v8</text>
+<line x1="640" y1="168" x2="484" y2="168" stroke="#1c2430" marker-end="url(#dd-writethrough-arrow)"/>
+<text x="580" y="160" font-size="12" fill="#1c2430" text-anchor="middle">3. SET $45 (v8)</text>
+<line x1="100" y1="212" x2="476" y2="212" stroke="#c898a4" stroke-width="2" marker-end="url(#dd-writethrough-arrow)"/>
+<text x="290" y="204" font-size="12" fill="#1c2430" text-anchor="middle">4. SET $40 (v7), delayed by a pause or a slow network</text>
+<rect x="330" y="236" width="300" height="64" rx="8" fill="#f8ebee" stroke="#c898a4"/>
+<text x="480" y="257" font-size="12" fill="#1c2430" text-anchor="middle">Plain SET: cache $40, database $45</text>
+<text x="480" y="275" font-size="12" fill="#1c2430" text-anchor="middle">Versioned SET: v7 &lt; v8, so step 4 is rejected</text>
+<text x="480" y="291" font-size="12" fill="#5c6b7c" text-anchor="middle">and the cache keeps $45</text>
+</svg>
+<figcaption>Write-through does not order writes by itself. The cache layer must either serialise writes per key or reject older versions.</figcaption>
+</figure>
+
+<p>There are three ways to close it.</p>
+<ul>
+<li><strong>Serialise writes per key in the cache layer.</strong> If all writes to a key pass through one owner that does "database, then cache" one write at a time, the cache sees them in commit order. Data grids work this way: in Hazelcast, an <code>IMap.put</code> with a write-through <code>MapStore</code> runs on the partition that owns the key, and that partition handles its operations in sequence. The cost is that a slow database write blocks the next write to every key in that partition.</li>
+<li><strong>Version-conditional updates.</strong> Carry the database's version with the value, and let the cache accept an update only if its version is newer than what it holds. This is cheap and works with many independent writers.</li>
+<li><strong>Invalidate instead of updating when in doubt.</strong> Some layers update the cache only when they hold a per-key lock, and delete otherwise.</li>
+</ul>
+<p>In Redis, the version check is a short Lua script, which Redis runs atomically:</p>
+<pre><code>-- KEYS[1] = cache key; ARGV[1] = version; ARGV[2] = value; ARGV[3] = TTL seconds
+local cur = redis.call('HGET', KEYS[1], 'v')
+if cur and tonumber(cur) &gt;= tonumber(ARGV[1]) then
+  return 0                          -- an equal or newer version is already cached
+end
+redis.call('HSET', KEYS[1], 'v', ARGV[1], 'd', ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return 1</code></pre>
+<p>Write-through layers usually serve reads through the same cache, so reader fills need care too. A reader that missed and loaded the old row can arrive after the writer's update. The same version check handles it: the reader's fill carries v7, the cache holds v8, and the fill is rejected. Without versions, filling with "store only if absent" (Redis <code>SET … NX</code>, Memcached <code>add</code>) while writers always overwrite closes most of that window.</p>
+
+<h3 id=dd-writethrough-invalidate-fails level=3>When the invalidation cannot reach the cache</h3>
+<p>The lesson's fallback for a failed cache update is "invalidate". But the most common reason a cache update fails is that the cache is unreachable, and then the invalidation fails too. The old value stays in the cache, and when the cache comes back it serves that stale value.</p>
+<p>A careful layer has a third line of defence. Options, roughly in order of effort:</p>
+<ul>
+<li><strong>A short TTL.</strong> The stale value lasts at most one TTL. This is why the lesson insists TTLs stay.</li>
+<li><strong>A repair log.</strong> Append the key to a durable list (a database table, a queue) when invalidation fails, and replay it when the cache is healthy again.</li>
+<li><strong>Change-data capture as a backstop.</strong> A process tailing the database's change log deletes or updates keys for every commit. It catches failed invalidations and bypassing writers alike.</li>
+<li><strong>Flush or bump a generation after a cache outage.</strong> Crude but certain: when a cache node returns after a partition, treat its contents as suspect.</li>
+</ul>
+
+<h3 id=dd-writethrough-replication level=3>The cache's own replicas</h3>
+<p>Redis replicates asynchronously. A write-through update can be acknowledged by the Redis primary and lost if the primary fails before its replica receives it. After the failover, the new primary holds the <em>previous</em> value. The database has the new one. Nothing on the write path will touch that key again until the next write.</p>
+<p>With cache-aside this rarely matters: a lost <code>SET</code> is a later miss. With write-through, a lost update leaves a stale value that looks valid. A TTL bounds it. <code>WAIT</code> in Redis can make the writer wait for replicas to acknowledge, at a latency cost, and it still does not make Redis a strongly consistent store. The honest fix is to treat a cache failover as an event that requires cleanup: flush, bump the key generation, or rely on short TTLs.</p>
+
+<h3 id=dd-writethrough-multi-key level=3>Many keys, no transaction</h3>
+<p>A database transaction can change a product price and the total of a bundle that contains it, atomically. The cache layer then updates two keys one after the other. Between those updates, a reader can see the new product price with the old bundle total. Most caches do not offer transactions that span the database and the cache together. Redis <code>MULTI</code> makes a group of cache commands atomic among themselves, but the database commit and the cache update are still two separate steps.</p>
+<p>Usually this brief inconsistency is acceptable. When it is not, cache the composite as one entry (the bundle with its items' prices inside), or put a version on the parent and have readers reject children with a mismatched version.</p>
+
+<h3 id=dd-writethrough-implementations level=3>Where real systems put the logic</h3>
+<ul>
+<li><strong>JCache (JSR-107).</strong> <code>setWriteThrough(true)</code> plus a <code>CacheWriter</code>. A <code>put</code> calls the writer, and a writer exception means the cache entry is not updated. Ehcache and other providers implement this.</li>
+<li><strong>Data grids.</strong> Hazelcast's <code>MapStore</code> is write-through when its write delay is 0 and write-behind when it is positive. Apache Ignite and Oracle Coherence have equivalent <code>CacheStore</code> hooks. The grid owns each key on one member, which is what makes per-key ordering possible.</li>
+<li><strong>DAX.</strong> Writes through DAX go to DynamoDB and then update DAX's item cache. Its query cache is not updated by writes, and writes made directly to DynamoDB are not seen by DAX until entries expire.</li>
+<li><strong>Your own data-access layer.</strong> Most teams with Redis build write-through as a repository class: one function per entity that commits, then updates the cache with a version. That works, provided every writer uses it.</li>
+</ul>
+
+<h2 id=dd-writethrough-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The running assumptions: a database commit takes 5 ms at p50 and 25 ms at p99. A cache update takes 1 ms at p50 and 5 ms at p99. The cache has 6 GB of usable memory. It holds the 2,000,000-item catalog at about 2 KB per item, plus per-locale variants, sellers and review summaries, so it is always full and relies on eviction.</p>
+
+<h3 id=dd-writethrough-latency-math level=3>Write latency</h3>
+<p>The two steps run in sequence, so their latencies add. At the median, 5 + 1 = 6 ms. At the tail, adding p99s gives an upper bound, not the exact p99: up to 25 + 5 = 30 ms. If the two are independent, the real combined p99 is a little below that.</p>
+<p>The cache step is small compared with the commit. But it is a second dependency on every write's critical path, and its tail is what matters. A Redis node doing a background save, or a cache client waiting on a full connection pool, can add hundreds of milliseconds to writes that the database finished in 5 ms. Give the cache step its own short timeout, and on timeout, invalidate and acknowledge.</p>
+
+<h3 id=dd-writethrough-availability-math level=3>Write availability</h3>
+<p>Suppose the database is available 99.95% of the time and the cache 99.9%. A month has about 43,200 minutes.</p>
+<ul>
+<li>If a cache failure fails the write: availability ≈ 0.9995 × 0.999 ≈ 99.85%. That allows about 65 minutes of failed writes per month.</li>
+<li>If a cache failure only causes an invalidation (or a repair-log entry) and the write succeeds: availability stays near the database's 99.95%, about 22 minutes per month.</li>
+</ul>
+<p>The difference, around 43 minutes a month, is the price of letting the cache block writes. That is why the lesson's rule is "invalidate and return success". The cache is an optimisation, so it must not reduce write availability.</p>
+
+<h3 id=dd-writethrough-churn-math level=3>Cache churn</h3>
+<p>Every write puts its value into the cache, whether anyone reads it or not. Memory taken by written-but-unread values is roughly write rate × value size × the time they stay before eviction or expiry.</p>
+<ul>
+<li><strong>The activity log.</strong> 5,000 click events per second × 500 bytes × a 1-hour TTL = 9 GB. That is more than the whole product cache. Under <code>allkeys-lru</code>, those fresh but useless entries push out hot products, and the product hit ratio falls.</li>
+<li><strong>The nightly price import.</strong> 2,000,000 updates of 2 KB each is 4 GB written in 10 minutes. On a full 6 GB cache, the import's entries look like the most recently used data, so they push out hot entries that were read less recently. The cache fills with whatever the import touched, in import order. The morning's traffic then starts with a partly cold cache.</li>
+</ul>
+<p>The fix for both is the same: bulk and write-only paths should <em>write around</em> the cache. They write to the database and invalidate the keys that exist, rather than inserting every value. Redis LFU eviction (<code>allkeys-lfu</code>) also resists this kind of churn better than LRU, since a key written once has a low frequency count.</p>
+
+<h3 id=dd-writethrough-benefit-math level=3>What write-through actually buys</h3>
+<p>Write-through does not reduce database load much. Every write still goes to the database, and delete-on-write costs only one extra read per written key that is read again. For profile edits at 50 per second, where most edits are viewed right away, delete-on-write adds about 50 extra database reads per second. That is trivial next to the 12,000 reads per second a cache absorbs.</p>
+<p>The real gains are elsewhere. The user who just saved sees the saved value from the cache in 1 ms instead of 16 ms. There is no window in which a delete has happened but a refill has not. Write paths need no invalidation code, provided they go through the layer. Judge the pattern on those gains, because judged on load alone it rarely wins.</p>
+
+<h3 id=dd-writethrough-replica-math level=3>Write amplification on the cache</h3>
+<p>Each write-through update touches the cache primary and every cache replica. A cache with two replicas turns 2,000 writes per second of 2 KB into 2,000 × 2 KB × 3 = 12 MB/s of cache writes and replication traffic. That is small for a product catalog. It becomes significant for write-heavy entities like inventory counters or session-like state, which is another reason those paths often skip the cache or use a different pattern.</p>
+
+<h2 id=dd-writethrough-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-writethrough-fm-race level=3>1. Two quick edits, the wrong one wins</h3>
+<p><strong>Symptom.</strong> A merchant changes a price twice within a second. The database shows the second price. The site shows the first, until the TTL expires.</p>
+<p><strong>Mechanism.</strong> Two write-through requests ran on different application servers. Both committed in order, but the first one's cache update was delayed by a GC pause and landed after the second's. A plain <code>SET</code> let the older value overwrite the newer one, exactly the race the cache-aside lesson warned about.</p>
+<p><strong>Detect.</strong> A sampled consistency checker that compares cache values with the database for recently written keys. Logging the version written on each cache update makes the reversal visible.</p>
+<p><strong>Fix.</strong> Version-conditional cache updates, or per-key serialisation in the cache layer. Keep the TTL as a bound for anything the version check misses.</p>
+
+<h3 id=dd-writethrough-fm-ambiguous level=3>2. The write that failed, and also succeeded</h3>
+<p><strong>Symptom.</strong> The user gets an error on save and tries again. Both attempts show up in the database. Meanwhile the cache shows the price from before either attempt.</p>
+<p><strong>Mechanism.</strong> The database commit took longer than the layer's timeout. The commit actually landed, but the layer treated the timeout as a failure: it skipped the cache update and returned an error. The cache kept the old value. The retry then committed again.</p>
+<p><strong>Detect.</strong> Count database timeouts on the write path separately from rejections. Compare against rows that were in fact written.</p>
+<p><strong>Fix.</strong> Treat "unknown" as its own outcome. Invalidate the key so the next read finds the truth, and tell the caller the result is unknown rather than failed. Make the write idempotent with a request key, so a retry cannot apply twice; see <a href="#idempotency">Idempotency</a>.</p>
+
+<h3 id=dd-writethrough-fm-cache-down level=3>3. The cache was down during the write</h3>
+<p><strong>Symptom.</strong> After a five-minute network partition between the application and one cache node, a handful of products show prices that were changed during the partition. The prices are wrong until their TTLs expire.</p>
+<p><strong>Mechanism.</strong> During the partition, writes committed to the database. Their cache updates failed, and so did the invalidations, because the node was unreachable. The node still held the old values. When the partition healed, it served them as valid entries.</p>
+<p><strong>Detect.</strong> Count failed invalidations as a metric, not a log line. Any non-zero count means stale entries may exist.</p>
+<p><strong>Fix.</strong> Record failed invalidations in a durable repair log and replay it when the node recovers, or tail the database's change log as a backstop. Keep TTLs short enough that the worst case is tolerable.</p>
+
+<h3 id=dd-writethrough-fm-failover level=3>4. The update that a failover undid</h3>
+<p><strong>Symptom.</strong> Right after a Redis primary failover, a few recently edited products revert to their previous values on the site. The database is correct.</p>
+<p><strong>Mechanism.</strong> Redis acknowledged those cache updates on the old primary, which failed before replicating them. The promoted replica had the older values. Write-through assumes that a successful cache update stays updated, so nothing corrected them. If the team had removed TTLs, they would stay wrong until the next write to each product.</p>
+<p><strong>Detect.</strong> Treat failover events as triggers for a consistency check on keys written in the last few seconds before it. The replication offset gap reported at failover tells you how much was lost.</p>
+<p><strong>Fix.</strong> Keep TTLs. After a failover, flush or bump the generation of the affected key range, or replay recent writes from the database's change log. Use <code>WAIT</code> only if you have measured that the extra write latency is worth it.</p>
+
+<h3 id=dd-writethrough-fm-churn level=3>5. The import that evicted the hot set</h3>
+<p><strong>Symptom.</strong> Every morning after the nightly price import, the product hit ratio drops from 99% to about 70% and slowly recovers by noon. Database load is highest at the start of the business day.</p>
+<p><strong>Mechanism.</strong> The import was moved onto the write-through layer, so it would stop bypassing the cache. That fixed staleness, but it wrote 2,000,000 entries into a cache that was already full. Hot entries that had not been read for a while (overnight, most of them) were evicted to make room for cold products the import touched.</p>
+<p><strong>Detect.</strong> Evictions per second and hit ratio plotted against batch job schedules. A sharp eviction spike during the job is the signature.</p>
+<p><strong>Fix.</strong> Bulk jobs write around the cache: commit to the database, then invalidate only keys that are present. Or update a key only if it already exists (Redis <code>SET … XX</code>), so the import refreshes cached entries without adding cold ones. Consider LFU eviction.</p>
+
+<h3 id=dd-writethrough-fm-partial level=3>6. The bundle total that did not add up</h3>
+<p><strong>Symptom.</strong> For a few seconds after a price change, a bundle page shows item prices that do not sum to the bundle total. Customers screenshot it.</p>
+<p><strong>Mechanism.</strong> One database transaction changed the item and the bundle. The write-through layer then updated the item key and the bundle key separately. A reader between those updates saw one new and one old. Under load, the gap stretched to seconds because the second update queued behind others.</p>
+<p><strong>Detect.</strong> An invariant check on rendered pages, or a synthetic test that changes a price and reads the bundle in a loop.</p>
+<p><strong>Fix.</strong> Cache the bundle as one composite entry, compute the total at read time from cached items, or version the parent and have readers reject children from a different version. Accept brief inconsistency where it does not matter, and say so in the design.</p>
+
+<h3 id=dd-writethrough-fm-slow-writes level=3>7. Writes got slow and the database was fine</h3>
+<p><strong>Symptom.</strong> Save latency p99 rises from 30 ms to 800 ms. Database commit latency is unchanged.</p>
+<p><strong>Mechanism.</strong> The cache step sits on every write's critical path. A cache node was busy with a large key deletion and a background save, and its clients' connection pool was exhausted. Writes waited for a cache connection after their commit was already done.</p>
+<p><strong>Detect.</strong> Trace spans for the database step and the cache step separately. The cache client's pool wait time.</p>
+<p><strong>Fix.</strong> A tight timeout on the cache step (a few times its normal p99), after which the layer invalidates (or logs for repair) and acknowledges. A circuit breaker that skips the cache update when the node is unhealthy. The database's commit is the durable part; the cache step must never hold the user hostage.</p>
+
+<h2 id=dd-writethrough-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-writethrough-choose-write-policy level=3>What happens to the cache on a write</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Policy<th>Cache after the write<th>Read-after-write<th>Write latency<th>Durability<th>Bypassing writers<th>Churn<tbody><tr><td>Delete-on-write (cache-aside)<td>Key absent<td>One miss<td>Database + a delete<td>Database<td>Stale until TTL<td>None<tr><td>Write-around + invalidate<td>Key absent<td>One miss<td>Database + a delete<td>Database<td>Stale until TTL<td>None; the write itself fills nothing<tr><td>Write-through<td>New value<td>Hit<td>Database + cache update<td>Database<td>Stale until TTL<td>Every written key enters the cache<tr><td>Write-through, update-if-present (<code>SET XX</code>)<td>New value if it was cached; absent otherwise<td>Hit if it was hot<td>Database + cache update<td>Database<td>Stale until TTL<td>None<tr><td>Change-data capture updates the cache<td>New value after log lag<td>Possible miss or stale read within the lag<td>Database only<td>Database<td>Covered<td>Depends on whether it inserts or only updates<tr><td>Write-behind<td>New value immediately<td>Hit<td>Cache only<td>Cache until flushed: acknowledged writes can be lost<td>Conflicts with the pending flush<td>Every written key</table></div></div>
+<p>Write-through is the right default when users read back what they just wrote and all writers can go through one layer. For anything bulk, write-heavy or rarely read, use write-around with invalidation. Update-if-present is a useful middle ground: hot keys stay warm and fresh after writes, and cold keys never enter the cache through the write path. When there are writers you cannot control, put change-data capture underneath whatever you choose. For write-behind's durability trade, see <a href="#writebehind">Write-Behind</a>.</p>
+
+<h3 id=dd-writethrough-choose-ordering level=3>Ordering and conflict control</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Choice<th>What it prevents<th>What it costs<tbody><tr><td>Database first, then cache<td>Phantom values the database never stored<td>Readers see the new value a millisecond later<tr><td>Cache first, then database<td>Nothing worth having<td>Phantom values on database failure; avoid<tr><td>Plain overwrite<td>Nothing<td>Out-of-order updates leave old values cached<tr><td>Version-conditional update<td>Out-of-order writes and late reader fills<td>A version column in the database and a script in the cache<tr><td>Per-key serialisation (data-grid partition owner)<td>All per-key reordering<td>A slow write delays later writes to the same partition<tr><td>Invalidate on any doubt<td>Stale or phantom values after ambiguous outcomes<td>One extra miss each time</table></div></div>
+<p>A sound combination for a Redis-based layer: database first, version-conditional cache updates, invalidate on any unknown outcome, short TTLs, and change-data capture if there are writers outside the layer.</p>
+
+<h2 id=dd-writethrough-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Is the order strictly "database commit, then cache update", and never inside the transaction?</li>
+<li>What does the layer do when the commit outcome is unknown (timeout, dropped connection)? Does it invalidate, and what does it tell the caller?</li>
+<li>How are two concurrent writes to the same key ordered in the cache: per-key serialisation, version checks, or nothing?</li>
+<li>Do reader fills check versions, or use "store only if absent", so a late fill cannot overwrite a newer write?</li>
+<li>When both the cache update and the invalidation fail, where is the key recorded, and who repairs it?</li>
+<li>Does a cache failure ever fail the user's write? What is the cache step's timeout?</li>
+<li>Which writers bypass the layer: bulk imports, other services, manual fixes? What catches them: change-data capture, TTLs, or both?</li>
+<li>What TTL remains on every entry, and has anyone proposed removing it?</li>
+<li>What happens after a cache primary failover? Is there a cleanup step for updates the replica may have missed?</li>
+<li>Which write paths should not insert into the cache at all (logs, metrics, bulk jobs), and do they write around it?</li>
+<li>Where does a single database transaction update several cached keys, and is the brief mixed state acceptable?</li>
+<li>Which metrics exist: cache-step latency and failures, failed invalidations, version rejections, evictions during batch jobs, sampled cache-versus-database mismatches?</li>
+</ol>
+
+<h2 id=dd-writethrough-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"With write-through, can the cache ever be stale for a key written through it?"</summary>
+<p>Yes, unless the layer orders updates. Two concurrent writes can commit in one order and reach the cache in the other, which leaves the older value cached. It is the same race that makes "update on write" risky in cache-aside. The fixes are per-key serialisation in the cache layer, as data grids do with partition owners, or version-conditional updates that reject older versions. Add to that ambiguous commits, failed invalidations and cache failovers, and the honest claim is "fresh, provided the layer handles these cases, with TTLs as the bound when it does not".</p>
+</details>
+
+<details>
+<summary>"The database commit times out. What does the cache layer do?"</summary>
+<p>It does not know whether the write landed, so it must not update the cache with the new value or leave the old one trusted. It deletes the key, so the next read fetches whatever the database actually holds. It then returns an "unknown outcome" error, and the client retries with an idempotency key so a commit that did land is not applied twice.</p>
+</details>
+
+<details>
+<summary>"Why not update the cache first? Readers would see the change sooner."</summary>
+<p>Because if the database write then fails, the cache holds a value that exists nowhere else, and readers see a price that was never saved. Database first means a database failure leaves the cache untouched, and the user gets an error that matches reality. The cost is about a millisecond before readers see the new value, which is nothing.</p>
+</details>
+
+<details>
+<summary>"Should the nightly bulk import go through the write-through layer?"</summary>
+<p>It should go through the layer's invalidation logic, but it should not insert every row into the cache. Writing 2 million cold entries through the cache evicts the hot set and starts the next morning with a poor hit ratio. Better: commit in batches, then invalidate the keys that exist, or update only keys already present (<code>SET XX</code>). That keeps the import from leaving stale data and from flushing the cache.</p>
+</details>
+
+<details>
+<summary>"Redis fails over right after a write-through update. What can go wrong?"</summary>
+<p>Redis replication is asynchronous, so the primary may have acknowledged the update without its replica receiving it. The promoted replica then serves the previous value while the database holds the new one, and nothing on the write path revisits that key. A TTL bounds the damage. Beyond that, treat failover as a cleanup event: flush or bump the generation for recent keys, or replay recent commits from the change log. <code>WAIT</code> can reduce the window at a latency cost, but it does not make Redis strongly consistent.</p>
+</details>
+
+<details>
+<summary>"With write-through and change-data capture in place, can we remove TTLs?"</summary>
+<p>I would not. TTLs cost almost nothing, and they bound every failure you have not thought of: a bug in the change-log tailer, a lost cache update in a failover, a race the version check missed, an old key format nobody reads. Make them long if freshness comes from the write path, say a day for product descriptions. The lesson's misuse case is exactly a team that removed TTLs and then could not explain why some values never updated.</p>
+</details>
+
+<details>
+<summary>"Inventory counts change on every purchase. Write-through, write-behind or neither?"</summary>
+<p>Usually neither for the authoritative count. The purchase must check the database, so the cache cannot be the source of truth, and write-behind would risk losing acknowledged decrements. For the displayed "only 3 left" number, a short TTL or update-if-present write-through is fine, because a few seconds of staleness is acceptable there. The real decision is to separate the count that decides a sale from the count that decorates a page.</p>
+</details>
+
+<details>
+<summary>"Write-through doesn't cut database load. So why use it?"</summary>
+<p>For read-after-write and for structure. The user who just saved sees the saved value in about 1 ms, with no delete-then-refill gap. Write paths that go through the layer need no invalidation code, so the forgotten-delete bug cannot happen there. If neither matters, for example for data users rarely read right after writing, delete-on-write is simpler and works with any cache. I would not choose write-through to save database capacity.</p>
+</details>

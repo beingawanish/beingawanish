@@ -1,0 +1,21 @@
+# fulfilment-svc. Infrastructure variables (guide §7) are mapped by edacommon; only defaults and
+# service-specific settings live here.
+eda:
+  service-name: fulfilment-svc
+  consumer:
+    topics: [fulfilment.commands.v1, shipping.events.v1]
+  idempotency:
+    paths: [/ops/dlq/replay]
+server:
+  port: 8106
+fulfilment:
+  wms-tick-interval: 500ms
+  # admin.yaml FakeWmsConfig, as FAKE_WMS_* (upper snake case)
+  fake-wms:
+    drop-request-rate: ${FAKE_WMS_DROP_REQUEST_RATE:0.1}
+    accept-delay-ms: ${FAKE_WMS_ACCEPT_DELAY_MS:2000}
+    pick-delay-ms: ${FAKE_WMS_PICK_DELAY_MS:20000}
+    pack-delay-ms: ${FAKE_WMS_PACK_DELAY_MS:20000}
+    fail-rate: ${FAKE_WMS_FAIL_RATE:0.02}
+    manifest-lines: ${FAKE_WMS_MANIFEST_LINES:2000}
+    inspection-damaged-rate: ${FAKE_WMS_INSPECTION_DAMAGED_RATE:0.2}

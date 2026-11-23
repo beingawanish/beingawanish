@@ -1,0 +1,290 @@
+<h2 id=dd-autoscaling-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson draws auto-scaling as one loop: measure, compare, act. In a real system that loop is several pieces owned by different components, and each piece adds its own delay. A metric is collected by one system, evaluated by another, acted on by a third, and the new server is admitted by a fourth. Most auto-scaling incidents happen in the seams between them, so it pays to know what each one actually does.</p>
+
+<h3 id=dd-autoscaling-loop-parts level=3>The four stages of one scaling decision</h3>
+<ol>
+<li><strong>Sample.</strong> Something measures the signal. On AWS that is CloudWatch, which receives EC2 metrics every 5 minutes on basic monitoring and every minute with detailed monitoring turned on. On Kubernetes, the metrics-server scrapes each node's kubelet for CPU and memory. A custom signal such as requests per pod comes through an adapter (Prometheus Adapter, KEDA, or a cloud metrics adapter).</li>
+<li><strong>Evaluate.</strong> A controller turns samples into a decision. It averages or sums across the fleet, checks how long the signal has been out of range, and computes a desired count.</li>
+<li><strong>Act.</strong> The controller asks for capacity. An Auto Scaling Group calls the EC2 API to launch instances. A Kubernetes HPA changes a Deployment's replica count, and the scheduler places pods. If no node has room, pods stay <code>Pending</code> until a second loop, the cluster autoscaler or Karpenter, adds a node.</li>
+<li><strong>Admit.</strong> The new server boots, starts the app, and passes the load balancer's health checks. Only then does it take traffic. Removal runs the same path backwards: stop sending new requests, drain, then terminate.</li>
+</ol>
+<p>A senior reviewer asks for the delay of each stage separately. "It scales in about five minutes" hides which stage to fix.</p>
+
+<h3 id=dd-autoscaling-lag-anatomy level=3>Where the reaction lag actually goes</h3>
+<p>The lesson calls the 3-7 minutes of reaction lag "physics". Here is that physics broken out for a typical AWS fleet with default-ish settings. The numbers are representative, not guaranteed; measure your own.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-autoscaling-svg-title dd-autoscaling-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-autoscaling-svg-title">The reaction lag of one scale-out, stage by stage</title>
+<desc id="dd-autoscaling-svg-desc">A timeline from minute 0, when a spike begins, to minute 8. The metric period runs from 0 to about 1.5 minutes. Alarm evaluation over three datapoints runs to about 3 minutes. Instance launch and operating system boot run to about 4.5 minutes. Application start and cache warm-up run to about 5.5 minutes. Load balancer health checks run to about 7 minutes. Only after that does the new server take traffic. During the whole time, the existing fleet's headroom carries the extra load.</desc>
+<rect x="0" y="0" width="720" height="300" fill="#ffffff"/>
+<line x1="150" y1="250" x2="700" y2="250" stroke="#1c2430"/>
+<g font-size="12" fill="#5c6b7c" text-anchor="middle">
+<text x="150" y="268">0</text><text x="219" y="268">1</text><text x="288" y="268">2</text><text x="356" y="268">3</text><text x="425" y="268">4</text><text x="494" y="268">5</text><text x="563" y="268">6</text><text x="631" y="268">7</text><text x="700" y="268">8 min</text>
+</g>
+<g font-size="13" fill="#1c2430">
+<text x="10" y="44">Metric period</text>
+<text x="10" y="82">Alarm evaluation</text>
+<text x="10" y="120">Launch + OS boot</text>
+<text x="10" y="158">App start + warm</text>
+<text x="10" y="196">Health checks</text>
+<text x="10" y="234">Takes traffic</text>
+</g>
+<rect x="150" y="28" width="103" height="22" rx="4" fill="#e4eef8" stroke="#7ea4c8"/>
+<rect x="253" y="66" width="103" height="22" rx="4" fill="#e4eef8" stroke="#7ea4c8"/>
+<rect x="356" y="104" width="103" height="22" rx="4" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<rect x="459" y="142" width="69" height="22" rx="4" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<rect x="528" y="180" width="103" height="22" rx="4" fill="#f8ebee" stroke="#c898a4"/>
+<rect x="631" y="218" width="69" height="22" rx="4" fill="#e5f3ec" stroke="#7eae96"/>
+<g font-size="11" fill="#5c6b7c">
+<text x="258" y="44">1-min data + publish delay</text>
+<text x="361" y="82">3 datapoints over threshold</text>
+<text x="464" y="120">EC2 API, kernel, agents</text>
+<text x="533" y="158">JIT, config, cache</text>
+<text x="420" y="196">ALB: 30 s interval x 5 healthy checks</text>
+</g>
+<path d="M150,14 L631,14" stroke="#c898a4" stroke-width="2" stroke-dasharray="5 4"/>
+<text x="390" y="10" font-size="12" fill="#1c2430" text-anchor="middle">existing headroom carries all of this</text>
+</svg>
+<figcaption>About seven minutes from spike to first useful request. Note how little of it is the boot itself: detection and admission take as long as the server does.</figcaption>
+</figure>
+
+<p>Three things in that timeline surprise people:</p>
+<ul>
+<li><strong>Detection is slow by design.</strong> AWS target tracking creates two CloudWatch alarms for you. In AWS's documentation, the scale-out alarm needs 3 datapoints over 3 minutes and the scale-in alarm needs 15 datapoints over 15 minutes. That asymmetry is the "up fast, down slow" rule, built in. On basic monitoring, the 5-minute metric period alone can eat most of your headroom.</li>
+<li><strong>Health checks are a hidden delay.</strong> An Application Load Balancer target group defaults to a 30-second check interval and 5 consecutive healthy checks. A new target can wait about 2.5 minutes after the app is ready. Dropping to a 10-second interval and 2 or 3 healthy checks cuts that to well under a minute, as long as your health endpoint is honest about readiness.</li>
+<li><strong>Boot is often the smallest slice.</strong> A baked image (AMI or container with dependencies included) boots in under a minute. A server that runs a long configuration script at boot can take five. Baking images is usually the cheapest lag reduction available.</li>
+</ul>
+
+<h3 id=dd-autoscaling-aws level=3>AWS Auto Scaling Groups: the knobs that matter</h3>
+<p>An Auto Scaling Group (ASG) holds a <strong>min</strong>, a <strong>max</strong> and a <strong>desired</strong> count, plus one or more policies that move desired between them.</p>
+<ul>
+<li><strong>Target tracking</strong> is the default choice. You name a metric (<code>ASGAverageCPUUtilization</code>, <code>ALBRequestCountPerTarget</code>, or a custom metric) and a target value. AWS manages the alarms and step sizes. It scales out roughly in proportion to how far you are over target and scales in gradually.</li>
+<li><strong>Step scaling</strong> lets you write the bands yourself: at 70-85% add 2, above 85% add 5. Use it when you need a larger first jump than target tracking gives, for example on a service with known violent spikes.</li>
+<li><strong>Scheduled actions</strong> change min, max or desired at a cron time. The 6 PM pre-warm in the lesson is a scheduled action that raises <em>min</em>, so the reactive policy can still go higher.</li>
+<li><strong>Predictive scaling</strong> forecasts load from the group's recent history and schedules capacity ahead of it. It has a forecast-only mode. Run that for a couple of weeks and compare the forecast with reality before letting it act.</li>
+<li><strong>Instance warmup</strong> tells the group to leave a new instance's metrics out of the fleet average until it has settled. Without it, a booting instance's CPU spike (or its zero requests) distorts the average and the policy overreacts.</li>
+<li><strong>Health check grace period</strong> stops the group from killing an instance that fails health checks while still starting. Too short, and the group terminates every new instance in a loop (failure 3 below).</li>
+<li><strong>Lifecycle hooks</strong> pause an instance in <code>Pending:Wait</code> or <code>Terminating:Wait</code> so a script can warm a cache or finish jobs before it joins or leaves.</li>
+<li><strong>Warm pools</strong> keep pre-initialised instances stopped (you pay for their disks, not their compute), hibernated, or running. A stopped warm instance can join in tens of seconds instead of minutes.</li>
+</ul>
+<p>On the load balancer side, <strong>deregistration delay</strong> (300 seconds by default on ALB target groups) is how long a removed target keeps its in-flight requests. Set it a little above your longest normal request, not to the default. Five minutes of drain on every scale-in slows the whole loop.</p>
+
+<h3 id=dd-autoscaling-hpa level=3>Kubernetes HPA: the formula and its guards</h3>
+<p>The Horizontal Pod Autoscaler runs a simple proportional rule every 15 seconds by default:</p>
+<pre><code>desiredReplicas = ceil( currentReplicas × currentMetric / targetMetric )</code></pre>
+<p>Ten pods at 90 requests per second each, with a target of 60, gives <code>ceil(10 × 90/60) = 15</code>. The rule jumps straight to the size it thinks it needs, which is why the HPA reacts faster than a fixed step policy. Several guards sit around that formula:</p>
+<ul>
+<li><strong>Tolerance.</strong> If the ratio is within 10% of 1.0 (the default), nothing happens. That is a built-in dead band against noise.</li>
+<li><strong>CPU is relative to requests.</strong> "70% CPU" means 70% of the pod's <code>resources.requests.cpu</code>, not of the node. Set requests carelessly and the target means nothing.</li>
+<li><strong>Not-ready pods.</strong> While scaling up, the HPA treats pods that are not yet ready as using 0% of the target, and pods with missing metrics conservatively. This damps overreaction to booting pods, the same job as ASG instance warmup.</li>
+<li><strong>The <code>behavior</code> field.</strong> Scale-down has a 300-second stabilisation window by default: the HPA picks the <em>highest</em> recommendation from the last five minutes, so one quiet sample cannot shrink the fleet. Scale-up has no window by default and may add 100% or 4 pods per 15 seconds, whichever is more. You can tune both, per direction.</li>
+<li><strong>Multiple metrics.</strong> Give the HPA requests per pod <em>and</em> CPU, and it computes a replica count for each and takes the largest. That is a cheap safety net when you are not sure which resource runs out first.</li>
+</ul>
+<p>Below the HPA sits the second loop. The cluster autoscaler watches for unschedulable pods and adds nodes from a node group; Karpenter picks an instance type that fits the pending pods. Node boot adds a minute or more. Scale-down of nodes is deliberately slow: the cluster autoscaler by default waits until a node has been underused for about 10 minutes. Two stacked loops mean two lags, and a pod scale-up that needs new nodes is only as fast as the slower one.</p>
+
+<p>The proportional rule plus a stabilisation window fits in a few lines. This is a model, not the real controller, but it is useful for replaying a traffic curve against a policy before production does it for you:</p>
+<pre><code>import math
+from collections import deque
+
+def hpa_step(current, metric, target, history, window=20, tolerance=0.1):
+    """One 15-second HPA tick. history holds recent recommendations;
+    window=20 ticks is the default 300 s scale-down stabilisation."""
+    ratio = metric / target
+    want = current if abs(ratio - 1) &lt;= tolerance else math.ceil(current * ratio)
+    history.append(want)
+    while len(history) &gt; window:
+        history.popleft()
+    if want &lt; current:                      # scaling down: be pessimistic
+        return max(history)
+    return want
+
+history = deque()
+replicas = 3
+for rps in [900, 900, 3000, 6000, 9000, 12000, 12000, 4000, 4000]:
+    per_pod = rps / replicas
+    replicas = min(20, max(3, hpa_step(replicas, per_pod, 520, history)))
+    print(rps, replicas)
+</code></pre>
+<p>Run it and notice two things. Scale-up jumps in a few ticks because the ratio is large. Scale-down does not happen at all inside the window, even though traffic fell by two-thirds. That is the stabilisation window doing its job.</p>
+
+<h3 id=dd-autoscaling-queue-signal level=3>Scaling on a queue: KEDA, SQS and Lambda</h3>
+<p>For workers, the signal comes from the queue, not the workers. <strong>KEDA</strong> is the common Kubernetes tool. It polls a source (SQS, Kafka consumer lag, RabbitMQ, Redis, Prometheus) and feeds the HPA an external metric. It can also take a deployment to zero replicas and back, which the plain HPA does not do on its own.</p>
+<p>The useful knob is the per-replica target, such as "one replica per 50 messages of lag". On Kafka there is a hard cap the autoscaler cannot see: a consumer group can use at most one consumer per partition. A twelve-partition topic gets no benefit from a thirteenth replica, so the max for that deployment is twelve. See <a href="#partitioned-consumption">Partitioned Consumption</a>.</p>
+<p>On AWS, Lambda reading from SQS scales its pollers with queue depth and has its own concurrency controls. <em>Reserved concurrency</em> caps how many copies can run, which is the max-as-bulkhead idea applied to functions. Without it, a backlog can launch hundreds of functions that each open a database connection.</p>
+
+<h2 id=dd-autoscaling-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The lesson's fleet is the running example: 800 requests per second (req/s) per server at the limit, 520 planned (the 65% target), min 3, max 20. Here is how to derive each of those numbers instead of picking them.</p>
+
+<h3 id=dd-autoscaling-target-math level=3>How much headroom: the target from growth rate and lag</h3>
+<p>Headroom has one job: carry the traffic growth that happens during the reaction lag. That gives a direct formula. Suppose traffic grows by a fraction <em>g</em> of the current load per minute, and the lag is <em>L</em> minutes. At the end of the lag, load is (1 + gL) times today's. The fleet must survive that at 100% utilisation, so the target <em>u</em> must satisfy:</p>
+<pre><code>u ≤ 1 / (1 + g × L)</code></pre>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Growth per minute</th><th>Lag 3 min</th><th>Lag 5 min</th><th>Lag 8 min</th></tr></thead><tbody>
+<tr><td>5% (an ordinary evening ramp)</td><td>87%</td><td>80%</td><td>71%</td></tr>
+<tr><td>10% (a busy launch)</td><td>77%</td><td>67%</td><td>56%</td></tr>
+<tr><td>20% (a TV mention)</td><td>63%</td><td>50%</td><td>38%</td></tr>
+</tbody></table></div></div>
+<p>The 65% target in the lesson is about right for 10% growth a minute with a five-minute lag. Read the table the other way too. If you cut the lag from 8 to 3 minutes (baked images, faster health checks, warm pools), you can run at 77% instead of 56% for the same risk. That is a 27% smaller fleet, earned by engineering the lag instead of buying headroom. Lag reduction is usually the cheaper investment.</p>
+<p>For spikes steeper than any reasonable target allows, like 20% a minute with an eight-minute lag, no target will save you. You need either scheduled capacity or a front door that sheds load.</p>
+
+<h3 id=dd-autoscaling-min-math level=3>The min is quietly your best spike defence</h3>
+<p>At 4 AM the lesson's fleet serves 900 req/s on 3 servers. The arithmetic says 900 / 520 rounds to 2, and N+1 makes it 3. But look at what 3 servers can absorb: 3 × 800 = 2,400 req/s at the limit. That is 2.7 times the current load. The minimum fleet has far more headroom than the evening fleet, because N+1 is a big fraction of a small number.</p>
+<p>This matters for the TV Tuesday replay. The spike began at 900 req/s, so the first stretch of it fell on a fleet that was proportionally huge. The dangerous moment is not the first minute. It is minute five or six, when traffic has passed the minimum fleet's ceiling and the first wave of new servers is only just arriving.</p>
+
+<h3 id=dd-autoscaling-max-math level=3>Deriving the max from the database</h3>
+<p>The lesson says the max comes from downstream. Here is the arithmetic, with stated assumptions for the bookstore:</p>
+<ul>
+<li>Each API request issues about 3 database queries before caching.</li>
+<li>The cache absorbs 80% of them, so 0.6 queries per request reach the database tier.</li>
+<li>Load tests show the primary plus replicas hold p99 under 20 ms up to 6,500 queries per second (qps).</li>
+</ul>
+<p>One server at its 520 req/s planning load sends 520 × 0.6 = 312 qps. The database tier therefore supports 6,500 / 312 ≈ 20.8 servers. Round down: <strong>max = 20</strong>. That is where the lesson's number comes from.</p>
+<p>The same derivation says when to revisit it. If the cache hit ratio drops from 80% to 60%, each server sends 624 qps and the safe max halves to 10. A max is a statement about the systems behind the fleet, so it must be recomputed when they change. A max that was right last quarter can be dangerous now.</p>
+<p>Do the same check for connections. Twenty servers with a pool of 20 each hold 400 database connections. That is above Postgres's common default <code>max_connections</code> of 100 before you start, which is why the next lesson, <a href="#database-connection-pooling">Database Connection Pooling</a>, puts a pooler in the path.</p>
+
+<h3 id=dd-autoscaling-cost-math level=3>The cost of scaling down, and of warm capacity</h3>
+<p>The lesson's average fleet of 4.2 instead of 8 halves compute spend. A few costs eat into that saving, and a design review should see them estimated:</p>
+<ul>
+<li><strong>Churn.</strong> Each instance launched and removed wastes its boot and warm-up time (billed but not serving) and costs the database a burst of new connections. If the fleet does 40 scale events a day at 5 minutes each, that is about 3.3 server-hours of waste. Small, unless the loop is flapping.</li>
+<li><strong>Scheduled pre-warm.</strong> Raising min to 8 at 5:30 PM instead of letting the loop react costs perhaps 30 minutes of 5 extra servers, 2.5 server-hours a day. It buys zero lag for the known peak. That trade is almost always worth it.</li>
+<li><strong>Warm pools.</strong> Ten stopped instances cost only their disks. Ten running ones cost the same as ten serving ones. Running warm capacity makes sense only when boot is very slow, as with GPU model servers (see <a href="#gpu-autoscaling">GPU Auto-Scaling</a>).</li>
+<li><strong>Placeholder capacity on Kubernetes.</strong> A common trick is a low-priority "pause pod" deployment that reserves, say, 10% spare node capacity. When real pods need room, the scheduler evicts the placeholders, the real pods start in seconds, and the cluster autoscaler replaces the evicted capacity in the background. You pay 10% of the cluster permanently to remove node boot from the critical path.</li>
+</ul>
+
+<h3 id=dd-autoscaling-drain-math level=3>Drain time sets your scale-in speed</h3>
+<p>A server leaving the fleet must finish its in-flight requests. With p99 requests at 2 seconds, a 30-second drain is plenty. With long-polling or file uploads that last minutes, it is not.</p>
+<p>The drain also caps how fast the fleet can shrink. Removing one server at a time with a 30-second drain and a 2-minute cooldown takes 20 servers down to 3 in about 40 minutes. That is fine. With the 300-second default deregistration delay and a 5-minute cooldown, the same shrink takes nearly three hours, and you pay for the idle servers the whole time.</p>
+
+<h2 id=dd-autoscaling-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+<p>The lesson covers the two classic failures: the wrong signal and flapping. These are the ones that still catch teams who got those two right.</p>
+
+<h3 id=dd-autoscaling-fm-latency-loop level=3>1. Scaling on latency into a slow database</h3>
+<p><strong>Symptom.</strong> The database slows down. Within minutes the app fleet doubles, then hits max. The database gets slower still, and the incident is worse than if the scaler had done nothing.</p>
+<p><strong>Mechanism.</strong> The team moved off CPU, as the lesson recommends, and scaled on p95 latency. But here the latency came from downstream. More app servers mean more concurrent queries against the same struggling database, more lock contention, and higher latency. The scaler sees higher latency and adds more servers. That is positive feedback: the control action makes the measured error worse.</p>
+<p><strong>Detect.</strong> App latency and fleet size rise together while app CPU stays flat and database CPU, active sessions or lock waits climb. A trace shows request time is mostly spent in database spans.</p>
+<p><strong>Fix.</strong> Scale on requests per instance (an input the fleet controls) rather than latency alone (an output any tier can cause). If you do use latency, combine it with a check that the time is spent locally. Keep the max honest, so the worst case is bounded. And protect the database with <a href="#bulkhead">bulkhead</a> limits and a pool cap that do not grow with the fleet.</p>
+
+<h3 id=dd-autoscaling-fm-warmup level=3>2. Overshoot from booting instances</h3>
+<p><strong>Symptom.</strong> A modest rise in traffic adds 4 servers, then 6 more a minute later, then the fleet slowly shrinks back over the next 30 minutes. Every scale-out overshoots.</p>
+<p><strong>Mechanism.</strong> New instances burn CPU while starting: JIT compilation, loading config, filling caches. If their metrics count in the fleet average before they serve traffic, the average goes <em>up</em> as capacity is added. The policy reads that as more load. The reverse also happens with request-count signals: new instances report zero requests and drag the average down, so the loop scales in too early.</p>
+<p><strong>Detect.</strong> Overlay scale events on the per-instance metric. The fleet average jumps right after each launch, and the jump comes from the youngest instances.</p>
+<p><strong>Fix.</strong> Set instance warmup on the ASG, or rely on the HPA's not-ready handling with an accurate readiness probe. Make the app do its expensive initialisation before it reports ready, not after.</p>
+
+<h3 id=dd-autoscaling-fm-health-loop level=3>3. The launch-and-kill loop</h3>
+<p><strong>Symptom.</strong> During a spike, the activity log shows dozens of launches and terminations, but the fleet never grows. Capacity is stuck at the old size while the bill rises.</p>
+<p><strong>Mechanism.</strong> The app takes 4 minutes to warm its cache, but the health check grace period is 2 minutes. The group marks each new instance unhealthy and replaces it. Under load the warm-up takes even longer, so the loop gets worse exactly when capacity is needed. A Kubernetes version: a liveness probe that fails during slow start makes the kubelet restart the container forever.</p>
+<p><strong>Detect.</strong> Instance lifetimes in the activity history cluster just above the grace period. Termination reasons say "failed health check". On Kubernetes, restart counts climb and pods never reach ready.</p>
+<p><strong>Fix.</strong> Set the grace period from measured p99 startup time under load, with margin. On Kubernetes use a <code>startupProbe</code> so liveness checks do not begin until the app has started. Separately, check that readiness means "can serve" and liveness means "is not wedged"; mixing them causes this loop (see <a href="#health-check-endpoint">Health Check Endpoint</a>).</p>
+
+<h3 id=dd-autoscaling-fm-scale-in-kill level=3>4. Scale-in cuts off in-flight work</h3>
+<p><strong>Symptom.</strong> Every evening, as the fleet shrinks, error rates tick up by a fraction of a percent. Some users see failed uploads. Some queue jobs run twice.</p>
+<p><strong>Mechanism.</strong> The scaler terminated instances before their work finished. For web traffic, the instance was removed from the balancer but terminated before long requests ended, or the app ignored <code>SIGTERM</code> and was killed when the grace period ran out (30 seconds by default on Kubernetes). For workers, a job half-done was abandoned, and the queue redelivered it after its visibility timeout.</p>
+<p><strong>Detect.</strong> Errors and redeliveries correlate with scale-in events, not with load. 502s or connection resets appear at the balancer in the seconds around a termination.</p>
+<p><strong>Fix.</strong> Handle <code>SIGTERM</code>: stop accepting new work, finish what is in flight, then exit. On Kubernetes add a short <code>preStop</code> sleep so endpoint removal propagates before the app stops listening. For workers, use a termination lifecycle hook or scale-in protection while a job runs, and make jobs <a href="#idempotency">idempotent</a> because redelivery will still happen sometimes.</p>
+
+<h3 id=dd-autoscaling-fm-cold-herd level=3>5. The scale-out that knocks over the database</h3>
+<p><strong>Symptom.</strong> The fleet grows from 8 to 16 servers in one step. For the next 90 seconds the database's CPU spikes and connection errors appear, and the spike is worse than the traffic that caused it.</p>
+<p><strong>Mechanism.</strong> Eight new servers start at once. Each opens its full connection pool (authentication is deliberately expensive in Postgres with SCRAM), loads configuration from the database, and starts with a cold local cache. The miss rate on those servers is near 100%, so each sends many times the normal query load until it warms. Eight cold servers can briefly cost the database more than the sixteen warm ones will.</p>
+<p><strong>Detect.</strong> Database connection rate and query rate spike right after launches. The per-instance query rate on new instances is far above the fleet's steady-state rate.</p>
+<p><strong>Fix.</strong> Put a pooler between the fleet and the database so new servers do not open new database connections. Open app pools lazily or with a small <code>minimumIdle</code>. Warm local caches before reporting ready, or lean on a shared cache tier so new servers are not cold. Use <a href="#cache-stampede-prevention">stampede prevention</a> on the shared cache.</p>
+
+<h3 id=dd-autoscaling-fm-no-capacity level=3>6. The cloud says no</h3>
+<p><strong>Symptom.</strong> Desired count is 18, but only 11 servers run. The loop believes it has acted, and nothing in the app dashboards says why the fleet is short.</p>
+<p><strong>Mechanism.</strong> Launches are failing. The availability zone has no capacity for that instance type (<code>InsufficientInstanceCapacity</code>), the account hit a vCPU quota, a Spot pool was reclaimed, or on Kubernetes the node group is at its own max and pods sit <code>Pending</code>. Big regional events cause many customers to scale at once, so this is most likely exactly when you need capacity.</p>
+<p><strong>Detect.</strong> Alert on desired minus in-service greater than zero for more than a few minutes. Watch ASG activity history for failed launches and count <code>Pending</code> pods with a <code>FailedScheduling</code> reason. Also alert when the fleet sits at max, which is a capacity limit doing its job but still needs a human.</p>
+<p><strong>Fix.</strong> Allow several instance types and all zones in the group (mixed-instances policies, or a flexible Karpenter provisioner). Keep quotas well above max. Keep a base of on-demand capacity under any Spot. And have the edge shed load when the fleet cannot grow (see <a href="#rate-limiting">Rate Limiting</a> and <a href="#graceful-degradation">Graceful Degradation</a>).</p>
+
+<h3 id=dd-autoscaling-fm-blind level=3>7. The scaler goes blind</h3>
+<p><strong>Symptom.</strong> Traffic doubles and nothing scales. Or, worse, the fleet slowly shrinks to min during a normal evening.</p>
+<p><strong>Mechanism.</strong> The metric pipeline broke. The metrics-server pod was evicted, the Prometheus Adapter query started returning nothing after a label rename, or the custom metric stopped being published after a deploy. Each controller treats missing data its own way. Some hold, some treat it as zero. A missing request-rate metric read as zero means "scale in".</p>
+<p><strong>Detect.</strong> The HPA status shows condition <code>ScalingActive</code> false, or events like <code>FailedGetExternalMetric</code>. On AWS, a target-tracking alarm in <code>INSUFFICIENT_DATA</code>. Put an alert on these, not just on the app.</p>
+<p><strong>Fix.</strong> Treat the metric path as production code: alert on its staleness, test label changes, and add a second, simpler metric (such as CPU) as a floor so a broken custom signal cannot drive the fleet to min.</p>
+
+<h2 id=dd-autoscaling-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-autoscaling-choose-signal level=3>Choosing the signal</h3>
+<p>The lesson says the signal is the design decision. This table is the decision, by workload.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Signal</th><th>Good for</th><th>Misleads when</th><th>Notes</th></tr></thead><tbody>
+<tr><td>CPU utilisation</td><td>Compute-bound services: rendering, compression, crypto</td><td>Work is waiting on IO; CPU limits throttle the pod</td><td>Easiest to get; a good secondary floor even when not primary</td></tr>
+<tr><td>Requests per instance</td><td>Most stateless HTTP APIs</td><td>Request cost varies a lot (a search vs a health check); retries inflate it</td><td>Needs a load-tested per-instance capacity; <code>ALBRequestCountPerTarget</code> on AWS</td></tr>
+<tr><td>Concurrency / in-flight requests</td><td>APIs with long or variable request times</td><td>Rarely; it is close to the true resource (threads, sockets)</td><td>Little's law: in-flight = rate × duration, so it captures slow downstreams honestly</td></tr>
+<tr><td>Latency (p95/p99)</td><td>As a guardrail or secondary signal</td><td>The slowness is downstream (failure 1)</td><td>An output, not an input; never the only signal</td></tr>
+<tr><td>Queue backlog age or depth</td><td>Async workers</td><td>Consumers are blocked by a shared downstream; partitions cap parallelism</td><td>Age states the user-visible delay directly; depth is easier to aim at a target per replica</td></tr>
+<tr><td>Domain metric (tokens outstanding, active sessions)</td><td>GPU inference, WebSocket gateways</td><td>The metric pipeline is custom and can go blind (failure 7)</td><td>Often the only honest signal for specialised fleets</td></tr>
+</tbody></table></div></div>
+<p>Concurrency deserves more use than it gets. A server with 200 worker threads is full at 200 in-flight requests, whatever the cause. If requests slow from 50 ms to 500 ms, in-flight count rises tenfold at the same request rate. That is a real loss of capacity, and concurrency shows it, while requests per second does not. It still has the downstream problem of failure 1, so pair it with a max that respects the database.</p>
+
+<h3 id=dd-autoscaling-choose-controller level=3>Choosing the control style</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach</th><th>How it decides</th><th>Strength</th><th>Weakness</th><th>Use it when</th></tr></thead><tbody>
+<tr><td>Target tracking (ASG) / HPA</td><td>Proportional to the error</td><td>Few knobs, big jumps on big errors</td><td>Assumes load scales linearly with instances</td><td>The default for almost every stateless tier</td></tr>
+<tr><td>Step scaling</td><td>Fixed bands you write</td><td>Explicit, predictable first response</td><td>More tuning; bands go stale as the fleet grows</td><td>Known violent spikes where you want a large first step</td></tr>
+<tr><td>Scheduled</td><td>Calendar</td><td>Zero lag for known peaks</td><td>Blind to surprises; drifts out of date</td><td>Always, for daily and weekly cycles and planned events</td></tr>
+<tr><td>Predictive</td><td>Forecast from history</td><td>Removes lag for regular patterns</td><td>Confidently wrong on new patterns</td><td>Strong daily seasonality and slow boot</td></tr>
+<tr><td>Event-driven (KEDA, Lambda on SQS)</td><td>Queue or stream state</td><td>Scale to zero; signal is the backlog itself</td><td>Cold start from zero; partition caps</td><td>Workers and bursty batch</td></tr>
+<tr><td>Overprovision (placeholder pods, warm pools)</td><td>Spare capacity kept ready</td><td>Removes node or instance boot from the critical path</td><td>Permanent cost</td><td>Slow boot, steep spikes, tight latency promises</td></tr>
+</tbody></table></div></div>
+<p>These are layers, as the lesson says. A mature setup on Kubernetes might look like this: a scheduled raise of <code>minReplicas</code> before the evening; an HPA on requests per pod with CPU as a floor; a 5-10% placeholder buffer; Karpenter adding nodes behind it; and a max derived from the database. Each layer covers a different gap.</p>
+
+<h3 id=dd-autoscaling-choose-vertical level=3>Horizontal, vertical, or both</h3>
+<p>Kubernetes also has a Vertical Pod Autoscaler (VPA), which changes a pod's CPU and memory requests. Do not let the VPA and an HPA both act on CPU for the same deployment. The VPA raises requests, which lowers measured utilisation, which makes the HPA scale in, and the two loops fight. A common safe split is the VPA in recommendation-only mode to right-size requests, and the HPA to scale count.</p>
+
+<h3 id=dd-autoscaling-choose-zero level=3>Scale to zero, or not</h3>
+<p>Scaling to zero saves the most money and costs the first request a cold start. For an internal batch worker, that is ideal. For a user-facing API it usually is not, because the min of N+1 also gives you availability across zones. Keep zero for workers, preview environments and rarely used endpoints, and decide explicitly what latency the first request may see.</p>
+
+<h2 id=dd-autoscaling-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the scaling signal, and what evidence says it tracks the resource that actually runs out (threads, CPU, sockets, GPU memory)?</li>
+<li>What is the measured per-instance capacity, from a load test, and how old is that test?</li>
+<li>What is the end-to-end reaction lag, broken into metric period, evaluation, launch, app start and health checks? Which slice is being reduced?</li>
+<li>Does the target follow from the growth rate you must survive and that lag, or was it picked from a blog post?</li>
+<li>Where does max come from? Show the downstream arithmetic (queries per request, cache hit ratio, database capacity, connections). Who recomputes it when those change?</li>
+<li>What happens to traffic above max: shed at the edge, queued, or degraded? Has that path been tested?</li>
+<li>Is min at least N+1 per zone, so losing a zone at 4 AM does not take the service down?</li>
+<li>Are scale-up and scale-down asymmetric, with a dead band, cooldowns or a stabilisation window? What is the expected flap rate?</li>
+<li>Do new instances report ready only when they can really serve? Are warm-up metrics excluded from the fleet average?</li>
+<li>Does every instance handle <code>SIGTERM</code> and drain within the balancer's deregistration delay? Are workers protected during jobs?</li>
+<li>What alerts fire on desired-not-met, at-max, launch failures, and a stale or missing scaling metric?</li>
+<li>When was the policy last exercised by a deliberate load test, rather than by production traffic?</li>
+</ol>
+
+<h2 id=dd-autoscaling-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Your autoscaler targets 65%. Why not 80%, and why not 40%?"</summary>
+<p>The target is whatever leaves enough room for traffic growth during the reaction lag: u ≤ 1/(1 + g × L). With 10% growth a minute and a five-minute lag, that is about 67%. At 80% you only survive about 5% growth a minute. At 40% you are paying for headroom that only a 30%-per-minute spike would use, and such spikes need load shedding anyway. The better lever is usually cutting L, which lets you raise the target safely.</p>
+</details>
+
+<details>
+<summary>"You switched from CPU to latency as the signal and now the database incidents got worse. Why?"</summary>
+<p>Latency is an output that any tier can cause. When the database slows, app latency rises, the scaler adds app servers, and those servers add concurrent queries to the struggling database. That is positive feedback. Scale on an input the fleet controls, such as requests or in-flight requests per instance, keep latency as a guardrail, and rely on a max and a pool cap that bound how much pressure the app tier can put on the database.</p>
+</details>
+
+<details>
+<summary>"The HPA formula is ceil(current × metric/target). Where does this go wrong?"</summary>
+<p>It assumes load spreads evenly and capacity scales linearly with replicas. It goes wrong when the bottleneck is shared (doubling pods does not double database capacity), when the metric includes work the pods create themselves (retries), and when the metric is distorted by pods that are booting or not ready. It also needs <code>resources.requests</code> to be accurate for CPU targets. The guards (10% tolerance, not-ready handling, the scale-down stabilisation window) exist because of these failure modes.</p>
+</details>
+
+<details>
+<summary>"How do you autoscale a Kafka consumer group, and what is the max?"</summary>
+<p>Scale on consumer lag, in messages or better in time, through something like KEDA. The max is the partition count, because each partition goes to at most one consumer in a group. Beyond that, extra consumers sit idle. Every scale event also triggers a rebalance, which pauses consumption briefly, so use a cooperative or static assignment strategy and a stabilisation window to avoid rebalance storms. If you need more parallelism than partitions allow, you must add partitions (which changes key-to-partition mapping) or process within a consumer in parallel per key.</p>
+</details>
+
+<details>
+<summary>"Scale-up takes 7 minutes. The product team wants it under 2. What do you change?"</summary>
+<p>Break the 7 minutes down first. Typical wins, in order of cost: 1-minute metrics instead of 5-minute; a faster alarm or HPA evaluation; ALB health checks at a 10-second interval with 2 or 3 healthy checks; a baked image so boot does not install anything; app warm-up done before ready. If node boot on Kubernetes is the bottleneck, add placeholder pods. If instance boot is, use a warm pool. If you still cannot reach 2 minutes, raise min for known peaks and accept that the remaining gap is covered by headroom and load shedding.</p>
+</details>
+
+<details>
+<summary>"Why scale in slowly? Isn't idle capacity just waste?"</summary>
+<p>Each removal has costs that do not show up in the compute bill: a drain that cuts off long requests if done wrongly, warm caches thrown away, and connections re-opened if the capacity comes back. Traffic is also noisy. If you remove capacity on one quiet minute, the next busy minute adds it back, and you pay those costs twice. A five- to fifteen-minute window costs a few server-minutes of idle time and avoids that churn. The asymmetry exists because the downside of too little capacity (an outage) is far worse than the downside of too much (a little money).</p>
+</details>
+
+<details>
+<summary>"The fleet is at max during a sale and the site is slow. Should you raise max?"</summary>
+<p>Only if you can show the downstream can take it. First find the bottleneck. If the database is saturated, more app servers make it worse, and max is protecting you. If the database is fine and the max was set conservatively, raise it in steps while watching database latency. Either way, the immediate move is at the edge: shed or queue the excess, serve cached or degraded pages, and protect checkout over browsing.</p>
+</details>
+
+<details>
+<summary>"How should autoscaling interact with deployments?"</summary>
+<p>A rolling deploy removes a batch of instances at a time, which lowers capacity just like a scale-in. If the fleet is at 65% and you roll 25% at once, the remainder runs near 87%. Either deploy with surge (launch new before removing old), size batches against current headroom, or pause scaling actions during the deploy so the scaler and the deploy do not fight over the same instances. Also make sure the deploy tool does not reset desired count back to a stale number from the template.</p>
+</details>

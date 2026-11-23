@@ -1,0 +1,25 @@
+{
+  "type": "record",
+  "name": "CapturePayment",
+  "namespace": "com.edacommerce.payment",
+  "doc": "Command: take the authorised funds. Sent when the parcel is dispatched.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "paymentId",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": "com.edacommerce.common.Money"
+    }
+  ]
+}

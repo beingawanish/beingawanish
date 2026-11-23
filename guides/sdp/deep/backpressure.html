@@ -1,0 +1,294 @@
+<h2 id=dd-backpressure-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's three answers, buffer, drop or slow, apply at every layer of a system. What changes from layer to layer is the signal that carries "slow down" back upstream. In a socket it is a window. In a stream library it is a demand count. In Kafka it is the absence of a fetch. At the edge it is a 429. A senior review traces one stream through all of those layers and asks, at each seam, what the signal is and where the excess goes.</p>
+
+<h3 id=dd-backpressure-tcp level=3>TCP: the receive window</h3>
+<p>TCP is backpressure you already run everywhere, so it is worth seeing exactly how it works.</p>
+<p>Each side of a connection has a <strong>receive buffer</strong> in the kernel. The application drains it by calling <code>read()</code>. Every ACK the receiver sends carries a <strong>window</strong>: how many more bytes it can accept right now, which is the free space in that buffer. The sender may never have more unacknowledged bytes in flight than the window allows.</p>
+<p>Follow a slow application through the stack:</p>
+<ol>
+<li>The application stops calling <code>read()</code>, perhaps blocked on a slow database.</li>
+<li>The receive buffer fills. The advertised window shrinks to zero.</li>
+<li>The sender stops sending. It probes periodically with tiny "persist" packets to learn when the window reopens.</li>
+<li>The sender's own <strong>send buffer</strong> fills, because the application keeps writing into it.</li>
+<li>The sender's <code>write()</code> now blocks, or returns <code>EAGAIN</code> on a non-blocking socket.</li>
+</ol>
+<p>At step 5 the pressure has reached the producing application. What it does next is the design question. A thread-per-connection server simply blocks, which is the slow-the-producer answer. An event-loop server gets <code>EAGAIN</code>, and if it then copies the data into its own unbounded user-space buffer "to send later", it has thrown away the kernel's backpressure. That is the bidirectional lesson's gateway incident, at the socket layer.</p>
+<p>Two details matter for sizing. First, the window field is only 16 bits. Without the <strong>window scale</strong> option, negotiated at connection setup, a window can never exceed 64 KiB. Second, flow control is not congestion control. The window protects the receiver. A separate congestion window protects the network. The sender obeys whichever is smaller.</p>
+
+<h3 id=dd-backpressure-http2 level=3>HTTP/2 and gRPC: windows per stream and per connection</h3>
+<p>HTTP/2 multiplexes many streams over one TCP connection, so TCP's window cannot tell a slow stream from a fast one. HTTP/2 adds its own flow control on top, at two levels:</p>
+<ul>
+<li>A <strong>window per stream</strong>, so one slow download cannot hog the connection.</li>
+<li>A <strong>window for the whole connection</strong>, which caps the total.</li>
+</ul>
+<p>Both start at 65,535 bytes unless the peer's SETTINGS frame says otherwise. The receiver reopens them by sending WINDOW_UPDATE frames as the application consumes data. Only DATA frames count against the windows; headers and control frames do not.</p>
+<p>gRPC streaming inherits this. In grpc-java, a server-streaming handler should check <code>isReady()</code> and wait for the <code>onReady</code> callback before writing more. A handler that ignores it and calls <code>onNext()</code> in a loop is buffering in memory, unbounded, behind the window. Some gRPC implementations grow the windows automatically from a bandwidth-delay estimate; check what yours does before tuning by hand.</p>
+
+<h3 id=dd-backpressure-reactive level=3>Reactive streams: demand as a number</h3>
+<p>The Reactive Streams specification (and Java's <code>java.util.concurrent.Flow</code>, which copies it) makes the signal explicit. A subscriber calls <code>subscription.request(n)</code>. The publisher keeps a <strong>demand counter</strong>, adds <code>n</code> to it, and may call <code>onNext</code> only while the counter is above zero, decrementing it each time. With demand at zero, the publisher must hold, drop or stop producing. Whichever it chooses, it is never allowed to push.</p>
+<p>Real libraries batch this. Operators usually request a prefetch of a few dozen to a few hundred items, then top up when about three-quarters are consumed. That keeps the pipe full without one round of signalling per item. When a source cannot be slowed (a UI event, a sensor), the libraries make you pick a policy by name: <code>onBackpressureBuffer</code> with a size, <code>onBackpressureDrop</code>, or <code>onBackpressureLatest</code>. That is the lesson's buffer-drop-slow choice turned into an API, and that is the right shape for it.</p>
+
+<h3 id=dd-backpressure-runtimes level=3>The defaults in your language are often unbounded</h3>
+<p>Most incidents start with an in-process queue that nobody sized. Know the defaults:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Construct<th>Default bound<th>What happens when the consumer is slow<tbody>
+<tr><td>Python <code>queue.Queue()</code>, <code>asyncio.Queue()</code><td>Unbounded (<code>maxsize=0</code>)<td>Grows until memory runs out<tr><td>Python <code>concurrent.futures.ThreadPoolExecutor</code><td>Unbounded work queue<td><code>submit()</code> never blocks; queued tasks pile up<tr><td>Java <code>Executors.newFixedThreadPool</code><td>Unbounded <code>LinkedBlockingQueue</code><td>Same as above<tr><td>Java <code>ThreadPoolExecutor</code> with <code>ArrayBlockingQueue(n)</code><td>Bounded, you choose<td>Rejection policy runs; <code>CallerRunsPolicy</code> slows the caller<tr><td>Go <code>make(chan T)</code> / <code>make(chan T, n)</code><td>0 or n<td>Sender blocks: backpressure by default<tr><td>Node.js writable stream<td><code>highWaterMark</code> (advisory)<td><code>write()</code> returns <code>false</code>; you must wait for <code>'drain'</code> or it buffers anyway</table></div></div>
+<p>Go is the honest one: a full channel blocks the sender. Node.js is the subtle one. The bound is a hint, and code that ignores the <code>false</code> return value keeps buffering. Use <code>stream.pipeline()</code>, which respects it for you.</p>
+<p>Here is the bounded version in Python, with both policies the lesson names. Block for facts, keep-latest for freshness-only data:</p>
+<pre><code>import asyncio
+
+orders = asyncio.Queue(maxsize=10_000)    # facts: never drop
+
+async def on_order(evt):
+    await orders.put(evt)                 # blocks the producer when full
+
+positions = {}                            # freshness-only: one slot per driver
+
+def on_position(driver_id, pos):
+    positions[driver_id] = pos            # keep-latest: overwrite, never grow
+
+async def publish_positions(send):
+    while True:
+        snapshot = dict(positions)
+        positions.clear()
+        for driver_id, pos in snapshot.items():
+            await send(driver_id, pos)    # slow sender? old positions are just replaced
+        await asyncio.sleep(0.5)</code></pre>
+<p>The memory for positions is bounded by the number of drivers, not by the rate mismatch. That is what "a buffer with one slot" means in practice.</p>
+
+<h3 id=dd-backpressure-flink level=3>Flink: credit-based flow control between operators</h3>
+<p>Between two Flink tasks on different machines, data moves in network buffers (memory segments, 32 KiB by default). Each receiving channel has a few <strong>exclusive buffers</strong> of its own, 2 by default. Each input gate also shares a pool of <strong>floating buffers</strong>, 8 by default, that any of its channels may borrow.</p>
+<p>The protocol is credit-based:</p>
+<ol>
+<li>The receiver announces credit to the sender: one credit per free buffer it holds for that channel.</li>
+<li>The sender sends a buffer only when it has credit, and spends one credit per buffer.</li>
+<li>With each buffer, the sender also reports its <strong>backlog</strong>: how many more buffers are waiting. The receiver uses this to request floating buffers for busy channels.</li>
+<li>When the receiving operator is slow, its buffers stay full, it announces no credit, and the sender's output buffers fill. The sender's operator then blocks on writing its output.</li>
+</ol>
+<p>Repeat that across the topology and the slowdown walks back, one operator at a time, until the source reads slower from Kafka. The source is a pull consumer, so Kafka lag absorbs the rest. The design advantage over plain TCP is isolation. Many logical channels share one TCP connection between two task managers. Credits stop one blocked channel from stalling the others on the same connection.</p>
+<p>Flink reports, per subtask, the milliseconds per second spent <strong>busy</strong>, <strong>idle</strong> and <strong>backpressured</strong>. The bottleneck is the first operator, walking downstream, that is busy and not itself backpressured. Everything upstream of it is backpressured; everything downstream of it is idle.</p>
+<p>Buffer counts matter for checkpoints. Barriers queue behind every full buffer in front of them. More in-flight buffers mean more data a barrier must wait behind. <strong>Buffer debloating</strong> resizes buffers so that the in-flight data amounts to roughly a target time, one second by default, of throughput. Barriers then move in roughly that time even under pressure.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-backpressure-svg-title dd-backpressure-svg-desc" viewBox="0 0 720 250" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-backpressure-svg-title">Credit-based backpressure walking upstream from a slow sink</title>
+<desc id="dd-backpressure-svg-desc">Four stages in a row: Kafka source, parse, aggregate, and a warehouse sink that is slow. Data arrows point right. Each stage's input buffers are drawn as small boxes. The sink's buffers are full and it grants zero credit, so the aggregate's output fills, then the parse stage's, then the source slows its fetches from Kafka. Credit arrows point left. Metrics under each stage read: source backpressured, parse backpressured, aggregate backpressured, sink busy 100 percent.</desc>
+<defs><marker id="dd-backpressure-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker>
+<marker id="dd-backpressure-arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#b5475e"/></marker></defs>
+<rect x="0" y="0" width="720" height="250" fill="#ffffff"/>
+<rect x="20" y="60" width="130" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="85" y="86" font-size="14" fill="#1c2430" text-anchor="middle">Kafka source</text>
+<text x="85" y="104" font-size="12" fill="#5c6b7c" text-anchor="middle">fetches less</text>
+<rect x="200" y="60" width="130" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="265" y="94" font-size="14" fill="#1c2430" text-anchor="middle">Parse</text>
+<rect x="380" y="60" width="130" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="445" y="94" font-size="14" fill="#1c2430" text-anchor="middle">Aggregate</text>
+<rect x="560" y="60" width="140" height="60" rx="8" fill="#f8ebee" stroke="#b5475e" stroke-width="2"/>
+<text x="630" y="86" font-size="14" fill="#1c2430" text-anchor="middle">Warehouse sink</text>
+<text x="630" y="104" font-size="12" fill="#5c6b7c" text-anchor="middle">table lock: slow</text>
+<line x1="150" y1="80" x2="196" y2="80" stroke="#1c2430" marker-end="url(#dd-backpressure-arrow)"/>
+<line x1="330" y1="80" x2="376" y2="80" stroke="#1c2430" marker-end="url(#dd-backpressure-arrow)"/>
+<line x1="510" y1="80" x2="556" y2="80" stroke="#1c2430" marker-end="url(#dd-backpressure-arrow)"/>
+<line x1="556" y1="108" x2="514" y2="108" stroke="#b5475e" stroke-dasharray="4 3" marker-end="url(#dd-backpressure-arrow-red)"/>
+<line x1="376" y1="108" x2="334" y2="108" stroke="#b5475e" stroke-dasharray="4 3" marker-end="url(#dd-backpressure-arrow-red)"/>
+<line x1="196" y1="108" x2="154" y2="108" stroke="#b5475e" stroke-dasharray="4 3" marker-end="url(#dd-backpressure-arrow-red)"/>
+<text x="535" y="138" font-size="12" fill="#b5475e" text-anchor="middle">0 credit</text>
+<text x="355" y="138" font-size="12" fill="#b5475e" text-anchor="middle">0 credit</text>
+<text x="175" y="138" font-size="12" fill="#b5475e" text-anchor="middle">0 credit</text>
+<text x="85" y="180" font-size="12" fill="#1c2430" text-anchor="middle">backpressured</text>
+<text x="265" y="180" font-size="12" fill="#1c2430" text-anchor="middle">backpressured</text>
+<text x="445" y="180" font-size="12" fill="#1c2430" text-anchor="middle">backpressured</text>
+<text x="630" y="180" font-size="12" fill="#b5475e" text-anchor="middle">busy 100%</text>
+<text x="360" y="220" font-size="12" fill="#5c6b7c" text-anchor="middle">Data flows right. Credit (permission to send) flows left, and stops at the slow stage.</text>
+<text x="360" y="36" font-size="13" fill="#1c2430" text-anchor="middle">The bottleneck is the busy stage that is not itself backpressured.</text>
+</svg>
+<figcaption>Every stage upstream of the sink reports backpressure, which is why the loudest stage is rarely the guilty one. The checkpoint barriers wait in the same full buffers.</figcaption>
+</figure>
+
+<h3 id=dd-backpressure-kafka level=3>Kafka: pull, pause and producer blocking</h3>
+<p>The lesson says pull-based consumers get backpressure for free. They do, with one catch that bites almost every team once.</p>
+<p>A Kafka consumer must call <code>poll()</code> at least every <code>max.poll.interval.ms</code> (5 minutes by default), or the group evicts it and rebalances. So "just stop polling when the sink is slow" works for seconds, then triggers a rebalance. The correct tool is <code>pause(partitions)</code>. The consumer keeps calling <code>poll()</code>, which keeps it in the group, but receives no records from paused partitions. When the internal queue drains below a threshold, it calls <code>resume()</code>. Pause and resume are how a pull consumer turns a bounded internal buffer into real backpressure.</p>
+<p>The fetch settings bound how much a consumer pulls at once: <code>max.poll.records</code> (500 by default) per poll, <code>max.partition.fetch.bytes</code> (1 MiB) per partition per fetch, and <code>fetch.max.bytes</code> (50 MiB) per fetch request. A consumer that owns many partitions can still hold a lot in memory; do the multiplication.</p>
+<p>On the producer side, the client buffers unsent records in <code>buffer.memory</code> (32 MiB by default). When the brokers cannot keep up, that buffer fills, and <code>send()</code> blocks for up to <code>max.block.ms</code> (60 seconds by default), then throws. That is the slow-the-producer answer built into the client. An application that catches the exception and keeps its own retry list has rebuilt the unbounded buffer one layer up.</p>
+<p>Brokers can also push back. With client <strong>quotas</strong> on byte rate or request time, a broker that sees a client over its quota still answers, but includes a throttle time and holds the connection for that long. Well-behaved clients wait it out. It is a 429 with a built-in Retry-After, inside the cluster.</p>
+
+<h3 id=dd-backpressure-boundary level=3>At the boundary: 429s, shedding and concurrency limits</h3>
+<p>At the system edge, the producer is a client you do not control. You cannot hold its socket open forever, so the signal becomes an explicit rejection. Three tools do this, and they answer different questions.</p>
+<ul>
+<li><strong>Rate limits</strong> cap arrivals per client per unit of time, as in <a href="#rate-limiting">Rate Limiting</a>. They protect fairness between clients. They do not know whether the system is healthy right now.</li>
+<li><strong>Concurrency limits</strong> cap the requests in progress. By Little's law, in-flight requests = arrival rate × latency. When a dependency slows, latency rises, the limit fills, and new requests are rejected immediately instead of queuing. Adaptive versions move the limit with measured latency, in the spirit of TCP congestion control.</li>
+<li><strong>Load shedding</strong> drops work by priority when the server itself is overloaded. Health checks and paid checkouts come first, recommendation widgets and analytics beacons last.</li>
+</ul>
+<p>A short nginx example of a bounded edge queue: each client IP gets 20 requests per second, with a burst queue of 40. The first 10 burst requests go through immediately, and the rest are paced. Beyond that, nginx answers 429.</p>
+<pre><code>limit_req_zone $binary_remote_addr zone=api:10m rate=20r/s;
+
+server {
+    location /api/ {
+        limit_req zone=api burst=40 delay=10;
+        limit_req_status 429;
+        proxy_pass http://app;
+    }
+}</code></pre>
+<p>The burst is a bounded buffer. The delay is slow-the-producer. The 429 is the drop. All three answers in four lines.</p>
+
+<h2 id=dd-backpressure-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Backpressure sizing is mostly two equations: excess × duration for buffers, and Little's law for latency. The rest is remembering that a backlog drains at the <em>spare</em> rate, not the full rate.</p>
+
+<h3 id=dd-backpressure-burst-math level=3>Sizing a buffer for a burst, and the drain time nobody computes</h3>
+<p>Take the lesson's burst: 10x traffic for 90 seconds. Make the assumptions explicit. Steady input is 3,000 events per second. The consumer can do 4,500 per second, so it has 50% headroom. Events are 1 KB.</p>
+<ul>
+<li>Burst input: 30,000/s. Excess: 30,000 − 4,500 = 25,500/s.</li>
+<li>Buffer needed: 25,500 × 90 s ≈ 2.3 million events, about 2.3 GB.</li>
+<li>Drain time after the burst: the consumer has only 4,500 − 3,000 = 1,500/s spare. So 2.3 million / 1,500 ≈ 1,530 seconds, about 25 minutes.</li>
+</ul>
+<p>Two lessons sit in those three lines. First, 2.3 GB is too much for a process heap, which is why this burst belongs in a log, not an in-memory queue. Second, a 90-second burst causes 25 minutes of lag. Headroom, not buffer size, decides how fast you recover. Doubling the consumer's headroom to 6,000/s cuts the drain time to about 13 minutes.</p>
+
+<h3 id=dd-backpressure-latency-math level=3>A bounded buffer is a latency budget</h3>
+<p>Little's law says the time an item waits in a queue is the queue length divided by the rate it is served. A full buffer of 10,000 items in front of a consumer doing 3,000 per second adds 3.3 seconds to every item.</p>
+<p>So size in-process buffers from the latency budget, not from memory:</p>
+<p>maximum buffer = latency budget × service rate.</p>
+<p>A request path with 200 ms to spare, in front of a stage doing 500 requests per second, wants a queue of at most 100. A queue of 10,000 does not make the system more robust. It just guarantees that, under pressure, every request waits 20 seconds and then the client has already given up. Large buffers on request paths are how you end up doing work nobody is waiting for.</p>
+
+<h3 id=dd-backpressure-oom-math level=3>Time to out-of-memory for an unbounded buffer</h3>
+<p>The lesson's mismatch: 5,000 events per second in, 3,000 out. The excess is 2,000 per second. Assume 2 KB per event in memory, once object overhead is counted, and 4 GB of free heap.</p>
+<ul>
+<li>Growth: 2,000 × 2 KB = 4 MB per second.</li>
+<li>Time to exhaustion: 4,000 MB / 4 MB/s = 1,000 seconds, about 17 minutes.</li>
+</ul>
+<p>In practice it fails earlier. As the heap fills, the garbage collector runs more often and frees less, so the consumer slows down, which makes the mismatch bigger. Many JVM services spend their last few minutes almost entirely in GC before the crash.</p>
+
+<h3 id=dd-backpressure-lag-math level=3>How fast lag eats retention</h3>
+<p>With a log in the middle, the risk moves from memory to retention. What matters is the <strong>backlog age</strong>, the age of the oldest unprocessed event. If the consumer processes at μ events per second and events arrive at λ, it moves through event time at μ/λ seconds per second of wall-clock time. So the backlog age grows at 1 − μ/λ seconds per second.</p>
+<ul>
+<li>3,000 out of 5,000: the age grows by 0.4 s every second.</li>
+<li>With 7 days of retention, data starts being deleted unread after 7 / 0.4 = 17.5 days.</li>
+<li>With 24 hours of retention, after 2.5 days.</li>
+</ul>
+<p>That is why the right alert is on backlog age against retention, not on lag in messages. A lag of 10 million messages is fine on a topic doing 100,000 per second and a disaster on one doing 100.</p>
+
+<h3 id=dd-backpressure-window-math level=3>Window sizes and the bandwidth-delay product</h3>
+<p>A window-based protocol can have at most one window in flight per round trip. Its throughput ceiling is window / RTT.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Window<th>RTT<th>Ceiling<th>Where you see it<tbody>
+<tr><td>64 KiB (TCP without window scaling)<td>80 ms<td>~800 KB/s (~6.5 Mbit/s)<td>Old middleboxes that strip the scale option<tr><td>65,535 B (HTTP/2 default per stream)<td>100 ms<td>~650 KB/s per stream<td>Cross-region gRPC streams that never raise the window<tr><td>10 MB<td>80 ms<td>~125 MB/s (1 Gbit/s)<td>A tuned TCP connection, cross-continent</table></div></div>
+<p>Turn it around to size the window: window = bandwidth × RTT. A 1 Gbit/s link with an 80 ms RTT needs 125 MB/s × 0.08 s = 10 MB in flight. A slow cross-region stream is often a window that is correct for a LAN and wrong for a WAN, not a slow consumer at all.</p>
+
+<h2 id=dd-backpressure-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-backpressure-fm-hidden-queue level=3>1. The thread pool that ate the heap</h3>
+<p><strong>Symptom.</strong> A service's memory climbs steadily during a dependency slowdown. Latency rises, GC time rises, and the process is killed for running out of memory about twenty minutes in. Restarting it buys another twenty minutes.</p>
+<p><strong>Mechanism.</strong> Request handlers submit work to a fixed-size thread pool whose queue is unbounded, the default for <code>Executors.newFixedThreadPool</code> and Python's <code>ThreadPoolExecutor</code>. The threads are blocked on the slow dependency. Submissions never block, so every incoming request becomes a queued task holding its request body.</p>
+<p><strong>Detect.</strong> Heap growth that tracks the dependency's latency. The executor's queue size, if you export it. Most teams discover in the postmortem that they did not.</p>
+<p><strong>Fix.</strong> A bounded queue with an explicit rejection policy: reject fast with a 503, or <code>CallerRunsPolicy</code> to push the wait onto the caller. Export queue depth as a metric for every executor. Put a timeout on the dependency so threads come back.</p>
+
+<h3 id=dd-backpressure-fm-retry-storm level=3>2. Retries that kept the system down after the cause was fixed</h3>
+<p><strong>Symptom.</strong> The database had a 5-minute slowdown. It recovered. The API stayed at 30% success for another 40 minutes, while request volume was three times normal.</p>
+<p><strong>Mechanism.</strong> During the slowdown, clients timed out and retried, each up to three times. Queues filled with requests whose clients had already given up. The servers spent their capacity on that dead work, so new requests also timed out and retried. The load stayed high because of the failure, not because of users. This is a <strong>metastable failure</strong>: the trigger is gone but the overload sustains itself.</p>
+<p><strong>Detect.</strong> The ratio of attempts to unique requests (log a request ID and an attempt number). Goodput, meaning successful responses that arrive before the client's deadline, against raw throughput. Time spent in queue compared with the client timeout.</p>
+<p><strong>Fix.</strong> Retry budgets (for example, retries may be at most 10% of requests), with exponential backoff and jitter, as in <a href="#retry-with-exponential-backoff">Retry with Exponential Backoff</a>. Propagate deadlines and drop queued work whose deadline has passed before doing it. Shed load early with fast rejections, which cost almost nothing, instead of slow timeouts, which cost a full request each.</p>
+
+<h3 id=dd-backpressure-fm-poll-eviction level=3>3. The consumer that waited itself out of the group</h3>
+<p><strong>Symptom.</strong> The warehouse sink slows. Shortly after, the consumer group starts rebalancing every few minutes, lag rises in a sawtooth, and some batches are written twice.</p>
+<p><strong>Mechanism.</strong> The consumer implemented backpressure by blocking its poll loop until the sink accepted the batch. Blocked longer than <code>max.poll.interval.ms</code>, it was evicted. Its partitions moved to another consumer, which blocked on the same slow sink and was evicted in turn. Uncommitted work was redone each time.</p>
+<p><strong>Detect.</strong> Consumer logs about leaving the group because the poll interval was exceeded. Rebalance rate. Time between polls per consumer.</p>
+<p><strong>Fix.</strong> Separate polling from processing. Keep polling, and <code>pause()</code> the partitions while an internal bounded buffer is full; <code>resume()</code> when it drains. Lower <code>max.poll.records</code> so one batch fits comfortably within the interval. See <a href="#message-queue">Message Queue</a> for the rebalance storm in its general form.</p>
+
+<h3 id=dd-backpressure-fm-shared-connection level=3>4. Publishing blocked, so consuming stopped too</h3>
+<p><strong>Symptom.</strong> A RabbitMQ cluster raises a memory alarm. The workers that both consume a queue and publish results to another queue stop entirely, including their acks. Queue depth climbs, which keeps memory high, which keeps the alarm on.</p>
+<p><strong>Mechanism.</strong> On a memory or disk alarm, RabbitMQ blocks connections that publish. The workers used a single connection for consuming and publishing. When it was blocked, their acks and further consumption on that connection stalled with it. The backpressure meant for publishers reached the consumers that would have drained the queue.</p>
+<p><strong>Detect.</strong> Connection state shown as blocked in the management UI. A memory alarm combined with a consume rate that dropped to zero.</p>
+<p><strong>Fix.</strong> Separate connections for publishing and consuming, which RabbitMQ's own guidance recommends. In general: never let the signal for "stop producing" share a channel with the work that relieves the pressure. The same shape appears with a shared HTTP/2 connection whose connection-level window is exhausted by one slow stream.</p>
+
+<h3 id=dd-backpressure-fm-wrong-drop level=3>5. Dropping the wrong data</h3>
+<p><strong>Symptom.</strong> After a traffic spike, finance finds 0.2% of order events missing from the warehouse. Nobody saw an error.</p>
+<p><strong>Mechanism.</strong> An edge collector forwarded all events, metrics and orders alike, through one bounded in-memory queue with drop-on-full. The policy was right for metrics and wrong for orders. Under the spike, it dropped both in proportion.</p>
+<p><strong>Detect.</strong> A drop counter per event class. Without the class label, a single "dropped" counter hides exactly this. A reconciliation count between the order database and the warehouse.</p>
+<p><strong>Fix.</strong> Separate queues per class with separate policies: drop-oldest for metrics, block or spill to disk for facts. Send facts to a durable log as close to the source as possible. Dropping is a policy only when it is scoped to data that may be dropped.</p>
+
+<h3 id=dd-backpressure-fm-bloat level=3>6. The buffer that was bounded but too big</h3>
+<p><strong>Symptom.</strong> Under heavy load, p50 latency jumps from 50 ms to 8 seconds. Error rate stays low. Users still see timeouts, because the mobile app gives up after 5 seconds.</p>
+<p><strong>Mechanism.</strong> The queue in front of the workers is bounded at 50,000 entries. It never overflows, so it never rejects. At 6,000 requests per second, a full queue means 50,000 / 6,000 ≈ 8 seconds of wait. The server completes most requests after their clients have left. Networking calls this <strong>bufferbloat</strong>.</p>
+<p><strong>Detect.</strong> Time in queue as its own metric, compared with the client timeout. A rising share of responses written to connections that the client has already closed.</p>
+<p><strong>Fix.</strong> Size the queue from the latency budget. Better, bound the queue by time: drop items that have waited longer than a target, in the style of the CoDel queue discipline. Under overload, some systems also switch to serving the newest requests first, because those clients are still waiting.</p>
+
+<h3 id=dd-backpressure-fm-autoscale level=3>7. Scaling the consumer into the database</h3>
+<p><strong>Symptom.</strong> Lag rises, the autoscaler doubles the consumers, and lag rises faster. The database's CPU is at 100% and its connection count is at its limit.</p>
+<p><strong>Mechanism.</strong> The real bottleneck was the database the consumers write to. More consumers meant more concurrent writes, more lock contention and more connections, so total throughput fell. Scaling a stage that is not the bottleneck moves the pressure onto the one that is.</p>
+<p><strong>Detect.</strong> Throughput per consumer falling as consumers are added. Database saturation metrics rising with consumer count. Flink-style busy/backpressured metrics, or their equivalent, pointing at the sink.</p>
+<p><strong>Fix.</strong> Cap the autoscaler at the downstream's capacity, not at the partition count alone. Put a concurrency limit on the sink client. Batch writes. If the sink is shared, give this consumer a <a href="#bulkhead">bulkhead</a>: its own connection pool with a fixed size.</p>
+
+<h2 id=dd-backpressure-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-backpressure-choose-signal level=3>The signals compared</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Mechanism<th>Signal upstream<th>Granularity<th>Where excess goes<th>Typical place<tbody>
+<tr><td>Blocking bounded queue<td>Producer's put blocks<td>Per queue<td>Producer waits<td>In-process stages, Go channels<tr><td>Bounded queue + reject<td>Error to producer<td>Per queue<td>Producer decides (retry, fail)<td>Thread pools, request queues<tr><td>Drop policy (oldest, newest, keep-latest)<td>None<td>Per stream<td>Discarded by rule<td>Metrics, positions, video<tr><td>Window (TCP, HTTP/2)<td>Advertised free space<td>Per connection or stream<td>Sender's buffer, then its writer blocks<td>Every network hop<tr><td>Demand / credit (Reactive Streams, Flink)<td>Explicit permits<td>Per subscription or channel<td>Never produced or held upstream<td>Stream libraries, stream engines<tr><td>Pull (Kafka, SQS)<td>Absence of a fetch<td>Per consumer, per partition with pause<td>The log, as lag<td>Between services and stages<tr><td>Rate limit (429)<td>Rejection + Retry-After<td>Per client<td>Client-side retry<td>Public APIs<tr><td>Concurrency limit / load shedding<td>Fast rejection (503/429)<td>Per server or per priority<td>Lowest-priority work is refused<td>Service edges, gateways</table></div></div>
+
+<h3 id=dd-backpressure-choose-guidance level=3>How to choose</h3>
+<p>Ask four questions about each stream, in this order.</p>
+<ol>
+<li><strong>May any of it be lost?</strong> If no, dropping is off the table. If only stale versions may be lost, keep-latest is usually the best answer of all, because its memory does not depend on the mismatch.</li>
+<li><strong>Is the mismatch a burst or sustained?</strong> Bursts get a buffer sized by excess × duration, in a log if that is more than a few megabytes. Sustained mismatches need more capacity or a slower producer. No buffer fixes them.</li>
+<li><strong>Can the producer be slowed?</strong> Internal producers can: use pull, credits or blocking. External clients can only be asked, with a 429 and Retry-After, and some will not listen. Shed load by priority for those.</li>
+<li><strong>Should this stage's slowness reach everyone upstream?</strong> Inside a tight pipeline, coupling is fine and simpler. When a slow consumer should not hold back others, such as the warehouse sink, put a log seam between them and accept lag on that one branch.</li>
+</ol>
+<p>A rule of thumb for request paths: prefer rejecting fast over queuing long. A rejected request costs microseconds and tells the client the truth. A request that waits 8 seconds and then times out costs a full unit of work and teaches the client to retry.</p>
+
+<h3 id=dd-backpressure-choose-seam level=3>Coupled pipeline vs. log seams</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th>One coupled topology<th>Log seam between stages<tbody>
+<tr><td>End-to-end latency<td>Lowest<td>Adds a produce/consume hop (ms to tens of ms)<tr><td>Slow sink affects<td>The whole pipeline and its checkpoints<td>Only the branch behind the seam<tr><td>Recovery<td>One checkpoint for everything<td>Each side recovers alone, by offset<tr><td>Cost<td>None extra<td>Storage for the topic, an extra serialization<tr><td>Fits<td>Stages that must stay in step<td>Sinks with their own failure modes: warehouses, third-party APIs</table></div></div>
+
+<h2 id=dd-backpressure-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>List every queue, buffer, channel and executor in the path. What is the bound on each, in items and in bytes? Any that say "unbounded" or "default"?</li>
+<li>For each stream, which response applies, buffer, drop or slow, and who chose it?</li>
+<li>Which data may be dropped, and is it physically separated from data that may not?</li>
+<li>For each bounded buffer, what latency does it add when full, and is that within the budget of whoever is waiting?</li>
+<li>For the worst expected burst, what is the excess × duration, and where does it fit? What is the drain time afterwards at the real spare capacity?</li>
+<li>What happens at the system boundary when everything is slow: 429, 503, or slow responses? Is there a Retry-After, and are clients' retries budgeted?</li>
+<li>Do Kafka consumers use <code>pause()</code>/<code>resume()</code> rather than blocking the poll loop? Does one batch fit well within <code>max.poll.interval.ms</code>?</li>
+<li>What does the autoscaler scale on (backlog age, not CPU), and what caps it: partitions, or the downstream's capacity?</li>
+<li>Is there an alert on backlog age against retention for every log seam?</li>
+<li>Can a slow sink stall checkpoints for the whole job? If so, does that sink sit behind a seam?</li>
+<li>Are dropped, rejected and throttled counts exported per stream class, so a drop is never silent?</li>
+<li>Do the signals that stop producers ever share a connection or channel with the work that drains the backlog?</li>
+</ol>
+
+<h2 id=dd-backpressure-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"TCP already has flow control. Why does my WebSocket gateway still run out of memory?"</summary>
+<p>Because the application read the pressure and then ignored it. When a client is slow, the kernel's send buffer fills and the socket stops accepting writes. An event-loop server that responds by queuing outgoing messages in user space has built an unbounded buffer above TCP. The fix is a bounded per-connection send queue with a policy: drop or coalesce stale updates, and disconnect a client that stays behind for too long, so it can reconnect and resynchronize.</p>
+</details>
+
+<details>
+<summary>"Why does a bigger queue often make an overloaded service worse?"</summary>
+<p>Because under sustained overload the queue is always full, so its only effect is added wait: queue length divided by service rate. Requests then finish after their clients have timed out. That is wasted work, and the timeouts trigger retries that add more load. A small queue with fast rejection keeps latency bounded and gives clients a clear signal. Queues should absorb bursts, and should be sized by the latency budget.</p>
+</details>
+
+<details>
+<summary>"In a Flink job every operator shows backpressure. How do you find the cause?"</summary>
+<p>Backpressure shows upstream of the bottleneck, not at it. Walk the topology from source to sink and find the first operator that is busy and not backpressured. Everything before it is waiting on it, and everything after it is mostly idle. Then ask why that stage is slow: a sink, skew on one subtask, a hot key, or GC. Checkpoint alignment time growing at the same time confirms that barriers are stuck behind the same buffers.</p>
+</details>
+
+<details>
+<summary>"A Kafka consumer's sink is slow. Why not just stop calling poll()?"</summary>
+<p>Because the group treats a consumer that does not poll within <code>max.poll.interval.ms</code> as dead and rebalances its partitions. The next owner hits the same slow sink and is evicted too, which produces a rebalance storm and duplicate work. Keep polling, and pause the partitions while the internal buffer is full. Polling paused partitions returns nothing but keeps membership alive.</p>
+</details>
+
+<details>
+<summary>"How do you size the buffer for a 10x burst lasting 90 seconds?"</summary>
+<p>Excess × duration, where excess is the burst rate minus what the consumer can actually do. Then compute the drain time: the backlog divided by spare capacity, meaning consumer capacity minus the steady input. Most of the time the drain dominates. A 90-second burst can mean 25 minutes of lag at 50% headroom. If the buffer is more than a few megabytes, it belongs in a log, with an alert on backlog age.</p>
+</details>
+
+<details>
+<summary>"When is dropping better than slowing the producer?"</summary>
+<p>When newer data replaces older data, such as positions, frames and gauges. Slowing the producer then just delivers stale data late. Keep-latest is also the cheapest policy, because its memory is bounded by the number of keys rather than by the rate mismatch. Dropping is wrong for facts, such as orders and billing events, and for anything protected by exactly-once guarantees.</p>
+</details>
+
+<details>
+<summary>"The database is the bottleneck. Why didn't autoscaling the consumers help?"</summary>
+<p>Because the consumers were not the bottleneck. Adding them raised concurrency on the database, increasing lock contention and connection overhead, so throughput fell. Autoscaling must be capped by the downstream's capacity, and the sink client needs a concurrency limit. Watch throughput per consumer: if it falls as you add consumers, you are scaling the wrong stage.</p>
+</details>
+
+<details>
+<summary>"Where should backpressure finally surface to users, and how do you decide?"</summary>
+<p>Somewhere you chose, with the lowest-value work affected first. Internally, let logs absorb it as lag. At the edge, return 429 or 503 with Retry-After for low-priority traffic before high-priority traffic is touched: shed analytics beacons before checkouts. The worst place for it to surface is as random timeouts across all traffic, which is what you get when nobody decides.</p>
+</details>

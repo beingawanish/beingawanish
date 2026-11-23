@@ -1,0 +1,221 @@
+<h2 id=dd-circuit-breaker-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's breaker has three states and three numbers. A production breaker is mostly about the parts between those numbers: how the window stores outcomes, which outcomes count, how half-open hands out its few test calls safely, and what exactly a breaker is wrapped around. Those choices decide whether the breaker trips in two seconds or never, and whether it closes cleanly or flaps.</p>
+
+<h3 id=dd-circuit-breaker-windows level=3>Two kinds of window</h3>
+<p>A breaker needs a recent failure rate, computed cheaply on every call. There are two standard data structures for it.</p>
+<p><strong>Count-based: a ring buffer of the last N outcomes.</strong> An array of N slots, a write index, and two running counters (calls and failures). Each call overwrites the oldest slot and adjusts the counters, so updating and reading the rate are both O(1). The window always means "the last N calls", however long ago they happened. That is its weakness on quiet paths. On an endpoint called 4 times an hour, the last 20 calls span five hours, as the lesson says.</p>
+<p><strong>Time-based: a ring of per-second buckets.</strong> For a 10-second window, keep 10 buckets, each holding counts for one second. A call adds to the current bucket. When a new second starts, the oldest bucket is cleared and reused. The rate is the sum over all buckets. This window always means "the last 10 seconds", however many calls that is. Hystrix used this design (10 buckets of 1 second by default). Resilience4j offers both, as <code>COUNT_BASED</code> and <code>TIME_BASED</code>.</p>
+<p>Both need a <strong>minimum number of calls</strong> before the rate means anything. Two failures out of three calls is 67%, but it is not evidence. Hystrix's <code>requestVolumeThreshold</code> defaulted to 20 calls per window. Resilience4j's <code>minimumNumberOfCalls</code> defaults to 100. That last default is high enough that a low-traffic instance may never trip, which comes up again under failure modes.</p>
+
+<h3 id=dd-circuit-breaker-what-counts level=3>What counts as a failure</h3>
+<p>This is the most consequential setting, and libraries default it loosely. The usual good answer for an HTTP dependency:</p>
+<ul>
+<li><strong>Count:</strong> timeouts, connection failures, 5xx responses, and 429s if you want to back off from a throttling dependency.</li>
+<li><strong>Do not count:</strong> 4xx caused by the caller's own request (400, 404, 409, 422). They say nothing about the dependency's health. Counting them lets one buggy client, or one tenant sending bad data, open the breaker for everyone.</li>
+<li><strong>Do not count:</strong> rejections by the breaker itself, and cancellations caused by the caller's own deadline expiring before the call started.</li>
+<li><strong>Count separately: slow successes.</strong> A dependency answering every call correctly in 1.9 seconds, just under a 2-second timeout, is failing in the way that matters to your thread pool. Resilience4j has a second threshold for this: <code>slowCallDurationThreshold</code> and <code>slowCallRateThreshold</code>. The breaker opens if, say, 80% of calls exceed 1 second, even though none failed.</li>
+</ul>
+<p>In Resilience4j, <code>recordExceptions</code> and <code>ignoreExceptions</code> (or a <code>recordException</code> predicate) express these rules. Whatever library you use, write a test for each class of error and assert whether it counts.</p>
+
+<h3 id=dd-circuit-breaker-half-open level=3>Half-open needs a permit counter</h3>
+<p>"Let 5 test calls through" sounds simple. In a service with 200 threads, it is a race. When the cooldown expires, dozens of threads may see <code>half_open</code> at the same instant. If each one checks "are fewer than 5 probes running?" and then starts one, you get far more than 5 probes. That is the check-then-act race from the <a href="#idempotency">idempotency</a> lesson again, inside one process.</p>
+<p>The fix is a permit counter claimed atomically: a semaphore, or an atomic decrement that fails below zero. Only threads that get a permit call the dependency. Everyone else is rejected as if the breaker were still open. The state change itself is a compare-and-set, so only one thread performs the <code>open → half_open</code> transition, and only one performs <code>half_open → closed</code>.</p>
+<p>Then decide what the probes must prove. Resilience4j's default is 10 permitted calls in half-open, judged against the same failure-rate threshold. A stricter rule closes only if all probes succeed. A single probe is too little evidence. One lucky success closes the breaker, full traffic arrives, and it trips again.</p>
+
+<h3 id=dd-circuit-breaker-code level=3>A minimal, correct breaker in standard-library Python</h3>
+<p>This uses a time-based window with per-second buckets, a minimum call count, and an atomic half-open permit.</p>
+<pre><code>import threading, time
+
+class CircuitOpen(Exception):
+    pass
+
+class Breaker:
+    def __init__(self, window_s=10, min_calls=20, threshold=0.5,
+                 cooldown_s=30, probes=5):
+        self.window_s, self.min_calls, self.threshold = window_s, min_calls, threshold
+        self.cooldown_s, self.probes = cooldown_s, probes
+        self.buckets = [[0, 0, 0] for _ in range(window_s)]  # [second, calls, failures]
+        self.state, self.opened_at = "closed", 0.0
+        self.permits = self.probe_ok = 0
+        self.lock = threading.Lock()
+
+    def _bucket(self, now):
+        sec = int(now)
+        b = self.buckets[sec % self.window_s]
+        if b[0] != sec:                    # stale slot from an older second: reuse it
+            b[:] = [sec, 0, 0]
+        return b
+
+    def _rate(self, now):
+        live = [b for b in self.buckets if b[0] &gt; now - self.window_s]
+        calls = sum(b[1] for b in live)
+        return calls, (sum(b[2] for b in live) / calls if calls else 0.0)
+
+    def before_call(self):
+        now = time.monotonic()
+        with self.lock:
+            if self.state == "open" and now - self.opened_at &gt;= self.cooldown_s:
+                self.state, self.permits, self.probe_ok = "half_open", self.probes, 0
+            if self.state == "open":
+                raise CircuitOpen()
+            if self.state == "half_open":
+                if self.permits == 0:
+                    raise CircuitOpen()    # probes already handed out
+                self.permits -= 1
+
+    def after_call(self, failed):
+        now = time.monotonic()
+        with self.lock:
+            if self.state == "half_open":
+                if failed:
+                    self.state, self.opened_at = "open", now
+                else:
+                    self.probe_ok += 1
+                    if self.probe_ok == self.probes:
+                        self.state = "closed"
+                        self.buckets = [[0, 0, 0] for _ in range(self.window_s)]
+                return
+            b = self._bucket(now)
+            b[1] += 1
+            b[2] += failed
+            calls, rate = self._rate(now)
+            if self.state == "closed" and calls &gt;= self.min_calls and rate &gt; self.threshold:
+                self.state, self.opened_at = "open", now
+</code></pre>
+<p>One global lock is fine at a few thousand calls per second. Libraries built for higher rates use atomics per bucket instead. Note what <code>after_call</code> must receive: a real classification of the outcome, following the rules above, not just "an exception was raised".</p>
+
+<h3 id=dd-circuit-breaker-real-systems level=3>The knobs in real systems</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>System<th>Trip rule<th>Open / cooldown<th>Recovery<tbody>
+<tr><td>Hystrix (maintenance mode since 2018)<td><code>errorThresholdPercentage</code> 50 over a 10 s rolling window, after <code>requestVolumeThreshold</code> 20 calls<td><code>sleepWindowInMilliseconds</code> 5,000<td>One trial call; success closes
+<tr><td>Resilience4j<td><code>failureRateThreshold</code> 50 and/or <code>slowCallRateThreshold</code>, over <code>slidingWindowSize</code> (100 by default), after <code>minimumNumberOfCalls</code><td><code>waitDurationInOpenState</code>, 60 s by default; can grow on each re-open<td><code>permittedNumberOfCallsInHalfOpenState</code>, 10 by default
+<tr><td>Envoy outlier detection<td>Per host: <code>consecutive_5xx</code> (5 by default), or success-rate statistics across hosts<td>Host ejected for <code>base_ejection_time</code> (30 s) × number of times ejected<td>Host returns to the pool after its ejection time; <code>max_ejection_percent</code> (10% by default) caps how many hosts can be out
+<tr><td>Envoy "circuit breakers"<td>Concurrency caps: <code>max_connections</code>, <code>max_pending_requests</code>, <code>max_requests</code>, <code>max_retries</code><td>None: excess requests fail immediately while the cap is reached<td>Instant, as soon as concurrency drops
+</tbody></table></div></div>
+<p>The last row trips people up in reviews. Envoy's settings called "circuit breakers" are concurrency limits. They are a <a href="#bulkhead">bulkhead</a>, not the three-state machine from this lesson. Envoy's closest equivalent to the lesson's breaker is <strong>outlier detection</strong>, and it works per host rather than per service. It ejects the one bad instance of the recommendation service and keeps sending to the healthy ones.</p>
+<p>Outlier detection has one more safety valve worth knowing. If too many hosts are ejected or unhealthy, Envoy's <strong>panic threshold</strong> (50% by default) makes it ignore health and spread traffic across all hosts. The reasoning: if half the fleet looks bad, the detector is probably wrong, and sending all traffic to a few survivors would crush them.</p>
+
+<h3 id=dd-circuit-breaker-granularity level=3>What one breaker wraps</h3>
+<p>The lesson wraps "the recommendation service". In practice you choose a scope, and every scope has a failure it handles badly:</p>
+<ul>
+<li><strong>Per dependency.</strong> Simple and the usual default. But if only the <code>/similar</code> endpoint is failing, the breaker also blocks the healthy <code>/trending</code> endpoint.</li>
+<li><strong>Per endpoint or operation.</strong> Isolates a bad query path. Each breaker sees less traffic, so it takes longer to gather evidence.</li>
+<li><strong>Per host.</strong> Handles one bad instance, which is the most common failure in a large fleet. This is outlier detection's scope.</li>
+<li><strong>Per tenant.</strong> For multi-tenant dependencies where one customer's shard is down. A shared breaker would punish every tenant for one tenant's problem.</li>
+</ul>
+<p>A sensible default for the bookstore: outlier detection per host in the mesh, plus a per-dependency breaker in the application with a fallback. The first handles one bad instance quietly. The second handles "the whole service is down" and decides what the page shows instead.</p>
+
+<h2 id=dd-circuit-breaker-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-circuit-breaker-detection level=3>Time to trip</h3>
+<p>Time to trip is roughly the time to collect enough failures, plus the time for each failure to be recognised:</p>
+<pre><code>time_to_trip ≈ timeout + (min_calls / per_instance_rate)</code></pre>
+<p>The lesson's walkthrough used one instance at 300 calls per second. Now spread the same 300 calls across 50 instances: 6 calls per second each. Assume a 2-second timeout and a 20-call minimum.</p>
+<ul>
+<li>One instance at 300/s: 20 calls arrive in 67 ms. Trip time ≈ 2 s + 0.07 s ≈ 2.1 s.</li>
+<li>Fifty instances at 6/s each: 20 calls take 3.3 s per instance. Trip time ≈ 2 s + 3.3 s ≈ 5.3 s.</li>
+<li>With Resilience4j's default minimum of 100 calls: 100 / 6 ≈ 17 s, plus the timeout. During those 19 seconds every instance is filling its threads with waiting calls.</li>
+</ul>
+<p>The total discovery cost across the fleet is about <code>instances × min_calls × failure_fraction</code>. Here that is 50 × 20 × ~0.5 ≈ 500 failed calls. That is cheap for the dependency. It matters more for the caller, because each of those 500 calls held a thread for 2 seconds. This is why the breaker cannot replace a bulkhead: someone has to limit the damage during those first seconds.</p>
+
+<h3 id=dd-circuit-breaker-false-trips level=3>False trips: the binomial math</h3>
+<p>A small window is noisy. Consider a dependency whose normal error rate is a high but harmless 20%. With a 50% threshold, how often does random noise alone push a window over the line? Treat each window as independent and use the binomial distribution. At 300 calls per second, a window of N calls refills about 300/N times per second. Rough results:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Window (calls)<th>P(more than half fail) at a 20% error rate<th>Approximate time between false trips<tbody>
+<tr><td>10<td>0.64%<td>about every 5 seconds
+<tr><td>20<td>0.056%<td>about every 2 minutes
+<tr><td>50<td>0.00005%<td>about every 4 days
+<tr><td>100<td>about 5 × 10^-12<td>effectively never
+</tbody></table></div></div>
+<p>Sliding windows overlap, so these are approximations. The shape is the point. Each doubling of the window cuts false trips by orders of magnitude, while costing only a few hundred milliseconds of detection at this traffic level. Set the threshold well above the normal error rate, and give the window enough calls that noise cannot reach it. At 1% normal errors, even a 20-call window virtually never trips by chance.</p>
+
+<h3 id=dd-circuit-breaker-cooldown level=3>Cooldown and probe cost</h3>
+<p>With a 30-second cooldown and 5 probes, a dependency that stays down for 4 minutes receives 8 rounds of probes. That is 40 calls per instance, or 2,000 across 50 instances: under 10 calls per second against a broken service. That is nothing next to the 300 per second it would otherwise receive.</p>
+<p>The cost of the cooldown is on the other side. When the dependency recovers, it stays unused for up to one full cooldown. With a 30-second cooldown, the average delay is 15 seconds. A growing cooldown (30 s, 60 s, 120 s, capped at a few minutes) suits dependencies that are either briefly blipping or truly down for a long time. Resilience4j supports an interval function for this. Add jitter to the cooldown, for reasons the failure modes will make clear.</p>
+
+<h3 id=dd-circuit-breaker-ramp level=3>The recovery surge</h3>
+<p>When the breaker closes, traffic goes from near zero to 300 per second at once. The recovering recommendation database has a cold cache. Assume its cold capacity is 150 queries per second for the first minute. A full-traffic close overloads it immediately, the probes' success was misleading, and the breaker reopens. A <strong>ramp</strong> fixes this. After closing, let 10% of calls through, then 25%, 50% and 100% over 30 to 60 seconds. Envoy has the same idea for new hosts, called slow start. Few application breaker libraries ramp built-in, so this is often a few lines of your own code on top.</p>
+
+<h2 id=dd-circuit-breaker-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-circuit-breaker-fm-flap level=3>1. Flapping: open, closed, open, closed</h3>
+<p><strong>Symptom:</strong> the breaker changes state every 30 to 40 seconds for twenty minutes. The page alternates between showing and hiding recommendations. <strong>Mechanism:</strong> the dependency can handle a few calls but not full traffic. Probes succeed, the breaker closes, full load arrives, failures follow, and it trips again. A single-probe half-open makes this much worse. <strong>Detect:</strong> count state transitions per breaker per hour, and alert on more than a few. A flat line at "open" is an outage. A sawtooth is a flap. <strong>Fix:</strong> more probes, a stricter close rule, a ramp after closing, and a cooldown that grows on each consecutive re-open.</p>
+
+<h3 id=dd-circuit-breaker-fm-never-trips level=3>2. The breaker that never trips</h3>
+<p><strong>Symptom:</strong> the dependency is down, checkout's threads are exhausted, and the breaker dashboard shows every instance closed. <strong>Mechanism:</strong> the minimum call count was larger than the traffic one instance sees within the window. At 6 calls per second per instance and a 10-second time window, an instance never sees 100 calls, so the breaker never evaluates. A second cause: calls are slow but succeed, and slow calls are not counted. <strong>Detect:</strong> chaos testing. Inject a full outage in staging and measure time to trip per instance. Compare <code>minimumNumberOfCalls</code> with per-instance traffic in the window at your quietest hour. <strong>Fix:</strong> size the minimum and the window from per-instance traffic, not fleet traffic. Turn on slow-call detection with a threshold below the timeout.</p>
+
+<h3 id=dd-circuit-breaker-fm-client-errors level=3>3. One bad client trips the breaker for everyone</h3>
+<p><strong>Symptom:</strong> after a mobile app release, the search breaker opens, and search disappears for every user on every platform. <strong>Mechanism:</strong> the new app version sent a malformed query parameter, and search returned 400 for those calls. The breaker counted every exception as a failure, and 400s from the new version passed 50%. <strong>Detect:</strong> break down the failures that tripped the breaker by status code and caller. A trip made of 4xx responses is the caller's fault, never the dependency's. <strong>Fix:</strong> count only 5xx, timeouts and connection errors. Where callers or tenants differ widely, scope breakers to them.</p>
+
+<h3 id=dd-circuit-breaker-fm-herd level=3>4. Synchronized probes from the whole fleet</h3>
+<p><strong>Symptom:</strong> a recovering dependency gets a burst of traffic every 30 seconds exactly, and each burst knocks it down again. <strong>Mechanism:</strong> all 50 instances saw the outage at the same moment, so all tripped within a second of each other. Their cooldowns expire together, all go half-open together, and probes plus the post-close surge arrive as one wave. It is the <a href="#retry-with-exponential-backoff">thundering herd</a> again, this time generated by breakers. <strong>Detect:</strong> the dependency's request rate shows regular spikes at the cooldown period. Breaker transition timestamps cluster across instances. <strong>Fix:</strong> jitter the cooldown (for example 30 s ± 20%), ramp traffic after closing, and keep half-open probes few.</p>
+
+<h3 id=dd-circuit-breaker-fm-too-coarse level=3>5. One bad host opens the breaker for the whole service</h3>
+<p><strong>Symptom:</strong> one of ten inventory instances has a full disk. The application's inventory breaker opens, and checkout falls back to "availability unknown" for all products. <strong>Mechanism:</strong> the breaker wraps the whole service. One host failing 100% of its calls, behind a round-robin balancer, gives a 10% service error rate. With retries landing on the same host, or with a sticky connection, the observed rate went much higher and passed the threshold. Nine healthy hosts were cut off with it. <strong>Detect:</strong> break down failures by backend host. A breaker trip dominated by one host's errors is a scope problem. <strong>Fix:</strong> per-host outlier detection in the mesh or the client-side load balancer, so the bad host is ejected before the service-level breaker sees much.</p>
+
+<h3 id=dd-circuit-breaker-fm-eject level=3>6. Outlier detection ejects too much of the fleet</h3>
+<p><strong>Symptom:</strong> during a deploy, error rates are briefly high on many hosts. Shortly after, the remaining hosts overload and the whole service fails. <strong>Mechanism:</strong> outlier detection ejected each host that crossed <code>consecutive_5xx</code>. With a high <code>max_ejection_percent</code>, it removed most of the pool, and all traffic landed on the few hosts left. <strong>Detect:</strong> the ejected-host gauge (Envoy exposes <code>outlier_detection.ejections_active</code>) rising past a few percent of the pool. <strong>Fix:</strong> keep <code>max_ejection_percent</code> low, rely on the panic threshold, and make sure deploys drain hosts gracefully so they do not return 5xx while shutting down.</p>
+
+<h3 id=dd-circuit-breaker-fm-silent level=3>7. The fallback hides an outage for days</h3>
+<p><strong>Symptom:</strong> a week after a config change, someone notices recommendations have not appeared on any page since Tuesday. No alert fired. <strong>Mechanism:</strong> the breaker opened and the fallback rendered the page without the widget, exactly as designed. Error rates stayed at zero because fallbacks are not errors. The recommendation service was misconfigured and nobody was told. <strong>Detect:</strong> alert on breaker state itself: open for more than a few minutes pages the owning team. Track the fallback rate as a first-class metric next to the error rate. <strong>Fix:</strong> every breaker gets an owner, an "open" alert, and a dashboard panel. A fallback protects users. It must not hide the problem from engineers.</p>
+
+<h2 id=dd-circuit-breaker-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Window<td>Count-based (last N calls)<td>Time-based (last N seconds)<td>Traffic is steady and high. Choose time-based when traffic is bursty or quiet, so old outcomes age out.
+<tr><td>Trip rule<td>Failure rate over a window<td>Consecutive failures<td>Traffic is high enough for a meaningful rate. Consecutive failures suit per-host detection and low traffic, but are fooled by an alternating good-bad pattern.
+<tr><td>State sharing<td>Per instance<td>Shared through a store (e.g. Redis)<td>Almost always. Sharing saves a few hundred discovery calls but adds a dependency to your failure handling, and that dependency can fail during the same incident.
+<tr><td>Where it lives<td>Application library<td>Service mesh (outlier detection)<td>You need a fallback, per-operation scope, or rules about which errors count. The mesh is better for per-host ejection across every service at once. Most systems use both.
+<tr><td>Scope<td>Per dependency<td>Per host, endpoint or tenant<td>Failures tend to be whole-service. Narrow the scope when one host, one endpoint or one tenant usually fails alone.
+<tr><td>Response<td>Binary: closed or open<td>Adaptive throttling: reject a fraction of calls in proportion to recent failures<td>You want simple, explainable behaviour. Choose adaptive throttling for overloaded but partly working dependencies, where sending some traffic is better than sending none.
+<tr><td>Cooldown<td>Fixed<td>Growing, with jitter<td>Outages are usually short and uniform. Choose growing cooldowns when outages vary from seconds to hours.
+</tbody></table></div></div>
+<p>The adaptive row deserves an explanation, because it is the less known option. Google's SRE book describes <strong>client-side adaptive throttling</strong>. Each client tracks <code>requests</code> and <code>accepts</code> over the last couple of minutes. It rejects a new call locally with probability <code>max(0, (requests - K × accepts) / (requests + 1))</code>, typically with K = 2. When the backend accepts everything, nothing is rejected. When it accepts half, the client starts shedding. The traffic sent tracks what the backend can actually serve, without a hard open state. It is a good fit for an overloaded dependency that still serves a share of calls, where a binary breaker would cut it off entirely.</p>
+<p>A firm opinion on state sharing: <strong>keep breakers per instance</strong>. The lesson notes that sharing costs a dependency. It also tends to fail exactly when you need it, because network trouble that breaks your dependency often breaks the path to Redis too. The per-instance discovery cost is a few hundred calls. That price is worth paying for a breaker that only depends on itself.</p>
+
+<h2 id=dd-circuit-breaker-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What does this breaker wrap: a service, an endpoint, a host or a tenant? What failure does that scope handle badly?</li>
+<li>Which outcomes count as failures? Are 4xx responses and the breaker's own rejections excluded? Show the test.</li>
+<li>Are slow successes counted, with a threshold below the timeout?</li>
+<li>What is the per-instance traffic at the quietest hour, and can the minimum call count be reached within the window at that rate?</li>
+<li>Given the dependency's normal error rate, how often will noise alone trip this breaker? Show the window size math.</li>
+<li>What is the time to trip during a full outage, and what limits thread usage until then (a timeout and a bulkhead)?</li>
+<li>How many probes run in half-open, how are they claimed atomically, and what must they prove to close?</li>
+<li>Is the cooldown jittered? Does it grow on repeated re-opens? Is traffic ramped after closing?</li>
+<li>What does the user see while the breaker is open, and who decided that?</li>
+<li>Does the breaker sit outside the retries, counting final outcomes, so retries cannot multiply load while it is open?</li>
+<li>Who is paged when it opens, and is the fallback rate on a dashboard next to the error rate?</li>
+<li>Has a fault-injection drill measured trip time, probe behaviour and recovery for this breaker in a realistic environment?</li>
+</ol>
+
+<h2 id=dd-circuit-breaker-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Your breaker uses the library default of 100 minimum calls. Is that a problem?"</summary>
+<p>It depends on per-instance traffic, not fleet traffic. Divide the dependency's call rate by the number of instances. If one instance gets 6 calls per second, it needs about 17 seconds to collect 100 calls. With a time-based window of 10 seconds, it never collects them, so the breaker never trips. Size the minimum from the quietest instance's traffic within the window, and verify with a drill.</p>
+</details>
+<details>
+<summary>"Should the breaker go inside or outside the retry loop?"</summary>
+<p>Outside, counting the final outcome of each logical call. Then the breaker sees one failure per user request, and when it opens, retries stop with it. If the breaker sits inside the retries, every attempt counts separately, so it trips faster, and an open breaker gives each retry an instant rejection that the loop may keep retrying. Some designs also let the breaker see each attempt for faster detection. Either way, an open breaker must end the retry loop.</p>
+</details>
+<details>
+<summary>"Why not share breaker state across instances so the fleet learns faster?"</summary>
+<p>Because the shared store becomes part of your failure path. Network trouble that breaks the dependency often breaks the path to the store too. Then every instance has to choose between a stale view and a blocking lookup during the incident. The gain is small: each instance spends a handful of calls to learn the outage on its own. Per-instance state with jittered cooldowns is simpler and more robust.</p>
+</details>
+<details>
+<summary>"The dependency answers every call successfully in 1.9 seconds, under a 2-second timeout. Does your breaker help?"</summary>
+<p>Only if it counts slow calls. Error-rate logic sees 0% failures and stays closed, while every call holds a thread for nearly two seconds. Little's law then exhausts the pool just as in a hang. Resilience4j's slow-call threshold handles this: open if most calls exceed, say, 1 second. A bulkhead also helps, by capping how many threads the slow dependency can hold.</p>
+</details>
+<details>
+<summary>"How is Envoy's circuit breaking different from this lesson's breaker?"</summary>
+<p>Envoy's settings called circuit breakers are concurrency caps: max connections, pending requests, active requests and retries per upstream cluster. Excess requests fail immediately. That is a bulkhead. The closest match to the three-state breaker is outlier detection, which ejects individual hosts after consecutive errors or poor success rates and returns them after an ejection period that grows on repeat offences. It works per host, not per service.</p>
+</details>
+<details>
+<summary>"When would you choose adaptive throttling over a breaker?"</summary>
+<p>When the dependency is overloaded rather than dead. A binary breaker either sends everything or nothing. Against a backend serving 60% of requests, "nothing" wastes 60% of useful capacity, and "everything" keeps it overloaded. Client-side adaptive throttling rejects locally in proportion to how much the backend is refusing, so sent traffic converges on what the backend can serve. Use a breaker when calls are pointless; use throttling when some of them still succeed.</p>
+</details>
+<details>
+<summary>"The breaker closes and the dependency immediately falls over again. Why, and what do you change?"</summary>
+<p>The probes proved the dependency could handle a few calls, not full traffic. After an outage it often has cold caches, a fresh connection pool, or a backlog. Full traffic at once overloads it, and the breaker reopens. Use more probes with a stricter close rule, ramp traffic up after closing (10%, 25%, 50%, 100%), jitter the cooldown so instances don't close together, and grow the cooldown on consecutive re-opens.</p>
+</details>
+<details>
+<summary>"Where would you not put a breaker even though the call is remote?"</summary>
+<p>On calls where a fast "no" is worse than waiting, such as capturing a payment that has already been authorised, or writes to the primary database with no fallback. There, an open breaker turns a slow period into guaranteed failures. Use a timeout, careful retries with idempotency, and a queue for work that can wait. Also skip it on very low-traffic calls, where no window can tell an outage from noise.</p>
+</details>

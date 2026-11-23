@@ -1,0 +1,35 @@
+{
+  "type": "record",
+  "name": "StockReserved",
+  "namespace": "com.edacommerce.inventory",
+  "doc": "Reply to ReserveStock: all lines are held until expiresAt.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "reservationId",
+      "type": "string"
+    },
+    {
+      "name": "lines",
+      "type": {
+        "type": "array",
+        "items": "com.edacommerce.common.StockLine"
+      }
+    },
+    {
+      "name": "expiresAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

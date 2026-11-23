@@ -1,0 +1,47 @@
+{
+  "type": "record",
+  "name": "ReturnClosed",
+  "namespace": "com.edacommerce.returns",
+  "doc": "Terminal event of the returns saga.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": "string"
+    },
+    {
+      "name": "outcome",
+      "type": {
+        "type": "enum",
+        "name": "ReturnOutcome",
+        "namespace": "com.edacommerce.returns",
+        "doc": "How a return ended. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+        "symbols": [
+          "REFUNDED",
+          "PARTIALLY_REFUNDED",
+          "REJECTED",
+          "EXPIRED",
+          "CANCELLED",
+          "MANUAL_REVIEW",
+          "UNKNOWN"
+        ],
+        "default": "UNKNOWN"
+      }
+    },
+    {
+      "name": "closedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "type": "record",
+  "name": "IssueReturnLabel",
+  "namespace": "com.edacommerce.shipping",
+  "doc": "Command: book a return shipment and produce a label for the customer.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": "string"
+    },
+    {
+      "name": "shipmentId",
+      "type": "string",
+      "doc": "Minted by the caller so the command is idempotent."
+    },
+    {
+      "name": "pickupFrom",
+      "type": "com.edacommerce.common.Address",
+      "pii": true
+    },
+    {
+      "name": "toWarehouseId",
+      "type": "string"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+# Build outputs are never committed (generated Avro classes included).
+build/
+.gradle/
+out/
+*.class
+*.log
+.idea/
+*.iml
+.vscode/
+bin/

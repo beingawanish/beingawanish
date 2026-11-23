@@ -1,0 +1,316 @@
+<h2 id=dd-load-balancing-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson gives the balancer four jobs. Each job is a small state machine with timers and thresholds. Those numbers, more than the product you pick, decide whether a bad server costs six seconds or eleven minutes, and whether a deploy is invisible or a spike on the error graph.</p>
+
+<h3 id=dd-load-balancing-states level=3>One backend's life inside the balancer</h3>
+<p>For every backend, the balancer keeps a little record: its address, its weight, its current in-flight count, recent check results, and a state. The states and the transitions between them are the same in every serious balancer, though the names vary.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-load-balancing-svg-title dd-load-balancing-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-load-balancing-svg-title">The states of one backend inside a load balancer</title>
+<desc id="dd-load-balancing-svg-desc">A new backend starts in Warming, with its weight ramping up during slow start, and becomes Healthy after enough successful probes. A Healthy backend becomes Down after a run of failed probes, or Ejected when passive checks see too many errors. Down returns to Warming after a run of successful probes. Ejected returns after an ejection timer. A deploy moves a Healthy backend to Draining, where it receives no new requests; it is Removed when its in-flight count reaches zero or the drain timeout ends.</desc>
+<defs><marker id="dd-load-balancing-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="300" fill="#ffffff"/>
+<rect x="20" y="40" width="130" height="56" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="85" y="64" font-size="14" fill="#1c2430" text-anchor="middle">Warming</text>
+<text x="85" y="83" font-size="12" fill="#5c6b7c" text-anchor="middle">weight ramps up</text>
+<rect x="290" y="40" width="140" height="56" rx="8" fill="#e5f3ec" stroke="#7eae96" stroke-width="2"/>
+<text x="360" y="64" font-size="14" fill="#1c2430" text-anchor="middle">Healthy</text>
+<text x="360" y="83" font-size="12" fill="#5c6b7c" text-anchor="middle">gets new requests</text>
+<rect x="570" y="40" width="130" height="56" rx="8" fill="#eef2f6" stroke="#7ea4c8"/>
+<text x="635" y="64" font-size="14" fill="#1c2430" text-anchor="middle">Draining</text>
+<text x="635" y="83" font-size="12" fill="#5c6b7c" text-anchor="middle">no new requests</text>
+<rect x="570" y="200" width="130" height="56" rx="8" fill="#eef2f6" stroke="#d5dee8"/>
+<text x="635" y="232" font-size="14" fill="#1c2430" text-anchor="middle">Removed</text>
+<rect x="200" y="200" width="120" height="56" rx="8" fill="#f8ebee" stroke="#c898a4"/>
+<text x="260" y="224" font-size="14" fill="#1c2430" text-anchor="middle">Down</text>
+<text x="260" y="243" font-size="12" fill="#5c6b7c" text-anchor="middle">probes failing</text>
+<rect x="380" y="200" width="120" height="56" rx="8" fill="#f8ebee" stroke="#c898a4"/>
+<text x="440" y="224" font-size="14" fill="#1c2430" text-anchor="middle">Ejected</text>
+<text x="440" y="243" font-size="12" fill="#5c6b7c" text-anchor="middle">real errors seen</text>
+<line x1="150" y1="68" x2="286" y2="68" stroke="#1c2430" marker-end="url(#dd-load-balancing-arrow)"/>
+<text x="218" y="60" font-size="12" fill="#1c2430" text-anchor="middle">rise: 2 passes</text>
+<line x1="430" y1="68" x2="566" y2="68" stroke="#1c2430" marker-end="url(#dd-load-balancing-arrow)"/>
+<text x="498" y="60" font-size="12" fill="#1c2430" text-anchor="middle">deploy / scale-in</text>
+<line x1="635" y1="96" x2="635" y2="196" stroke="#1c2430" marker-end="url(#dd-load-balancing-arrow)"/>
+<text x="645" y="140" font-size="12" fill="#1c2430">in-flight = 0</text>
+<text x="645" y="156" font-size="12" fill="#1c2430">or drain timeout</text>
+<line x1="330" y1="96" x2="275" y2="196" stroke="#c898a4" stroke-width="2" marker-end="url(#dd-load-balancing-arrow)"/>
+<text x="250" y="140" font-size="12" fill="#1c2430" text-anchor="middle">fall: 3 failed probes</text>
+<line x1="390" y1="96" x2="430" y2="196" stroke="#c898a4" stroke-width="2" marker-end="url(#dd-load-balancing-arrow)"/>
+<text x="470" y="140" font-size="12" fill="#1c2430" text-anchor="middle">5 errors in a row</text>
+<path d="M200,228 C120,228 85,180 85,100" fill="none" stroke="#1c2430" marker-end="url(#dd-load-balancing-arrow)"/>
+<text x="110" y="200" font-size="12" fill="#1c2430" text-anchor="middle">probes pass</text>
+<path d="M440,256 C440,290 100,290 70,100" fill="none" stroke="#1c2430" marker-end="url(#dd-load-balancing-arrow)"/>
+<text x="300" y="286" font-size="12" fill="#1c2430" text-anchor="middle">ejection timer ends</text>
+</svg>
+<figcaption>Active probes drive Healthy and Down. Passive checks drive Ejected. Deploys drive Draining. Each arrow has a threshold or timer you configure.</figcaption>
+</figure>
+
+<p>The three inputs are separate on purpose:</p>
+<ul>
+<li><strong>Active probes</strong> (the probe loop) run on a timer whether or not traffic flows. In HAProxy the knobs are <code>inter</code> (interval), <code>fall</code> (failures to mark down) and <code>rise</code> (successes to mark up). The gap between fall and rise is hysteresis. It stops a server that passes one probe in three from flapping in and out.</li>
+<li><strong>Passive checks</strong> watch real responses. Envoy calls this <strong>outlier detection</strong>: by default, 5 consecutive 5xx responses eject a host for a base time of 30 seconds, and the ejection time grows each time the same host is ejected again. HAProxy does it with <code>observe layer7</code> plus <code>error-limit</code> and <code>on-error</code>. Open-source nginx has passive checks only (<code>max_fails</code> and <code>fail_timeout</code> on the upstream server, defaulting to 1 failure and 10 seconds); active health checks are part of NGINX Plus.</li>
+<li><strong>Administrative state</strong> comes from the deploy system: drain this server, add that one. In HAProxy, the runtime API's <code>set server store_web/web2 state drain</code>. In AWS, deregistering a target. In Kubernetes, the pod leaving the Service's endpoints.</li>
+</ul>
+
+<h3 id=dd-load-balancing-safety-valves level=3>The safety valves: when "unhealthy" is wrong</h3>
+<p>The lesson's 3:07 AM incident, where a deep check removed every server, has a mechanical defence built into good balancers. They refuse to believe that everything is broken.</p>
+<ul>
+<li><strong>Envoy's panic threshold</strong> (default 50%). If fewer than half the hosts in a cluster are healthy, Envoy stops trusting health and balances across <em>all</em> hosts. Some requests fail, but most succeed, which beats sending them all nowhere.</li>
+<li><strong>Envoy's <code>max_ejection_percent</code></strong> (default 10%) caps how much of the cluster passive outlier detection may eject at once.</li>
+<li><strong>AWS load balancers fail open.</strong> If every target in a group is unhealthy, they route to all targets anyway.</li>
+</ul>
+<p>Know which behaviour your balancer has. "Remove everything and return 503" and "ignore health and try everything" are both valid choices. They produce very different outages.</p>
+
+<h3 id=dd-load-balancing-algorithms level=3>Algorithms, one level deeper</h3>
+<p>Round-robin and least-connections are the textbook pair. Production balancers have a few more, each answering a specific weakness.</p>
+<ul>
+<li><strong>Smooth weighted round-robin</strong> (nginx's weighted mode). Weights 5, 1, 1 give the sequence a a b a c a a rather than a a a a a b c, so the heavy server never receives a burst.</li>
+<li><strong>Least outstanding requests.</strong> Least-connections, but counting requests rather than TCP connections. That matters with keep-alive and HTTP/2, where one connection carries many requests. AWS ALB offers it as an option next to round-robin.</li>
+<li><strong>Power of two choices (P2C).</strong> Pick two backends at random and send to the one with fewer in-flight requests. It sounds like a shortcut. It is actually better than strict least-connections when there are many balancer nodes. Each node sees only its own in-flight counts, so strict least-connections makes all of them pile onto the same "emptiest" server at the same moment. Random pairs break that herd, and the theory shows the maximum load is still close to the best possible. Envoy's <code>LEAST_REQUEST</code> uses P2C by default.</li>
+<li><strong>Latency-weighted (EWMA).</strong> Score each backend by an exponentially weighted moving average of its response time, multiplied by its in-flight count. Linkerd and Finagle use this family. It reacts to a slow server before its queue grows.</li>
+<li><strong>Hashing.</strong> A ring hash (the <a href="#consistent-hashing">consistent hashing</a> ring) or <strong>Maglev</strong> hashing. Maglev builds a fixed-size lookup table (65,537 entries in Google's paper). Every balancer node computes the same table, so each maps the same key to the same backend with no shared state. Plain hashing can overload one backend when a key is hot. "Consistent hashing with bounded loads" caps each backend at, say, 1.25 times the average and spills over to the next one.</li>
+</ul>
+<p>Most balancers also offer <strong>slow start</strong>. A new or recovered backend's weight ramps from near zero to full over a set time (HAProxy's <code>slowstart</code>, Envoy's slow start config, ALB's <code>slow_start.duration_seconds</code>). Without it, least-connections sends a burst to the server with the emptiest queue, which is exactly the one with the coldest cache.</p>
+
+<h3 id=dd-load-balancing-l4-l7 level=3>What L4 and L7 actually do with your packets</h3>
+<p><strong>An L4 balancer</strong> sees TCP or UDP. It picks a backend when a connection opens and then forwards that connection's packets. Two forwarding styles:</p>
+<ul>
+<li><strong>NAT / full proxy.</strong> The balancer rewrites addresses in both directions, so replies come back through it. Simple, works anywhere, and the balancer sees all bytes both ways.</li>
+<li><strong>Direct server return (DSR).</strong> The balancer forwards only the incoming packets. The backend replies straight to the client from the shared virtual IP, which it holds on a loopback interface. Responses are usually much larger than requests, so the balancer handles a fraction of the bytes. The cost is backend network configuration and no visibility into responses.</li>
+</ul>
+<p>Large L4 tiers scale out with <strong>ECMP</strong>: the routers spread packets for one virtual IP across many balancer nodes by hashing each flow's addresses and ports. If a node is added or removed, some flows rehash onto a different node. That node has no record of the connection. Consistent hashing like Maglev means it picks the same backend anyway, so most connections survive. Google's Maglev, Facebook's Katran (built on XDP/eBPF) and GitHub's GLB are public designs of this kind.</p>
+<p><strong>An L7 balancer</strong> terminates the client's connection, parses HTTP and opens its own connections to backends. So there are always two connections per request path. The consequences:</p>
+<ul>
+<li>It can balance <em>per request</em>, which is the only way to spread HTTP/2 and gRPC traffic. Those protocols multiplex many requests over one long-lived connection, and an L4 balancer would place that whole connection on one backend forever.</li>
+<li>It keeps a pool of keep-alive connections to backends. Their timeouts must line up with the backends' (see failure mode 1).</li>
+<li>It can retry a failed request on another backend. That is powerful and dangerous (see failure mode 5).</li>
+<li>It holds TLS state and HTTP buffers per connection. It is the more expensive layer to run.</li>
+</ul>
+
+<h3 id=dd-load-balancing-draining level=3>Draining, step by step</h3>
+<p>Draining sounds like one action. On the wire it is several, and each protocol needs a different signal.</p>
+<ol>
+<li><strong>Stop new work.</strong> The balancer marks the backend Draining and picks other backends for new requests.</li>
+<li><strong>Close idle keep-alive connections politely.</strong> For HTTP/1.1, the backend adds <code>Connection: close</code> to its next response on each connection. For HTTP/2, it sends a <code>GOAWAY</code> frame naming the last stream it will process. Clients open new connections, which land on other backends.</li>
+<li><strong>Let in-flight requests finish.</strong> Up to a deadline: <code>deregistration_delay</code> on AWS target groups, which defaults to 300 seconds, or the pod's termination grace period in Kubernetes.</li>
+<li><strong>Tell long-lived streams.</strong> SSE and WebSocket connections will not end by themselves. The server sends a reconnect hint and closes them, ideally spread over the drain window.</li>
+<li><strong>Exit.</strong> Anything still open at the deadline is cut.</li>
+</ol>
+<p>In Kubernetes, step 1 and the shutdown signal happen at the same time on different paths. The kubelet sends SIGTERM to the pod. In parallel, the endpoint removal travels to kube-proxy, ingress controllers and external balancers, which can take seconds. If the app stops accepting at SIGTERM, it refuses requests that balancers are still sending. The common fix is a <code>preStop</code> hook that sleeps for a few seconds before SIGTERM arrives, so the removal can propagate first.</p>
+
+<h3 id=dd-load-balancing-config level=3>The lesson's design as HAProxy config</h3>
+<pre><code>defaults
+    mode http
+    timeout connect 3s
+    timeout client  60s
+    timeout server  30s
+    timeout http-keep-alive 10s
+
+backend store_web
+    balance leastconn
+    option httpchk
+    http-check send meth GET uri /healthz/ready
+    http-check expect status 200
+    # probe every 2 s; 3 failures mark down, 2 successes mark up;
+    # ramp new servers over 30 s; mark down after 10 consecutive real errors
+    default-server inter 2s fall 3 rise 2 slowstart 30s observe layer7 error-limit 10 on-error mark-down
+    server web1 10.0.1.11:8080 check
+    server web2 10.0.1.12:8080 check
+    server web3 10.0.1.13:8080 check</code></pre>
+<p>Every number in that block is a decision. The next section shows how to pick them.</p>
+
+<h3 id=dd-load-balancing-ha level=3>Who balances the balancer, mechanically</h3>
+<ul>
+<li><strong>Active/passive pair with a floating IP.</strong> Keepalived runs VRRP between the two nodes. The active node holds the virtual IP and sends advertisements every second or so. When they stop, the standby claims the IP and announces it with gratuitous ARP. Existing TCP connections break unless connection state was synchronised (conntrackd for L4). For an L7 proxy, they break regardless and clients reconnect.</li>
+<li><strong>Active/active with ECMP and BGP.</strong> Each node announces the same virtual IP to the routers. A node that fails stops announcing and the routers drop it. All nodes carry traffic, so none sits idle.</li>
+<li><strong>Anycast.</strong> The same address is announced from many sites. Internet routing picks the nearest. A site failure withdraws its route and traffic shifts to the next nearest.</li>
+<li><strong>Managed balancers</strong> do some of this for you. They run as fleets of nodes, which is why their DNS names resolve to several changing addresses. Clients that cache one IP forever (old JVM DNS caching is the classic) defeat it.</li>
+</ul>
+
+<h2 id=dd-load-balancing-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-load-balancing-detection level=3>Detection time and its price</h3>
+<p>The worst-case time to mark a server down is about <code>inter &times; fall + timeout</code>. With 2 s, 3 and a 1 s probe timeout, that is about 7 seconds. In the lesson's replay it came to about 6.</p>
+<p>Price the difference. One server of six takes one-sixth of 4,000 rps, about 667 rps:</p>
+<ul>
+<li>Removed in 6 s: about 4,000 failed or slow requests.</li>
+<li>Removed by hand in 11 minutes: about 667 &times; 660 &asymp; 440,000.</li>
+</ul>
+<p>Faster detection is not free. Lower <code>inter</code> and <code>fall</code> mark servers down on brief hiccups: a 2-second GC pause can fail two probes. Each false removal shifts load onto the others, which can then hiccup in turn. A reasonable range for web backends is 1 to 5 s intervals with fall 2 to 3. Passive checks cover the fast cases, because real traffic samples a server hundreds of times per second, while probes sample it once every few seconds.</p>
+
+<h3 id=dd-load-balancing-probe-load level=3>What the health checks themselves cost</h3>
+<p>Every balancer <em>node</em> probes every backend. A managed balancer may run many nodes across zones, and each one probes independently.</p>
+<ul>
+<li>10 balancer nodes &times; 200 backends &divide; 2 s interval = 1,000 probes per second across the fleet.</li>
+<li>Each backend sees 10 / 2 = 5 probes per second. Cheap, if the probe is shallow.</li>
+<li>If each probe runs two database queries "to be thorough", that is 2,000 queries a second hitting the database for health alone, at all times.</li>
+</ul>
+<p>Deep checks are expensive as well as dangerous. A shallow readiness check, with dependency health reported separately to monitoring, costs almost nothing.</p>
+
+<h3 id=dd-load-balancing-black-hole level=3>Least-connections and the fast-failing server</h3>
+<p>Least-connections assumes a busy server is a slow server. A broken server can be very fast. Suppose server 3 starts returning a 500 error in 1 ms, while healthy servers take 50 ms.</p>
+<p>Least-connections equalises in-flight counts. By Little's law, in-flight = rate &times; latency. Equal in-flight counts therefore mean each server's request rate is inversely proportional to its latency. Server 3 is 50x faster, so it gets 50x the rate of each healthy server:</p>
+<ul>
+<li>Share for server 3: 50 / (50 + 5 &times; 1) = 50 / 55 &asymp; <strong>91% of all traffic</strong>.</li>
+</ul>
+<p>The algorithm that protects you from a slow server sends nearly everything to a broken one. Round-robin would have sent it one-sixth. This is why least-connections must be paired with passive error detection: ejection on consecutive 5xx catches it within milliseconds of real traffic. Active probes may miss it entirely, because the health endpoint might still return 200.</p>
+
+<h3 id=dd-load-balancing-ports level=3>Connection reuse and ephemeral ports</h3>
+<p>An L7 balancer opens connections to backends from its own IP. Each connection to one backend IP and port needs a distinct local port. Linux's default ephemeral range is 32768 to 60999, which is 28,232 ports. A closed connection holds its port in TIME_WAIT for 60 seconds on the side that closed first.</p>
+<ul>
+<li>Without keep-alive, sustainable new connections per backend &asymp; 28,232 / 60 &asymp; <strong>470 per second</strong> from one balancer IP.</li>
+<li>The lesson's fleet sends about 667 rps to each backend. One connection per request would exhaust ports within about a minute of peak.</li>
+</ul>
+<p>With keep-alive, a few dozen connections per backend carry the same load. So upstream keep-alive is not a tuning nicety. Without it, the balancer fails at a traffic level well below its CPU limit. The symptoms are connect errors such as "cannot assign requested address" on the balancer.</p>
+
+<h3 id=dd-load-balancing-drain-sizing level=3>Sizing drain windows</h3>
+<ul>
+<li><strong>Short API calls.</strong> Drain timeout above the p99.9 request duration, plus the propagation delay. If p99.9 is 2 s and endpoint removal takes up to 5 s, 15 to 30 s is plenty. AWS's default of 300 s makes a 48-server rolling deploy crawl for no benefit.</li>
+<li><strong>Uploads and reports.</strong> Long requests set the floor. Either raise the drain window for that route, or move long work to a background job so the request returns quickly.</li>
+<li><strong>Streams.</strong> A server holding 50,000 SSE streams must not close them all at once. Spread the closes across 30 s and the survivors receive about 50,000 / 30 &asymp; 1,700 reconnects a second. Close them together and they get 50,000 in one second, each paying TLS and auth. Client-side jitter on reconnect spreads them further.</li>
+</ul>
+
+<h3 id=dd-load-balancing-tls level=3>TLS termination cost</h3>
+<p>Full TLS handshakes dominate an L7 balancer's CPU, not request parsing. Two levers matter most:</p>
+<ul>
+<li><strong>Session resumption</strong> (tickets or session IDs, and TLS 1.3 resumption) lets returning clients skip the expensive key exchange. A high resumption rate cuts handshake CPU sharply.</li>
+<li><strong>Certificate key type.</strong> ECDSA certificates are much cheaper to sign with than RSA-2048 on the server side. Measure on your hardware with <code>openssl speed</code> rather than trusting a remembered number.</li>
+</ul>
+<p>The practical sizing rule: estimate new connections per second (not requests), multiply by the measured cost of a full handshake times the share of non-resumed connections, and keep that below about half the balancer's cores. Long-lived keep-alive from clients helps here too.</p>
+
+<h2 id=dd-load-balancing-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-load-balancing-fm-keepalive level=3>1. The steady trickle of 502s</h3>
+<p><strong>Symptom.</strong> A low, constant rate of 502 Bad Gateway errors, around 0.01% to 0.1% of requests. They are worse at low traffic, oddly. Backend logs show no errors at all.</p>
+<p><strong>Mechanism.</strong> A keep-alive timeout race. The backend closes idle connections after 5 seconds; Node.js's default <code>keepAliveTimeout</code> is 5,000 ms. The balancer keeps idle upstream connections for 60 seconds, the ALB default idle timeout. At second 5, the balancer sends a request on a connection the backend is closing at that instant. The request gets a reset, and the balancer returns 502. It never reached the application, so nothing is logged there. Low traffic makes it worse because more connections sit idle long enough to hit the race.</p>
+<p><strong>Detect.</strong> 502s in balancer logs with zero bytes received from the backend. On AWS, the ELB 502 count rising while target 5xx stays flat. Errors cluster on connections that were idle for about the backend's timeout.</p>
+<p><strong>Fix.</strong> The backend's keep-alive timeout must be <em>longer</em> than the balancer's idle timeout, so the balancer always closes first. For a 60 s balancer timeout, set the backend to 65 s or more (in Node, raise <code>headersTimeout</code> above it as well). Allow idempotent requests to retry once on a connection reset.</p>
+
+<h3 id=dd-load-balancing-fm-black-hole level=3>2. The broken server that took all the traffic</h3>
+<p><strong>Symptom.</strong> One server's database credentials expire. Instead of losing one-sixth of traffic, the site's error rate jumps to around 90%.</p>
+<p><strong>Mechanism.</strong> The sizing section's black hole. The broken server fails each request in 1 ms. Least-connections sees it as the least busy server and sends it most new requests. The health endpoint only checks the process, so it still returns 200 and active probes never remove it.</p>
+<p><strong>Detect.</strong> Per-backend request rate: one backend at many times its peers. Per-backend error rate near 100% for that backend. Response time for that backend far <em>below</em> the others, which is the giveaway.</p>
+<p><strong>Fix.</strong> Passive outlier detection on consecutive 5xx, so real traffic ejects it in milliseconds. Cap ejection with a max percentage so it cannot remove the fleet. Count errors into the selection score, as EWMA balancers do. And make the readiness check include the server's own critical local resources, like whether it can load its credentials, without probing shared dependencies.</p>
+
+<h3 id=dd-load-balancing-fm-l4-http2 level=3>3. gRPC traffic that never spreads</h3>
+<p><strong>Symptom.</strong> A gRPC service scales from 4 to 12 pods. The original 4 stay at 80% CPU; the new 8 sit idle. Kubernetes reports all 12 as ready.</p>
+<p><strong>Mechanism.</strong> A Kubernetes ClusterIP Service balances at L4: it picks a pod per <em>connection</em>. Each gRPC client opens one HTTP/2 connection and multiplexes every call over it for hours. The callers' connections were placed when there were 4 pods, and no new connections are being opened.</p>
+<p><strong>Detect.</strong> Per-pod request rate wildly uneven while per-pod connection counts are tiny. Connection ages in hours.</p>
+<p><strong>Fix.</strong> Balance per request at L7: a mesh sidecar, an L7 proxy, or gRPC's client-side balancing with a headless Service so clients see every pod. Or set a server-side maximum connection age (gRPC's <code>MaxConnectionAge</code>) so clients reconnect periodically and re-spread.</p>
+
+<h3 id=dd-load-balancing-fm-drain-race level=3>4. Errors at every deploy, despite draining</h3>
+<p><strong>Symptom.</strong> Draining is configured, yet every rolling deploy produces a burst of connection-refused or 502 errors lasting a few seconds per pod.</p>
+<p><strong>Mechanism.</strong> On Kubernetes, SIGTERM reaches the pod at the same time the endpoint removal starts travelling to kube-proxy and the ingress. The app stops listening immediately on SIGTERM. For the next few seconds, balancers that have not yet heard about the removal keep sending it requests, which are refused.</p>
+<p><strong>Detect.</strong> Errors aligned to pod termination timestamps, lasting about the endpoint propagation delay. Ingress logs show upstream connect failures to the terminating pod's IP.</p>
+<p><strong>Fix.</strong> A <code>preStop</code> sleep of 5 to 15 seconds, so the pod keeps serving while removal propagates. Then handle SIGTERM gracefully: stop accepting, finish in-flight work, exit. Keep the grace period longer than the sleep plus the longest request.</p>
+
+<h3 id=dd-load-balancing-fm-retry-storm level=3>5. The retry storm</h3>
+<p><strong>Symptom.</strong> A backend tier slows down briefly. Within a minute, its request rate is several times normal and it collapses completely. Clients see timeouts everywhere.</p>
+<p><strong>Mechanism.</strong> Retries at every layer multiply. The browser retries 3 times, the edge balancer retries each attempt 3 times, the service's client library retries 3 times. One user action becomes up to 3 &times; 3 &times; 3 = 27 attempts at the bottom. And retries arrive exactly when the backend is weakest.</p>
+<p><strong>Detect.</strong> Backend request rate rising while user traffic is flat. The ratio of upstream attempts to downstream requests climbing well above 1. Balancer retry counters (Envoy's <code>upstream_rq_retry</code>) spiking.</p>
+<p><strong>Fix.</strong> Retry at one layer only, usually the one closest to the caller with the best context. Use a <strong>retry budget</strong> instead of a fixed count: Envoy's retry budget allows retries up to a percentage of active requests (20% by default when a budget is configured). Retry only idempotent requests, with backoff and jitter. Combine with a <a href="#circuit-breaker">circuit breaker</a>, so a failing tier gets rest instead of more load.</p>
+
+<h3 id=dd-load-balancing-fm-flapping level=3>6. The server that flaps</h3>
+<p><strong>Symptom.</strong> A backend toggles between up and down every few seconds. Its peers' load swings with it. Logs show a ladder of "server down" and "server up" lines.</p>
+<p><strong>Mechanism.</strong> The server is degraded, not dead. It fails one probe in two or three, perhaps from periodic GC or a saturated thread pool. With <code>fall 1 rise 1</code>, each single result flips its state. Each time it comes back, it receives a burst of traffic, which pushes it into failing again.</p>
+<p><strong>Detect.</strong> State-change events per backend per minute. Any backend with more than a couple of transitions an hour deserves a look.</p>
+<p><strong>Fix.</strong> Hysteresis: <code>fall</code> 3 and <code>rise</code> 2 or more. Slow start on recovery, so a returning server ramps up rather than taking a burst. Growing ejection time on repeat offenders, as Envoy does. Then fix the server: flapping is a symptom of something else.</p>
+
+<h3 id=dd-load-balancing-fm-cross-zone level=3>7. One zone overloaded, two zones idle</h3>
+<p><strong>Symptom.</strong> After an auto-scaling event, servers in one zone run hot while servers in other zones are cool. Latency is bad for about a third of users.</p>
+<p><strong>Mechanism.</strong> The balancer's nodes are per zone, and DNS spreads clients roughly evenly across those nodes. With cross-zone balancing off, each node sends traffic only to backends in its own zone. If zone A has 2 backends and zones B and C have 4 each, each zone A backend takes twice the load. On AWS, cross-zone balancing is on by default for ALB but off by default for NLB.</p>
+<p><strong>Detect.</strong> Per-zone request rate per backend. Uneven backend counts per zone in the target group.</p>
+<p><strong>Fix.</strong> Enable cross-zone balancing (accepting cross-zone data transfer cost where it applies). Or keep backend counts equal per zone, which auto-scaling groups can enforce with zone balancing. Or use zone-aware routing that prefers the local zone only while it has enough capacity, as Envoy's zone-aware routing does.</p>
+
+<h2 id=dd-load-balancing-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-load-balancing-choose-layer level=3>Where balancing happens</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Layer<th>Decides per<th>Sees health?<th>Reacts in<th>Strength<th>Weakness<tbody>
+<tr><td>DNS / GSLB<td>Resolution, cached by clients<td>Its own probes, coarse<td>TTL to hours<td>Global, cheap, region choice<td>Cached answers; no per-request control
+<tr><td>Anycast<td>Network route<td>Route withdrawal<td>Seconds to minutes (routing convergence)<td>Nearest site, DDoS absorption<td>No awareness of backend load
+<tr><td>L4 (NAT or DSR)<td>Connection<td>Probes, connection failures<td>Seconds<td>Very high throughput, any protocol<td>Cannot spread multiplexed connections; no HTTP awareness
+<tr><td>L7 proxy<td>Request<td>Probes plus real responses<td>Milliseconds to seconds<td>Per-request routing, retries, TLS, paths<td>More CPU; one more critical tier
+<tr><td>Client-side / mesh sidecar<td>Request, at the caller<td>Its own view of every backend<td>Milliseconds<td>No central hop; rich local signals<td>Logic in every client; needs service discovery
+</table></div></div>
+<p>Real systems stack these. Anycast or DNS picks a region. An L4 tier spreads connections across L7 nodes. L7 nodes spread requests across services. Inside the cluster, sidecars or client libraries balance service-to-service calls. Each layer handles what the one above it cannot see.</p>
+
+<h3 id=dd-load-balancing-choose-algorithm level=3>Choosing an algorithm</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Algorithm<th>Signal it uses<th>Good at<th>Bad at<tbody>
+<tr><td>Round-robin<td>None<td>Uniform short requests; many balancer nodes<td>Slow servers; mixed request cost
+<tr><td>Weighted round-robin<td>Static weights<td>Mixed instance sizes; canaries at 5%<td>Changes in real load
+<tr><td>Least connections / outstanding requests<td>In-flight count<td>Mixed costs, slow servers, long streams<td>Fast-failing servers (black hole); herding across many balancer nodes
+<tr><td>Power of two choices<td>In-flight count of 2 random picks<td>Many balancer nodes with local views<td>Same black-hole risk without outlier detection
+<tr><td>EWMA latency<td>Recent latency &times; in-flight<td>Reacting to slowness early<td>Tuning the decay; mixed request types skew it
+<tr><td>Ring hash / Maglev<td>A request key<td>Cache locality, affinity, conversation state<td>Hot keys, unless load-bounded
+<tr><td>Random<td>None<td>Simplicity at large scale<td>Same as round-robin
+</table></div></div>
+<p>A sound default: least outstanding requests or P2C, with passive outlier detection and slow start. Use round-robin only when requests really are uniform. Use hashing only when locality earns its hot-key risk, and then with bounded loads.</p>
+
+<h3 id=dd-load-balancing-choose-health level=3>What the health check should mean</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Check<th>Tests<th>Catches<th>Risk<tbody>
+<tr><td>TCP connect<td>Port open<td>Crashed process<td>Passes for a hung or broken app
+<tr><td>Shallow HTTP (liveness)<td>Process answers HTTP<td>Hung event loop or thread pool<td>Passes when local resources are broken
+<tr><td>Readiness (local)<td>Config loaded, pools open, disk not full, not draining<td>Most single-server failures<td>Needs care to stay cheap
+<tr><td>Deep (dependencies)<td>Database, cache, other services<td>Broken dependency paths<td>Removes the whole fleet when a shared dependency blips
+<tr><td>Passive (real traffic)<td>Actual responses<td>Fast-failing servers; partial failures<td>Can eject healthy servers during an upstream outage; needs caps
+</table></div></div>
+<p>Combine readiness probes with passive detection. Report dependency health to monitoring, not to the balancer. This is the lesson's rule, "should I get traffic?", turned into a configuration.</p>
+
+<h2 id=dd-load-balancing-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What does the health endpoint test? Could one shared dependency failing make every backend fail it?</li>
+<li>What are the probe interval, fall, rise and timeout, and what worst-case detection time do they give?</li>
+<li>Are passive checks on, and what caps how much of the fleet they can eject?</li>
+<li>What does the balancer do when every backend is unhealthy: fail closed, fail open, or panic mode?</li>
+<li>Which algorithm, and what happens with a server that fails fast? With a new, cold server?</li>
+<li>Is balancing per request or per connection, and does any traffic use long-lived multiplexed connections (HTTP/2, gRPC, WebSocket)?</li>
+<li>Is the backend keep-alive timeout longer than the balancer's idle timeout?</li>
+<li>How does draining work end to end: stop new work, close keep-alives, finish in-flight, warn streams? Is there a <code>preStop</code> delay for propagation?</li>
+<li>Is the drain timeout set from measured request duration, not left at a default?</li>
+<li>Which layer retries, how many times, and with what budget? Are only idempotent requests retried?</li>
+<li>How is the balancer itself redundant, and what happens to open connections when it fails over?</li>
+<li>Is cross-zone balancing configured to match how backends are spread across zones?</li>
+</ol>
+
+<h2 id=dd-load-balancing-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Least-connections is the better default. When does it make things worse?"</summary>
+<p>When a server fails fast. Least-connections equalises in-flight counts, and in-flight = rate &times; latency, so a server answering errors in 1 ms while others take 50 ms gets about 50x the rate of each healthy server. In a fleet of six that is around 91% of all traffic. It also herds: many balancer nodes with local counts all pick the same emptiest server. The fixes are passive outlier detection on 5xx, power-of-two-choices instead of a global minimum, and slow start for new servers.</p>
+</details>
+
+<details>
+<summary>"Why do you see 502s when the backend logs show no errors?"</summary>
+<p>The request never reached the application. The usual cause is a keep-alive race: the backend closes an idle connection at the same moment the balancer reuses it. With Node's 5 s default against a 60 s balancer idle timeout, that happens constantly at low volume. Make the backend's timeout longer than the balancer's, so the balancer always closes first. Other causes are a backend crashing mid-response or the balancer running out of source ports when upstream keep-alive is off.</p>
+</details>
+
+<details>
+<summary>"We scaled our gRPC service and the new pods get no traffic. Why?"</summary>
+<p>gRPC multiplexes all calls over a long-lived HTTP/2 connection, and a Kubernetes ClusterIP Service balances at L4, once per connection. The existing clients' connections stay on the old pods. Balance per request: an L7 proxy or mesh, or gRPC client-side balancing against a headless Service. Server-side maximum connection age also helps, by making clients reconnect and re-spread over time.</p>
+</details>
+
+<details>
+<summary>"Strict least-connections or power of two random choices?"</summary>
+<p>With one balancer, strict least-connections is fine. With many balancer nodes, each sees only its own in-flight counts, and they all pick the same minimum at once, which overloads it. Picking two at random and taking the less loaded breaks that synchronisation. The theory shows two choices already bring the maximum load close to optimal, and it costs O(1) per decision. That is why Envoy's least-request balancer uses P2C by default.</p>
+</details>
+
+<details>
+<summary>"How does an L4 tier scale beyond one machine without breaking connections?"</summary>
+<p>Routers spread flows for one virtual IP across many L4 nodes with ECMP. When a node joins or leaves, some flows hash to a different node that has no state for them. If every node uses the same consistent hash, such as Maglev's lookup table, that new node picks the same backend and the connection continues. Connection tracking handles the usual case; consistent hashing handles the change. DSR reduces load further by letting backends reply to clients directly.</p>
+</details>
+
+<details>
+<summary>"How long should the drain timeout be?"</summary>
+<p>Longer than the slowest request you want to complete, plus the time for the removal to propagate to every balancer. For a JSON API with a p99.9 of 2 s, 15 to 30 s. The 300 s AWS default makes rolling deploys slow for no gain. Long uploads either get a longer window on their route or move to background jobs. Streams are closed deliberately over the window, with client reconnect jitter, so the survivors receive a steady trickle rather than a reconnect storm.</p>
+</details>
+
+<details>
+<summary>"Should the balancer retry failed requests?"</summary>
+<p>Yes, but only in one layer, only for idempotent requests or ones that never reached the backend, and within a budget. A connection reset before any bytes were sent is safe to retry anywhere. A timeout on a POST is not, unless the API takes an idempotency key. Fixed retry counts at several layers multiply into a storm during exactly the incidents you want to survive. A budget, such as retries capped at a percentage of active requests, keeps the extra load bounded.</p>
+</details>
+
+<details>
+<summary>"Every backend fails its health check at once. What should the balancer do?"</summary>
+<p>Almost never return 503 for everything. A fleet-wide failure is far more likely to be a broken check or a shared dependency blip than six servers dying in the same second. Envoy's panic threshold balances across all hosts when fewer than half are healthy. AWS balancers fail open. Either way, some requests succeed instead of none. Pair that with an alert, because fail-open hides a real outage if nobody is told.</p>
+</details>

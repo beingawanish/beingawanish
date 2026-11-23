@@ -1,0 +1,18 @@
+{
+  "type": "record",
+  "name": "Money",
+  "namespace": "com.edacommerce.common",
+  "doc": "An amount in minor units (cents, pence). Never a float, never an Avro decimal: integer minor units are identical in every language.",
+  "fields": [
+    {
+      "name": "amountMinor",
+      "type": "long",
+      "doc": "Amount in the currency's minor unit. 1999 with EUR means 19.99 EUR."
+    },
+    {
+      "name": "currency",
+      "type": "string",
+      "doc": "ISO 4217 alphabetic code, upper case."
+    }
+  ]
+}

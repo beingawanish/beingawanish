@@ -1,0 +1,20 @@
+{
+  "type": "record",
+  "name": "ReturnLine",
+  "namespace": "com.edacommerce.common",
+  "doc": "A line of an order being returned.",
+  "fields": [
+    {
+      "name": "lineId",
+      "type": "string"
+    },
+    {
+      "name": "sku",
+      "type": "string"
+    },
+    {
+      "name": "quantity",
+      "type": "int"
+    }
+  ]
+}

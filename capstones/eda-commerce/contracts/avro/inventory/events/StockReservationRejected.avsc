@@ -1,0 +1,46 @@
+{
+  "type": "record",
+  "name": "StockReservationRejected",
+  "namespace": "com.edacommerce.inventory",
+  "doc": "Reply to ReserveStock: at least one line is short. Nothing is held (all-or-nothing).",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "reservationId",
+      "type": "string"
+    },
+    {
+      "name": "shortages",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "Shortage",
+          "namespace": "com.edacommerce.inventory",
+          "fields": [
+            {
+              "name": "sku",
+              "type": "string"
+            },
+            {
+              "name": "requested",
+              "type": "int"
+            },
+            {
+              "name": "available",
+              "type": "int"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

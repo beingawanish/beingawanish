@@ -1,0 +1,218 @@
+# Example: run the application services in containers next to the infrastructure.
+#
+#   IMPL=python docker compose -f infra/docker-compose.yml -f infra/compose.apps.example.yml up -d
+#   ORDER_IMPL=java PAYMENT_IMPL=python ...   # mix languages per service (the interop drill)
+#
+# This file pins the configuration contract from docs/implementation-guide.md "Configuration":
+# both builds of a service read exactly these variables. Images are placeholders; build them
+# from impl-python/ or impl-java/ and tag them eda-commerce/<service>-<impl>:dev.
+
+x-app-env: &app-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  KAFKA_SECURITY_PROTOCOL: PLAINTEXT
+  SCHEMA_REGISTRY_URL: http://schema-registry:8081
+  OUTBOX_RELAY: debezium            # or polling (fallback relay inside the service, ADR-003)
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  S3_ENDPOINT: http://minio:9000
+  S3_REGION: us-east-1
+  S3_ACCESS_KEY: claimcheck
+  S3_SECRET_KEY: claimcheck-secret
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_TRACES_SAMPLER: parentbased_always_on
+  ENVIRONMENT: local
+  AUTH_MODE: none                   # oidc with the "auth" profile
+  OIDC_ISSUER_URL: http://keycloak:8080/realms/edacommerce
+  LOG_FORMAT: json
+  LOG_LEVEL: INFO
+
+x-app: &app
+  restart: unless-stopped
+  depends_on:
+    kafka: {condition: service_healthy}
+    schema-registry: {condition: service_healthy}
+    postgres: {condition: service_healthy}
+  healthcheck:
+    test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health/ready || wget -qO- http://localhost:8080/health/ready"]
+    interval: 10s
+    timeout: 3s
+    retries: 12
+    start_period: 30s
+
+services:
+  catalog-svc:
+    <<: *app
+    image: eda-commerce/catalog-svc-${CATALOG_IMPL:-${IMPL:-python}}:dev
+    ports: ["8101:8080"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: catalog-svc
+      OTEL_SERVICE_NAME: catalog-svc
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=edacommerce,eda.impl=${CATALOG_IMPL:-${IMPL:-python}}
+      HTTP_PORT: "8080"
+      CONSUMER_GROUP: catalog-svc
+      DB_NAME: catalog_db
+      DB_USER: catalog_svc
+      DB_PASSWORD: catalog_svc
+
+  checkout-svc:
+    <<: *app
+    image: eda-commerce/checkout-svc-${CHECKOUT_IMPL:-${IMPL:-python}}:dev
+    ports: ["8102:8080"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: checkout-svc
+      OTEL_SERVICE_NAME: checkout-svc
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=edacommerce,eda.impl=${CHECKOUT_IMPL:-${IMPL:-python}}
+      HTTP_PORT: "8080"
+      CONSUMER_GROUP: checkout-svc
+      DB_NAME: checkout_db
+      DB_USER: checkout_svc
+      DB_PASSWORD: checkout_svc
+
+  order-svc:
+    <<: *app
+    image: eda-commerce/order-svc-${ORDER_IMPL:-${IMPL:-python}}:dev
+    ports: ["8103:8080"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: order-svc
+      OTEL_SERVICE_NAME: order-svc
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=edacommerce,eda.impl=${ORDER_IMPL:-${IMPL:-python}}
+      HTTP_PORT: "8080"
+      CONSUMER_GROUP: order-svc
+      DB_NAME: order_db
+      DB_USER: order_svc
+      DB_PASSWORD: order_svc
+      SAGA_STOCK_TIMEOUT: 30s
+      SAGA_PAYMENT_TIMEOUT: 180s
+      SAGA_COMMIT_TIMEOUT: 30s
+      SAGA_FULFILMENT_ACK_TIMEOUT: 600s
+      SAGA_FULFILMENT_MAX_RESENDS: "3"
+      SAGA_DISPATCH_TIMEOUT: 24h
+      SAGA_CAPTURE_TIMEOUT: 300s
+      SAGA_COMPENSATION_TIMEOUT: 60s
+
+  payment-svc:
+    <<: *app
+    image: eda-commerce/payment-svc-${PAYMENT_IMPL:-${IMPL:-python}}:dev
+    ports: ["8104:8080"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: payment-svc
+      OTEL_SERVICE_NAME: payment-svc
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=edacommerce,eda.impl=${PAYMENT_IMPL:-${IMPL:-python}}
+      HTTP_PORT: "8080"
+      CONSUMER_GROUP: payment-svc
+      DB_NAME: payment_db
+      DB_USER: payment_svc
+      DB_PASSWORD: payment_svc
+      PSP_WEBHOOK_SECRET: dev-psp-secret
+      PSP_WEBHOOK_URL: http://payment-svc:8080/webhooks/psp
+      FAKE_PSP_DECLINE_RATE: "0.05"
+      FAKE_PSP_TIMEOUT_RATE: "0.02"
+      FAKE_PSP_DUPLICATE_WEBHOOK_RATE: "0.1"
+
+  inventory-svc:
+    <<: *app
+    image: eda-commerce/inventory-svc-${INVENTORY_IMPL:-${IMPL:-python}}:dev
+    ports: ["8105:8080"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: inventory-svc
+      OTEL_SERVICE_NAME: inventory-svc
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=edacommerce,eda.impl=${INVENTORY_IMPL:-${IMPL:-python}}
+      HTTP_PORT: "8080"
+      CONSUMER_GROUP: inventory-svc
+      DB_NAME: inventory_db
+      DB_USER: inventory_svc
+      DB_PASSWORD: inventory_svc
+      RESERVATION_TTL: 900s
+      RESERVATION_SWEEP_INTERVAL: 5s
+
+  fulfilment-svc:
+    <<: *app
+    image: eda-commerce/fulfilment-svc-${FULFILMENT_IMPL:-${IMPL:-python}}:dev
+    ports: ["8106:8080"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: fulfilment-svc
+      OTEL_SERVICE_NAME: fulfilment-svc
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=edacommerce,eda.impl=${FULFILMENT_IMPL:-${IMPL:-python}}
+      HTTP_PORT: "8080"
+      CONSUMER_GROUP: fulfilment-svc
+      DB_NAME: fulfilment_db
+      DB_USER: fulfilment_svc
+      DB_PASSWORD: fulfilment_svc
+      FAKE_WMS_DROP_REQUEST_RATE: "0.1"
+      FAKE_WMS_MANIFEST_LINES: "2000"
+
+  shipping-svc:
+    <<: *app
+    image: eda-commerce/shipping-svc-${SHIPPING_IMPL:-${IMPL:-python}}:dev
+    ports: ["8107:8080"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: shipping-svc
+      OTEL_SERVICE_NAME: shipping-svc
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=edacommerce,eda.impl=${SHIPPING_IMPL:-${IMPL:-python}}
+      HTTP_PORT: "8080"
+      CONSUMER_GROUP: shipping-svc
+      DB_NAME: shipping_db
+      DB_USER: shipping_svc
+      DB_PASSWORD: shipping_svc
+      CARRIER_WEBHOOK_SECRET: dev-carrier-secret
+      CARRIER_WEBHOOK_URL: http://shipping-svc:8080/webhooks/carrier
+      FAKE_CARRIER_DUPLICATE_RATE: "0.2"
+      FAKE_CARRIER_OUT_OF_ORDER_RATE: "0.2"
+
+  notification-svc:
+    <<: *app
+    image: eda-commerce/notification-svc-${NOTIFICATION_IMPL:-${IMPL:-python}}:dev
+    ports: ["8108:8080"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: notification-svc
+      OTEL_SERVICE_NAME: notification-svc
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=edacommerce,eda.impl=${NOTIFICATION_IMPL:-${IMPL:-python}}
+      HTTP_PORT: "8080"
+      CONSUMER_GROUP: notification-svc
+      DB_NAME: notification_db
+      DB_USER: notification_svc
+      DB_PASSWORD: notification_svc
+
+  returns-svc:
+    <<: *app
+    image: eda-commerce/returns-svc-${RETURNS_IMPL:-${IMPL:-python}}:dev
+    ports: ["8109:8080"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: returns-svc
+      OTEL_SERVICE_NAME: returns-svc
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=edacommerce,eda.impl=${RETURNS_IMPL:-${IMPL:-python}}
+      HTTP_PORT: "8080"
+      CONSUMER_GROUP: returns-svc
+      DB_NAME: returns_db
+      DB_USER: returns_svc
+      DB_PASSWORD: returns_svc
+      RETURN_WINDOW_DAYS: "30"
+      RETURN_AUTO_APPROVE_LIMIT_MINOR: "50000"
+      RETURN_PARCEL_DUE_DAYS: "14"
+
+  # The order-history read model runs as its own process from the order-svc codebase
+  # (same image, different entrypoint argument), with its own consumer group (ADR-010).
+  order-history-projector:
+    <<: *app
+    image: eda-commerce/order-svc-${ORDER_IMPL:-${IMPL:-python}}:dev
+    command: ["projector"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: order-history-projector
+      OTEL_SERVICE_NAME: order-history-projector
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=edacommerce,eda.impl=${ORDER_IMPL:-${IMPL:-python}}
+      HTTP_PORT: "8080"
+      CONSUMER_GROUP: order-history-projector
+      DB_NAME: order_db
+      DB_USER: order_svc
+      DB_PASSWORD: order_svc

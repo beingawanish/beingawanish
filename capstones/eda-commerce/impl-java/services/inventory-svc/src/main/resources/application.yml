@@ -1,0 +1,11 @@
+# inventory-svc. Infrastructure variables (guide §7) are mapped by edacommon; only defaults and
+# service-specific settings live here.
+eda:
+  service-name: inventory-svc
+  consumer:
+    topics: [inventory.commands.v1]
+server:
+  port: 8105
+inventory:
+  reservation-ttl: ${RESERVATION_TTL:900s}
+  reservation-sweep-interval: ${RESERVATION_SWEEP_INTERVAL:5s}

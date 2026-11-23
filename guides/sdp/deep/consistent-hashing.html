@@ -1,0 +1,264 @@
+<h2 id=dd-consistent-hashing-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson gives the ring's two moves: hash servers and keys onto a circle, then walk clockwise. A real implementation has to answer more questions. Which hash function? How many points per server, and named how? Who owns the server list, and what happens when two clients disagree about it? How do replicas fit on the ring? And should you use a ring at all? Several later algorithms keep the minimal-movement property with better balance or no ring memory.</p>
+
+<h3 id=dd-consistent-hashing-ring-code level=3>A ring in thirty lines</h3>
+<p>The whole data structure is a sorted array of <code>(token, server)</code> pairs. A token is the hash of one virtual node's name. Lookup is a binary search for the first token at or after the key's hash, wrapping to the start when it runs off the end.</p>
+<pre><code>import bisect, hashlib
+
+def h(s: str) -> int:
+    return int.from_bytes(hashlib.md5(s.encode()).digest()[:8], "big")
+
+class Ring:
+    def __init__(self, nodes, vnodes=150):
+        self.vnodes = vnodes
+        self.tokens = []          # sorted list of (token, node)
+        for n in nodes:
+            self.add(n)
+
+    def add(self, node):
+        for i in range(self.vnodes):
+            bisect.insort(self.tokens, (h(f"{node}#{i}"), node))
+
+    def remove(self, node):
+        self.tokens = [t for t in self.tokens if t[1] != node]
+
+    def owner(self, key):
+        i = bisect.bisect(self.tokens, (h(key), ""))
+        return self.tokens[i % len(self.tokens)][1]   # wrap past the top
+
+keys = [f"customer:{i}" for i in range(100_000)]
+for v in (1, 10, 100, 1000):
+    ring = Ring([f"shard-{n}" for n in range(4)], vnodes=v)
+    before = {k: ring.owner(k) for k in keys}
+    ring.add("shard-4")
+    moved = sum(before[k] != ring.owner(k) for k in keys)
+    load = {}
+    for k in keys:
+        load[ring.owner(k)] = load.get(ring.owner(k), 0) + 1
+    print(f"vnodes={v:5}  moved={moved/len(keys):.1%}  "
+          f"busiest/average={max(load.values())/(len(keys)/5):.2f}")</code></pre>
+<p>One run of this, going from 4 shards to 5:</p>
+<pre><code>vnodes=    1  moved=23.6%  busiest/average=1.39
+vnodes=   10  moved=22.6%  busiest/average=1.33
+vnodes=  100  moved=20.2%  busiest/average=1.17
+vnodes= 1000  moved=20.2%  busiest/average=1.01</code></pre>
+<p>Movement sits near the ideal 1/5 regardless. Balance is what the virtual nodes buy. Three details in those thirty lines matter in production:</p>
+<ul>
+<li><strong>The hash function</strong> only needs to be fast and well spread, not cryptographic. MD5 is traditional (the widely copied <strong>ketama</strong> scheme for memcached uses it); Cassandra uses Murmur3, with tokens from −2<sup>63</sup> to 2<sup>63</sup>−1. What matters far more is that every client uses the <em>same</em> function on the <em>same</em> bytes.</li>
+<li><strong>Virtual node names</strong> (<code>"shard-4#17"</code> here) are part of the algorithm. If one client library names them <code>"host:port-17"</code> and another <code>"host-17"</code>, they build different rings from the same server list.</li>
+<li><strong>Server identity</strong> should be a stable name, not an IP address. Hash the IP, and replacing a failed machine with one at a new address moves its keys to random new spots instead of handing them to the replacement.</li>
+</ul>
+
+<h3 id=dd-consistent-hashing-vnodes level=3>Virtual nodes, drawn</h3>
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-consistent-hashing-svg-title dd-consistent-hashing-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-consistent-hashing-svg-title">A ring with three virtual nodes per server</title>
+<desc id="dd-consistent-hashing-svg-desc">Twelve points sit on a ring, three for each of servers A, B, C and D, interleaved in the order A1, B1, C1, D1, B2, A2, C2, D2, A3, B3, D3, C3 going clockwise. A key just before B1 belongs to B. When server B fails, each of its three arcs goes to the next point clockwise: B1's arc to C, B2's arc to A, and B3's arc to D. B's load spreads across all three survivors instead of landing on one neighbour.</desc>
+<rect x="0" y="0" width="720" height="300" fill="#ffffff"/>
+<circle cx="190" cy="150" r="105" fill="none" stroke="#7ea4c8" stroke-width="2"/>
+<circle cx="217" cy="49" r="9" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="223" y="29" font-size="12" fill="#1c2430" text-anchor="middle">A1</text>
+<circle cx="264" cy="76" r="9" fill="#f8ebee" stroke="#c898a4" stroke-width="2"/>
+<text x="281" y="63" font-size="12" fill="#1c2430" text-anchor="middle">B1</text>
+<circle cx="291" cy="123" r="9" fill="#e5f3ec" stroke="#7eae96" stroke-width="2"/>
+<text x="315" y="121" font-size="12" fill="#1c2430" text-anchor="middle">C1</text>
+<circle cx="291" cy="177" r="9" fill="#ffffff" stroke="#5c6b7c" stroke-width="2"/>
+<text x="315" y="187" font-size="12" fill="#1c2430" text-anchor="middle">D1</text>
+<circle cx="264" cy="224" r="9" fill="#f8ebee" stroke="#c898a4" stroke-width="2"/>
+<text x="281" y="245" font-size="12" fill="#1c2430" text-anchor="middle">B2</text>
+<circle cx="217" cy="251" r="9" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="223" y="279" font-size="12" fill="#1c2430" text-anchor="middle">A2</text>
+<circle cx="163" cy="251" r="9" fill="#e5f3ec" stroke="#7eae96" stroke-width="2"/>
+<text x="157" y="279" font-size="12" fill="#1c2430" text-anchor="middle">C2</text>
+<circle cx="116" cy="224" r="9" fill="#ffffff" stroke="#5c6b7c" stroke-width="2"/>
+<text x="99" y="245" font-size="12" fill="#1c2430" text-anchor="middle">D2</text>
+<circle cx="89" cy="177" r="9" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="65" y="187" font-size="12" fill="#1c2430" text-anchor="middle">A3</text>
+<circle cx="89" cy="123" r="9" fill="#f8ebee" stroke="#c898a4" stroke-width="2"/>
+<text x="65" y="121" font-size="12" fill="#1c2430" text-anchor="middle">B3</text>
+<circle cx="116" cy="76" r="9" fill="#ffffff" stroke="#5c6b7c" stroke-width="2"/>
+<text x="99" y="63" font-size="12" fill="#1c2430" text-anchor="middle">D3</text>
+<circle cx="163" cy="49" r="9" fill="#e5f3ec" stroke="#7eae96" stroke-width="2"/>
+<text x="157" y="29" font-size="12" fill="#1c2430" text-anchor="middle">C3</text>
+<rect x="238" y="54" width="10" height="10" fill="#1c2430" transform="rotate(45 242 59)"/>
+<text x="236" y="84" font-size="12" fill="#1c2430" text-anchor="middle">key</text>
+<text x="370" y="60" font-size="14" fill="#1c2430">Clockwise rule: the key belongs to B1, so B.</text>
+<text x="370" y="100" font-size="14" fill="#1c2430">If B fails, each of its arcs moves to the</text>
+<text x="370" y="120" font-size="14" fill="#1c2430">next point clockwise:</text>
+<text x="390" y="150" font-size="13" fill="#1c2430">B1's arc → C1 (server C)</text>
+<text x="390" y="172" font-size="13" fill="#1c2430">B2's arc → A2 (server A)</text>
+<text x="390" y="194" font-size="13" fill="#1c2430">B3's arc → D3 (server D)</text>
+<text x="370" y="232" font-size="13" fill="#5c6b7c">With one point per server, all of B's load</text>
+<text x="370" y="252" font-size="13" fill="#5c6b7c">would land on C alone.</text>
+</svg>
+<figcaption>Three points per server is enough to see the effect. Real rings use dozens to hundreds, so a failed server's load splits into many small pieces.</figcaption>
+</figure>
+
+<h3 id=dd-consistent-hashing-replicas level=3>Replicas on the ring</h3>
+<p>Storage systems need each key on several servers. The ring gives a natural answer: walk clockwise from the key and take the first <em>R</em> <strong>distinct</strong> servers. The Dynamo paper calls that list the key's <strong>preference list</strong>. With virtual nodes, the walk must skip points belonging to a server already chosen; otherwise two "replicas" could sit on the same machine.</p>
+<p>Cassandra adds topology. Its <code>NetworkTopologyStrategy</code> keeps walking until it has replicas in distinct racks (or availability zones), so one rack failure cannot take out every copy. The rule generalises: the ring decides <em>order</em>, and placement policy decides which points in that order are acceptable.</p>
+<p>Virtual nodes have a cost here that the lesson does not mention. With one token per server, a range's three replicas are three neighbouring servers. Two simultaneous failures hurt only if the two servers are close on the ring. With hundreds of tokens per server, almost every pair of servers shares some range. In a 30-node cluster with replication factor 3, losing any two nodes then makes some ranges lose quorum. That is among the reasons Cassandra 4.0 lowered the default <code>num_tokens</code> from 256 to 16, paired with a token allocator (<code>allocate_tokens_for_local_replication_factor</code>) that places the few tokens for balance instead of at random.</p>
+
+<h3 id=dd-consistent-hashing-membership level=3>Who owns the server list</h3>
+<p>The ring is pure math, but its input, the membership list, is shared state. Three common models:</p>
+<ul>
+<li><strong>Static client config.</strong> Memcached clients typically read a server list from config. Simple, but every client must be updated together, and a partial rollout means two rings at once.</li>
+<li><strong>A coordination service.</strong> A list in etcd, ZooKeeper or Consul, with a version number. Clients watch it and switch atomically to each new version.</li>
+<li><strong>Gossip.</strong> Cassandra nodes exchange membership and token ownership peer to peer. No central store, but views converge over seconds, and a node joining is a multi-step state change (it streams its ranges while the old owners keep serving them, and writes for those ranges go to both during the move).</li>
+</ul>
+<p>The failure detector also belongs here. Removing a server on the first missed health check makes the ring flap. Most systems mark a server <em>down</em> (route around it temporarily, often to the next replica) long before they <em>remove</em> it from the ring (which reassigns ownership and moves data). Keeping those two decisions separate is one of the most useful design choices in this whole pattern.</p>
+
+<h3 id=dd-consistent-hashing-alternatives level=3>Beyond the ring: four algorithms worth knowing</h3>
+<ul>
+<li><strong>Rendezvous hashing</strong> (highest random weight). For each key, score every server with <code>hash(key, server)</code> and pick the highest. Removing a server moves only that server's keys; adding one steals exactly the keys it now wins. No ring, no virtual nodes, near-perfect balance, and easy weights. The cost is O(N) hashes per lookup, which is fine for tens of servers and wasteful for thousands.</li>
+<li><strong>Jump consistent hash</strong> (Lamping and Veach, Google, 2014). A ten-line function that maps a 64-bit key to a bucket number from 0 to N−1 in O(log N) time with no memory at all, and moves the minimal 1/(N+1) of keys when N grows. The catch: buckets are numbered, and you can only add or remove the <em>last</em> one. It suits storage shards that only grow, not cache servers that fail at random.</li>
+<li><strong>Maglev hashing</strong> (Google, NSDI 2016). Builds a lookup table of prime size (Envoy's default is 65,537 entries) where each backend fills nearly equal slots by its own permutation. Lookups are one array index, balance is near perfect, and a backend change disturbs only a little more than the minimum. Designed for software load balancers that must route millions of packets per second consistently.</li>
+<li><strong>Consistent hashing with bounded loads</strong> (Mirrokni, Thorup and Zadimoghaddam, 2016). Cap each server at <em>c</em> times the average load, for example <em>c</em> = 1.25. A request whose owner is full goes clockwise to the next server with room. This is the only variant here that does something about a hot key's <em>neighbourhood</em>: no server can exceed 125% of average. HAProxy implements it as <code>hash-balance-factor</code> with <code>hash-type consistent</code>.</li>
+</ul>
+<p>Proxies expose these directly. nginx has <code>hash $request_uri consistent;</code> (ketama-compatible). Envoy offers <code>RING_HASH</code> (with a minimum ring size, 1,024 entries by default) and <code>MAGLEV</code> load-balancing policies.</p>
+
+<h3 id=dd-consistent-hashing-slots level=3>The hybrid, again: fixed slots</h3>
+<p>The lesson ends on Redis Cluster's 16,384 hash slots. The Dynamo paper reached the same place in 2007. Its "strategy 3" splits the hash space into Q equal, fixed partitions and gives each server Q/S of them, because random tokens made bootstrapping, archiving and membership changes slow and uneven. Fixed slots plus a small assignment map give you even partitions, cheap metadata (one row per slot) and deliberate moves. Redis Cluster clients cache the map and follow <code>MOVED</code> and <code>ASK</code> redirects when a slot has moved or is mid-migration, which is how stale maps correct themselves.</p>
+
+<h2 id=dd-consistent-hashing-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-consistent-hashing-vnode-count level=3>How many virtual nodes</h3>
+<p>Here is the ring code above run on 10 servers, 200,000 keys, five random clusters each. The number is the busiest server's load divided by the average:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Virtual nodes per server<th>Busiest / average, five runs<th>What it means for capacity<tbody><tr><td>1<td>1.7 to 4.1<td>You must provision every server for 2 to 4 times the average<tr><td>10<td>1.3 to 1.7<td>Still a large tax<tr><td>100<td>1.13 to 1.22<td>About 20% headroom wasted on imbalance<tr><td>256<td>1.05 to 1.16<td>Good<tr><td>1,000<td>1.03 to 1.09<td>Diminishing returns</table></div></div>
+<p>The pattern follows a rule of thumb: the spread of slice sizes shrinks roughly with the square root of the number of points per server. Going from 100 to 1,000 virtual nodes buys about a 10% better worst case. That is why 100 to 200 points is the common choice for stateless or cache routing, and why storage systems that care about pairwise failure overlap use fewer tokens placed by an allocator instead.</p>
+<p>Memory and lookup cost are small. 1,000 servers × 200 points is 200,000 entries. At 16 bytes each (an 8-byte token plus a server index) that is about 3 MB, and a binary search over it takes about 18 comparisons. Rebuilding it on every membership change is fine; doing it per request is not.</p>
+
+<h3 id=dd-consistent-hashing-miss-storm level=3>The miss storm, sized</h3>
+<p>The lesson compares modulo and ring for a 20-node cache. Put the database in the picture. Assume 200,000 cache reads per second, a 95% hit rate, and a database sized for the 10,000 misses per second that leaves.</p>
+<ul>
+<li><strong>Modulo, add one node.</strong> 20/21 of keys remap, about 95%. Nearly every read misses until the cache refills: roughly 190,000 database reads per second against a database sized for 10,000. That is a 19-times overload, and it is an outage.</li>
+<li><strong>Ring, add one node.</strong> 1/21 of keys remap, about 4.8%. Extra misses: 200,000 × 0.048 × 0.95, about 9,000 per second. The database briefly sees about 19,000 reads per second, nearly double its normal load.</li>
+</ul>
+<p>So the ring turns an outage into a doubling. A doubling can still hurt if the database runs hot. Three cheap fixes help. Scale the cache during low traffic. Add nodes one at a time, a few minutes apart, so each wave of misses refills before the next. Or warm the new owner on its misses by reading the previous owner first (the old ring tells you who that was) before falling back to the database.</p>
+
+<h3 id=dd-consistent-hashing-failure-load level=3>Failure spread and headroom</h3>
+<p>With good virtual-node spread, a failed server's load divides roughly evenly among the survivors. Each survivor's load rises by a factor of N / (N − 1):</p>
+<ul>
+<li>5 servers: +25% each (the lesson's 500 to 625 writes per second).</li>
+<li>10 servers: +11%.</li>
+<li>50 servers: +2%.</li>
+</ul>
+<p>Combine that with the imbalance factor. At 100 virtual nodes the busiest server already runs about 1.2 times the average. On a 5-server cluster after one failure it runs about 1.2 × 1.25 = 1.5 times the old average. If you want every server at most 80% busy after one failure, the old average must stay below about 53%. Small clusters pay for their headroom twice.</p>
+
+<h3 id=dd-consistent-hashing-rebuild level=3>Rebuild time: neighbours versus everyone</h3>
+<p>Replacing a failed 2 TB storage node means streaming its ranges from the replicas that hold them.</p>
+<ul>
+<li>With one token per node, those ranges live on a couple of neighbours. Two peers each throttled to 50 MB per second give 100 MB per second: 2 TB takes about 5.6 hours, and the cluster runs with reduced redundancy all that time.</li>
+<li>With many tokens per node, the ranges are spread across most of the cluster. Fifteen peers at 50 MB per second could send 750 MB per second, so the new node's own disk or network becomes the limit. At 500 MB per second, about 70 minutes.</li>
+</ul>
+<p>That is the virtual-node trade in one line: faster, gentler rebuilds, in exchange for more server pairs sharing data and therefore more ways for two failures to overlap.</p>
+
+<h3 id=dd-consistent-hashing-bounded level=3>Bounded loads: what the cap costs</h3>
+<p>With bounded loads at <em>c</em> = 1.25, no server exceeds 125% of average, by construction. The cost is that some requests do not go to their "home" server. For a cache, those are misses on the overflow server. With <em>c</em> = 1.25 and normally balanced traffic, only a small share of requests overflow; under a hot-key surge, the overflow is exactly the traffic that would otherwise have overloaded one server. The lower <em>c</em> is, the more even the load and the worse the hit rate. Vimeo's published experience with HAProxy is a good reference for tuning it on real video traffic.</p>
+
+<h2 id=dd-consistent-hashing-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-consistent-hashing-fm-two-rings level=3>1. Two rings at once</h3>
+<p><strong>Symptom.</strong> During a cache cluster resize, the hit rate drops and stays low. Some users see old data after updates, and the old data persists for the full TTL.</p>
+<p><strong>Mechanism.</strong> The new server list rolled out to application instances over 20 minutes. During that window, half the clients route key <code>product:42</code> to server C, the other half to new server E. A write that invalidates the key on E leaves the copy on C untouched. Readers still on the old list keep getting the stale copy from C.</p>
+<p><strong>Detect.</strong> Each client exports the version or a hash of the ring it is using. More than one value in production, for longer than the rollout should take, is the alarm.</p>
+<p><strong>Fix.</strong> Publish membership from one versioned source and switch clients quickly. For caches, also invalidate on both the old and new owners during a transition, and keep TTLs short enough that any missed invalidation heals on its own.</p>
+
+<h3 id=dd-consistent-hashing-fm-languages level=3>2. The Python service and the Java service disagree</h3>
+<p><strong>Symptom.</strong> A newly launched Java service has a cache hit rate near 0% on data the existing Python service writes to the same memcached cluster. Both are "using consistent hashing."</p>
+<p><strong>Mechanism.</strong> The two client libraries build different rings: different hash functions, different virtual node naming, or a different number of points per server. Each is consistent with itself, and they place the same key on different servers.</p>
+<p><strong>Detect.</strong> A cross-language test that asks both clients for the owner of a fixed list of keys and compares. In production, compare hit rates per client on shared keys.</p>
+<p><strong>Fix.</strong> Pick one documented scheme (ketama compatibility is the common lingua franca for memcached) and enable it explicitly in every client. Or put a proxy such as mcrouter or twemproxy in front, so routing exists in one place.</p>
+
+<h3 id=dd-consistent-hashing-fm-flapping level=3>3. A flapping node churns the whole cache</h3>
+<p><strong>Symptom.</strong> Database load spikes every few minutes. Cache servers are all healthy when anyone looks.</p>
+<p><strong>Mechanism.</strong> One server has an intermittent network problem. It misses a health check, clients remove it from the ring, its keys move to neighbours and miss. Thirty seconds later it passes a check, rejoins, and the keys move back and miss again. Each flap is a small miss storm, and it repeats all day.</p>
+<p><strong>Detect.</strong> Count ring membership changes per hour. A healthy cluster changes rarely; dozens of changes is a flap.</p>
+<p><strong>Fix.</strong> Hysteresis: require several consecutive failures to remove and a sustained healthy period to rejoin. Better, separate "down" from "removed": while a server is briefly down, treat its keys as misses without reassigning ownership, and remove it from the ring only if it stays down.</p>
+
+<h3 id=dd-consistent-hashing-fm-stale-return level=3>4. A returning cache node serves stale data</h3>
+<p><strong>Symptom.</strong> After a short network partition heals, some product prices revert to values from an hour ago. They fix themselves when the TTL expires.</p>
+<p><strong>Mechanism.</strong> Server B was unreachable for an hour. Its keys moved to C, and price updates were written and invalidated on C. When B returned, clients routed those keys back to B, which still held the hour-old values in memory and served them as hits.</p>
+<p><strong>Detect.</strong> Hard to see without a check. Track a server's absence time on rejoin; any rejoin after more than a few seconds is suspect. Version stamps in cached values, checked against the source for a sample of reads, reveal staleness directly.</p>
+<p><strong>Fix.</strong> Flush a cache server's contents (or bump a generation number in its key prefix) before it rejoins the ring after an absence. Keep TTLs on all cached values as the backstop.</p>
+
+<h3 id=dd-consistent-hashing-fm-identity level=3>5. Replacing a host moves the wrong keys</h3>
+<p><strong>Symptom.</strong> A routine replacement of one cache host, same size, causes a miss storm as large as adding several hosts at once.</p>
+<p><strong>Mechanism.</strong> The ring is built from IP addresses. The replacement came up with a new IP, so it got new random token positions. The old host's slices went to its neighbours, and the new host took different slices from other servers: two moves of 1/N each instead of zero. With jump hash, the equivalent mistake is building the bucket list from an unsorted host list, so a reordering renumbers buckets.</p>
+<p><strong>Detect.</strong> Compare key ownership before and after a planned replacement in a dry run. A same-size replacement should move nothing.</p>
+<p><strong>Fix.</strong> Hash stable logical names (<code>cache-07</code>) and map names to addresses separately. A replacement then inherits the name, and every key stays put.</p>
+
+<h3 id=dd-consistent-hashing-fm-hot-key level=3>6. Even keys, uneven load</h3>
+<p><strong>Symptom.</strong> One cache server runs at 95% CPU and drops connections during a flash sale. Key counts per server are within 5% of each other.</p>
+<p><strong>Mechanism.</strong> A single product page key receives 30% of all reads. The ring balanced the keys perfectly; it never promised to balance requests. The lesson calls this skew, and consistent hashing does nothing for it.</p>
+<p><strong>Detect.</strong> Per-server request rate and network throughput, not just key counts. Hot-key sampling: Redis can report its hottest keys (<code>redis-cli --hotkeys</code>, when an LFU eviction policy is set); elsewhere, sample key names in the client or proxy.</p>
+<p><strong>Fix.</strong> A small in-process cache in each application instance for the hottest keys, with a short TTL. Replicate a hot key under several names (<code>product:42#1</code> to <code>#8</code>) and read one at random. Or use bounded loads so overflow spills to neighbours instead of melting one server.</p>
+
+<h3 id=dd-consistent-hashing-fm-overlap level=3>7. Two failures, and quorum is gone</h3>
+<p><strong>Symptom.</strong> A Cassandra cluster of 30 nodes, replication factor 3, loses two nodes in different racks during a maintenance window. Some fraction of <code>QUORUM</code> reads and writes start failing, cluster-wide.</p>
+<p><strong>Mechanism.</strong> With 256 tokens per node, every pair of nodes shares replica sets for some ranges. Those ranges now have one live replica out of three, and quorum needs two. Rack-aware placement protects against losing one rack, not against losing two nodes in two racks.</p>
+<p><strong>Detect.</strong> Unavailable exceptions by consistency level in client metrics; <code>nodetool status</code> shows which nodes are down. Before maintenance, a pre-check of which ranges would lose quorum if the planned node goes down too.</p>
+<p><strong>Fix.</strong> Take nodes down one at a time, and only when all others are up. For new clusters, use fewer tokens with the allocation algorithm (the 4.0 default of 16), which lowers the share of node pairs that overlap. And size the replication factor for the number of simultaneous failures you actually plan for.</p>
+
+<h2 id=dd-consistent-hashing-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Scheme<th>Lookup cost<th>Memory<th>Keys moved on change<th>Balance<th>Remove any server?<th>Weights<th>Typical home<tbody><tr><td><code>hash % N</code><td>O(1)<td>None<td>About N/(N+1)<td>Good<td>Yes, but remaps nearly all<td>Awkward<td>Fixed-size clusters only<tr><td>Ring + virtual nodes<td>O(log V·N)<td>V·N tokens<td>About 1/N<td>Good with 100+ points<td>Yes<td>More points<td>Cache clients, Cassandra, Dynamo-style stores<tr><td>Rendezvous (HRW)<td>O(N)<td>None<td>About 1/N, exact<td>Very good<td>Yes<td>Easy<td>Small to medium server sets, CDN selection<tr><td>Jump hash<td>O(log N)<td>None<td>About 1/N, exact<td>Very good<td>Only the last bucket<td>No<td>Storage shards that only grow<tr><td>Maglev table<td>O(1)<td>Table of M entries<td>Slightly above 1/N<td>Near perfect<td>Yes<td>Yes<td>L4/L7 load balancers<tr><td>Ring with bounded loads<td>O(log V·N) plus overflow walk<td>V·N tokens<td>About 1/N, plus overflow<td>Capped at c × average<td>Yes<td>More points<td>Caches with hot keys, sticky load balancing<tr><td>Fixed slots + directory<td>O(1)<td>One row per slot<td>Exactly the slots you move<td>Good; manual tuning possible<td>Yes, by reassigning slots<td>Assign more slots<td>Redis Cluster, Vitess, Citus, most modern databases</table></div></div>
+<p>How to choose, in practice:</p>
+<ul>
+<li><strong>A cache tier, routed by clients.</strong> A ring with 100 to 200 virtual nodes, a stable naming scheme, and one shared library or proxy. Add bounded loads if you have hot keys.</li>
+<li><strong>A load balancer that must keep sessions or warm state on the same backend.</strong> Maglev or ring hash in the proxy (Envoy, HAProxy, nginx). Use bounded loads when some keys are much hotter than others.</li>
+<li><strong>A database you operate.</strong> Fixed slots plus a directory. You want deliberate, verified moves and the ability to isolate a hot tenant, which the pure ring cannot give you.</li>
+<li><strong>A small, stable set of servers with occasional changes</strong> (say, picking one of 12 origin servers). Rendezvous hashing: the simplest correct choice, with weights for free.</li>
+<li><strong>Numbered shards that only ever grow.</strong> Jump hash, if you never need to remove a shard from the middle.</li>
+</ul>
+
+<h2 id=dd-consistent-hashing-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Which algorithm, and why this one over fixed slots with a directory or rendezvous hashing?</li>
+<li>How many virtual nodes per server, and what busiest-to-average ratio does that give at your server count? Is capacity planned for that ratio, plus one failure?</li>
+<li>What is hashed to place a server: a stable logical name, or an address that changes on replacement?</li>
+<li>Where does membership live, how is it versioned, and how long can two clients see different rings? What happens to writes and invalidations during that window?</li>
+<li>Do all clients, in every language, build the identical ring? Is there a test that proves it?</li>
+<li>Are "server is down" and "server is removed from the ring" separate decisions with separate thresholds?</li>
+<li>For caches: what happens to the database when a node is added or lost? Is the miss surge sized, and is there a warming or rate-limited rollout plan?</li>
+<li>For caches: is a returning node flushed or generation-bumped before it serves again?</li>
+<li>For storage: how are replicas chosen on the ring (distinct servers, racks, zones), and how many simultaneous failures can the design survive at the consistency level used?</li>
+<li>How are hot keys detected and handled, given the ring does not address them?</li>
+<li>How is data moved during a membership change, and do old owners keep serving until handoff completes?</li>
+</ol>
+
+<h2 id=dd-consistent-hashing-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Why does adding virtual nodes improve balance, and why not use 10,000 of them?"</summary>
+<p>Each server's share is the sum of many small random arcs instead of one large random arc, so the variation averages out, roughly with the square root of the number of points. Gains flatten quickly: in tests on 10 servers, 100 points gave a worst case about 1.2 times average, 1,000 points about 1.05. Very large counts cost memory, ring rebuild time and gossip size. In replicated storage they also make every pair of servers share data, so any two failures can take some ranges below quorum. Cassandra moved from 256 to 16 tokens partly for that reason.</p>
+</details>
+
+<details>
+<summary>"Compare consistent hashing with rendezvous hashing."</summary>
+<p>Both move only about 1/N of keys on a change. Rendezvous computes a score for every server per key and takes the maximum: no ring, no virtual nodes, excellent balance and simple weights, but O(N) work per lookup. The ring is O(log) per lookup but needs virtual nodes for balance and memory for the token table. For tens of servers, rendezvous is often the simpler and better choice; for thousands, the ring or a slot table wins.</p>
+</details>
+
+<details>
+<summary>"When would you choose jump hash, and when is it wrong?"</summary>
+<p>Jump hash needs no memory and gives near-perfect balance and minimal movement, but it maps keys to bucket numbers 0 to N−1. Adding bucket N is cheap; removing bucket 3 renumbers everything after it. So it fits storage shards that only grow and are replicated internally, where a "failed" bucket is repaired rather than removed. It is wrong for a cache tier where any server can disappear at any time.</p>
+</details>
+
+<details>
+<summary>"A cache node is unreachable for ten minutes and then returns. What can go wrong?"</summary>
+<p>Two things. During the outage, its keys move to neighbours, which miss and refill; writes and invalidations go there. When it returns, keys route back to it, and it still has the values from ten minutes ago, which it serves as hits. That is stale data with no error anywhere. Flush the node or bump a key generation before it rejoins, and keep TTLs as the backstop. For short outages, consider not removing it from the ring at all. Treat its keys as misses while it is down, so ownership never changes.</p>
+</details>
+
+<details>
+<summary>"How does Redis Cluster handle a client that has the wrong slot map?"</summary>
+<p>The server tells it. If a client sends a command for a slot the node no longer owns, the node replies <code>MOVED</code> with the slot's current owner; the client updates its cached map and retries. While a slot is migrating, keys that have already moved produce <code>ASK</code>, a one-time redirect that does not update the map. The design accepts that client maps will be stale and makes staleness cost one extra round trip instead of wrong data. That is the property to look for in any routing design.</p>
+</details>
+
+<details>
+<summary>"Design a load balancer that keeps each LLM conversation on the GPU that holds its KV cache, while autoscaling."</summary>
+<p>Hash by conversation ID with a consistent scheme in the balancer: ring hash or Maglev. Scaling events then move only about 1/N of conversations, which lose their warm cache and pay a prefill. Add bounded loads, because some conversations are much heavier, and a pure hash would overload a GPU that happens to own several long ones. Overflow sends a request to the next GPU, which costs one cold prefill rather than a queue. Drain servers before removal so in-flight streams finish. Measure cache hit rate per scaling event to tune the balance factor.</p>
+</details>
+
+<details>
+<summary>"Why do modern databases prefer fixed slots over a pure ring?"</summary>
+<p>Operations. A pure ring decides placement by hash, so you cannot say "move this hot range to an empty node" or "keep this tenant alone." Fixed slots keep the even spread from hashing but turn placement into a small table you can edit, verify and roll back. Moves happen one slot at a time with a clear owner at each moment. The Dynamo paper itself moved to fixed equal partitions for the same reasons: faster bootstrapping, simpler metadata and easier archiving.</p>
+</details>

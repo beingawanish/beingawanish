@@ -1,0 +1,21 @@
+eda:
+  service-name: payment-svc
+  consumer:
+    topics: [payment.commands.v1]
+server:
+  port: 8104
+payment:
+  psp:
+    webhook-secret: ${PSP_WEBHOOK_SECRET:dev-psp-secret}
+    webhook-url: ${PSP_WEBHOOK_URL:http://localhost:8104/webhooks/psp}
+    request-timeout: 5s          # guide §6.5: 5 s for outbound PSP calls
+    reconcile-interval: 15s      # architecture §5.6
+    reconcile-window: 2m
+    pending-check-after: 5m      # safety net for a PENDING payment whose webhook never came
+  fake-psp:
+    decline-rate: ${FAKE_PSP_DECLINE_RATE:0.05}
+    timeout-rate: ${FAKE_PSP_TIMEOUT_RATE:0.02}
+    duplicate-webhook-rate: ${FAKE_PSP_DUPLICATE_WEBHOOK_RATE:0.1}
+    webhook-delay-ms: ${FAKE_PSP_WEBHOOK_DELAY_MS:300}
+    slow-webhook-ms: ${FAKE_PSP_SLOW_WEBHOOK_MS:90000}
+    api-latency-ms: ${FAKE_PSP_API_LATENCY_MS:80}

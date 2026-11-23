@@ -1,0 +1,278 @@
+<h2 id=dd-vector-clocks-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson gives you the comparison rule: greater-or-equal everywhere means "descends", ahead somewhere on both sides means "concurrent". That rule is the easy part. A real store also has to decide who counts as a writer, how a client proves what it read, how replicas reconcile, and when old counters may be thrown away. Those decisions are where implementations differ, and where the bugs live.</p>
+
+<h3 id=dd-vector-clocks-three-operations level=3>Three operations on one small map</h3>
+<p>A version is a map from writer id to counter. Missing entries count as zero. Everything a store does with it reduces to three operations:</p>
+<ul>
+<li><strong>Increment.</strong> When writer <code>w</code> produces a new version, it sets <code>clock[w]</code> to one more than the highest value of <code>w</code> it has ever seen for this key.</li>
+<li><strong>Merge.</strong> Take the maximum of each entry, slot by slot. The result descends from both inputs. Merge is how a resolved write proves it saw every sibling.</li>
+<li><strong>Compare.</strong> Check both directions of "less than or equal in every slot". You get one of four answers: equal, before, after or concurrent.</li>
+</ul>
+<p>Merge is commutative, associative and idempotent. Merge A then B, or B then A, or A twice, and you get the same clock. That is not a nicety. Replicas exchange versions in any order, sometimes more than once, and the result has to come out the same everywhere.</p>
+
+<h3 id=dd-vector-clocks-vector-or-version level=3>Vector clocks versus version vectors</h3>
+<p>The names get mixed up, including in the Dynamo paper, so it helps to separate them once.</p>
+<p>A <strong>vector clock</strong> in the original sense (Fidge and Mattern, 1988) timestamps <em>events</em> in a set of processes. Every send, receive and local step ticks the process's own entry, and a receive merges the sender's clock in. It answers "did event a happen before event b?" for any two events in the system.</p>
+<p>A <strong>version vector</strong> tracks versions of one piece of <em>data</em>. It ticks only on writes to that key. It answers "does this version of the cart contain that one?". That is what Dynamo, Riak and Voldemort actually store, even when the docs call it a vector clock. The course uses the popular name, and so does this section, but in a design review the distinction matters. A version vector says nothing about the order of writes to two different keys.</p>
+
+<h3 id=dd-vector-clocks-protocol level=3>The read-modify-write protocol</h3>
+<p>A client never invents a clock. It reads one, then hands it back with its write. In Riak this travelled as an opaque <code>X-Riak-Vclock</code> header; Dynamo's API called it the <strong>context</strong>. One cart update looks like this:</p>
+<ol>
+<li>The client sends <code>GET cart:alice</code>. The coordinator reads R replicas, compares their versions, drops any that are strictly older, and returns the survivors (one value or several siblings) plus a context: the merge of their clocks.</li>
+<li>The client applies its change. If there were siblings, it merges them first, for example by set union with tombstones.</li>
+<li>The client sends <code>PUT cart:alice</code> with the new value and the context it received.</li>
+<li>The coordinator increments its writer slot on top of that context, stores the result locally and sends it to the other replicas. It acknowledges once W have it.</li>
+<li>Each replica compares the incoming clock with what it holds. Versions the new clock descends from are discarded. Versions it does not descend from stay as siblings.</li>
+</ol>
+<p>Step 3 is the one that breaks in practice. A PUT with no context, or a stale one, is a write that claims to have seen nothing. Under a correct implementation it becomes a sibling of everything already there. Riak exposed this as a bucket setting: with <code>allow_mult=true</code> the store keeps siblings and the application resolves them; with <code>allow_mult=false</code> it quietly falls back to last-write-wins. Clients that never sent the context worked fine in testing, then filled production with siblings.</p>
+
+<h3 id=dd-vector-clocks-who-is-a-writer level=3>Who counts as a writer</h3>
+<p>The lesson says production systems often count writers per server rather than per device. Here is why, and what it costs.</p>
+<p><strong>Per-client ids</strong> give perfect precision. Two devices writing through the same server still get separate slots, so concurrency is never missed. But every phone, laptop, browser tab and reinstalled app becomes a permanent slot in the clock of every key it ever touched. A popular shared key collects hundreds of entries.</p>
+<p><strong>Per-server ids</strong> bound the clock. With N=3 replicas and occasional handoffs, a key's clock rarely holds more than a handful of entries. This is what Dynamo described: the node that coordinates a write increments its own slot. Now two clients that write concurrently through the <em>same</em> coordinator share one slot. The plain version-vector rule cannot tell their writes apart.</p>
+<p>Walk it through. Replica <code>r1</code> holds the cart at <code>{r1:1}</code>. The phone and the laptop both read it and get context <code>{r1:1}</code>. The phone writes first, and <code>r1</code> stores <code>{r1:2}</code>. The laptop's write arrives with the stale context <code>{r1:1}</code>. If <code>r1</code> just increments again, it produces <code>{r1:3}</code>, which descends from <code>{r1:2}</code>. The phone's write is discarded as "older". Nobody sees a sibling, and an item vanishes from the cart.</p>
+<p>Implementations that saw this coming refused to collapse the two writes. They kept the laptop's write as a sibling because its context did not cover the phone's version. That avoided the lost update, but the siblings' clocks could no longer describe precisely what each one had seen. In Riak before 2.0, repeated concurrent writes through one coordinator piled up siblings that no read could clear. The community called it <strong>sibling explosion</strong>.</p>
+
+<h3 id=dd-vector-clocks-dvv level=3>Dotted version vectors: the fix</h3>
+<p><strong>Dotted version vectors</strong> (DVV) keep server-side ids and fix the precision problem. Riak 2.0 shipped them, and they became the default for new bucket types. The idea is small. Each sibling carries a <strong>dot</strong>: the single (writer, counter) pair of the write that created it. The key as a whole carries one version vector of everything the replica has seen.</p>
+<p>A write removes only the siblings whose dots its context covers. A dot <code>(r1, 2)</code> is covered by a context if the context's <code>r1</code> entry is at least 2. Replay the example. The phone's write gets dot <code>(r1,2)</code>. The laptop's context <code>{r1:1}</code> does not cover it, so the phone's sibling survives. The laptop's write gets dot <code>(r1,3)</code>. Two siblings, each with an exact identity, and a later read that merges them clears both. CRDT sets such as the OR-Set use the same dot trick internally, which is not a coincidence.</p>
+<p>Here is the whole mechanism for one key on one replica, plus replica-to-replica sync. It runs on the Python standard library.</p>
+<pre><code>class Key:
+    """One key on one replica: siblings tagged with dots, plus what this replica has seen."""
+
+    def __init__(self):
+        self.siblings = {}   # dot (actor, n) -&gt; value
+        self.seen = {}       # actor -&gt; highest n seen (a version vector)
+
+    def get(self):
+        # The client gets every sibling plus a context: the vector it must send back.
+        return list(self.siblings.values()), dict(self.seen)
+
+    def put(self, actor, context, value):
+        # Drop only the siblings this writer had read. Everything else stays.
+        self.siblings = {d: v for d, v in self.siblings.items()
+                         if context.get(d[0], 0) &lt; d[1]}
+        n = self.seen.get(actor, 0) + 1
+        self.seen[actor] = n
+        self.siblings[(actor, n)] = value
+
+    def sync(self, other):
+        # Anti-entropy between two replicas of the same key.
+        merged = {}
+        for mine, their_seen, theirs in ((self.siblings, other.seen, other.siblings),
+                                         (other.siblings, self.seen, self.siblings)):
+            for d, v in mine.items():
+                # Keep a dot if the other side has it too, or has never seen it.
+                # If they saw it and dropped it, it was superseded there.
+                if d in theirs or their_seen.get(d[0], 0) &lt; d[1]:
+                    merged[d] = v
+        self.siblings = merged
+        self.seen = {a: max(self.seen.get(a, 0), other.seen.get(a, 0))
+                     for a in self.seen.keys() | other.seen.keys()}
+
+k = Key()
+_, phone_ctx = k.get()
+_, laptop_ctx = k.get()
+k.put("r1", phone_ctx, {"sneakers"})
+k.put("r1", laptop_ctx, {"hat"})       # stale context: becomes a sibling
+values, ctx = k.get()                  # [{'sneakers'}, {'hat'}], {'r1': 2}
+k.put("r1", ctx, set().union(*values)) # merged write clears both siblings
+</code></pre>
+<p>Notice what <code>sync</code> does with a dot that one side has and the other lacks. If the other side has <em>seen</em> that dot (its vector covers it) and no longer holds it, the dot was superseded there, so it is dropped. If the other side has never seen it, it is new, so it is kept. That one rule replaces "compare whole clocks" and is what makes server-side ids safe.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-vector-clocks-svg-title dd-vector-clocks-svg-desc" viewBox="0 0 720 280" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-vector-clocks-svg-title">A cart's version history with a fork and a merge</title>
+<desc id="dd-vector-clocks-svg-desc">The empty cart has clock phone 0, laptop 0. It forks into two versions: the phone adds sneakers with clock phone 1, laptop 0, and the offline laptop adds a hat with clock phone 0, laptop 1. Neither descends from the other, so they are concurrent siblings. A later read on the phone merges them by union. The merged clock is the slot-by-slot maximum, phone 1, laptop 1, and the phone's write then increments its own slot, giving phone 2, laptop 1, which descends from both siblings.</desc>
+<defs><marker id="dd-vector-clocks-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="280" fill="#ffffff"/>
+<rect x="20" y="110" width="130" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="85" y="135" font-size="14" fill="#1c2430" text-anchor="middle">empty cart</text>
+<text x="85" y="155" font-size="12" fill="#5c6b7c" text-anchor="middle">{phone:0, laptop:0}</text>
+<rect x="230" y="30" width="160" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="310" y="55" font-size="14" fill="#1c2430" text-anchor="middle">{sneakers}</text>
+<text x="310" y="75" font-size="12" fill="#5c6b7c" text-anchor="middle">{phone:1, laptop:0}</text>
+<rect x="230" y="190" width="160" height="60" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="310" y="215" font-size="14" fill="#1c2430" text-anchor="middle">{hat}</text>
+<text x="310" y="235" font-size="12" fill="#5c6b7c" text-anchor="middle">{phone:0, laptop:1}</text>
+<rect x="510" y="105" width="190" height="70" rx="8" fill="#e5f3ec" stroke="#7eae96" stroke-width="2"/>
+<text x="605" y="130" font-size="14" fill="#1c2430" text-anchor="middle">{sneakers, hat}</text>
+<text x="605" y="150" font-size="12" fill="#5c6b7c" text-anchor="middle">max = {phone:1, laptop:1}</text>
+<text x="605" y="166" font-size="12" fill="#1f5f99" text-anchor="middle">phone writes: {phone:2, laptop:1}</text>
+<line x1="150" y1="130" x2="226" y2="70" stroke="#1c2430" marker-end="url(#dd-vector-clocks-arrow)"/>
+<text x="170" y="88" font-size="12" fill="#1c2430">phone writes</text>
+<line x1="150" y1="150" x2="226" y2="210" stroke="#1c2430" marker-end="url(#dd-vector-clocks-arrow)"/>
+<text x="160" y="205" font-size="12" fill="#1c2430">laptop writes</text>
+<line x1="310" y1="92" x2="310" y2="186" stroke="#c898a4" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="320" y="135" font-size="12" fill="#1c2430">concurrent:</text>
+<text x="320" y="151" font-size="12" fill="#1c2430">each ahead in one slot</text>
+<line x1="390" y1="60" x2="506" y2="125" stroke="#1c2430" marker-end="url(#dd-vector-clocks-arrow)"/>
+<line x1="390" y1="220" x2="506" y2="158" stroke="#1c2430" marker-end="url(#dd-vector-clocks-arrow)"/>
+<text x="440" y="72" font-size="12" fill="#1c2430">read sees</text>
+<text x="440" y="88" font-size="12" fill="#1c2430">both siblings</text>
+</svg>
+<figcaption>The merged write descends from both branches, so no replica will ever see the fork again. Skip the merge step and the next replica to sync revives a sibling.</figcaption>
+</figure>
+
+<h3 id=dd-vector-clocks-replication level=3>Where comparisons happen in a leaderless store</h3>
+<p>Clocks are compared in four places, and each one is a chance for divergent copies to converge:</p>
+<ul>
+<li><strong>On write,</strong> each replica drops the versions the new clock descends from.</li>
+<li><strong>On read,</strong> the coordinator compares the R responses (see <a href="#quorum">quorum</a>), returns the maximal versions, and usually sends the winner back to stale replicas. That is <strong>read repair</strong>.</li>
+<li><strong>Hinted handoff.</strong> When a replica is down, another node stores its writes as hints and replays them later. The replayed versions go through the same comparison, so old hints cannot overwrite newer data.</li>
+<li><strong>Anti-entropy.</strong> A background process compares replicas, typically by exchanging Merkle-tree hashes of key ranges, and syncs the keys that differ. This is the only path that fixes keys nobody reads.</li>
+</ul>
+<p>All four are safe to run in any order, any number of times, because merge is commutative and idempotent. If your merge function is not, these paths will make replicas disagree permanently. The failure section returns to this.</p>
+
+<h3 id=dd-vector-clocks-pruning-knobs level=3>Pruning and its knobs</h3>
+<p>The Dynamo paper describes a simple guard: store a wall-clock timestamp with each entry, and when the clock passes a threshold (the paper mentions 10 entries), drop the oldest entry. Riak exposed four bucket properties for the same idea: <code>small_vclock</code>, <code>big_vclock</code>, <code>young_vclock</code> and <code>old_vclock</code>. An entry was never pruned while the clock was small or the entry was young. It was eligible once the clock grew big or the entry grew old. Defaults have changed between versions, so read them from your own configuration.</p>
+<p>The trade is direct. Prune earlier, and clocks stay small. Prune too early, and you destroy history that a slow replica, an old hint or a restored backup still needs. With dotted version vectors and server ids, the clock is bounded by the replica set, and pruning becomes rare instead of routine. That is the main operational win of DVV.</p>
+
+<h2 id=dd-vector-clocks-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The question a reviewer asks is not "how big is a clock?" It is "how big is a clock compared with the value, and how often do siblings form?" Both have quick answers.</p>
+
+<h3 id=dd-vector-clocks-clock-bytes level=3>Bytes per key</h3>
+<p>Assume each entry holds an 8-byte writer id, an 8-byte counter and an 8-byte timestamp for pruning. Call it 24 bytes, plus some framing. Real encodings vary; Riak, for instance, stored clocks in Erlang's binary term format. The arithmetic is what matters.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Writer model<th>Entries per cart<th>Clock size<th>Share of a 2 KB cart<th>100M carts × 3 replicas<tbody><tr><td>Per server (N=3, some handoffs)<td>3–5<td>~120 B<td>~6%<td>~36 GB<tr><td>Per device<td>~10<td>~240 B<td>~12%<td>~72 GB<tr><td>Per session or tab, never pruned<td>~60<td>~1.4 KB<td>~70%<td>~430 GB</table></div></div>
+<p>The last row is how clocks end up larger than the data they describe. The cost is not only disk. The clock travels on every read and write, and with R=2 the coordinator receives two copies. Doubling the object size roughly doubles network bytes per request, and that is felt at p99.</p>
+
+<h3 id=dd-vector-clocks-sibling-rate level=3>How often siblings form</h3>
+<p>Two writes become concurrent when the second writer read the key before the first write reached it. Call the gap between a client's read and its write, plus replication delay, the <strong>window</strong> <code>w</code>. If writes to one key arrive at rate <code>λ</code>, a new write overlaps about <code>λ × w</code> other writes on average.</p>
+<ul>
+<li><strong>A normal cart.</strong> One write every 30 seconds during an active session, a 300 ms window. <code>λw = (1/30) × 0.3 = 0.01</code>. About 1 write in 100 produces a sibling, and the next read clears it. This is the workload vector clocks were built for.</li>
+<li><strong>A shared cart during a flash sale.</strong> A family of four tapping fast, say 2 writes per second with a 500 ms window. <code>λw = 1</code>. Nearly every write forms a sibling. Siblings get cleared, but reads now carry two or three values each.</li>
+<li><strong>A hot counter.</strong> A "stock remaining" key written 200 times per second with a 50 ms window. <code>λw = 10</code>. Each read returns about ten siblings, each merge races ten more writes, and the key never settles. That is the wrong data model, not a tuning problem. Use a CRDT counter or put the key behind a leader, as in <a href="#primaryreplica">primary-replica</a>.</li>
+</ul>
+<p>The rule of thumb: when <code>λw</code> is well under 1, siblings are rare and cheap. As it approaches 1, sibling handling becomes the normal path and needs to be fast. Above 1, the design is wrong for that key.</p>
+
+<h3 id=dd-vector-clocks-sibling-cost level=3>What siblings cost</h3>
+<p>Each sibling is a full copy of the value. A 2 KB cart with 5 siblings is a 10 KB object, and a read must ship all of it before the client can merge. Riak 2.x added warning and hard limits on sibling count and object size to <code>riak.conf</code> because sibling explosion took clusters down. Treat siblings-per-read as a first-class metric. A healthy cart store shows a p99 of 1 or 2. A p99 of 10 means some client is writing blind.</p>
+
+<h3 id=dd-vector-clocks-tombstone-math level=3>Tombstone storage</h3>
+<p>The lesson's fix for resurrected sneakers is a tombstone. Tombstones must live longer than the longest time a stale copy can stay hidden: an offline device, a long hinted-handoff queue, a node rebuilt from backup. Cassandra's equivalent knob, <code>gc_grace_seconds</code>, defaults to 10 days for exactly this reason.</p>
+<p>Size it. Assume 10 million active carts, 2 item removals per cart per day, 60 bytes per tombstone, 3 replicas, kept for 10 days.</p>
+<pre><code>10,000,000 carts × 2 removals × 60 B   = 1.2 GB per day, one copy
+× 3 replicas                           = 3.6 GB per day
+× 10 days retention                    = 36 GB of tombstones at steady state
+</code></pre>
+<p>That is affordable. The real cost is per key: a cart that a user fills and empties daily carries its tombstones in every read until cleanup runs. Collapse them when you can, for example by recording one "cleared at version X" marker instead of one tombstone per item.</p>
+
+<h2 id=dd-vector-clocks-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+<p>Vector clock bugs share one nasty property. The common failure is silent data loss, or silent data resurrection, not an error. Every detection below is something you must build on purpose.</p>
+
+<h3 id=dd-vector-clocks-fm-blind-writes level=3>1. Sibling explosion from blind writes</h3>
+<p><strong>Symptom.</strong> Read latency on some keys climbs over days. Object sizes grow. Eventually reads on those keys time out.</p>
+<p><strong>Mechanism.</strong> A client writes without sending the context it read, or caches a context for hours. Each such write claims to have seen nothing, so it becomes a sibling of everything stored. Common culprits are a batch job that "just sets" a field, a new service using a thin client library, or a retry path that rebuilds the request and drops the header.</p>
+<p><strong>Detect.</strong> A histogram of siblings per read and object size per bucket, plus a count of writes that arrive with an empty context. Log the client id on context-less writes, and the offender usually shows up in an hour.</p>
+<p><strong>Fix.</strong> Reject context-less writes to keys that already exist, or route them through a read-merge-write wrapper. Clear the swollen keys with one merged write each.</p>
+
+<h3 id=dd-vector-clocks-fm-false-descent level=3>2. Lost updates from shared writer slots</h3>
+<p><strong>Symptom.</strong> Users report items that "disappeared" from carts. There are no siblings and no errors. The store looks perfectly healthy.</p>
+<p><strong>Mechanism.</strong> The per-server-id problem from the mechanism section. Two clients write through one coordinator with the same stale context. A naive increment makes the second write appear to descend from the first, so the first is discarded.</p>
+<p><strong>Detect.</strong> Nearly impossible from inside the store, because the store believes it did the right thing. Detect it from outside. Have clients log their writes and periodically compare a sample against what the store returns. Or run a property test against the client library that fires concurrent writes with the same context and checks that both survive.</p>
+<p><strong>Fix.</strong> Dotted version vectors, or per-client ids for the keys where precision matters. Put that property test in CI so a library upgrade cannot quietly reintroduce it.</p>
+
+<h3 id=dd-vector-clocks-fm-actor-reuse level=3>3. A writer id restarts at zero</h3>
+<p><strong>Symptom.</strong> After a node is rebuilt, every write coordinated by that node over the next hours seems to vanish. Clients get acknowledgements. Later reads return older data.</p>
+<p><strong>Mechanism.</strong> The rebuilt node kept its old writer id but lost the counters it had issued. Its first new write gets <code>{n7:1}</code>. Other replicas already hold versions with <code>n7:340</code>. The new write looks like an ancestor of what they hold, so it is discarded as stale. The same happens with a client id restored from a backup, or a mobile app that reinstalls and reuses an id from the server.</p>
+<p><strong>Detect.</strong> Alert when a write's own slot is lower than the slot already stored for that writer on the same key. In a correct system that never happens, so any occurrence is a bug.</p>
+<p><strong>Fix.</strong> Give every incarnation a fresh writer id: node id plus a boot epoch, or a new UUID per install. Ids are cheap. Reusing them is the bug.</p>
+
+<h3 id=dd-vector-clocks-fm-pruning level=3>4. Pruning that rewrites history</h3>
+<p><strong>Symptom.</strong> Spurious siblings on keys that were edited by one device in sequence, or, rarer and worse, a concurrent write lost after a long partition heals.</p>
+<p><strong>Mechanism.</strong> Pruning removes information from a clock, and it can go wrong in both directions. Remove an entry from a <em>newer</em> version, and it may no longer dominate its ancestor, so sequential versions look concurrent. That is noisy but safe. Remove an entry from a version that was <em>concurrent</em>, and it may now look dominated, so it is discarded. That loses a write. The dangerous case arises when an old, untouched replica or a late hint carries a version whose clock was pruned elsewhere.</p>
+<p><strong>Detect.</strong> Count prune events per bucket and correlate them with sibling spikes. If pruning runs often, your writer model is wrong.</p>
+<p><strong>Fix.</strong> Move to server-side ids with DVV so clocks are bounded and pruning is rare. Make the "old" threshold longer than the worst partition or handoff you have seen.</p>
+
+<h3 id=dd-vector-clocks-fm-resurrection level=3>5. Zombies after tombstone cleanup</h3>
+<p><strong>Symptom.</strong> Deleted items, or deleted keys, reappear days or weeks after deletion. The timing often lines up with a node returning from maintenance.</p>
+<p><strong>Mechanism.</strong> Tombstones were reaped while one replica, or an offline client, still held the pre-delete version. When that copy syncs, there is no tombstone left to supersede it. To the store, it looks like a fresh version nobody has seen.</p>
+<p><strong>Detect.</strong> Track the age of the oldest pending hint and the longest node downtime. Alert when either approaches the tombstone retention. A "deleted, then present again" counter in the application catches the symptom directly.</p>
+<p><strong>Fix.</strong> Never let a node rejoin after an absence longer than tombstone retention without a full repair first. Prefer deleting tombstones only after anti-entropy confirms every replica has them.</p>
+
+<h3 id=dd-vector-clocks-fm-merge-race level=3>6. Merge races and non-deterministic merges</h3>
+<p><strong>Symptom.</strong> Siblings that never go away even though clients resolve them. Or replicas that return different merged values for the same key.</p>
+<p><strong>Mechanism.</strong> Two readers fetch the same two siblings and each writes back a merge with the same context. Their two merged writes are concurrent with each other, so the store keeps both. If the merge function is deterministic, the two values are identical and the next read collapses them. If it is not (it sorts by a hash with a random seed, includes "merged at" timestamps, or picks a winner by local clock), the two merges differ, and the cycle repeats.</p>
+<p><strong>Detect.</strong> Sample keys with siblings and check whether the sibling values are byte-identical. Identical siblings mean a merge race. Different values on every round mean a non-deterministic merge.</p>
+<p><strong>Fix.</strong> Make the merge a pure function of the sibling set: commutative, associative and idempotent, with no clocks and no randomness. Collapse identical siblings on read. On hot keys, have one designated resolver, such as the key's first replica, perform write-back.</p>
+
+<h3 id=dd-vector-clocks-fm-lww-fallback level=3>7. A quiet fallback to last-write-wins</h3>
+<p><strong>Symptom.</strong> The sibling rate drops to zero after a migration or config change, and support tickets about lost cart items rise.</p>
+<p><strong>Mechanism.</strong> A bucket was created with default properties that use LWW, or a data migration copied keys with new timestamps and empty clocks. Nothing errors. Concurrency just stops being detected.</p>
+<p><strong>Detect.</strong> A sibling rate of zero on a key space that used to show 1% is an alarm, not good news. Keep a dashboard of sibling rate by bucket next to the bucket's settings.</p>
+<p><strong>Fix.</strong> Treat conflict-handling settings as schema. Declare them in code, review them in pull requests, and check them at deploy time.</p>
+
+<h2 id=dd-vector-clocks-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<p>Vector clocks are one point in a wider space of answers to "two writers touched this key; now what?". The useful comparison is what each option detects and who pays.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach<th>Detects concurrency?<th>Metadata per key<th>Who resolves<th>Typical home<tbody><tr><td>Last-write-wins, wall clock<td>No<td>One timestamp<td>Nobody: one write is dropped<td>Cassandra's default, caches, presence<tr><td>LWW with hybrid logical clocks<td>No (orders, does not detect)<td>One timestamp<td>Nobody, but ordering survives skew<td>MVCC ordering in CockroachDB-style systems<tr><td>Lamport clock<td>No (consistent order only)<td>One integer<td>Nobody<td>Ordering logs, tie-breaking<tr><td>Version vector, per-client ids<td>Yes, exactly<td>Grows with clients<td>Application on read<td>Small, bounded writer sets<tr><td>Version vector, per-server ids<td>Yes, but can lose writes without care<td>Bounded by replicas<td>Application on read<td>Dynamo as described in the paper<tr><td>Dotted version vectors<td>Yes, exactly<td>Bounded by replicas, plus one dot per sibling<td>Application on read<td>Riak 2.0 and later<tr><td>CRDTs (OR-Set, counters, sequence types)<td>Yes, internally<td>Per element, sometimes large<td>The data type, automatically<td>Collaborative editing, carts, counters<tr><td>Leader or consensus per key<td>Not needed: one order<td>A term or log index<td>Nobody: writes are serialized<td>Primary-replica, Raft-backed stores, DynamoDB</table></div></div>
+<p>Note the last row. Amazon DynamoDB, the managed service, is not the Dynamo from the 2007 paper. It routes each partition's writes through a leader and offers conditional writes, so it has no siblings to resolve. Interviewers like to check whether you know that.</p>
+
+<h3 id=dd-vector-clocks-choose-writer-model level=3>Choosing the writer model</h3>
+<p>Use per-client ids when the set of writers per key is small and stable: a handful of devices per user's settings document, a few services writing a shared record. Use server ids with dotted version vectors when writers are many or unbounded. Do not use plain server ids without dots unless you have proven the coordinator never sees two concurrent writes with one context. In practice it does.</p>
+
+<h3 id=dd-vector-clocks-choose-resolution level=3>Choosing where resolution happens</h3>
+<ul>
+<li><strong>On read, in the application.</strong> This is the classic Dynamo choice. It is the most flexible, since the application knows what "merge" means. It is also the most fragile, because every client must implement the merge correctly.</li>
+<li><strong>On write, in the store.</strong> The store runs a registered merge or a CRDT type, so clients never see siblings. Riak's data types and most CRDT databases do this. The merge has to be expressible in the store's terms.</li>
+<li><strong>By a person.</strong> Show both versions. This is right for documents, configuration and anything where a wrong automatic merge is worse than a question. It is wrong for carts, because nobody wants to be asked about their socks.</li>
+</ul>
+
+<h3 id=dd-vector-clocks-choose-or-not level=3>When the honest answer is "put a leader on it"</h3>
+<p>Vector clocks exist to keep writes available during failures without a leader. If a key does not need that, for example an order record written by one service, a leader is simpler and loses nothing. The cart earns leaderless writes because a cart that refuses "add to basket" during a node failure costs money. The order, the payment and the inventory count do not. Use vector clocks where availability is worth more than a single order of writes, and nowhere else.</p>
+
+<h2 id=dd-vector-clocks-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Which keys actually need leaderless writes, and what is the cost of refusing a write to each during a node failure?</li>
+<li>Who is a writer: client, device, session, server? What bounds the number of entries per key?</li>
+<li>If writer ids are per server, does the store use dotted version vectors, or how else are two concurrent writes through one coordinator kept apart?</li>
+<li>How does every client get and return the context? What happens to a write that arrives without one?</li>
+<li>What is the merge function for each data type, and is it deterministic, commutative, associative and idempotent? Where is it tested?</li>
+<li>How are deletions represented, how long do tombstones live, and how does that compare with the longest possible offline or handoff period?</li>
+<li>What are the pruning settings, and what is the worst partition or node absence they must survive?</li>
+<li>How does a writer get a fresh id after a rebuild, restore or reinstall?</li>
+<li>What is <code>λ × w</code> for the hottest keys? Which keys should be CRDTs or behind a leader instead?</li>
+<li>Which metrics are on the dashboard: siblings per read, object size, context-less writes, prune events, sibling rate by bucket?</li>
+<li>Are the conflict-handling settings (siblings on or off, data type, merge policy) declared in code and checked at deploy?</li>
+</ol>
+
+<h2 id=dd-vector-clocks-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Why not use a Lamport clock? It's one integer instead of a vector."</summary>
+<p>A Lamport clock guarantees one direction only: if a happened before b, then L(a) &lt; L(b). The reverse is not true. L(a) &lt; L(b) can also mean the two were concurrent. So Lamport clocks give a total order that respects causality, which is fine for breaking ties, but they cannot tell you that two writes were concurrent. Detecting concurrency needs one entry per writer, because you must know what each writer had seen. That is the vector.</p>
+</details>
+
+<details>
+<summary>"Your clocks use server ids. Two clients write through the same node with the same context. What happens?"</summary>
+<p>With a plain version vector, the node increments its own slot twice, and the second write appears to descend from the first. The first write is lost silently. Riak hit this and either lost writes or, when it tried to be safe, accumulated siblings it could not clear. Dotted version vectors fix it. Each sibling is tagged with the exact (node, counter) dot that created it, and a write removes only siblings whose dots its context covers. The first write's dot is not covered by the stale context, so it survives as a sibling.</p>
+</details>
+
+<details>
+<summary>"A node's disk dies and you rebuild it with the same id. Anything to worry about?"</summary>
+<p>Yes. Its counters restart, so its first new writes carry low numbers in its own slot. Every other replica already holds versions with higher numbers in that slot. The new writes look like ancestors and are discarded, even though clients got acknowledgements. Give each incarnation a new id, for example node name plus boot epoch. Alternatively, recover the counters from peers before accepting writes, but a new id is simpler and harder to get wrong.</p>
+</details>
+
+<details>
+<summary>"Two readers resolve the same siblings at the same moment. Do you get a conflict again?"</summary>
+<p>Technically yes: both merged writes carry the same context, so they are concurrent, and the store keeps both. If the merge is deterministic, the two values are identical. The next read collapses them and the key settles. If the merge is not deterministic, the key can loop forever. The real requirement is a merge that is a pure function of the sibling set. On very hot keys, also designate a single resolver.</p>
+</details>
+
+<details>
+<summary>"How would you bound clock size without risking data loss?"</summary>
+<p>First bound it structurally. Use server ids with dotted version vectors, so the number of entries follows the replica set rather than the client population. Then pruning is a rare safety valve. When you do prune, only remove entries older than the longest plausible absence of any replica, hint or offline client. Remember that pruning can make a concurrent version look dominated, which loses a write, not just one that makes a descendant look concurrent.</p>
+</details>
+
+<details>
+<summary>"Does DynamoDB use vector clocks?"</summary>
+<p>No. The 2007 Dynamo paper described vector clocks with siblings resolved on read. Amazon DynamoDB, the managed service, uses a leader per partition and supports conditional writes and transactions. Writes to one item are serialized, so there are no siblings to detect. Its multi-region global tables have historically reconciled concurrent cross-region writes with last-writer-wins, which is a timestamp policy, not causality tracking. The paper inspired Riak, Voldemort and Cassandra; it does not describe the AWS product.</p>
+</details>
+
+<details>
+<summary>"How do CRDTs relate to vector clocks? Are they a replacement?"</summary>
+<p>They are a packaging of the same idea. An observed-remove set tags each added element with a unique dot and tracks a version vector of what it has seen. A remove deletes only the dots it observed, so a concurrent add survives. That is the same rule dotted version vectors apply to siblings, applied per element instead of per value. The difference is who merges. With vector clocks the application merges siblings. With a CRDT the merge is built into the type, so it cannot be forgotten or written wrongly in one client.</p>
+</details>
+
+<details>
+<summary>"When does a vector clock design stop working for a key?"</summary>
+<p>When concurrent writes become the norm. Estimate <code>λ × w</code>: write rate times the read-to-write window. Well under 1, siblings are rare and cheap. Around 1, every read carries siblings. Above 1, merges race new writes and the key never settles, the classic case being a hot stock counter. Move that key to a CRDT counter, or behind a leader with conditional writes. Vector clocks suit many keys with occasional conflicts, not few keys with constant ones.</p>
+</details>

@@ -1,0 +1,36 @@
+{
+  "envelope": {
+    "eventId": "4026aac8-2539-5574-a1fd-423acbd35c75",
+    "type": "com.edacommerce.shipping.ShipmentCreated",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "cceae10f-103e-5aeb-8e89-698d65ca8ce4",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "shipping-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Shipment",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "shipmentId": "6e259293-3210-55da-87cf-88f0b81f5939",
+  "direction": "OUTBOUND",
+  "fulfilmentId": "3b77ce0f-a101-59ce-9176-71557e8b5d67",
+  "returnId": "58004325-7300-578b-b8d2-51b7b8b4e986",
+  "carrier": "fake-carrier",
+  "trackingNumber": "FC123456789DE",
+  "label": {
+    "store": "s3",
+    "bucket": "invoices",
+    "objectKey": "order/2026/11/6ed9d0ed-127a-524b-b079-a06e34f3ec73/invoice.pdf",
+    "contentType": "application/pdf",
+    "sizeBytes": 48213,
+    "sha256": "50d858e0985ecc7f60418aaf0cc5ab587f42c2570a884095a9e8ccacd0f6545c",
+    "expiresAt": 1795000000000
+  },
+  "createdAt": 1795000000000
+}

@@ -1,0 +1,48 @@
+{
+  "type": "record",
+  "name": "ClaimCheck",
+  "namespace": "com.edacommerce.common",
+  "doc": "Pointer to a large payload stored in object storage (ADR-009). The event carries the pointer and a hash, never the bytes.",
+  "fields": [
+    {
+      "name": "store",
+      "type": "string",
+      "doc": "Storage scheme. 's3' for MinIO and AWS S3.",
+      "default": "s3"
+    },
+    {
+      "name": "bucket",
+      "type": "string"
+    },
+    {
+      "name": "objectKey",
+      "type": "string"
+    },
+    {
+      "name": "contentType",
+      "type": "string",
+      "doc": "MIME type, e.g. application/pdf."
+    },
+    {
+      "name": "sizeBytes",
+      "type": "long"
+    },
+    {
+      "name": "sha256",
+      "type": "string",
+      "doc": "Lower-case hex SHA-256 of the object. Consumers verify it after download."
+    },
+    {
+      "name": "expiresAt",
+      "type": [
+        "null",
+        {
+          "type": "long",
+          "logicalType": "timestamp-millis"
+        }
+      ],
+      "doc": "When the lifecycle policy deletes the object. Null means retained under legal hold rules.",
+      "default": null
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+# Non-secret configuration. Names match docs/implementation-guide.md "Configuration".
+# Secrets (DB_PASSWORD, S3_SECRET_KEY, webhook secrets) come from a Secret named <service>-secrets
+# that this base does not create.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: svc-config
+data:
+  HTTP_PORT: "8080"
+  KAFKA_BOOTSTRAP_SERVERS: kafka-bootstrap.kafka.svc:9093
+  KAFKA_SECURITY_PROTOCOL: SSL
+  SCHEMA_REGISTRY_URL: http://schema-registry.kafka.svc:8081
+  OUTBOX_RELAY: debezium
+  DB_PORT: "5432"
+  S3_REGION: eu-central-1
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability.svc:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  AUTH_MODE: oidc
+  LOG_FORMAT: json
+  LOG_LEVEL: INFO

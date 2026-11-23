@@ -1,0 +1,196 @@
+<h2 id=dd-idempotency-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's version of the key store has two columns: the key and the saved result. A store that survives production has about ten, because it has to answer questions the simple version cannot. Is this really the same request, or a reused key? Is the first attempt still running, or did it crash halfway? Which part of the work already happened? This section builds that store, then looks at how the same idea appears inside Kafka, HTTP and DynamoDB.</p>
+
+<h3 id=dd-idempotency-schema level=3>The key record</h3>
+<p>Here is a Postgres table for the bookstore's checkout API. It lives in the same database as the orders, which matters, as the next subsection shows.</p>
+<pre><code>CREATE TABLE idempotency_keys (
+  account_id      bigint      NOT NULL,
+  idem_key        text        NOT NULL,
+  request_hash    bytea       NOT NULL,        -- SHA-256 of method, path and canonical body
+  state           text        NOT NULL,        -- 'started' | 'completed'
+  recovery_point  text        NOT NULL DEFAULT 'start',
+  locked_until    timestamptz,                 -- lease for the attempt that is running
+  response_code   int,
+  response_body   jsonb,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, idem_key)
+);
+CREATE INDEX ON idempotency_keys (created_at);  -- for the expiry sweep</code></pre>
+<p>Each column answers one question:</p>
+<ul>
+<li><strong><code>account_id</code> in the primary key.</strong> Keys are scoped to a caller. Without the scope, two customers who happen to choose the same key would collide, and one could receive the other's saved response. That is a data leak, not just a bug.</li>
+<li><strong><code>request_hash</code>.</strong> A fingerprint of what was asked. If a key arrives again with a different body, the client has a bug: it reused a key for a new operation. Replaying the old response would be wrong and dangerous. Reject it. Stripe returns an error in this case, and the IETF draft for the <code>Idempotency-Key</code> header suggests 422.</li>
+<li><strong><code>state</code> and <code>locked_until</code>.</strong> Together they handle the in-progress case. A second request that finds <code>started</code> with an unexpired lease gets 409 Conflict, "still running, try again". One that finds an <em>expired</em> lease knows the first attempt died, and may take over.</li>
+<li><strong><code>recovery_point</code>.</strong> Records how far a multi-step operation got. A takeover resumes from there instead of starting over. More on this below.</li>
+<li><strong><code>response_code</code>, <code>response_body</code>.</strong> The saved answer that a duplicate receives.</li>
+</ul>
+
+<h3 id=dd-idempotency-protocol level=3>The protocol, step by step</h3>
+<p>When the effect lives in the same database as the key, the whole thing is one transaction. That is the easy and best case:</p>
+<pre><code>BEGIN;
+-- 1. Claim. Exactly one concurrent transaction can insert this row.
+INSERT INTO idempotency_keys (account_id, idem_key, request_hash, state, locked_until)
+VALUES ($1, $2, $3, 'started', now() + interval '30 seconds')
+ON CONFLICT (account_id, idem_key) DO NOTHING
+RETURNING idem_key;
+-- 2. No row returned? Someone owns the key. ROLLBACK, then read the existing row:
+--      hash differs            -> 422, key reused for a different request
+--      state = 'completed'     -> replay response_code and response_body
+--      lease still valid       -> 409, in progress
+--      lease expired           -> take over (see recovery points)
+-- 3. Row returned: we own it. Do the work in the same transaction.
+INSERT INTO orders (...) VALUES (...);
+UPDATE inventory SET reserved = reserved + 1 WHERE sku = $4;
+-- 4. Save the answer and commit everything together.
+UPDATE idempotency_keys
+   SET state = 'completed', response_code = 201, response_body = $5
+ WHERE account_id = $1 AND idem_key = $2;
+COMMIT;</code></pre>
+<p>Because the claim, the effect and the saved response commit atomically, there is no window where one exists without the others. A crash before <code>COMMIT</code> rolls back all of it, including the claim, so the retry starts fresh. One note on concurrency: a second transaction inserting the same key while the first is still open will <em>block</em> on the unique index until the first commits or rolls back. So in this single-transaction design, concurrent duplicates wait rather than getting a 409. Keep the transaction short.</p>
+
+<h3 id=dd-idempotency-recovery-points level=3>When the effect is external: recovery points</h3>
+<p>The payment call is the hard case. Charging a card is a call to the provider, so it cannot join your database transaction. Hold a transaction open across a network call and you hold row locks for its full duration, which is worse. The usual answer is to split the request into <strong>atomic phases</strong>, each a local transaction that ends by recording a recovery point:</p>
+<ol>
+<li><strong>Phase <code>start</code>.</strong> Claim the key, create the order row as <code>pending</code>, set <code>recovery_point = 'order_created'</code>. Commit.</li>
+<li><strong>External call.</strong> Charge the card, passing a key derived from yours, for example <code>ord_7f3a:charge</code>. This is outside any transaction.</li>
+<li><strong>Phase <code>charge_recorded</code>.</strong> Store the charge ID, mark the order <code>paid</code>, set <code>recovery_point = 'charge_recorded'</code>. Commit.</li>
+<li><strong>Phase <code>finished</code>.</strong> Enqueue the receipt email through an outbox row, save the response, set <code>state = 'completed'</code>. Commit.</li>
+</ol>
+<p>If the process dies after step 2, the key is stuck in <code>order_created</code> with an expiring lease. The next attempt takes over and repeats step 2. The provider sees <code>ord_7f3a:charge</code> again and returns the original charge instead of creating a second one. Every phase is safe to repeat, so the whole request is. This is how an idempotent API calls a non-transactional world: <strong>pass a derived key to every downstream system that supports one</strong>, and record progress locally between calls.</p>
+
+<h3 id=dd-idempotency-which-responses level=3>Which outcomes to save</h3>
+<p>Not every result should be replayed forever. A working rule:</p>
+<ul>
+<li><strong>Save</strong> successes, and deterministic refusals that happened <em>after</em> execution began, such as "card declined". Retrying a decline with the same key should return the same decline, not try the card again.</li>
+<li><strong>Do not save</strong> validation failures that happened before any work, or "conflict, still in progress". Nothing was executed, so there is nothing to protect. Stripe documents behaviour along these lines.</li>
+<li><strong>Decide deliberately about 5xx.</strong> If the failure happened before any side effect, delete the claim so the retry can run again. Saving a transient 500 turns a 50 ms blip into a permanent failure for that key. If the failure happened after a side effect, keep the row and its recovery point so a retry resumes rather than restarts.</li>
+</ul>
+
+<h3 id=dd-idempotency-elsewhere level=3>The same mechanism under other names</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>System<th>What plays the key<th>Where it is remembered<th>Window<tbody>
+<tr><td>Kafka idempotent producer<td>Producer ID plus a per-partition sequence number on each batch<td>The partition leader tracks recent sequence numbers per producer (the last 5 batches)<td>For the producer session; epochs fence off old instances
+<tr><td>HTTP methods (RFC 9110)<td>The method itself: PUT and DELETE are defined as idempotent, GET as safe<td>Nowhere. The semantics carry it.<td>Unlimited, if the server honours the semantics
+<tr><td>HTTP conditional requests<td><code>If-Match: "etag"</code> on a PUT<td>The resource's current version<td>Unlimited
+<tr><td>DynamoDB<td>A condition such as <code>attribute_not_exists(pk)</code>; or <code>ClientRequestToken</code> on <code>TransactWriteItems</code><td>The item itself; the token is remembered for a short window (documented as 10 minutes)<td>Condition: unlimited. Token: short.
+<tr><td>SQS FIFO<td><code>MessageDeduplicationId</code><td>The queue<td>5 minutes
+<tr><td>Message consumers<td>Message or event ID<td>An inbox table, inserted in the same transaction as the effect<td>Your retention choice
+</tbody></table></div></div>
+<p>Look at the last column. Short windows (SQS's 5 minutes, DynamoDB's token window) protect against fast retries only. A message redelivered from a dead letter queue an hour later is outside them. Whenever a duplicate can arrive late, you need dedupe that you own and keep long enough.</p>
+
+<h3 id=dd-idempotency-key-choice level=3>Random keys or derived keys</h3>
+<p>The lesson's key, <code>ord_7f3a</code>, is a random ID minted at click time. The alternative is a <strong>derived</strong> key: a deterministic function of the business identity, such as <code>sha256("charge:" + order_id)</code>. Derived keys have one big advantage. Any process that knows the order ID computes the same key, even after a crash that lost all local state. Consumer code especially benefits: <code>event_id + ":" + handler_name</code> gives each handler its own key for the same event.</p>
+<p>Their risk is the opposite of the random key's. A derived key may be <em>too</em> stable. If the customer really does want to pay for the same order twice (a second, separate attempt after a decline), <code>charge:order_id</code> blocks it. Include whatever makes the intent unique, such as an attempt number that the user's action increments. Random keys are simplest for API clients. Derived keys are best for internal pipelines.</p>
+
+<h2 id=dd-idempotency-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-idempotency-retention level=3>How long to keep keys</h3>
+<p>The key must outlive every way a duplicate can arrive. Add up the windows rather than picking a round number:</p>
+<pre><code>retention ≥ client retry window
+          + queue redelivery and dead-letter replay window
+          + manual replay window (support re-running a job)
+          + safety margin</code></pre>
+<p>For the bookstore's checkout API, client retries span at most a minute, and Stripe-style 24 hours is generous. For a webhook consumer, the provider may retry for 3 days, and a support engineer may replay a dead-letter queue a week later. That consumer needs at least 7 days of dedupe. A 24-hour TTL there is a duplicate waiting to happen.</p>
+
+<h3 id=dd-idempotency-storage level=3>Storage and write cost at a larger scale</h3>
+<p>The lesson's checkout needs about 100 MB. Scale it to a payment platform with these assumptions: 50 million idempotent writes a day, 2 KB per saved response including the row overhead and index, and 7 days of retention.</p>
+<ul>
+<li>Rows held: 50 M × 7 = 350 million.</li>
+<li>Storage: 350 M × 2 KB = 700 GB. That is real, but well within one database cluster. Compress response bodies or store only the fields needed to rebuild the response, and it shrinks by several times.</li>
+<li>Write load: each request adds one insert and one update to the key table. At an average of about 580 writes per second (50 M / 86,400), that is about 1,160 extra row writes per second, doubling at peak. On a primary already busy with orders, measure this. It is often the largest real cost of the pattern.</li>
+<li>Expiry: deleting 50 M rows a day row by row is expensive in Postgres, because each delete creates dead tuples for vacuum. Partition the table by day and drop whole partitions instead. Dropping a partition is nearly free.</li>
+</ul>
+
+<h3 id=dd-idempotency-latency level=3>Latency: what the claim adds</h3>
+<p>In the same-database design, the claim is one extra indexed insert inside a transaction you already have. Expect well under a millisecond on the database, plus nothing for the network. A separate store such as Redis adds a full round trip, typically 0.3 to 1 ms in the same zone, and a second failure domain. A replay is cheap: one read by primary key, then return the saved body. The lesson's 5 ms is mostly HTTP overhead.</p>
+
+<h3 id=dd-idempotency-collisions level=3>Collision math for random keys</h3>
+<p>A UUIDv4 has 122 random bits. By the birthday bound, the chance of any collision among <code>n</code> keys is about <code>n² / 2^123</code>. For a trillion keys (10^12), that is about 10^24 / 10^37 = 10^-13. Collisions are not a real risk with a proper random source. Short keys are. A 6-character base-62 key has only about 5.7 × 10^10 values, and among a million keys the chance of some collision is near certainty. Scoping by account and keeping the full UUID removes the problem.</p>
+
+<h3 id=dd-idempotency-dup-rate level=3>Estimating how many duplicates you will see</h3>
+<p>For capacity and alerting, estimate the duplicate rate per source. With the lesson's checkout figures: 0.5% of calls time out, and one retry follows each, so about 0.5% of requests are retries. Add double-clicks (often 0.1% to 1% of form submits on web clients without button disabling) and queue redeliveries (near zero on a healthy day, but bursts of 100% of a partition after a consumer crash). Alert when the replay rate jumps. A sudden rise from 0.5% to 5% means something upstream is retrying far more than it should.</p>
+
+<h2 id=dd-idempotency-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-idempotency-fm-fresh-key level=3>1. The client mints a new key on every attempt</h3>
+<p><strong>Symptom:</strong> double charges continue after idempotency "shipped". The key store shows no replays at all. <strong>Mechanism:</strong> the key is generated inside the retry loop, or the HTTP client's middleware adds a fresh UUID per request. Every attempt looks new to the server. A variant: the mobile app generates the key in memory, the app is killed during the call, and on restart it creates a new one. <strong>Detect:</strong> a replay rate of exactly zero while the timeout rate is non-zero. Pairs of near-identical requests with different keys within seconds. <strong>Fix:</strong> generate the key when the user acts, persist it with the pending operation, and reuse it across attempts and restarts. Add a client test that kills the process mid-request and checks the key on restart.</p>
+
+<h3 id=dd-idempotency-fm-reused level=3>2. One key, two different requests</h3>
+<p><strong>Symptom:</strong> a customer buys a $20 gift card, then a $499 bundle. The second purchase "succeeds" instantly, but no charge appears and no bundle ships. <strong>Mechanism:</strong> the client used something too coarse as the key, such as the cart ID or the session ID. The second request carried the same key, and the server replayed the first response. <strong>Detect:</strong> fingerprint mismatches. If you store a request hash, count the cases where the key matches but the hash does not. Any non-zero count is a client bug. <strong>Fix:</strong> store and compare the request hash, and reject mismatches with 422. Document that a key names one operation, not one user or one cart.</p>
+
+<h3 id=dd-idempotency-fm-stuck level=3>3. Keys stuck "in progress" forever</h3>
+<p><strong>Symptom:</strong> a small number of orders return 409 on every retry, for hours. Support cannot complete them. <strong>Mechanism:</strong> the first attempt claimed the key in its own transaction, called the provider, and then the process crashed. The key row says <code>started</code> and nothing ever changes it. <strong>Detect:</strong> a gauge of keys in <code>started</code> older than a few times the request timeout. It should be close to zero at all times. <strong>Fix:</strong> give each claim a lease (<code>locked_until</code>). A retry that finds an expired lease takes over, resuming from the recovery point. Run a sweeper that finishes or fails abandoned keys, and make every phase safe to repeat so a takeover can't double anything.</p>
+
+<h3 id=dd-idempotency-fm-ttl level=3>4. The key expired before the duplicate arrived</h3>
+<p><strong>Symptom:</strong> after a consumer outage, an engineer replays the dead letter queue. Hundreds of customers get a second shipment. <strong>Mechanism:</strong> the consumer's dedupe TTL was 24 hours, copied from an API example. The DLQ replay happened on day 3. The keys were gone, so every replayed message was treated as new. <strong>Detect:</strong> compare the age of messages being processed with the dedupe TTL. Alert when any message older than the TTL is processed. <strong>Fix:</strong> derive retention from the longest replay window, not from habit. For effects that must never repeat, such as shipping, also guard with a natural constraint: a unique index on <code>(order_id)</code> in the shipments table survives any TTL.</p>
+
+<h3 id=dd-idempotency-fm-cache-store level=3>5. A cache used as the key store forgets</h3>
+<p><strong>Symptom:</strong> rare duplicates, clustered around Redis failovers and memory-pressure events. <strong>Mechanism:</strong> the claim was <code>SET key NX EX 86400</code> in Redis, and the effect was written to Postgres. Two things can lose the key. Redis replication is asynchronous, so a failover can promote a replica that never received the <code>SET</code>. And with an eviction policy like <code>allkeys-lru</code>, Redis may evict keys before their TTL under memory pressure. Either way, the next duplicate finds nothing and executes. <strong>Detect:</strong> Redis <code>evicted_keys</code> rising, failover events, and duplicates found by a reconciliation job against the business table. <strong>Fix:</strong> keep the key in the same database as the effect, inside the same transaction. If you must use a cache for speed, treat it as a fast first check, with a unique constraint in the database as the real guarantee.</p>
+
+<h3 id=dd-idempotency-fm-downstream level=3>6. Your API is idempotent, but your call to the provider is not</h3>
+<p><strong>Symptom:</strong> the bookstore's own logs show one execution per key, yet the payment provider shows two charges. <strong>Mechanism:</strong> inside the protected execution, the payment client has its own retry on timeout, without an idempotency key. One execution of your handler produced two provider calls. Or a takeover after a crash repeated the provider call with no key. <strong>Detect:</strong> reconcile your charge records against the provider's daily report. A provider charge with no matching local record is the sign. <strong>Fix:</strong> pass a derived key, such as <code>ord_7f3a:charge</code>, on every downstream call that accepts one. For providers that do not, record the intent before calling and check the provider's records before any repeat.</p>
+
+<h3 id=dd-idempotency-fm-cached-error level=3>7. A transient error is replayed forever</h3>
+<p><strong>Symptom:</strong> during a 30-second database blip, some checkouts failed. Hours later, those customers still get the same 500 every time they click Pay. <strong>Mechanism:</strong> the server saved every response, including the 500 from the blip. Every retry with the same key correctly replays that 500. <strong>Detect:</strong> saved 5xx responses in the key store, and replays of them. <strong>Fix:</strong> do not save failures that happened before any side effect; delete the claim instead, so a retry runs fresh. If the failure happened after a side effect, keep the row in <code>started</code> with its recovery point, so the retry resumes.</p>
+
+<h2 id=dd-idempotency-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Mechanism<td>Natural idempotency (set semantics, upsert, conditional write)<td>Idempotency key store<td>You can express the write as a full-value set or a versioned update. Choose keys for increments, appends, external calls and anything that creates a new resource.
+<tr><td>Key store location<td>Same database and transaction as the effect<td>Separate store (Redis, a dedupe service)<td>Almost always. Choose B only as a fast pre-check, backed by a database constraint.
+<tr><td>Key origin<td>Random, minted by the client at action time<td>Derived from business identity<td>The caller is an external API client. Choose derived keys for internal consumers and pipelines, where a restarted process must recompute the same key.
+<tr><td>What is stored<td>Full response, replayed byte for byte<td>Marker only; the response is rebuilt from current state<td>Callers need exactly the original answer (payments). B saves space when the response can be recomputed and current state is acceptable.
+<tr><td>Concurrent duplicate<td>Return 409 "in progress"<td>Block and wait for the first attempt's result<td>Requests can be slow, and holding a connection open is costly. Choose B for short operations where clients handle 409 poorly.
+<tr><td>Where dedupe happens<td>Consumer (inbox table, unique key)<td>Producer or broker (Kafka idempotent producer, SQS FIFO)<td>Always A for effects. B removes duplicates in transport only, and only inside its window; it cannot protect a consumer that crashes after acting but before committing its offset.
+<tr><td>Expiry<td>TTL by time<td>Keep forever as a unique constraint<td>The key table is large and duplicates are only plausible for a bounded time. Choose B when a natural identity exists (one shipment per order) and the duplicate would be very costly.
+</tbody></table></div></div>
+<p>An opinion on the first row: <strong>try hard to make the key store unnecessary</strong>. Many operations that look like increments can be rewritten as sets with a version check. "Reserve one copy" becomes "set reservation row (order 42, SKU 9) to quantity 1" with a unique index on the pair. A natural constraint never expires, never needs a sweeper, and cannot be bypassed by a client that sends the wrong key.</p>
+<p>And on the producer row: <strong>broker-level dedupe is transport hygiene, not business correctness</strong>. Kafka's idempotent producer stops duplicate batches in a partition. It does nothing if your consumer charges a card and then crashes before committing its offset. The consumer will see that message again, and only consumer-side idempotency saves you.</p>
+
+<h2 id=dd-idempotency-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Which operations in this design are not naturally idempotent? Could any be rewritten as a set, an upsert or a conditional write instead?</li>
+<li>Who creates the key, at what moment, and where is it persisted so that it survives a client crash and restart?</li>
+<li>Is the key scoped to the caller (account or tenant) in the uniqueness constraint?</li>
+<li>Is the claim an atomic insert-if-absent? Show the statement. Is there any check-then-write path left?</li>
+<li>Do the claim, the effect and the saved response commit in one transaction? If not, what are the recovery points?</li>
+<li>Is a request fingerprint stored and compared? What happens when a key is reused with a different body?</li>
+<li>What does a concurrent duplicate receive? What happens to a key whose first attempt crashed mid-way?</li>
+<li>Which outcomes are saved and replayed? Are transient pre-execution failures excluded?</li>
+<li>How long are keys kept, and how was that derived from the longest retry, redelivery and replay windows?</li>
+<li>Is a derived key passed to every downstream system that accepts one (payment providers, other internal APIs)?</li>
+<li>Are side effects such as emails and webhooks inside the boundary, or idempotent on their own keys?</li>
+<li>Are replay rate, fingerprint mismatches and stuck <code>started</code> keys measured and alerted on?</li>
+</ol>
+
+<h2 id=dd-idempotency-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"The first request claimed the key, charged the card, and then the server crashed. What does the retry see?"</summary>
+<p>It depends on whether the claim was committed separately from the work. If everything ran in one local transaction, the crash rolled back the claim too, and the retry runs fresh. But a card charge is external, so it cannot be in that transaction. In the phased design, the key is committed at <code>order_created</code> with a lease. The retry waits for the lease to expire, takes over, and repeats the charge call with the same derived key. The provider recognises it and returns the original charge. No double charge, and no stuck key.</p>
+</details>
+<details>
+<summary>"Why store a hash of the request body?"</summary>
+<p>To catch a key reused for a different operation. Without the hash, a buggy client that sends the same key with a new $499 body gets the saved response from an earlier $20 call. The client believes the purchase succeeded, and nothing was charged or shipped. With the hash, the server sees the mismatch and rejects it with 422, which surfaces the bug immediately.</p>
+</details>
+<details>
+<summary>"Can you use Redis <code>SET NX</code> as the key store?"</summary>
+<p>As a fast pre-check, yes. As the guarantee, not for money. Redis replication is asynchronous, so a failover can lose a recent <code>SET</code>, and some eviction policies drop keys before their TTL under memory pressure. Either way a duplicate executes. The claim and the effect also live in different systems, so they can't commit atomically. Put the real guarantee, a unique constraint, in the same database transaction as the effect.</p>
+</details>
+<details>
+<summary>"Kafka has exactly-once semantics. Why do consumers still need idempotency?"</summary>
+<p>Kafka's guarantee covers reads and writes inside Kafka: the idempotent producer stops duplicate batches, and transactions commit output records with consumer offsets atomically. An external effect, such as a card charge or an email, is outside that transaction. A consumer that performs the effect and then crashes before committing its offset will process the message again. Only an idempotent effect, keyed on the message, makes that safe.</p>
+</details>
+<details>
+<summary>"How long should idempotency keys live?"</summary>
+<p>Longer than the latest a duplicate can arrive. That is the sum of the client retry window, queue redelivery, dead-letter replay and any manual replay, plus a margin. For a synchronous API with short client retries, 24 hours is generous. For a webhook or queue consumer, it is often 7 days or more. Where the duplicate would be very costly, back the TTL with a permanent natural constraint, such as one shipment per order.</p>
+</details>
+<details>
+<summary>"Is PUT idempotent by definition? Then why do PUT endpoints still double things?"</summary>
+<p>HTTP defines PUT as idempotent, but that is a contract the server must honour, not something the protocol enforces. A PUT handler that appends a history row, sends an email or increments a counter breaks it. And a sequence of idempotent PUTs can still be reordered by retries, so an old value overwrites a new one. Conditional requests with <code>If-Match</code> and an ETag fix the ordering problem.</p>
+</details>
+<details>
+<summary>"Two identical requests with the same key arrive 1 ms apart. Walk me through the database."</summary>
+<p>Both run <code>INSERT … ON CONFLICT DO NOTHING</code>. The first takes the unique index entry. In Postgres, the second waits on that entry until the first transaction commits or rolls back. If the first commits, the second's insert does nothing and returns no row, so it reads the saved response and replays it. If the first rolls back, the second's insert succeeds and it executes. In a phased design where the claim is committed early, the second instead sees a <code>started</code> row with a live lease and returns 409.</p>
+</details>
+<details>
+<summary>"When is an idempotency key the wrong tool?"</summary>
+<p>When the operation can be made naturally idempotent, when duplicates are harmless downstream, or when the "duplicate" is a business rule. "Don't let the same user place the same order twice in a minute" is product policy. A key means "this is the same operation, retried", and a customer's deliberate second order is a new operation with a new key. Mixing the two produces either blocked real purchases or a dedupe rule that retries quietly bypass.</p>
+</details>

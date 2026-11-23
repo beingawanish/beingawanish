@@ -1,0 +1,34 @@
+{
+  "type": "record",
+  "name": "AuthorizePayment",
+  "namespace": "com.edacommerce.payment",
+  "doc": "Command: reserve funds on the customer's payment method.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "paymentId",
+      "type": "string",
+      "doc": "Minted by the orchestrator. Used as the PSP idempotency key."
+    },
+    {
+      "name": "customerId",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "paymentMethodToken",
+      "type": "string"
+    }
+  ]
+}

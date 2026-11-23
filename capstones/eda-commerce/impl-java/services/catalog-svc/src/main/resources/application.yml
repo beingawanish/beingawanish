@@ -1,0 +1,6 @@
+eda:
+  service-name: catalog-svc
+  consumer:
+    topics: [inventory.stock-level.v1]
+server:
+  port: 8101

@@ -1,0 +1,42 @@
+{
+  "type": "record",
+  "name": "RefundPayment",
+  "namespace": "com.edacommerce.payment",
+  "doc": "Command: return captured funds, fully or partly.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "paymentId",
+      "type": "string"
+    },
+    {
+      "name": "refundId",
+      "type": "string",
+      "doc": "Minted by the caller. Used as the PSP idempotency key."
+    },
+    {
+      "name": "returnId",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "amount",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "reason",
+      "type": "string"
+    }
+  ]
+}

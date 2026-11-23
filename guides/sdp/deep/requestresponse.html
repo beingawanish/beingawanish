@@ -1,0 +1,254 @@
+<h2 id=dd-requestresponse-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson treats a synchronous call as one arrow. In production that arrow is a stack of moving parts: a connection pool, a wire protocol, a deadline, and a retry policy. Each part has knobs. Most outages that blame "the network" are really one of those knobs set wrong.</p>
+
+<h3 id=dd-requestresponse-what-a-new-connection-costs level=3>What a new connection really costs</h3>
+<p>Before the first byte of a request can travel, the client pays for setup. TCP needs one round trip for its handshake. TLS 1.3 adds one more round trip. TLS 1.2 adds two. Then the request itself takes a round trip.</p>
+<p>Take checkout in one region calling a pricing service in another, with a 70 ms round trip:</p>
+<ul>
+<li><strong>New connection, TLS 1.3:</strong> 70 (TCP) + 70 (TLS) + 70 (request) = 210 ms.</li>
+<li><strong>New connection, TLS 1.2:</strong> 70 + 140 + 70 = 280 ms.</li>
+<li><strong>Reused connection:</strong> 70 ms.</li>
+</ul>
+<p>So a cold connection triples or quadruples the cost of a cross-region call. TLS 1.3 also offers 0-RTT resumption, which sends data with the first handshake message. It comes with a catch: 0-RTT data can be replayed by an attacker, so servers should accept it only for idempotent requests. Inside a data center the round trip is well under a millisecond, so the handshake matters less for latency. It still costs CPU, and the TLS key exchange is the expensive part.</p>
+
+<h3 id=dd-requestresponse-the-pool level=3>The pool and its four knobs</h3>
+<p>A connection pool keeps open connections per destination and lends them to requests. Every HTTP client has one, and each exposes roughly the same knobs:</p>
+<ul>
+<li><strong>Maximum connections per host.</strong> Caps concurrency to one destination. Too low, and requests queue inside your own process waiting for a connection. Too high, and a slow dependency can soak up thousands of sockets.</li>
+<li><strong>Maximum idle connections.</strong> How many open-but-unused connections to keep. Go's <code>http.Transport</code> keeps only 2 idle connections per host by default (<code>MaxIdleConnsPerHost</code>). Python's <code>requests</code> keeps 10 per host (<code>pool_maxsize</code>). Under real concurrency both defaults cause connection churn.</li>
+<li><strong>Idle timeout.</strong> How long an unused connection stays open. This must be <em>shorter</em> than the server's or load balancer's idle timeout, or you get the race described in failure mode 1.</li>
+<li><strong>Maximum lifetime.</strong> Closes connections after a fixed age even when busy. This lets DNS changes and new backend instances take effect. Without it, a long-lived pool keeps talking to the same few servers forever.</li>
+</ul>
+<p>A fifth knob hides in most clients: the <strong>acquire timeout</strong>, or how long a request waits for a free connection. Many clients wait forever by default. That turns a slow dependency into a blocked caller, which is exactly what the <a href="#bulkhead">Bulkhead</a> lesson guards against.</p>
+
+<h3 id=dd-requestresponse-wire-protocols level=3>HTTP/1.1, HTTP/2 and gRPC on the wire</h3>
+<p><strong>HTTP/1.1</strong> sends one request at a time per connection. Pipelining exists in the spec, but almost nothing uses it, because responses must come back in order. So concurrency means more connections. Browsers open about six per host. A service calling another at 500 requests in flight needs about 500 connections.</p>
+<p><strong>HTTP/2</strong> splits one TCP connection into many <strong>streams</strong>. Each request and its response is a stream with its own ID. The protocol cuts everything into small binary frames (HEADERS, DATA, SETTINGS, WINDOW_UPDATE, RST_STREAM, GOAWAY) and interleaves frames from different streams. Three details matter in design reviews:</p>
+<ul>
+<li><strong>Concurrent stream limit.</strong> The server announces <code>SETTINGS_MAX_CONCURRENT_STREAMS</code>. A value of 100 is common, though it varies by server. Past that limit, the client must queue or open another connection.</li>
+<li><strong>Flow control.</strong> Each stream and the connection as a whole have a receive window. The default initial window is 65,535 bytes. A receiver that reads slowly stops the sender on that stream. Large transfers over high-latency links need bigger windows, or throughput collapses.</li>
+<li><strong>Cancellation.</strong> <code>RST_STREAM</code> cancels one request without closing the connection. On HTTP/1.1 the only way to abandon a request is to close the whole connection, which then has to be rebuilt.</li>
+</ul>
+<p>HTTP/2 removes head-of-line blocking at the request level, but not at the TCP level. TCP delivers bytes in order. When one packet is lost, every stream on that connection waits for the retransmission. On clean data-center networks this rarely shows. On lossy mobile links it does, and that is the main reason HTTP/3 runs over QUIC, which keeps streams independent.</p>
+<p><strong>gRPC</strong> is a contract on top of HTTP/2: Protocol Buffers for the body, a method path like <code>/pricing.Pricing/GetQuote</code>, status codes in trailers, and four call shapes (unary, server streaming, client streaming, bidirectional). It also carries the call's deadline in a header, <code>grpc-timeout</code>. That one header is the most useful thing gRPC adds, as the next section shows.</p>
+
+<h3 id=dd-requestresponse-deadlines level=3>Timeouts versus deadlines</h3>
+<p>A <strong>timeout</strong> is a duration that one hop picks for itself: "wait 2 s for pricing." A <strong>deadline</strong> is an absolute point in time that the whole request shares: "this checkout must be done by 12:00:00.800." The difference shows up as soon as the chain is more than one hop deep.</p>
+<p>Clients usually have three separate timeouts. The <strong>connect timeout</strong> covers the TCP and TLS setup; keep it short, around a few round trips. The <strong>read timeout</strong> covers the gap between bytes and often resets every time a byte arrives. That means a server trickling one byte per second never trips it. The <strong>total timeout</strong> covers the whole call. Only the total timeout protects you, and it is the one most often left unset.</p>
+<p>With deadline propagation, each hop forwards the time remaining, minus what it has already spent. gRPC does this for you when you pass the incoming context into the outgoing call. With plain HTTP you do it by hand, often with a header like <code>X-Request-Deadline</code>. The server should check the remaining budget <em>before</em> doing expensive work. A request whose caller has already given up is pure waste.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-requestresponse-svg-title dd-requestresponse-svg-desc" viewBox="0 0 720 250" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-requestresponse-svg-title">Deadline propagation across three hops</title>
+<desc id="dd-requestresponse-svg-desc">A bar for each hop shows the remaining time budget. The edge starts with 800 ms. Checkout receives 780 ms, spends 120 ms, and passes 640 ms to payment. Payment spends 90 ms and passes 530 ms to the fraud service. A dashed line marks the shared deadline, which never moves.</desc>
+<rect x="0" y="0" width="720" height="250" fill="#ffffff"/>
+<line x1="660" y1="20" x2="660" y2="225" stroke="#1f5f99" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="655" y="240" font-size="13" fill="#1f5f99" text-anchor="end">deadline 12:00:00.800</text>
+<text x="20" y="48" font-size="14" fill="#1c2430">Edge</text>
+<rect x="140" y="32" width="520" height="26" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="150" y="50" font-size="13" fill="#1c2430">800 ms budget</text>
+<text x="20" y="98" font-size="14" fill="#1c2430">Checkout</text>
+<rect x="153" y="82" width="78" height="26" fill="#d5dee8"/>
+<rect x="231" y="82" width="429" height="26" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="160" y="100" font-size="12" fill="#5c6b7c">spent 120</text>
+<text x="240" y="100" font-size="13" fill="#1c2430">grpc-timeout: 640m</text>
+<text x="20" y="148" font-size="14" fill="#1c2430">Payment</text>
+<rect x="231" y="132" width="71" height="26" fill="#d5dee8"/>
+<rect x="302" y="132" width="358" height="26" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="236" y="150" font-size="12" fill="#5c6b7c">spent 90</text>
+<text x="311" y="150" font-size="13" fill="#1c2430">grpc-timeout: 530m</text>
+<text x="20" y="198" font-size="14" fill="#1c2430">Fraud</text>
+<rect x="315" y="182" width="345" height="26" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="324" y="200" font-size="13" fill="#1c2430">checks budget before scoring</text>
+</svg>
+<figcaption>Each hop forwards the time left, not a fresh timeout. Network time between hops (about 20 ms here) also comes out of the budget.</figcaption>
+</figure>
+
+<h3 id=dd-requestresponse-idempotent-methods level=3>Which methods are safe to retry</h3>
+<p>HTTP semantics (RFC 9110) split methods into two groups that matter for retries. <strong>Safe</strong> methods (GET, HEAD, OPTIONS, TRACE) promise not to change state. <strong>Idempotent</strong> methods are the safe ones plus PUT and DELETE: sending them twice leaves the same result as sending them once. POST and PATCH promise neither.</p>
+<p>The method is a promise, not a guarantee. A GET that increments a view counter breaks it. A POST can become safe to retry with an <code>Idempotency-Key</code> header, which the server stores alongside the result, as the <a href="#idempotency">Idempotency</a> lesson builds. The rule that ties this together:</p>
+<blockquote>
+<p><strong>Whether a retry is safe depends on two things: whether the request could have reached the server, and whether running it twice is harmless.</strong></p>
+</blockquote>
+<p>A refused connection never reached the server, so any method can be retried. A timeout after the request was sent is ambiguous: the server may have done the work. Only idempotent requests, or ones carrying an idempotency key, can be retried after that.</p>
+<p>gRPC lets you declare this per method in its service config: a <code>retryPolicy</code> with <code>maxAttempts</code>, backoff settings and <code>retryableStatusCodes</code> (usually just <code>UNAVAILABLE</code>), plus a <code>retryThrottling</code> token bucket that stops retries when the failure rate climbs. It also supports a <code>hedgingPolicy</code>, covered below.</p>
+
+<h2 id=dd-requestresponse-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-requestresponse-pool-sizing level=3>Sizing the pool with Little's law</h3>
+<p>Little's law says that the number of requests in flight equals the arrival rate times the time each one spends in the system. It is the only formula you need for pool sizing.</p>
+<p>Checkout calls pricing at 300 requests per second. Pricing's median latency is 40 ms and its p99 is 250 ms.</p>
+<ul>
+<li>At the median: 300 x 0.040 = 12 connections in use.</li>
+<li>During a slow minute where every call takes the p99: 300 x 0.250 = 75 connections.</li>
+<li>If pricing hangs until your 2-second timeout: 300 x 2 = 600 connections.</li>
+</ul>
+<p>Size the pool for the bad-but-normal case (here about 75 to 100), not the median. Then set the acquire timeout short, say 50 ms. If pricing degrades further, extra requests fail fast instead of piling up behind the pool. On HTTP/2 the same math gives streams, not connections. 75 concurrent streams fit on one connection with a 100-stream limit, though running two or more connections spreads the load across backends.</p>
+
+<h3 id=dd-requestresponse-port-math level=3>Ephemeral ports and connection churn</h3>
+<p>Every outbound connection uses a local port. Linux's default ephemeral range is 32768 to 60999, about 28,000 ports. When the client closes a connection, that port sits in TIME_WAIT for 60 seconds on Linux before reuse.</p>
+<p>So one client host talking to one destination IP and port can sustain only about 28,000 / 60, or roughly 470 new connections per second. A service that opens a fresh connection per request at 1,000 requests per second runs out of ports within a minute. Pooling fixes this completely: 75 pooled connections serve the same traffic with no churn at all.</p>
+
+<h3 id=dd-requestresponse-fan-out-math level=3>Fan-out and the tail</h3>
+<p>Suppose a product page fans out in parallel to N backends, and each backend is slow (past its p99) 1% of the time, independently. The page is slow whenever <em>any</em> backend is slow:</p>
+<p>P(page slow) = 1 − 0.99<sup>N</sup></p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Fan-out (N)<th>Requests that hit at least one backend's p99<tbody><tr><td>1<td>1%<tr><td>5<td>4.9%<tr><td>20<td>18.2%<tr><td>100<td>63.4%</table></div></div>
+<p>This is the core result of Dean and Barroso's "The Tail at Scale." With five parallel calls, your endpoint's p95 is roughly each backend's p99. With a search page that queries 100 index shards, the backend's p99 becomes the page's <em>median</em>. Improving the average does nothing here. Only the tail of each backend matters.</p>
+<p>Utilization makes the tail worse. In a simple queueing model (M/M/1), time in the system is service time divided by (1 − utilization). A backend with a 10 ms service time takes about 20 ms at 50% utilization, 50 ms at 80%, and 100 ms at 90%. Run fan-out backends hot and the tail explodes first.</p>
+
+<h3 id=dd-requestresponse-hedging-math level=3>Hedged requests: buying the tail with load</h3>
+<p>A <strong>hedged request</strong> sends a second copy of a call to another replica if the first has not answered within some delay, then uses whichever answer comes first. Set the delay at the backend's p95, and only about 5% of calls send a second copy. You pay about 5% extra load and, for reads, cut the tail sharply. The Tail at Scale paper reports a large p99.9 reduction for a small load increase in Google's own tests.</p>
+<p>Two limits apply. Hedge only idempotent reads. And cancel the loser (HTTP/2's <code>RST_STREAM</code> makes this cheap), or the extra load stays on the backend.</p>
+
+<h3 id=dd-requestresponse-retry-math level=3>Retry amplification</h3>
+<p>Say each layer makes up to 3 attempts (1 try plus 2 retries). Checkout calls payment, payment calls fraud, fraud calls a feature store. When the feature store is down, every layer retries:</p>
+<p>3 (checkout) x 3 (payment) x 3 (fraud) = <strong>27 attempts</strong> on the feature store for one user click.</p>
+<p>At 300 checkouts per second, that is 8,100 requests per second against a service that is already failing. Add a fourth layer and it becomes 81x. The fix is structural: retry at one layer only (usually the one closest to the user, or the one with the idempotency key), and cap retries as a share of traffic. A <strong>retry budget</strong> such as "retries may add at most 10% to normal request volume" keeps the worst case at 1.1x instead of 27x.</p>
+
+<h3 id=dd-requestresponse-budget-math level=3>Splitting a latency budget</h3>
+<p>The store's checkout SLO is 800 ms at the edge. A workable split, with numbers you can redo:</p>
+<ul>
+<li>Edge and auth: 50 ms.</li>
+<li>Cart, pricing and inventory in parallel: the slowest p99 is 150 ms, so set the timeout at 200 ms.</li>
+<li>Payment, which calls fraud: p99 300 ms, timeout 400 ms. One retry does not fit inside the budget, so payment gets zero retries here and relies on its idempotency key for a user-driven retry.</li>
+<li>Remaining slack: 800 − 50 − 200 − 400 = 150 ms for serialization, network and margin.</li>
+</ul>
+<p>Notice that the budget, not a habit, decided the retry count. A retry is only worth having if it can finish before the deadline.</p>
+
+<h2 id=dd-requestresponse-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-requestresponse-fm-keepalive-race level=3>1. Random 502s during quiet periods</h3>
+<p><strong>Symptom.</strong> A small, steady trickle of 502 errors at the load balancer. They get worse at night, when traffic is low, which feels backwards.</p>
+<p><strong>Mechanism.</strong> The load balancer keeps idle connections to the backend for 60 seconds (AWS ALB's default idle timeout). The backend is a Node.js server, whose <code>keepAliveTimeout</code> defaults to 5 seconds. After 5 idle seconds the backend closes the connection. If the load balancer sends a request on it at that same moment, the backend answers with a TCP reset and the load balancer returns 502. Low traffic means more idle connections hitting that window.</p>
+<p><strong>Detect.</strong> 502s at the load balancer with no matching error in the application log. Load balancer logs show the backend closed the connection or reset it. Packet captures show a RST right after the request.</p>
+<p><strong>Fix.</strong> The side that reuses a connection must give up on it first. Set the server's keep-alive timeout longer than the load balancer's (for Node.js, also raise <code>headersTimeout</code> above it). For your own clients, set the pool's idle timeout below the server's. Also allow an automatic retry when a reused connection fails before any response byte arrives, since the request never ran.</p>
+
+<h3 id=dd-requestresponse-fm-port-exhaustion level=3>2. "Cannot assign requested address"</h3>
+<p><strong>Symptom.</strong> Under load, outbound calls fail with <code>EADDRNOTAVAIL</code>, while the destination is perfectly healthy.</p>
+<p><strong>Mechanism.</strong> The client opens a new connection per request, or its idle pool is too small (Go's default of 2 idle connections per host is the classic case). Connections close as fast as they open. Closed ports pile up in TIME_WAIT, and the roughly 470-per-second limit from the sizing section is hit.</p>
+<p><strong>Detect.</strong> <code>ss -s</code> shows tens of thousands of sockets in TIME_WAIT. The connection-open rate per host is close to the request rate.</p>
+<p><strong>Fix.</strong> Raise the idle pool size to match concurrency and make sure response bodies are fully read and closed (an unread body often prevents the connection from returning to the pool). Kernel tweaks like widening the port range buy time, but they do not fix the cause.</p>
+
+<h3 id=dd-requestresponse-fm-pool-starvation level=3>3. One slow dependency takes down everything</h3>
+<p><strong>Symptom.</strong> The recommendations service slows down. Minutes later, checkout, search and login all time out, even though they never call recommendations.</p>
+<p><strong>Mechanism.</strong> The web tier shares one worker pool, say 200 threads. Each recommendation call now takes 5 s instead of 50 ms. Little's law: at 50 calls per second, 250 threads are needed just for recommendations. They take every thread, and unrelated requests have nothing left to run on.</p>
+<p><strong>Detect.</strong> Thread pool or connection pool utilization near 100%, with the acquire-wait time climbing. A trace of a stuck login shows it waiting for a thread, not for any downstream service.</p>
+<p><strong>Fix.</strong> Give each dependency its own capped pool (<a href="#bulkhead">Bulkhead</a>), a short acquire timeout, a total timeout well below 5 s, and a <a href="#circuit-breaker">circuit breaker</a>. Async I/O frameworks move the limit from threads to memory and sockets, but the same math applies.</p>
+
+<h3 id=dd-requestresponse-fm-retry-storm level=3>4. Retry storm keeps a service down</h3>
+<p><strong>Symptom.</strong> The fraud service has a 30-second blip and recovers. But its traffic is now 10x normal and it falls over again, and again.</p>
+<p><strong>Mechanism.</strong> Nested retries multiply (27x in the sizing example). Retries without jitter also line up, so they arrive in synchronized waves. Every client's timeout fires at the same moment, retries go out together, and the recovering service sees a spike far bigger than normal load.</p>
+<p><strong>Detect.</strong> Compare requests received by the backend with unique user requests at the edge. A ratio far above 1 is amplification. Tracing shows the same call repeated many times inside one trace.</p>
+<p><strong>Fix.</strong> One retrying layer, exponential backoff with full jitter (see <a href="#retry-with-exponential-backoff">Retry with Exponential Backoff</a>), a retry budget, and respect for <code>Retry-After</code> on 429 and 503. Servers should shed load early with a cheap 503 instead of slowly timing out.</p>
+
+<h3 id=dd-requestresponse-fm-sticky-connections level=3>5. New pods get no traffic</h3>
+<p><strong>Symptom.</strong> You scale a gRPC service from 4 pods to 12 during a spike. The 4 old pods stay at 95% CPU. The 8 new ones sit idle.</p>
+<p><strong>Mechanism.</strong> A layer-4 load balancer, such as a Kubernetes ClusterIP service, balances <em>connections</em>, not requests. gRPC clients open one HTTP/2 connection and multiplex every call over it for hours. Existing connections never move, so new pods only get clients that connect after they start.</p>
+<p><strong>Detect.</strong> Per-pod request rate is badly skewed while connection counts stay flat. The pattern appears after every scale-out or deploy.</p>
+<p><strong>Fix.</strong> Balance per request at layer 7 (Envoy, a <a href="#service-mesh">service mesh</a>, or a gRPC-aware load balancer), or use client-side round-robin over a headless service. Also set a server-side maximum connection age (gRPC's <code>MAX_CONNECTION_AGE</code>), which sends GOAWAY so clients reconnect and spread out.</p>
+
+<h3 id=dd-requestresponse-fm-zombie-work level=3>6. Work nobody is waiting for</h3>
+<p><strong>Symptom.</strong> During an incident the database is at 100% CPU. Most of its queries belong to requests that already returned errors to users.</p>
+<p><strong>Mechanism.</strong> The edge times out at 1 s. But checkout uses its own fresh 3-second timeout toward inventory, and inventory gives the database 10 seconds. Nobody forwards the deadline. When the edge gives up, the work below keeps running for up to 10 seconds, and the user's retry adds a second copy on top. The system does more work the slower it gets.</p>
+<p><strong>Detect.</strong> Nginx logs status 499 (client closed request) in large numbers. Server-side spans finish long after their parent span was cancelled. gRPC logs <code>CANCELLED</code> and <code>DEADLINE_EXCEEDED</code> on the server side.</p>
+<p><strong>Fix.</strong> Propagate the deadline. Make every hop's timeout the minimum of its own limit and the time remaining. Check the remaining budget before queuing or starting expensive work, and drop requests from internal queues whose deadline has passed. Cancel downstream calls when the upstream request is cancelled.</p>
+
+<h3 id=dd-requestresponse-fm-fan-out-tail level=3>7. The p99 nobody can find</h3>
+<p><strong>Symptom.</strong> The search page's p99 is 900 ms. Every one of its 40 shard backends reports a p99 under 150 ms. Each team insists their service is fine.</p>
+<p><strong>Mechanism.</strong> Fan-out math. With 40 shards, 1 − 0.99<sup>40</sup> = 33% of page loads hit at least one shard's p99. The page's p99 is therefore set by the shards' p99.9 and worse: garbage-collection pauses, cold caches, one noisy neighbor. Averages and per-service p99s hide this.</p>
+<p><strong>Detect.</strong> Look at the slowest span inside each slow trace, not at per-service dashboards. <a href="#distributed-tracing">Distributed tracing</a> with tail-based sampling keeps the slow traces you need. Rotate through shards: usually a different one is slowest each time.</p>
+<p><strong>Fix.</strong> Reduce fan-out where you can, hedge reads after the p95, return partial results when a few shards miss the deadline (with a flag saying so), and set alerts on backend p99.9, not p99.</p>
+
+<h2 id=dd-requestresponse-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-requestresponse-choose-protocol level=3>Choosing the wire protocol</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th>HTTP/1.1 + JSON<th>HTTP/2 + JSON<th>gRPC<th>HTTP/3<tbody><tr><td>Concurrency per connection<td>One request at a time<td>Many streams<td>Many streams<td>Many streams<tr><td>Head-of-line blocking<td>Per connection<td>At TCP level only<td>At TCP level only<td>None across streams<tr><td>Load balancing<td>Any L4 or L7 balancer works<td>Needs L7 for even spread<td>Needs L7 or client-side<td>Needs QUIC-aware balancer<tr><td>Contract<td>Informal or OpenAPI<td>Informal or OpenAPI<td>Strict schema (protobuf), generated clients<td>Same as HTTP<tr><td>Deadlines and cancellation<td>Hand-rolled header; cancel by closing<td>Hand-rolled header; RST_STREAM<td>Built in<td>Hand-rolled header<tr><td>Streaming<td>Awkward (chunked)<td>Possible<td>Four call types built in<td>Possible<tr><td>Debugging with curl and logs<td>Easiest<td>Easy<td>Needs tooling (grpcurl)<td>Tooling still uneven<tr><td>Best fit<td>Public APIs, simple services<td>Browser and public APIs at scale<td>Internal service-to-service<td>Mobile and lossy networks</table></div></div>
+<p>The rough guidance: use gRPC between your own services when you control both ends and have an L7 balancer or mesh. Its deadline propagation and schemas pay for themselves. Use HTTP with JSON at the public edge, because every client speaks it. Use HTTP/3 where clients sit on mobile networks. Inside a data center, it rarely matters.</p>
+
+<h3 id=dd-requestresponse-choose-retry-location level=3>Where retries and timeouts live</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Option<th>Good at<th>Risk<tbody><tr><td>Client library in each service<td>Knows which calls are idempotent; can use idempotency keys<td>Every team configures it differently; nested retries<tr><td>Service mesh sidecar<td>Uniform policy, retry budgets, per-request balancing<td>Retries things the app considers unsafe unless configured per route; hides behavior from developers<tr><td>Edge or API gateway only<td>One place, easy to audit<td>Too coarse; one retry re-runs the whole chain<tr><td>No retries, fail fast<td>Simplest; no amplification<td>Every transient blip reaches the user</table></div></div>
+<p>Pick <strong>one</strong> layer per call path that owns retries, and turn them off elsewhere. Timeouts are the opposite: every layer needs one, all derived from the same propagated deadline.</p>
+
+<h3 id=dd-requestresponse-snippet level=3>A deadline-aware retry, in code</h3>
+<p>This sketch shows the three rules together: retry only idempotent requests or ones with a key, never past the deadline, and only within a budget. It uses only the Python standard library.</p>
+<pre><code>import random, time, urllib.request, urllib.error
+
+RETRYABLE = {429, 502, 503, 504}
+
+def call(url, deadline, method="GET", body=None, key=None, budget=None):
+    """deadline: absolute time.monotonic() value shared by the whole request."""
+    safe_to_retry = method in {"GET", "HEAD", "PUT", "DELETE"} or key is not None
+    attempt = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining &lt;= 0.005:
+            raise TimeoutError("deadline exceeded before sending")
+        req = urllib.request.Request(url, data=body, method=method)
+        req.add_header("X-Request-Deadline-Ms", str(int(remaining * 1000)))
+        if key:
+            req.add_header("Idempotency-Key", key)
+        try:
+            with urllib.request.urlopen(req, timeout=remaining) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code not in RETRYABLE:
+                raise
+            err = e
+        except (urllib.error.URLError, TimeoutError) as e:
+            err = e
+        attempt += 1
+        if not safe_to_retry or attempt &gt;= 3 or (budget and not budget.try_spend()):
+            raise err
+        backoff = random.uniform(0, 0.05 * 2 ** attempt)   # full jitter
+        if time.monotonic() + backoff &gt;= deadline:
+            raise err
+        time.sleep(backoff)</code></pre>
+<p><code>budget.try_spend()</code> stands for a token bucket that refills by 0.1 token per normal request, which caps retries at about 10% of traffic. Note that <code>urlopen</code>'s <code>timeout</code> applies per socket operation, not to the whole call. That is the read-timeout trap from the mechanism section, so production code needs a client with a true total timeout.</p>
+
+<h2 id=dd-requestresponse-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>For each synchronous arrow, is there a <strong>total</strong> timeout, and is it derived from a propagated deadline rather than picked per hop?</li>
+<li>Is every client's pool idle timeout shorter than the idle timeout of the server or load balancer it talks to?</li>
+<li>Was the pool sized from Little's law at the dependency's p99 latency, and does it have a short acquire timeout?</li>
+<li>Which single layer owns retries on this path, and are retries off everywhere else?</li>
+<li>Is each retried call idempotent by method or by idempotency key? What happens on an ambiguous timeout for a POST?</li>
+<li>Is there a retry budget or token bucket, and do clients honor <code>Retry-After</code>?</li>
+<li>For gRPC or HTTP/2, how is load spread per request: L7 balancer, mesh or client-side? Is there a maximum connection age?</li>
+<li>What is the fan-out of the slowest endpoint, and what is the backend p99.9 that sets its tail?</li>
+<li>Can the endpoint return partial results, and does the response say when it did?</li>
+<li>Do servers check the remaining deadline before expensive work, and cancel downstream calls when the caller cancels?</li>
+<li>Are 499s, retry ratios and pool acquire-wait times on a dashboard?</li>
+<li>Does each dependency have its own pool or bulkhead, so one slow service cannot starve the rest?</li>
+</ol>
+
+<h2 id=dd-requestresponse-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"You moved from HTTP/1.1 to gRPC and p99 got worse. Why might that be?"</summary>
+<p>Three common causes. First, connection stickiness: all traffic rides a few long-lived HTTP/2 connections, so a few backends run hot while others idle, and hot backends have bad tails. Second, TCP head-of-line blocking: one lost packet now stalls every multiplexed call instead of one. Third, a stream limit: if the client hits <code>MAX_CONCURRENT_STREAMS</code>, calls queue on the client without obvious metrics. Check per-pod request skew first; it is the most common one.</p>
+</details>
+
+<details>
+<summary>"A call to payment timed out. Do you retry it?"</summary>
+<p>Only if the retry cannot double-charge. A timeout after sending is ambiguous: payment may have charged the card. So the retry must carry the same idempotency key as the first attempt, and the payment service must return the stored result for a repeated key. Without a key, do not retry automatically. Instead, query payment status, or mark the order "payment pending" and reconcile. Also check the deadline: if no retry can finish in time, fail and let the user-facing layer decide.</p>
+</details>
+
+<details>
+<summary>"Why not just set a generous timeout, like 30 seconds, so nothing fails?"</summary>
+<p>Because the timeout sets how many threads and connections a slow dependency can hold. By Little's law, 300 requests per second times 30 seconds is 9,000 requests in flight. That exhausts any pool, so a slow pricing service now takes down checkout. Also, the user left long before 30 seconds. A timeout should sit a little above the dependency's p99.9 and below the caller's remaining budget.</p>
+</details>
+
+<details>
+<summary>"An endpoint fans out to 50 services in parallel. Each has p99 of 100 ms. What is the endpoint's p99?"</summary>
+<p>Much worse than 100 ms. 1 − 0.99<sup>50</sup> is about 39%, so 39% of requests hit at least one backend's p99. The endpoint's median is near the backends' p99, and its p99 is set by their p99.98 or so, assuming independence. To fix it: cut the fan-out, hedge reads after the p95, or return partial results at a deadline.</p>
+</details>
+
+<details>
+<summary>"Retries at every layer seem safer. What is wrong with that?"</summary>
+<p>They multiply. Three attempts at each of three layers means 27 attempts at the bottom for one user click, which hits the weakest service exactly when it is struggling. Retry at one layer, add jittered backoff, and cap retries with a budget, for example 10% of normal traffic. Then the worst case is 1.1x load, not 27x.</p>
+</details>
+
+<details>
+<summary>"How do you size a connection pool for a new dependency?"</summary>
+<p>Little's law: rate times latency. Use the dependency's p99 latency, not its median, and peak rate, not average. At 300 requests per second and 250 ms p99, that is 75 concurrent connections. Round up for headroom. Then add a short acquire timeout so that when the dependency gets slower than planned, extra requests fail fast instead of queueing. Also check the server side: 50 client instances with 100 connections each is 5,000 connections at the server.</p>
+</details>

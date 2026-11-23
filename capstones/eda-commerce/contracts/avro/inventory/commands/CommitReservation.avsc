@@ -1,0 +1,21 @@
+{
+  "type": "record",
+  "name": "CommitReservation",
+  "namespace": "com.edacommerce.inventory",
+  "doc": "Command: turn a held reservation into an allocation. Removes the TTL.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "reservationId",
+      "type": "string"
+    }
+  ]
+}

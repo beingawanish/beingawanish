@@ -1,0 +1,77 @@
+{
+  "type": "record",
+  "name": "ReturnInspected",
+  "namespace": "com.edacommerce.fulfilment",
+  "doc": "Inspection outcome per returned line.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": "string"
+    },
+    {
+      "name": "results",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "InspectionResult",
+          "namespace": "com.edacommerce.fulfilment",
+          "fields": [
+            {
+              "name": "lineId",
+              "type": "string"
+            },
+            {
+              "name": "sku",
+              "type": "string"
+            },
+            {
+              "name": "quantity",
+              "type": "int"
+            },
+            {
+              "name": "outcome",
+              "type": {
+                "type": "enum",
+                "name": "InspectionOutcome",
+                "namespace": "com.edacommerce.fulfilment",
+                "doc": "Condition of a returned item. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+                "symbols": [
+                  "RESTOCKABLE",
+                  "DAMAGED",
+                  "MISSING",
+                  "UNKNOWN"
+                ],
+                "default": "UNKNOWN"
+              }
+            },
+            {
+              "name": "note",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "inspectedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

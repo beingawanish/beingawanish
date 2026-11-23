@@ -1,0 +1,27 @@
+{
+  "envelope": {
+    "eventId": "ff477550-a062-548f-b83e-19ef42f97624",
+    "type": "com.edacommerce.returns.ReturnRefunded",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "63227ccf-bb7d-5cb9-adaf-d60be354c620",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "returns-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Return",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "returnId": "94e55e9a-5fb4-599a-81ac-2a64c03ad250",
+  "refundId": "f7d373c2-1eb9-5234-a20e-a467f5f1574b",
+  "amount": {
+    "amountMinor": 1999,
+    "currency": "EUR"
+  },
+  "refundedAt": 1795000000000
+}

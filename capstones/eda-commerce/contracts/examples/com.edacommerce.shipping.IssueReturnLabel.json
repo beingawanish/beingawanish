@@ -1,0 +1,33 @@
+{
+  "envelope": {
+    "eventId": "2dd25a6c-c81f-57a7-af2d-463157564b33",
+    "type": "com.edacommerce.shipping.IssueReturnLabel",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "99aff356-cd36-5aad-bc60-061b7d223dc0",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "returns-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Shipment",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "returnId": "ef24cf2e-db1a-5627-8ba0-b9e93b39e3c1",
+  "shipmentId": "cfb54df9-3022-5eab-badc-c0bcaece65cd",
+  "pickupFrom": {
+    "recipientName": "Jane Doe",
+    "line1": "Invalidenstrasse 1",
+    "line2": "example-line2",
+    "city": "Berlin",
+    "region": "example-region",
+    "postalCode": "10115",
+    "countryCode": "DE",
+    "phone": "example-phone"
+  },
+  "toWarehouseId": "0335800d-1c31-5793-a0d3-ed24bbf74213"
+}

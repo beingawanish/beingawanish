@@ -1,0 +1,28 @@
+# Default autoscaling on CPU. For consumer-heavy services, prefer the KEDA lag scaler
+# (components/keda-lag-scaler), which replaces this HPA. Never scale a consumer group beyond the
+# partition count of its busiest topic (12 for the order-flow topics): extra pods sit idle.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: svc
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: svc
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # each scale event is a consumer-group rebalance; avoid flapping
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

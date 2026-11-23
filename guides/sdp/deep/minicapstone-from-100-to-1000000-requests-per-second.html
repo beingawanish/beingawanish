@@ -1,0 +1,198 @@
+<h2 id=dd-minicapstone-from-100-to-1000000-requests-per-second-capacity level=2>Deep Dive: The Capacity Plan, Stage by Stage</h2>
+<p>The capstone follows the bottleneck in words. A review panel wants the same journey in numbers, so it can check each "we are not scaling this yet" claim. Here is one consistent set of assumptions for the store's API. Change any of them and redo the line. The point is that every decision in the capstone falls out of a few multiplications.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-assumptions level=3>The assumptions</h3>
+<ul>
+<li><strong>App server.</strong> 4 cores, 800 req/s at its limit, 520 planned (the 65% target from <a href="#autoscaling">Auto-Scaling</a>). From Stage 4, 8-core instances at about 1,600 req/s limit and 1,040 planned.</li>
+<li><strong>Database work.</strong> Each API request reaches for 2 queries' worth of reads before caching. 5% of requests write (cart, order, review), at about 4 statements each, so 0.2 write statements per request.</li>
+<li><strong>Single primary.</strong> 16 cores. Load tests put its comfortable ceiling for this query mix near 15,000 queries per second (qps). A replica of the same size has the same read ceiling.</li>
+<li><strong>Cache.</strong> From Stage 2, cache-aside cuts reads reaching the database by about 40x, as the capstone states.</li>
+<li><strong>Peak to average.</strong> Peak is about 2.5 times the daily average.</li>
+</ul>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-table level=3>The plan in one table</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Stage (peak)</th><th>Reaches app tier</th><th>App servers</th><th>DB reads reaching DB</th><th>DB write statements</th><th>Connections</th></tr></thead><tbody>
+<tr><td>1: 1,000 req/s</td><td>1,000</td><td>2 (N+1 of 1.25)</td><td>2,000 qps, about 13% of the primary</td><td>200/s</td><td>2 × 20 = 40 direct</td></tr>
+<tr><td>2 before cache: 8,000 req/s</td><td>8,000</td><td>10</td><td>16,000 qps, over the ceiling</td><td>1,600/s</td><td>200 direct</td></tr>
+<tr><td>2 after cache: 9,600 req/s</td><td>9,600</td><td>13 (12 + 1)</td><td>480 qps + misses on cold keys</td><td>1,920/s</td><td>260 direct, near the limit</td></tr>
+<tr><td>3: 100,000 req/s</td><td>about 67,000 (CDN removes one-third)</td><td>min 8, max 120, about 130 at 520 each if uncapped</td><td>3,400 qps</td><td>13,400/s</td><td>up to 2,400 clients, about 60 server-side via PgBouncer</td></tr>
+<tr><td>4: 1,000,000 req/s</td><td>150,000-250,000</td><td>150-240 at 1,040 each</td><td>7,500-12,500 qps</td><td>30,000-50,000/s</td><td>thousands of clients, pooled per shard</td></tr>
+</tbody></table></div></div>
+<p>Read the table column by column, because each column tells a different story.</p>
+<p><strong>App servers grow almost linearly with traffic that reaches them.</strong> That is the payoff of statelessness: the fleet is the easy tier, which is why the capstone calls it "large and boring". The only interesting thing about it is the cap.</p>
+<p><strong>Reads collapse after Stage 2.</strong> The cache turns a database that would need 200,000 qps at Stage 3 into one that sees 3,400. Without the cache, no amount of replicas is a sane plan at Stage 4; with it, a primary and a few replicas carry reads to the end.</p>
+<p><strong>Writes are what the cache cannot remove.</strong> At Stage 3, 13,400 write statements a second land on one primary, close to its 15,000 ceiling. That is the number that makes Stage 4 a sharding stage. It also says Stage 3's max of 120 is set by writes, not by reads.</p>
+<p><strong>Connections grow fastest.</strong> 40 at Stage 1, 260 at Stage 2, a possible 2,400 at Stage 3. They pass the database's limits a full stage before CPU does, which is why the pooler arrives in Stage 3 and the pool audit in Stage 2.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-stage1-math level=3>Stage 1: why two servers, and when they stop being enough</h3>
+<p>Two servers at 800 each give 1,600 req/s. N+1 holds only while one server can carry the whole peak: up to 800 req/s. Between 800 and 1,000, losing a server means the survivor runs at 100-125% of its limit. The capstone notes this gap. In practice, plan the third server when peak passes about 600 req/s (one server's 75%), because a failure at peak then lands on a survivor with no headroom left.</p>
+<p>The database row explains "what we are NOT scaling". 2,000 qps against a 15,000 qps ceiling is 13% utilisation. Adding replicas at Stage 1 would buy nothing but replication lag to reason about.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-stage2-math level=3>Stage 2: the 40x and what it hides</h3>
+<p>A 98% hit ratio sounds like it should cut reads by 50x, not 40x. The gap comes from the keys the cache cannot hold: search queries with long tails, personalised results, and the first read after every invalidation. That is typical. Plan with the measured reduction, not the headline hit ratio.</p>
+<p>The cache also creates a dependency that is easy to miss. With 40x fewer reads reaching it, the database is now sized for a warm cache. If the cache is lost, it faces 40x its planned read load. Failure drill 2 below is about that number.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-stage3-math level=3>Stage 3: deriving min 8 and max 120</h3>
+<p>The capstone gives min 8 and max 120. Here is one way to land on them.</p>
+<ul>
+<li><strong>Min.</strong> The overnight trough is about 7,000 req/s reaching the app tier. At 520 per server that is 14 servers, so why is min 8? Because min is not the overnight size. It is the floor the loop never goes below. Eight is 4,160 planned req/s, enough for the deepest trough on the quietest day, plus N+1 across zones: with three zones, 8 servers means at least 2 per zone. The loop holds the fleet around 14 overnight.</li>
+<li><strong>Max.</strong> Writes set the database ceiling. The primary handles about 15,000 statements per second. At 0.2 write statements per request, every 1,000 app req/s costs 200 of them. So the primary supports about 75,000 req/s worth of writes in theory, but replication, vacuum and the reads that must stay on the primary share those cores. Load testing the mix gives a safe app-tier rate near 62,000 req/s. At 520 per server, that is about 120 servers.</li>
+</ul>
+<p>Max 120 at 520 each is 62,400 req/s. The table's 67,000 req/s at peak is above that. The capstone's design is honest about this: the excess beyond max is shed or queued at the edge, and the real fix for the gap is Stage 4's write path. A review panel should like that the max is below the peak. It shows the team measured the database instead of hoping.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-stage4-math level=3>Stage 4: where the million goes</h3>
+<p>Trace one million requests per second through the tiers, with stated hit ratios:</p>
+<ol>
+<li><strong>CDN and edge caches</strong> serve static assets and cacheable public pages (product pages for logged-out users, images, scripts). Assume they absorb 75-85%. Between 150,000 and 250,000 req/s continue to origin.</li>
+<li><strong>The load balancers</strong> spread that across three zones. Each zone carries a third in normal operation.</li>
+<li><strong>The app fleet</strong> handles 150,000-250,000 req/s. At 1,040 planned per 8-core server, that is 145-240 servers. That is the capstone's "200-300", and the range is set by the edge hit ratio, not by anything in the app.</li>
+<li><strong>The cache cluster</strong> takes about 2 operations per app request: 300,000-500,000 ops/s. A single Redis shard handles on the order of 100,000 simple ops/s, though that varies widely with value size and command mix. So plan for something like 8-12 primary shards with replicas, placed on the ring by <a href="#consistent-hashing">consistent hashing</a>.</li>
+<li><strong>The databases</strong> see 7,500-12,500 read qps across replicas and 30,000-50,000 write statements per second, two to three times what one primary can comfortably take. Sharded eight ways by customer (see <a href="#sharding">Sharding</a>), each shard sees about 3,750-6,250 a second, with room to grow.</li>
+</ol>
+<p>The most important number is step 1. Moving the edge hit ratio from 75% to 85% removes 100,000 req/s from origin, which is about 100 servers, a third of the cache load and a third of database reads. At this scale, the cheapest capacity is at the edge.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-zones level=3>Three zones change N+1</h3>
+<p>Spread across three availability zones, the unit of failure is no longer one server. It is a third of the fleet. If any zone can fail at peak, the remaining two must carry everything. So each zone must be sized for half of peak, not a third, and the fleet runs at about two-thirds of its capacity even before the 65% target.</p>
+<p>Some teams call this <strong>static stability</strong>: survive the loss of a zone with capacity already running, without depending on the autoscaler to launch replacements during the incident. The autoscaler might be slow, or the remaining zones might be out of instances because every other customer is also failing over. Static stability costs about 50% more than the minimum fleet. It is the most common argument at a Stage 4 design review, and the right answer depends on the business cost of a degraded hour.</p>
+
+<h2 id=dd-minicapstone-from-100-to-1000000-requests-per-second-latency level=2>Deep Dive: The Latency Budget and the Tail</h2>
+<p>Throughput is half the plan. At a million requests per second, the other half is the p99, because a small fraction of a large number is a lot of unhappy users. One in a hundred at 1M req/s is 10,000 slow requests every second.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-budget level=3>A budget for one origin request</h3>
+<p>Suppose the product page API must answer in 200 ms at p99, measured at the client. A plausible budget:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Hop</th><th>Typical</th><th>p99 allowance</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Client to edge</td><td>20 ms</td><td>60 ms</td><td>Mostly distance and the user's network; outside your control</td></tr>
+<tr><td>Edge to origin load balancer</td><td>5 ms</td><td>20 ms</td><td>Kept warm by the CDN's connection reuse</td></tr>
+<tr><td>Load balancer to app</td><td>&lt;1 ms</td><td>5 ms</td><td>In-zone</td></tr>
+<tr><td>App logic</td><td>5 ms</td><td>20 ms</td><td>Including serialisation and GC pauses</td></tr>
+<tr><td>Cache reads (several)</td><td>1 ms each</td><td>30 ms total</td><td>The tail of the slowest one dominates</td></tr>
+<tr><td>Database on a miss</td><td>5 ms</td><td>50 ms</td><td>Only on cache misses</td></tr>
+<tr><td>Margin</td><td></td><td>15 ms</td><td>Retries, queueing at peak</td></tr>
+</tbody></table></div></div>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-fanout level=3>Why fan-out ruins the tail</h3>
+<p>A product page that makes 10 cache calls in parallel is only as fast as the slowest of the 10. If each call is slow (over its own p99) 1% of the time, the chance that at least one of the 10 is slow is 1 − 0.99<sup>10</sup>, about 9.6%. So the page's p90 becomes the cache's p99. At 50 calls, it is 39%.</p>
+<p>This is why Stage 4 reviews spend time on the count of calls per request, not just on their speed. The levers: batch reads (one multi-get instead of 10 gets), cache a rendered composite instead of its parts, and set tight per-call <a href="#timeout">timeouts</a> with a fallback, so one slow shard degrades a section of the page instead of the whole page.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-queueing level=3>Utilisation and the knee</h3>
+<p>Queueing latency rises sharply as utilisation approaches 100%. In a simple single-queue model, waiting time is proportional to u / (1 − u). At 50% utilisation that factor is 1. At 65% it is about 1.9. At 80% it is 4. At 90% it is 9. The 65% target is not only about absorbing spikes. It also keeps every tier left of the knee, so its tail latency stays predictable. A tier that runs at 85% "because it has capacity left" is spending the latency budget of every tier above it.</p>
+
+<h2 id=dd-minicapstone-from-100-to-1000000-requests-per-second-drills level=2>Deep Dive: Failure Drills</h2>
+<p>A senior review runs drills against the Stage 4 design: name the failure, then walk through what happens minute by minute. Each drill below uses the capacity plan's numbers.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-drill1 level=3>Drill 1: One availability zone fails at peak</h3>
+<p><strong>What happens.</strong> A third of the app fleet, a third of the cache nodes, and possibly a database primary or two disappear at once. The load balancer stops routing to the dead zone within its health-check window, roughly 10-30 seconds. The remaining two zones each go from a third of the traffic to a half: a 50% jump.</p>
+<p><strong>If the fleet is statically stable</strong>, each zone was already running at about 43% (two-thirds of 65%), and the jump takes it to about 65%. Nothing else needs to happen. The autoscaler adds capacity over the next few minutes to restore headroom.</p>
+<p><strong>If it is not</strong>, the surviving zones jump to about 97% of their limit, latency hits the knee, and the autoscaler has to launch 100 servers while every other tenant in the region does the same. Some launches fail (see <a href="#autoscaling">Auto-Scaling</a>, failure 6).</p>
+<p><strong>The parts that break even with a good fleet.</strong> Cache shards whose primary was in the dead zone must fail over to replicas; keys being written during the failover may be lost, and a burst of misses hits the database. Database shards whose primary was in the dead zone fail over in tens of seconds, and clients reconnect, which is a reconnect storm the poolers must absorb (see <a href="#database-connection-pooling">Database Connection Pooling</a>, failure 3).</p>
+<p><strong>What the review should ask for.</strong> A game day that removes a zone on purpose, at a realistic load, with each tier's time to recover recorded.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-drill2 level=3>Drill 2: The cache cluster restarts cold</h3>
+<p><strong>What happens.</strong> A bad config push restarts all cache nodes at once, and they come back empty. The databases were sized for a warm cache that cuts reads 40x. Reads reaching them jump from about 10,000 qps toward 400,000 qps. The replicas saturate within seconds, app requests wait on the database, pools fill, and the app tier starts timing out. Because requests are failing, the cache is not being filled either, so the situation does not heal on its own.</p>
+<p><strong>The fix sequence.</strong> Shed load first: serve stale or degraded pages from the edge (lengthen CDN TTLs, turn on serve-stale), rate-limit at the front door, and turn off non-essential features through <a href="#feature-flags">feature flags</a>. Then let the cache refill under a controlled load, with <a href="#cache-stampede-prevention">stampede prevention</a> so one miss per key reaches the database rather than thousands. Pre-warm the hottest keys from a list if you have one.</p>
+<p><strong>The design lessons.</strong> Never restart all cache nodes at once; roll restarts across shards and zones. Keep the database able to survive some fraction of cold traffic, and know the number. Consider a two-level cache (a small in-process cache in front of the shared one) so a shared-cache outage is not a total loss. The 40x multiplier is a dependency, and dependencies need a failure plan.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-drill3 level=3>Drill 3: The CDN purges everything</h3>
+<p><strong>What happens.</strong> Someone runs "purge all" to fix one stale image. The edge hit ratio drops from 80% to near zero for a few minutes. Origin traffic goes from 200,000 to nearly 1,000,000 req/s, five times the fleet's planned load and far above max.</p>
+<p><strong>The fix sequence.</strong> The autoscaler hits max within minutes. The edge must reject or queue the excess, which is exactly what rejecting load beyond the fleet maximum is for. Most edge platforms also collapse concurrent requests for the same object into one origin fetch ("request coalescing" or "origin shielding"), which is the most important setting in this drill. With a shield tier in front of origin, a full purge costs one origin request per object per shield location, not one per user.</p>
+<p><strong>The design lessons.</strong> Purge by tag or path, not everything. Put purge-all behind an approval. Turn on origin shielding and serve-stale-on-error. And load-test the origin at a "CDN cold" level once, so you know what happens rather than guessing.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-drill4 level=3>Drill 4: A hot key</h3>
+<p><strong>What happens.</strong> A celebrity posts a link to one product. Its page gets 80,000 req/s at origin, most of it for one cache key. Consistent hashing puts that key on one shard, which is now asked for several times its capacity while the other shards are idle. Latency for every key on that shard rises, so unrelated products slow down too.</p>
+<p><strong>The fix sequence.</strong> Detect it: per-shard ops/s, and a top-keys report from the cache or from app-side sampling. Then spread the load: an in-process cache on each app server for a few seconds' TTL makes one hot key cost one cache read per server per TTL instead of one per request. For a write-hot key, split it into several sub-keys and combine on read. Also make sure the product page itself is cacheable at the edge, so most of those 80,000 never reach origin.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-drill5 level=3>Drill 5: A deploy during the evening peak</h3>
+<p><strong>What happens.</strong> A rolling deploy replaces 20% of the fleet at a time. During each batch, the remaining 80% carry the load, so a fleet at 65% runs at about 81%. That is still under the limit, but past the knee for latency. If the new version is 15% slower per request, the next batch pushes the fleet near its limit, and the autoscaler starts adding the old version's launch template, or the new one, depending on timing.</p>
+<p><strong>The design lessons.</strong> Deploy with surge (launch new capacity before draining old) so capacity never drops. Use a <a href="#canary-deployment">canary</a> that compares latency per request, not just error rate, so a slower version is caught at 1% of traffic. Freeze deploys during known peaks if your rollout cannot surge. And make sure the autoscaler and the deploy tool agree on which version new instances get.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-drill6 level=3>Drill 6: The retry storm</h3>
+<p><strong>What happens.</strong> One database shard slows for 30 seconds during a failover. App servers time out their calls to it and retry, three times each, with no jitter. Clients time out their calls to the app and retry too. One request can now become 3 × 3 = 9 attempts at the bottom. The shard comes back to a load nine times what it had, and slows again.</p>
+<p><strong>The design lessons.</strong> Retry at one layer only, with <a href="#retry-with-exponential-backoff">exponential backoff and jitter</a>. Cap retries with a retry budget (for example, retries may add at most 10% to the request rate). Put a <a href="#circuit-breaker">circuit breaker</a> on each shard so a failing one gets breathing room. And make write operations <a href="#idempotency">idempotent</a>, because some retries will repeat work that already succeeded.</p>
+
+<h2 id=dd-minicapstone-from-100-to-1000000-requests-per-second-evolution level=2>Deep Dive: The Evolution Path and Its Trigger Metrics</h2>
+<p>The capstone says order matters. In practice, a team needs to know <em>when</em> to take each step. The answer is a measured trigger, set before it is needed, rather than a feeling that the system is getting big.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Move</th><th>Trigger metric</th><th>Typical threshold</th><th>Lead time to build</th></tr></thead><tbody>
+<tr><td>Second server + statelessness</td><td>Any single-host dependency; peak vs one server's capacity</td><td>Before launch, or peak above 60-75% of one server</td><td>2-4 weeks (the checklist)</td></tr>
+<tr><td>Cache-aside on hot reads</td><td>DB read latency at peak; DB CPU from reads</td><td>p99 read latency doubling, or DB CPU over 60% at peak</td><td>1-3 weeks per entity, mostly invalidation</td></tr>
+<tr><td>Read replicas</td><td>Reads after cache still near one machine's ceiling</td><td>Read qps over 50% of primary ceiling</td><td>Days, plus lag-tolerance review</td></tr>
+<tr><td>Pool audit and pooler</td><td>Fleet total connections vs <code>max_connections</code></td><td>Total possible connections over 50% of the limit, or autoscaling planned</td><td>Days; weeks if session features must be removed</td></tr>
+<tr><td>Auto-scaling</td><td>Peak-to-trough ratio; idle spend; surprise peaks</td><td>Peak over 2.5x trough, or one unplanned spike over the fleet</td><td>2-4 weeks including load tests and drain handling</td></tr>
+<tr><td>CDN for static and public content</td><td>Share of origin requests that are cacheable</td><td>Over 20-30% of requests cacheable</td><td>Days for static; weeks for cache-control on dynamic pages</td></tr>
+<tr><td>Sharding the write path</td><td>Primary write statements/s; storage size; vacuum and backup time</td><td>Writes over 50% of primary ceiling with 3x yearly growth</td><td>3-9 months; start early</td></tr>
+</tbody></table></div></div>
+<p>The last column is the one that changes the plan. With 3x growth a year, a metric at 50% of its ceiling hits 100% in about seven and a half months. Sharding takes about that long. So the sharding project must start when writes cross roughly 30-50% of the primary's ceiling, which in this plan is during Stage 3, long before it is the bottleneck. A good evolution plan puts lead time next to every trigger and works backwards from the growth rate.</p>
+<p>The cheap moves have short lead times, so it is fine to take them just in time. The expensive ones do not. That asymmetry is the practical meaning of "a later-stage pattern used too early adds cost, but delaying a needed earlier pattern makes the next increase unsafe".</p>
+
+<h2 id=dd-minicapstone-from-100-to-1000000-requests-per-second-debates level=2>Deep Dive: The Trade-off Debates a Panel Will Have</h2>
+<p>These are the arguments that come up in a real review of this design. Each has a reasonable answer, but not a universal one.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-debate-vertical level=3>"Why not just buy a bigger database?"</h3>
+<p>Vertical scaling is underrated for databases. A primary with 4x the cores and RAM can buy a year or more, with no application changes. At Stage 2 and Stage 3, it is often the right first answer for the write path. The case against it: it does not help availability, cost grows faster than linearly at the top end, and there is a largest machine. A senior answer says "scale up while it is cheap, and start the sharding design in parallel, because the largest machine is a deadline, not a solution". See <a href="#vertical-scaling">Vertical Scaling</a>.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-debate-cache level=3>"Cache or replicas first?"</h3>
+<p>The capstone adds both at Stage 2. If only one could be done, the cache usually wins on raw numbers: 40x fewer reads versus at most N times more read capacity with N replicas. Replicas win on correctness simplicity, because there is no invalidation logic and their staleness is bounded by replication lag. The real answer depends on the read pattern. Hot, repeated reads (product pages) want a cache. Long-tail reads (search, order history) get little from a cache and want replicas.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-debate-autoscale level=3>"Autoscaling at Stage 2, to be ready?"</h3>
+<p>The capstone says no, and that is defensible: at 13 servers with predictable traffic, a static N+1 fleet is cheap and simple, and the team's attention is better spent on cache correctness. The counter-argument is that autoscaling forces good habits early (statelessness, drain handling, a measured per-instance capacity). A middle path is common: build the drain handling and load-test the per-instance capacity at Stage 2, and turn the control loop on at Stage 3 when the cost case appears.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-debate-max level=3>"The max is below the peak. Isn't that a design bug?"</h3>
+<p>At Stage 3, max 120 serves about 62,000 req/s and the peak is about 67,000. Some reviewers will call that under-provisioning. The better reading is that the database cannot take more, and a max above it would turn an edge-shedding event into a database outage. The design is honest. What the panel should insist on is that the shedding path is real: tested, prioritised (protect checkout over browse), and visible on a dashboard. And it should push for the write-path project, because shedding real customers at peak is a cost with a clock on it.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-debate-microservices level=3>"Shouldn't we split into microservices on the way up?"</h3>
+<p>Nothing in this capstone required it. Every stage was solved with one stateless service plus better data tiers. Splitting services helps teams ship independently and isolates failure domains, but it does not by itself add capacity, and it adds network hops to the latency budget. Split when team structure or failure isolation demands it, not because the request rate passed a round number.</p>
+
+<h3 id=dd-minicapstone-from-100-to-1000000-requests-per-second-debate-region level=3>"When do we go multi-region?"</h3>
+<p>Usually for latency to distant users or for regional disaster recovery, not for raw capacity, because one region can hold a fleet far larger than Stage 4 needs. The stateless tiers replicate easily. The database is the hard part: active-active writes across regions mean conflict handling or a consensus protocol (see <a href="#quorum">Quorum</a>). A common intermediate step is one write region with read-only replicas and edge caches elsewhere, which covers most read latency with a fraction of the complexity.</p>
+
+<h2 id=dd-minicapstone-from-100-to-1000000-requests-per-second-review level=2>Deep Dive: Design-Review Questions</h2>
+<ol>
+<li>At each stage, what is the current bottleneck, what metric shows it, and what is that metric's value at today's peak?</li>
+<li>What is the per-instance capacity of an app server, from which load test, and with what request mix?</li>
+<li>What fraction of requests reach origin, and what would a 10-point drop in the edge hit ratio do to every tier below it?</li>
+<li>How much read load would the database see if the cache were empty, and how long can it survive that?</li>
+<li>What is the write rate on the busiest primary as a fraction of its ceiling, and when does it cross 100% at the current growth rate?</li>
+<li>What is the total possible connection count at the fleet's max, and where is it capped?</li>
+<li>Is the fleet statically stable to the loss of one zone, or does it rely on the autoscaler during the incident?</li>
+<li>What happens to traffic above the fleet's max? Which requests are protected first, and has the shedding path been tested?</li>
+<li>Where are retries done, how many layers retry, and what is the retry budget?</li>
+<li>What is the p99 budget per hop, and how many downstream calls does the heaviest page make?</li>
+<li>Which expensive project (sharding, multi-region) has the longest lead time, and has it started early enough?</li>
+<li>What is deliberately not being scaled at this stage, and what metric would change that decision?</li>
+</ol>
+
+<h2 id=dd-minicapstone-from-100-to-1000000-requests-per-second-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"You're at 10,000 req/s. I 10x it. What breaks first?"</summary>
+<p>Do the multiplication out loud. App servers: 10x more, and that is fine if they are stateless and the fleet can grow. Database reads: with a warm cache, 10x of a small number is still modest. Connections: 10x the fleet times each pool, so they break before CPU does; a pooler is needed. Writes: the cache does nothing for them, so 10x writes on one primary is the real limit. And cost: a static fleet sized for peak is mostly idle overnight. So the answer is "connections first, then writes, with cost forcing autoscaling", and the fix order follows from that.</p>
+</details>
+
+<details>
+<summary>"Your cache hit ratio is 98%. Why might your database load still surprise you?"</summary>
+<p>Because the 2% that miss are not a random 2%. They are the long tail, the first read after each invalidation, and cold keys after restarts, and they often cost more per query than the hits would have. Also, 98% to 96% doubles the misses, so a small change in hit ratio is a large change in database load. And if the cache is lost entirely, the database sees 40 to 50 times its normal read load. Plan with measured miss load, and have a cold-cache plan.</p>
+</details>
+
+<details>
+<summary>"Why size each zone for half the peak instead of a third?"</summary>
+<p>Because with three zones, losing one leaves two, and those two must carry the whole peak. If each zone is sized for a third, the survivors are at 150% of their capacity until the autoscaler replaces the lost third, which may be slow or impossible during a regional event. Sizing each zone for half costs about 50% more fleet, and buys survival with capacity already running. Whether that is worth it is a business decision about the cost of a degraded hour.</p>
+</details>
+
+<details>
+<summary>"At 1M req/s, how many servers do you need?"</summary>
+<p>Answer by first asking how many requests reach the servers. If the edge serves 75-85%, then 150,000-250,000 reach origin. At a planned 1,040 req/s per 8-core server, that is 145-240 servers, before zone redundancy. Then add the static-stability factor if needed. A candidate who divides 1,000,000 by per-server capacity and says "1,250 servers" has forgotten the cheapest tier.</p>
+</details>
+
+<details>
+<summary>"When would you start sharding, if the database is fine today?"</summary>
+<p>When the time until it is not fine is shorter than the time to build sharding, with margin. With writes at 40% of the primary's ceiling and 3x growth a year, they reach 100% in about ten months. Sharding takes months to design, migrate and test. So you start now, or you buy time with a bigger primary and start anyway. The trigger is lead time, not current utilisation.</p>
+</details>
+
+<details>
+<summary>"The p99 doubled after you added 10 more cache calls per page, even though each call is fast. Why?"</summary>
+<p>Parallel fan-out makes the page's latency the maximum of its calls. If each call has a 1% chance of being slow, a page with 10 calls is slow about 10% of the time, so the page's p90 inherits the cache's p99. Fix it with batching (one multi-get), caching composed results, per-call timeouts with fallbacks, and fewer calls per request. Hedged requests (send a duplicate to another replica after a short delay) also help for idempotent reads, at the cost of a little extra load.</p>
+</details>
+
+<details>
+<summary>"Which of these stages translates to a GPU inference service, and which does not?"</summary>
+<p>Statelessness and load balancing translate, though balancing should be on queue depth or outstanding tokens rather than connections. Caching translates as semantic or prefix caching. Auto-scaling translates poorly: servers cost far more, boot in minutes, and the cloud may not have more to sell, so warm pools, predictive scaling and admission control at the edge become the main tools. Connection pooling has a cousin in request batching on the GPU. And per-request cost varies so much that requests per second is the wrong capacity unit; tokens per second is closer. See <a href="#gpu-autoscaling">GPU Auto-Scaling</a> and <a href="#model-serving">Model Serving</a>.</p>
+</details>

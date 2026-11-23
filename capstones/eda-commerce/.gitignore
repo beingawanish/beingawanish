@@ -1,0 +1,10 @@
+# Build and tool outputs are never committed.
+build/
+.gradle/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/

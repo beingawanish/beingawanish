@@ -1,0 +1,48 @@
+{
+  "type": "record",
+  "name": "RefundFailed",
+  "namespace": "com.edacommerce.payment",
+  "doc": "Reply to RefundPayment when the PSP refused.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "paymentId",
+      "type": "string"
+    },
+    {
+      "name": "refundId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "reason",
+      "type": "string"
+    },
+    {
+      "name": "retryable",
+      "type": "boolean"
+    },
+    {
+      "name": "failedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

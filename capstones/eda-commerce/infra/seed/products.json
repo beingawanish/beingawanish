@@ -1,0 +1,9 @@
+[
+  {"sku": "SKU-1001", "name": "Trail Running Shoe", "brand": "Northpeak", "categoryPath": ["Sport", "Footwear"], "attributes": {"colour": "blue", "size": "42"}, "status": "ACTIVE", "weightGrams": 620, "listPrice": {"amountMinor": 12999, "currency": "EUR"}, "onHand": 50},
+  {"sku": "SKU-1002", "name": "Merino Base Layer", "brand": "Northpeak", "categoryPath": ["Sport", "Clothing"], "attributes": {"colour": "black", "size": "M"}, "status": "ACTIVE", "weightGrams": 210, "listPrice": {"amountMinor": 7999, "currency": "EUR"}, "salePrice": {"amountMinor": 5999, "currency": "EUR"}, "onHand": 120},
+  {"sku": "SKU-1003", "name": "Headlamp 400lm", "brand": "Lumo", "categoryPath": ["Outdoor", "Lighting"], "attributes": {}, "status": "ACTIVE", "weightGrams": 90, "listPrice": {"amountMinor": 3999, "currency": "EUR"}, "onHand": 200},
+  {"sku": "SKU-1004", "name": "Ultralight Tent 2P", "brand": "Skyline", "categoryPath": ["Outdoor", "Shelter"], "attributes": {"capacity": "2"}, "status": "ACTIVE", "weightGrams": 1350, "listPrice": {"amountMinor": 44900, "currency": "EUR"}, "onHand": 8},
+  {"sku": "SKU-1005", "name": "Limited Edition Watch", "brand": "Tempo", "categoryPath": ["Accessories"], "attributes": {}, "status": "ACTIVE", "weightGrams": 120, "listPrice": {"amountMinor": 89900, "currency": "EUR"}, "onHand": 1},
+  {"sku": "SKU-1006", "name": "Water Bottle 1L", "brand": "Lumo", "categoryPath": ["Outdoor", "Hydration"], "attributes": {"colour": "green"}, "status": "ACTIVE", "weightGrams": 150, "listPrice": {"amountMinor": 1999, "currency": "EUR"}, "onHand": 0},
+  {"sku": "SKU-1007", "name": "Old Model Jacket", "brand": "Northpeak", "categoryPath": ["Sport", "Clothing"], "attributes": {}, "status": "DISCONTINUED", "weightGrams": 800, "listPrice": {"amountMinor": 19900, "currency": "EUR"}, "onHand": 3}
+]

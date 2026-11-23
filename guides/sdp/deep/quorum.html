@@ -1,0 +1,239 @@
+<h2 id=dd-quorum-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>W + R &gt; N is one line of arithmetic. A real leaderless store is a few thousand lines of machinery around it. Which machines hold a key? Which replicas does the coordinator actually contact? What counts as an acknowledgment? How do deletes work when any replica might have missed one? This section follows a cart write and a cart read through Cassandra, the most widely deployed Dynamo-style store, and notes where Riak and others differ.</p>
+
+<h3 id=dd-quorum-placement level=3>Placement: which N machines hold a key</h3>
+<p>The cluster hashes each partition key onto a ring of token ranges, as described in the <a href="#consistent-hashing">consistent hashing</a> lesson. The first node clockwise from the key's token holds the first replica. Walking further around the ring gives the rest. The list of N nodes is the key's <strong>replica set</strong> (Dynamo's paper calls it the preference list).</p>
+<p>The walk is not naive. In Cassandra, <code>NetworkTopologyStrategy</code> places replicas per datacenter and tries to put them on different racks:</p>
+<pre><code>CREATE KEYSPACE carts WITH replication = {
+  'class': 'NetworkTopologyStrategy',
+  'eu-west': 3,      -- N = 3 in this datacenter
+  'us-east': 3       -- and another 3 here
+};</code></pre>
+<p>Rack awareness matters more than it looks. If all three replicas of a key share a rack or availability zone, one zone failure removes all of them at once. The availability math later assumes independent failures. Rack placement is what makes that assumption roughly true. Configure the snitch so each node reports its real zone as its rack.</p>
+<p>Any node can coordinate any request. Token-aware client drivers send each request straight to a replica of the key, which saves a network hop. The coordinator is then itself one of the N.</p>
+
+<h3 id=dd-quorum-write-path level=3>The write path: send to all, wait for W</h3>
+<p>For a write, the coordinator sends the mutation to <strong>all N replicas</strong>, not just W of them. It replies to the client as soon as W acknowledge. The other replicas still receive the write a moment later. W only decides how long the client waits, not how many copies are written.</p>
+<p>On each replica, an acknowledgment means the mutation is in the <strong>commit log</strong> and the in-memory memtable. Whether the commit log has been fsynced depends on <code>commitlog_sync</code>. The default <code>periodic</code> mode syncs on a timer (10 seconds by default), so a replica can acknowledge a write it would lose in a power failure. The defence is replication itself: losing W replicas at the same instant is unlikely. Treat that as a stated assumption, not a given. If your three replicas share one power domain, <code>batch</code> or <code>group</code> sync mode makes acknowledgments durable at the cost of latency.</p>
+<p>Each written cell carries a <strong>timestamp</strong>, normally set by the coordinator or the client in microseconds. Conflicts resolve by last-write-wins on that timestamp, per cell. Cassandra has no vector clocks. Riak, by contrast, keeps causal context (dotted version vectors) and can return concurrent versions as <em>siblings</em> for the application to merge. The <a href="#vector-clocks">next lesson</a> shows why that difference matters for the cart.</p>
+
+<h3 id=dd-quorum-read-path level=3>The read path: one data request, digests, and repair</h3>
+<p>The lesson's coordinator "asks all three replicas". Cassandra is more economical, and the difference explains some of its latency behaviour. At QUORUM with N = 3, the coordinator contacts only R = 2 replicas. It asks the fastest-looking one (by its dynamic snitch scores) for the <strong>full data</strong>. It asks the other for a <strong>digest</strong>, a hash of the data.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-quorum-svg-title dd-quorum-svg-desc" viewBox="0 0 720 320" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-quorum-svg-title">A quorum read in Cassandra with N equal to 3 and consistency level QUORUM</title>
+<desc id="dd-quorum-svg-desc">The client sends a read to the coordinator. The coordinator sends a full data request to replica A and a digest request to replica B. Replica C is not contacted unless the speculative retry threshold passes, in which case it receives an extra request. If the digest matches A's data, the coordinator returns the result. If it does not match, the coordinator requests full data from both, picks the newest value per cell by timestamp, writes it back to the stale replica with blocking read repair, and only then replies to the client.</desc>
+<defs><marker id="dd-quorum-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="320" fill="#ffffff"/>
+<rect x="20" y="130" width="100" height="50" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="70" y="160" font-size="14" fill="#1c2430" text-anchor="middle">Client</text>
+<rect x="190" y="120" width="150" height="70" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="265" y="148" font-size="14" fill="#1c2430" text-anchor="middle">Coordinator</text>
+<text x="265" y="168" font-size="12" fill="#5c6b7c" text-anchor="middle">compare digests</text>
+<rect x="500" y="30" width="190" height="56" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="595" y="55" font-size="14" fill="#1c2430" text-anchor="middle">Replica A</text>
+<text x="595" y="74" font-size="12" fill="#5c6b7c" text-anchor="middle">full data, ts = 1042</text>
+<rect x="500" y="130" width="190" height="56" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="595" y="155" font-size="14" fill="#1c2430" text-anchor="middle">Replica B</text>
+<text x="595" y="174" font-size="12" fill="#5c6b7c" text-anchor="middle">digest only</text>
+<rect x="500" y="230" width="190" height="56" rx="8" fill="#ffffff" stroke="#c898a4" stroke-dasharray="5,4"/>
+<text x="595" y="255" font-size="14" fill="#1c2430" text-anchor="middle">Replica C</text>
+<text x="595" y="274" font-size="12" fill="#5c6b7c" text-anchor="middle">not asked (unless speculative)</text>
+<line x1="120" y1="155" x2="186" y2="155" stroke="#1c2430" marker-end="url(#dd-quorum-arrow)"/>
+<text x="153" y="146" font-size="12" fill="#1c2430" text-anchor="middle">read</text>
+<line x1="340" y1="135" x2="496" y2="62" stroke="#1c2430" marker-end="url(#dd-quorum-arrow)"/>
+<text x="400" y="86" font-size="12" fill="#1c2430">data request</text>
+<line x1="340" y1="155" x2="496" y2="158" stroke="#1c2430" marker-end="url(#dd-quorum-arrow)"/>
+<text x="400" y="150" font-size="12" fill="#1c2430">digest request</text>
+<line x1="340" y1="178" x2="496" y2="252" stroke="#c898a4" stroke-dasharray="5,4" marker-end="url(#dd-quorum-arrow)"/>
+<text x="352" y="236" font-size="12" fill="#1c2430">after p99 wait: extra request</text>
+<text x="20" y="300" font-size="12" fill="#5c6b7c">Digests match: reply. Mismatch: fetch full data from both, newest timestamp wins per cell,</text>
+<text x="20" y="316" font-size="12" fill="#5c6b7c">write it back to the stale replica (blocking read repair), then reply.</text>
+</svg>
+<figcaption>Only R replicas are read on the happy path. That makes a QUORUM read cost two replica requests, not three, and it means a slow replica in the chosen pair delays the read unless speculative retry steps in.</figcaption>
+</figure>
+
+<p>If the digest matches, the coordinator returns A's data. If it does not, the coordinator fetches full data from both, merges them cell by cell (newest timestamp wins), and writes the merged result back to whichever replica was behind. Since Cassandra 4.0 this <strong>read repair</strong> is <em>blocking</em> by default: the coordinator waits for the repair write to succeed before answering. The table option <code>read_repair</code> can be set to <code>'BLOCKING'</code> or <code>'NONE'</code>. Older versions also had probabilistic background repair (<code>read_repair_chance</code>), which 4.0 removed.</p>
+<p>Blocking matters for a subtle reason covered in the isolation section below: it is what makes quorum reads <strong>monotonic</strong>. Without it, one read can return the new value and the next read, through a different pair, can return the old one.</p>
+<p>What about the slow replica? Cassandra's <code>speculative_retry</code> table option (default <code>99p</code>, the replica's 99th-percentile latency) sends an extra request to the third replica when one of the first two has not answered within that time. That is how the "fastest W" straggler benefit from the lesson shows up in practice. Disable speculative retry and a QUORUM read is only as fast as the slower of the two replicas the coordinator happened to pick.</p>
+
+<h3 id=dd-quorum-consistency-levels level=3>Consistency levels, precisely</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Level<th>Replicas that must answer<th>N = 3 in one DC<th>Two DCs, 3 each<th>Notes<tbody><tr><td><code>ONE</code> / <code>LOCAL_ONE</code><td>1 (in any DC / in the local DC)<td>1<td>1<td>Fastest; no overlap guarantee unless the other side is ALL<tr><td><code>QUORUM</code><td>floor(total RF / 2) + 1, across all DCs<td>2<td>4 of 6, so cross-DC latency on every request<td>Rarely what you want with several DCs<tr><td><code>LOCAL_QUORUM</code><td>A majority of the coordinator's DC<td>2<td>2 of the local 3<td>The usual choice; overlap holds within a DC only<tr><td><code>EACH_QUORUM</code><td>A majority in every DC (writes)<td>2<td>2 in each DC<td>Survives losing a DC with overlap intact elsewhere, at WAN latency<tr><td><code>ALL</code><td>Every replica<td>3<td>6<td>One down replica fails the request<tr><td><code>ANY</code><td>Any node, a stored hint counts (writes only)<td>1, possibly a hint<td>1<td>The one level where a hint counts toward W<tr><td><code>SERIAL</code> / <code>LOCAL_SERIAL</code><td>A Paxos majority<td>2 plus Paxos rounds<td>Majority<td>Lightweight transactions: compare-and-set on one partition</table></div></div>
+<p>Two details catch teams out. First, <code>LOCAL_QUORUM</code> writes and <code>LOCAL_QUORUM</code> reads overlap only within one datacenter. A user who writes in eu-west and then reads in us-east has no overlap guarantee. The cross-region copy arrives asynchronously. Second, Cassandra uses strict quorums: hints written for a down replica do <em>not</em> count toward W, except at <code>ANY</code>. The sloppy quorums from the lesson are a Dynamo and Riak behaviour. Riak exposes the distinction as <code>PW</code> and <code>PR</code> (primary write and read), which count only true replicas.</p>
+
+<h3 id=dd-quorum-hints-antientropy level=3>Hinted handoff, anti-entropy and the tombstone deadline</h3>
+<p>When a replica is down, the coordinator stores a <strong>hint</strong>, a copy of the write addressed to the missing replica, and replays it when that replica returns. Cassandra stops collecting hints for a node that has been down longer than <code>max_hint_window</code> (3 hours by default). Past that window, the only way to bring the replica back in line is <strong>repair</strong>.</p>
+<p>Repair is Cassandra's anti-entropy. <code>nodetool repair</code> builds <strong>Merkle trees</strong> (trees of hashes over token ranges) on each replica, compares them, and streams only the ranges that differ. Incremental repair, made reliable in Cassandra 4.0, tracks which data was already repaired. Tools such as Cassandra Reaper schedule repairs so they run continuously in small slices rather than as one huge job.</p>
+<p>Deletes are where repair becomes mandatory. A delete writes a <strong>tombstone</strong>, a marker saying "this cell is gone as of timestamp T". Compaction may drop a tombstone once it is older than the table's <code>gc_grace_seconds</code> (864,000 seconds, 10 days, by default). Now suppose replica C missed the delete and was not repaired within 10 days. A and B purge their tombstone. C still holds the old value. The next repair or read repair sees C's value as the only version and copies it back everywhere. The deleted item returns. This is <strong>data resurrection</strong>, and it makes the rule simple: every replica must be fully repaired more often than <code>gc_grace_seconds</code>.</p>
+
+<h3 id=dd-quorum-linearizable level=3>Overlap is not linearizability</h3>
+<p>The lesson is careful to call W=2, R=2 "overlap visibility", not strong consistency. Here is a concrete case that shows the gap, even with no concurrent writers.</p>
+<ol>
+<li>A write of "sneakers" has reached replica A only. It is in progress; B and C are a few milliseconds behind.</li>
+<li>Reader 1 reads A and B. It sees "sneakers" on A, newer than B's value, and returns sneakers.</li>
+<li>Reader 2 starts after reader 1 finished. It reads B and C. Neither has the write yet. It returns the old cart.</li>
+</ol>
+<p>Reader 2 started later but saw an older value. No completed write was missed, because the write was not complete yet. But a linearizable system would never show a value and then "un-show" it. The fix is the second half of the classic ABD algorithm. Before returning a value, a reader writes it back to a quorum. Then any later quorum read must see it. Blocking read repair is exactly that write-back, applied when replicas disagree. That is why Cassandra 4.0 made it the default. Even so, Cassandra's last-write-wins on client timestamps means it does not claim linearizability for ordinary reads and writes. Lightweight transactions (<code>SERIAL</code>) are the linearizable path, and they cost Paxos rounds.</p>
+
+<h3 id=dd-quorum-other-systems level=3>Quorums inside leader-based systems</h3>
+<p>Quorum counting is not only a leaderless idea. Several leader-based systems use it for the durability half of a write.</p>
+<ul>
+<li><strong>Kafka</strong> with <code>acks=all</code> and <code>min.insync.replicas=2</code> on a replication factor of 3: the leader acknowledges a write once 2 in-sync replicas have it. The leader orders writes, so there are no forks.</li>
+<li><strong>PostgreSQL</strong> quorum commit: <code>synchronous_standby_names = 'ANY 1 (s1, s2)'</code> makes a commit wait until any one of two standbys confirms it. With the primary, that is 2 of 3 copies.</li>
+<li><strong>Raft</strong> (etcd, and many distributed SQL stores) commits a log entry once a majority holds it. Reads go through the leader or a read index, which gives linearizability. That is the "consensus instead of overlap" route the lesson recommends for exactly-one-winner problems.</li>
+<li><strong>DynamoDB</strong>, despite its name, does not expose leaderless quorums. Each partition has a leader that orders writes. A strongly consistent read goes to the leader and costs twice the read capacity of an eventually consistent read, which may be served by any replica.</li>
+</ul>
+<p>The common thread: a majority overlap guarantees that durable data survives a minority failure. What differs is whether something also orders the writes. In Raft and Kafka, the leader does. In Cassandra, the timestamps do, and that is weaker.</p>
+
+<h2 id=dd-quorum-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions for the bookstore cart: 10 million active carts, 2 KB each, 50,000 cart reads and 10,000 cart writes per second at peak, N = 3 in one region, and machines that are each up 99.9% of the time, failing independently.</p>
+
+<h3 id=dd-quorum-availability-math level=3>Availability per consistency level</h3>
+<p>Let q = 0.001 be the chance a given replica is down. A request at level k out of 3 fails when more than 3 - k replicas are down.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Level (N = 3)<th>Fails when<th>Probability of failure<th>Availability<th>Downtime per year<tbody><tr><td>ONE (k = 1)<td>All 3 down<td>q³ = 10⁻⁹<td>99.9999999%<td>Effectively none<tr><td>QUORUM (k = 2)<td>2 or more down<td>3q² ≈ 3 x 10⁻⁶<td>99.9997%<td>About 1.6 minutes<tr><td>ALL (k = 3)<td>Any 1 down<td>1 - 0.999³ ≈ 0.003<td>99.7%<td>About 26 hours</table></div></div>
+<p>QUORUM keeps almost all the availability of ONE and avoids the cliff of ALL. With N = 5 and a quorum of 3, failure needs three replicas down at once: about 10q³ = 10⁻⁸. Going from 3 to 5 replicas buys tolerance of two simultaneous failures, which matters during rolling restarts. While one node is down for maintenance, N = 3 at QUORUM has no spare left. N = 5 still has one.</p>
+<p>These numbers assume independence. A zone outage that takes out two replicas together turns 3q² into "the probability of a zone outage", which is far larger. Rack-aware placement is what keeps the table honest.</p>
+
+<h3 id=dd-quorum-tail-latency level=3>Tail latency: why the second-fastest of three is fast</h3>
+<p>Say each replica answers within 10 ms 99% of the time, so the chance that one replica is slower than 10 ms is s = 0.01. Treat replicas as independent.</p>
+<ul>
+<li><strong>Wait for one specific replica:</strong> slower than 10 ms with probability 1%.</li>
+<li><strong>Wait for all three (ALL):</strong> slower if any is slow, 1 - 0.99³ ≈ 2.97%. ALL turns a per-replica p99 into roughly a p97.</li>
+<li><strong>Wait for the fastest 2 of 3:</strong> slower only if at least two are slow, 3s²(1 - s) + s³ ≈ 0.03%. The per-replica p99 of 10 ms becomes roughly the request's p99.97.</li>
+</ul>
+<p>That last number is the straggler benefit from the lesson, quantified. But note the condition: it holds only if the coordinator actually asks all three and takes the fastest two. Cassandra's write path does (it sends to all N). Its read path asks only R replicas, so the speculative retry is what recovers most of the benefit. Correlated slowness, like a GC pause on a shared host or a congested switch, also breaks the independence. Measure it rather than trusting the formula.</p>
+
+<h3 id=dd-quorum-amplification level=3>Request amplification</h3>
+<ul>
+<li><strong>Writes:</strong> always sent to all 3 replicas. 10,000 writes per second become 30,000 replica writes, whatever W is.</li>
+<li><strong>Reads at QUORUM:</strong> 1 data request + 1 digest request = 2 replica requests. 50,000 reads become 100,000 replica reads. Speculative retries add a few percent more, roughly the share of requests that pass the p99 threshold.</li>
+<li><strong>Read repair:</strong> if 0.5% of reads find a mismatch, that is 250 extra full reads and 250 repair writes per second. Small, until a replica falls behind and the mismatch rate jumps.</li>
+<li><strong>Reads at ONE:</strong> 50,000 replica reads. Half the read load, at the price of the overlap guarantee.</li>
+</ul>
+<p>So the cluster serves about 130,000 replica operations per second for 60,000 client operations. Size the nodes for the first number.</p>
+
+<h3 id=dd-quorum-storage level=3>Storage and headroom</h3>
+<p>10 million carts x 2 KB = 20 GB of logical data. Times N = 3, that is 60 GB on disk before overhead. That is small. But compaction needs free space to rewrite SSTables. With size-tiered compaction, plan for large compactions temporarily needing about as much free space as the data being compacted. Tombstones from cart deletions and expired carts also stay on disk until <code>gc_grace_seconds</code> passes. A cart workload with heavy churn can carry more tombstones than live data. Leaving a disk at most about half full is a common rule for size-tiered tables. Leveled compaction needs less headroom but does more write I/O.</p>
+
+<h3 id=dd-quorum-hint-math level=3>Hints during a node outage</h3>
+<p>Replica B goes down for 2 hours. In a three-node cluster with N = 3, every key has a replica on B, so every write produces a hint for it. At 10,000 writes per second, 2 hours is 72 million hints. At about 1 KB each, that is around 72 GB of hints spread over the coordinators.</p>
+<p>When B returns, those hints replay at the rate set by <code>hinted_handoff_throttle</code> (it has been 1024 KB per second per delivery thread by default, and the setting name varies by version). At around 1 MB per second, 72 GB takes many hours to replay. So for long outages, repair is often faster than waiting for hints. And past the 3-hour <code>max_hint_window</code>, repair is the only option.</p>
+
+<h3 id=dd-quorum-staleness level=3>How stale is W = 1, R = 1 in practice?</h3>
+<p>The lesson says W=1/R=1 is "eventually consistent". You can put a number on "eventually". Suppose replication to the other replicas takes 2 ms at the median and 20 ms at p99, and a user rereads 500 ms after writing. Almost every reread is fresh, because 500 ms is far beyond replication delay. Now suppose a page fires a write and then a read 5 ms later. Some reads arrive before the write has reached their replica. With R = 1 that read has a 2 in 3 chance of hitting a replica other than the one that took the write. Research on "probabilistically bounded staleness" (PBS) shows how to estimate this from measured replication latencies. The practical lesson: W=1/R=1 is fine for "eventually", poor for "immediately after".</p>
+
+<h2 id=dd-quorum-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-quorum-fm-resurrection level=3>1. The deleted item that came back</h3>
+<p><strong>Symptom.</strong> Customers report items reappearing in carts they emptied weeks ago. It happens after a node was rebuilt or after a big repair run.</p>
+<p><strong>Mechanism.</strong> One replica missed the delete while it was down, and it was not repaired within <code>gc_grace_seconds</code>. The other replicas compacted their tombstones away. The stale replica's old value was then the only version left, and repair helpfully spread it.</p>
+<p><strong>Detect.</strong> Track the time since the last successful full repair per table and node, and alert when it approaches <code>gc_grace_seconds</code>. Tools like Reaper expose this directly. Resurrection itself is hard to detect; the alert has to fire before it happens.</p>
+<p><strong>Fix.</strong> Run repair continuously, finishing each full cycle well inside the grace period. Never bring back a node that has been down longer than <code>gc_grace_seconds</code>. Wipe it and rebuild it from its peers. For a cart, consider TTLs (expiring carts after 30 days) so stale data expires instead of relying only on deletes.</p>
+
+<h3 id=dd-quorum-fm-clock-skew level=3>2. Writes that succeed and then vanish</h3>
+<p><strong>Symptom.</strong> A customer adds an item, gets a success response, and the item never appears. Retries also "succeed" and also vanish. Only some app servers are affected.</p>
+<p><strong>Mechanism.</strong> Last-write-wins on timestamps. One app server's clock runs 3 seconds fast and sets client-side timestamps. Its writes carry timestamps from the future. For the next 3 seconds, every correctly-timed write to the same cell has an older timestamp and silently loses. The write was acknowledged by W replicas. It just lost the merge.</p>
+<p><strong>Detect.</strong> NTP or chrony offset per host, with an alert at tens of milliseconds, not seconds. Cell write timestamps compared with server receive time. A test that writes then reads at QUORUM and checks the value.</p>
+<p><strong>Fix.</strong> Keep clocks tightly synchronized. Prefer server-side timestamps unless you need client ones. Model the cart so concurrent changes do not overwrite each other: one row per cart item instead of one blob, or a merge-friendly data type. For true read-modify-write, use a lightweight transaction (<code>IF</code> condition) and accept its cost. The <a href="#vector-clocks">vector clocks</a> lesson covers the causal alternative.</p>
+
+<h3 id=dd-quorum-fm-mixed-levels level=3>3. Read-your-writes broken by mixed consistency levels</h3>
+<p><strong>Symptom.</strong> The flickering cart from the lesson returns, but only on one page. Every replica is healthy.</p>
+<p><strong>Mechanism.</strong> The "add to cart" endpoint writes at <code>ONE</code> for speed, a change someone made months ago. The cart page reads at <code>QUORUM</code>. 1 + 2 = 3, which is not greater than 3, so the read pair can miss the one replica that took the write. Each statement looks reasonable alone. The guarantee comes from the pair.</p>
+<p><strong>Detect.</strong> Audit consistency levels per statement, not per service. Driver metrics usually expose the level per request. Grep the code for statement-level overrides.</p>
+<p><strong>Fix.</strong> Set consistency levels in one place per dataset, as named profiles (most drivers support execution profiles), and review them as product decisions. Add a test that checks W + R &gt; N for every write/read pair on a key that needs read-your-writes.</p>
+
+<h3 id=dd-quorum-fm-downgrade level=3>4. The driver that quietly lowered the consistency level</h3>
+<p><strong>Symptom.</strong> During a node failure, error rates stay at zero, which looks great. Afterwards, support tickets show stale carts from exactly that window.</p>
+<p><strong>Mechanism.</strong> The client used a downgrading retry policy. When a QUORUM request could not get enough replicas, the driver retried at a lower level and reported success. Older DataStax Java drivers shipped such a policy, and the 4.x driver deprecated it for this reason. The application asked for overlap and silently received ONE.</p>
+<p><strong>Detect.</strong> Driver metrics for retries and the consistency level actually achieved. Any downgrade counter above zero is a finding.</p>
+<p><strong>Fix.</strong> Remove downgrading retries. If a dataset really should fall back to ONE during failures, make that an explicit, logged, per-operation decision, ideally with a degraded-mode signal in the response. That is honest <a href="#graceful-degradation">graceful degradation</a> rather than a hidden one.</p>
+
+<h3 id=dd-quorum-fm-correlated level=3>5. Quorum lost to one zone outage</h3>
+<p><strong>Symptom.</strong> One availability zone goes down and a fraction of carts become unwritable at QUORUM, although "we have three replicas".</p>
+<p><strong>Mechanism.</strong> Nodes were added over time without rack settings, so the snitch thought every node was in one rack. For some token ranges, two of the three replicas landed in the failed zone. Those keys lost their majority.</p>
+<p><strong>Detect.</strong> A placement audit: for each token range, count replicas per zone. Any range with more than one replica in a zone, when N equals the zone count, is a latent outage. <code>nodetool status</code> and <code>describering</code> output give the raw data.</p>
+<p><strong>Fix.</strong> Set each node's real zone as its rack, keep the number of nodes per zone balanced, and use <code>NetworkTopologyStrategy</code>. Fixing placement on a live cluster means streaming data, so plan it as a migration, not a config tweak.</p>
+
+<h3 id=dd-quorum-fm-hot-partition level=3>6. The giant partition that times out every replica</h3>
+<p><strong>Symptom.</strong> Requests for one key time out at every consistency level. The three nodes that hold it show long GC pauses. Everything else is fine.</p>
+<p><strong>Mechanism.</strong> A scraper bot built a cart with 200,000 items. Its partition grew to hundreds of megabytes. Every read of it loads a huge amount of data on each replica, so all replicas for that key are slow together. Quorum cannot help when all N replicas are overloaded by the same request. Their failure is correlated by design.</p>
+<p><strong>Detect.</strong> Cassandra logs warnings for large partitions during compaction, and <code>nodetool tablehistograms</code> shows partition size percentiles. Watch the max, not just the p99.</p>
+<p><strong>Fix.</strong> Cap cart size in the application. Split unbounded data across partitions, such as bucketing by time or by item ranges. Rate-limit the client that creates them.</p>
+
+<h3 id=dd-quorum-fm-repair-storm level=3>7. The recovery that hurt more than the failure</h3>
+<p><strong>Symptom.</strong> A node returns after a 2-hour outage. Cluster-wide p99 latency doubles for the next several hours.</p>
+<p><strong>Mechanism.</strong> Hint replay, read repair on every mismatched key, and a manually started full repair all compete for disk and network on the returning node and its peers. Meanwhile, the returning node is slow, and the dynamic snitch keeps routing some reads to it anyway.</p>
+<p><strong>Detect.</strong> Hint replay throughput, pending compactions, streaming throughput and read-repair rate, all plotted next to p99 latency.</p>
+<p><strong>Fix.</strong> Throttle hint delivery and streaming deliberately, and schedule repair rather than launching it in a hurry. For long outages, rebuilding the node from peers can be gentler than replaying hints. Make sure the drivers' load balancing avoids nodes that are still catching up.</p>
+
+<h2 id=dd-quorum-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-quorum-choose-replication level=3>Replication models for the same cart</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Model<th>Write ordering<th>Survives one replica loss<th>Read guarantee<th>Conflict handling<th>Example systems<tbody><tr><td>Leaderless, strict quorum<td>None; timestamps or versions<td>Yes, no pause<td>Overlap visibility; monotonic with blocking repair<td>LWW per cell, or siblings<td>Cassandra, ScyllaDB, Riak with PW/PR<tr><td>Leaderless, sloppy quorum<td>None<td>Yes, even during partitions<td>Weaker: hints may not be read<td>Must merge later<td>Dynamo (paper), Riak defaults<tr><td>Leader + async replicas<td>Leader orders all writes<td>Writes pause for failover; recent writes may be lost<td>Leader reads are fresh; replica reads lag<td>None needed<td>Postgres and MySQL with async replicas<tr><td>Leader + quorum commit<td>Leader orders<td>Writes pause briefly for failover; no acknowledged write lost<td>Leader reads are fresh<td>None needed<td>Kafka <code>acks=all</code>, Postgres <code>ANY 1</code><tr><td>Consensus (Raft, Multi-Paxos)<td>Majority-agreed log<td>Yes, after a short leader election<td>Linearizable via leader or read index<td>None needed<td>etcd, distributed SQL stores<tr><td>Leaderless + CRDTs<td>None needed<td>Yes<td>Converges; every replica can merge<td>Built into the data type<td>Riak data types, Redis Enterprise active-active</table></div></div>
+<p>The cart's requirement was "writable through a machine failure, without a 45-second pause". Leaderless quorums and consensus both meet it. Consensus brings a leader election, usually a few seconds in practice, rather than zero. Leaderless brings conflicts to resolve. For a cart, conflicts are easy to merge (union of items, with removals tracked), so leaderless fits well. For an order or a payment, conflicts are not acceptable, so use a leader or consensus.</p>
+
+<h3 id=dd-quorum-choose-levels level=3>Picking W and R per operation</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Operation<th>Write level<th>Read level<th>Why<tbody><tr><td>Cart add/remove, cart page<td>LOCAL_QUORUM<td>LOCAL_QUORUM<td>Read-your-writes in-region; survives one replica loss<tr><td>Cart read at checkout<td>(as above)<td>LOCAL_QUORUM, or SERIAL if the checkout must see a locked cart<td>Charging a stale cart is a support ticket<tr><td>Feature flags<td>ALL or QUORUM (rare writes)<td>ONE<td>W + R &gt; N with ALL/ONE; reads stay cheap<tr><td>Recently viewed items<td>ONE<td>ONE<td>A stale list costs nothing<tr><td>Clickstream events<td>ONE (or ANY)<td>Batch job chooses<td>Write latency matters most; losses are tolerable<tr><td>Unique username claim<td>SERIAL (lightweight transaction)<td>SERIAL<td>Needs exactly one winner; overlap is not enough</table></div></div>
+<p>Write the table down for your own datasets, and keep it next to the code. Most quorum incidents come from a level nobody chose on purpose.</p>
+
+<h3 id=dd-quorum-choose-conflicts level=3>Resolving conflicts</h3>
+<p>Last-write-wins is simple and loses data whenever two writes are concurrent or clocks drift. Siblings with vector clocks keep every concurrent version and push the merge to the application, which must then write a merge function. CRDTs (conflict-free replicated data types) build the merge into the type: an add-wins set for cart items, a counter for quantities. Choose by asking what a lost update costs. For a cart line, LWW on separate rows per item is often enough. For a whole-cart blob, it is not. The <a href="#vector-clocks">vector clocks</a> lesson takes this decision further.</p>
+
+<h2 id=dd-quorum-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What are N, W and R for each operation, where are they set in code, and does every write/read pair that needs read-your-writes satisfy W + R &gt; N?</li>
+<li>Are consistency levels <code>LOCAL_</code> variants, and is it understood that overlap then holds only within one datacenter?</li>
+<li>Does the store use strict or sloppy quorums, and does any client retry policy downgrade the level?</li>
+<li>Are replicas spread across racks or zones, and has placement been audited per token range?</li>
+<li>How are concurrent writes resolved: last-write-wins, siblings, or CRDTs? What does a lost update cost for this data?</li>
+<li>If last-write-wins is used, who sets timestamps, and what is the alerting threshold on clock offset?</li>
+<li>Is repair scheduled so every replica completes a full cycle inside <code>gc_grace_seconds</code>? Who owns that schedule?</li>
+<li>What is the hint window, and what is the procedure for a node down longer than it, or longer than the grace period?</li>
+<li>Is read repair blocking, and is speculative retry enabled with a sensible threshold?</li>
+<li>Has capacity been sized for replica operations (writes x N, reads x R, plus repair), not client operations?</li>
+<li>Which operations need exactly one winner, and do they use lightweight transactions or a consensus store instead of plain quorums?</li>
+<li>Is there a limit on partition size, and an alert on the largest partitions?</li>
+</ol>
+
+<h2 id=dd-quorum-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"W = 2, R = 2, N = 3. Can a read return an older value than a previous read did?"</summary>
+<p>Yes, while a write is still in progress. If the write has reached only one replica, a read that includes that replica returns the new value, and a later read through the other two returns the old one. No completed write was missed, but the system went backwards from the reader's view. The fix is for readers to write back what they return to a quorum before answering. Cassandra's blocking read repair does this when replicas disagree, which gives monotonic quorum reads.</p>
+</details>
+
+<details>
+<summary>"Why does Cassandra send a write to all three replicas if W is only 2?"</summary>
+<p>Because W is about how long the client waits, not how many copies exist. Sending to all N keeps every replica as current as possible, so later reads mismatch less and repair has less to do. If it sent to only W replicas, the third would fall permanently behind and depend entirely on anti-entropy. Reads are different: Cassandra contacts only R replicas, because extra reads cost capacity and do not make data more durable.</p>
+</details>
+
+<details>
+<summary>"Why is N = 4 with quorum reads and writes a poor choice?"</summary>
+<p>A majority of 4 is 3. So W = R = 3, and the cluster tolerates only one replica failure, the same as N = 3 with a quorum of 2. You pay for a fourth copy, and every quorum operation waits for three answers instead of two, for no gain in fault tolerance. Odd replica counts give the best tolerance per copy. N = 5 tolerates two failures.</p>
+</details>
+
+<details>
+<summary>"Can quorum reads and writes implement a lock or a unique username?"</summary>
+<p>No. Two clients can both read "username free" and both write "taken by me", each reaching a quorum through different replicas. Quorum guarantees that a later reader sees a completed write, not that only one write wins. You need an atomic compare-and-set ordered by consensus: Cassandra's lightweight transactions (Paxos per partition), or a Raft store like etcd. Those cost extra round trips, so use them only for the operations that need one winner.</p>
+</details>
+
+<details>
+<summary>"What is the relationship between hinted handoff, read repair and full repair?"</summary>
+<p>They are three layers catching different gaps. Hints replay writes a replica missed while it was briefly down, up to the hint window. Read repair fixes keys that real traffic happens to read. Full anti-entropy repair, with Merkle trees, fixes everything else, including keys nobody reads and anything older than the hint window. Only full repair is required for correctness, because of tombstones and <code>gc_grace_seconds</code>. The other two make it cheaper and make most reads fresh sooner.</p>
+</details>
+
+<details>
+<summary>"You use LOCAL_QUORUM in two regions. A user writes in Europe and reads in the US a second later. What do they see?"</summary>
+<p>Maybe the old value. LOCAL_QUORUM overlaps only within one datacenter. The write was acknowledged by two European replicas, and its copy to the US replicas travels asynchronously, typically arriving within the cross-region latency but with no guarantee. Options: route each user to a home region, write at EACH_QUORUM for the data that needs it (paying WAN latency on writes), or carry the version the user last saw and reject older reads. Usually home-region routing is the cheapest.</p>
+</details>
+
+<details>
+<summary>"If W + R &gt; N guarantees overlap, why did the cart still lose an item?"</summary>
+<p>List the exceptions and check each. Was some statement's level lower than you thought (mixed levels, a downgrading retry)? Was it a sloppy quorum during a partition? Were two writes concurrent, so last-write-wins dropped one? Did a clock skew give an older write a newer timestamp? Did a deleted item resurrect because repair missed the grace period? Overlap only promises that someone you ask has the latest completed write. Every one of these breaks a different part of that sentence.</p>
+</details>
+
+<details>
+<summary>"When would you pick N = 3, W = 1, R = 3 over W = 2, R = 2?"</summary>
+<p>When writes must survive heavy load or network trouble with the lowest latency, and reads are rare and can wait. Write-heavy telemetry that a few dashboards read is the classic case. The cost is that every read fails if any one replica is unavailable, because R = 3 needs all of them. In practice teams usually choose W = 1, R = 1 for such data and accept staleness, because R = 3 makes reads as fragile as ALL.</p>
+</details>

@@ -1,0 +1,12 @@
+{
+  "type": "enum",
+  "name": "ShippingMethod",
+  "namespace": "com.edacommerce.common",
+  "doc": "Delivery speed chosen at checkout. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+  "symbols": [
+    "STANDARD",
+    "EXPRESS",
+    "UNKNOWN"
+  ],
+  "default": "UNKNOWN"
+}

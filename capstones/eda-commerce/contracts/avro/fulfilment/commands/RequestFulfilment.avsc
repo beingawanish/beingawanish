@@ -1,0 +1,43 @@
+{
+  "type": "record",
+  "name": "RequestFulfilment",
+  "namespace": "com.edacommerce.fulfilment",
+  "doc": "Command: pick, pack and dispatch an order. Safe to resend: the warehouse dedupes on fulfilmentId.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "fulfilmentId",
+      "type": "string"
+    },
+    {
+      "name": "lines",
+      "type": {
+        "type": "array",
+        "items": "com.edacommerce.common.LineItem"
+      }
+    },
+    {
+      "name": "shipTo",
+      "type": "com.edacommerce.common.Address",
+      "pii": true
+    },
+    {
+      "name": "shippingMethod",
+      "type": "com.edacommerce.common.ShippingMethod"
+    },
+    {
+      "name": "attempt",
+      "type": "int",
+      "doc": "1 on the first send, incremented on each resend after a timeout.",
+      "default": 1
+    }
+  ]
+}

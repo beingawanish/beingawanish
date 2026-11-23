@@ -1,0 +1,51 @@
+{
+  "realm": "edacommerce",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 900,
+  "clientScopes": [
+    {"name": "shop", "protocol": "openid-connect", "attributes": {"include.in.token.scope": "true"}},
+    {"name": "ops", "protocol": "openid-connect", "attributes": {"include.in.token.scope": "true"}}
+  ],
+  "roles": {"realm": [{"name": "customer"}, {"name": "ops"}]},
+  "clients": [
+    {
+      "clientId": "storefront",
+      "name": "Storefront (public client, authorization code + PKCE)",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["http://localhost:3001/*"],
+      "webOrigins": ["+"],
+      "attributes": {"pkce.code.challenge.method": "S256"},
+      "defaultClientScopes": ["shop", "profile", "email"]
+    },
+    {
+      "clientId": "ops-cli",
+      "name": "Operations scripts (client credentials)",
+      "publicClient": false,
+      "secret": "ops-cli-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "defaultClientScopes": ["ops"]
+    }
+  ],
+  "users": [
+    {
+      "username": "jane",
+      "email": "jane.doe@example.com",
+      "firstName": "Jane",
+      "lastName": "Doe",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [{"type": "password", "value": "jane", "temporary": false}],
+      "realmRoles": ["customer"]
+    },
+    {
+      "username": "service-account-ops-cli",
+      "enabled": true,
+      "serviceAccountClientId": "ops-cli",
+      "realmRoles": ["ops"]
+    }
+  ]
+}

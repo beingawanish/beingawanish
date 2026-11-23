@@ -1,0 +1,239 @@
+<h2 id=dd-cache-stampede-prevention-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson names five tools. In code they collapse into two pieces of state: <strong>what you store with each value</strong>, and <strong>how a rebuild is claimed and released</strong>. Get those two right and the tools are small branches in one read function. Get them wrong and you have built a new outage source with a lock in it.</p>
+
+<h3 id=dd-cache-stampede-prevention-envelope level=3>The envelope: store more than the value</h3>
+<p>Plain cache-aside stores the value and lets the cache's TTL delete it. Every stampede tool needs the entry to outlive its freshness, so the value goes inside a small envelope:</p>
+<pre><code>product:8412 -&gt; {
+  "v":        { ...the product page data... },
+  "soft_exp": 1767297600000,   // ms: after this, the value is stale
+  "delta_ms": 48,              // how long the last rebuild took
+  "ver":      9131             // source version the value was built from
+}
+Redis TTL on the key (the hard expiry) = soft TTL + grace, e.g. 3600 s + 600 s</code></pre>
+<p>Each field feeds one tool. <code>soft_exp</code> is the lesson's logical expiry: past it, the entry is served as stale while one refresh runs. The Redis TTL is the hard expiry, a safety net that removes data nobody refreshed. <code>delta_ms</code> feeds probabilistic early refresh, which needs to know how long a rebuild takes. <code>ver</code> stops a slow rebuild from overwriting a newer one, which comes up under the failure modes.</p>
+<p>The gap between soft and hard expiry is the <strong>grace period</strong>. It is your answer to "how stale may this ever get if refresh keeps failing?" Pick it per data type, and write it down. It is the staleness sentence with a number in it.</p>
+
+<figure>
+<svg role="img" aria-labelledby="dd-cache-stampede-prevention-svg-title dd-cache-stampede-prevention-svg-desc" viewBox="0 0 720 210" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-cache-stampede-prevention-svg-title">The life of one cached entry with stampede protection</title>
+<desc id="dd-cache-stampede-prevention-svg-desc">A timeline. The entry is written and is fresh until its soft expiry. In the last moments before soft expiry is the early-refresh zone, where each request has a growing random chance of triggering a refresh. After soft expiry comes the grace period: the stale value is served instantly while one lock-guarded refresh runs. At the hard expiry the cache deletes the key, and the next request must wait for a single-flight rebuild.</desc>
+<line x1="30" y1="90" x2="700" y2="90" style="stroke:var(--ink,#1c2430)"/>
+<rect x="30" y="70" width="380" height="40" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="200" y="95" text-anchor="middle" style="fill:var(--ink,#1c2430)">fresh: serve from cache</text>
+<rect x="330" y="70" width="80" height="40" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99);stroke-dasharray:4 3"/>
+<text x="370" y="62" text-anchor="middle" style="fill:var(--muted,#5c6b7c);font-size:11px">early-refresh zone</text>
+<text x="370" y="95" text-anchor="middle" style="fill:var(--accent,#1f5f99);font-size:11px">XFetch</text>
+<rect x="410" y="70" width="210" height="40" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="515" y="88" text-anchor="middle" style="fill:var(--ink,#1c2430)">grace: serve stale instantly,</text>
+<text x="515" y="104" text-anchor="middle" style="fill:var(--ink,#1c2430)">one locked refresh</text>
+<rect x="620" y="70" width="80" height="40" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="660" y="88" text-anchor="middle" style="fill:var(--ink,#1c2430)">gone:</text>
+<text x="660" y="104" text-anchor="middle" style="fill:var(--ink,#1c2430)">wait</text>
+<path d="M30 120 V140 M410 120 V140 M620 120 V140" style="stroke:var(--muted,#5c6b7c)"/>
+<text x="30" y="156" style="fill:var(--muted,#5c6b7c)">written</text>
+<text x="410" y="156" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">soft_exp (logical TTL)</text>
+<text x="620" y="156" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">hard TTL (Redis EXPIRE)</text>
+<text x="30" y="188" style="fill:var(--muted,#5c6b7c)">Hot keys refresh inside the dashed zone and never reach grace. Cold keys skip the zone; they rarely see a crowd.</text>
+</svg>
+</figure>
+
+<h3 id=dd-cache-stampede-prevention-read-path level=3>The read path in one function</h3>
+<p>Here is the whole decision, as a sketch. <code>cache</code> is a Redis client and <code>rebuild</code> loads from the database:</p>
+<pre><code>import math, random, time, uuid
+
+def get_product(pid, beta=1.0):
+    env = cache.get_envelope(f"product:{pid}")          # None if hard-expired
+    now = time.time() * 1000
+    if env is not None:
+        remaining = env.soft_exp - now
+        if remaining &gt; 0:
+            # Tool 3: probabilistic early refresh (XFetch)
+            if -env.delta_ms * beta * math.log(random.random()) &lt; remaining:
+                return env.v                             # fresh, no refresh
+        # Early-refresh winner, or stale: Tool 2 + Tool 1
+        try_refresh_in_background(pid)                   # lock-guarded
+        return env.v                                     # never wait
+    # Hard miss: Tool 1 only. Someone must wait.
+    return rebuild_with_lock(pid, wait_ms=200)</code></pre>
+<p>Note the shape. Only the hard-miss branch ever blocks a user. Every other branch returns at cache speed. That is why the grace period matters so much: a key that is hot enough to stampede should never reach the hard-miss branch at all.</p>
+
+<h3 id=dd-cache-stampede-prevention-lock level=3>The lock, done properly</h3>
+<p>The lesson gives the acquire: <code>SET lock:product:8412 &lt;token&gt; NX PX 3000</code>. Three details decide whether it holds up in production.</p>
+<ul>
+<li><strong>The token is random and per attempt.</strong> A UUID, not the hostname. Release must check it:
+<pre><code>-- release only if we still own it
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0</code></pre>
+A plain <code>DEL</code> can remove a lock that expired and was then taken by someone else. Now two rebuilders run, and each believes it is alone. A release that returns 0 means your lock expired while you held it. Count that. It is a direct signal that the lock TTL is too short.</li>
+<li><strong>The TTL is sized from the slow tail, not the average.</strong> If rebuilds take 50 ms normally and 800 ms at p99.9 under load, a 100 ms lock fails exactly when it is needed. Start at several times the p99.9 rebuild time. For rebuilds that can run long, renew the lock from the holder every third of its TTL (a watchdog) and stop renewing if the rebuild is abandoned.</li>
+<li><strong>The write-back is conditional.</strong> The rebuilder read version 9131 from the database. Write the envelope only if the cached <code>ver</code> is lower, in one Lua script. Otherwise a slow rebuild that started before an update can land after a faster one and put old data back.</li>
+</ul>
+<p>This is a lock for efficiency, not for correctness. If it fails, you get two rebuilds and some extra load, not corrupted data. That is the right kind of lock to build on a single Redis primary. If you ever find yourself needing a cache lock to be <em>correct</em>, the design has a different problem.</p>
+
+<h3 id=dd-cache-stampede-prevention-two-tier level=3>Two-tier single flight: in-process first, then shared</h3>
+<p>A distributed lock collapses the crowd across servers. It does nothing about the crowd inside one server. With 60 app instances, the 600 concurrent misses are about 10 per instance, and each of those 10 would hit Redis to try the lock and then poll.</p>
+<p>So put an in-process coalescer in front. Go's <code>singleflight.Group.Do</code> runs a function once per key while other callers on the same key block and share the result. Java's Caffeine does the same in an <code>AsyncLoadingCache</code>, and its <code>refreshAfterWrite</code> gives you serve-stale-and-refresh inside the process. In Python, a dict of in-flight futures keyed by cache key does the job.</p>
+<p>Now the funnel is 600 misses, then 60 lock attempts (one per instance), then 1 database query. The sizing section shows why that middle step is worth having.</p>
+
+<h3 id=dd-cache-stampede-prevention-waiting level=3>How waiters learn the value is ready</h3>
+<p>Requests that lose the lock in the hard-miss branch need the result. Three ways to get it:</p>
+<ul>
+<li><strong>Poll.</strong> Sleep 10 to 20 ms with jitter, <code>GET</code> again, give up after a deadline. Simple and stateless. It costs extra reads on the hottest shard you have.</li>
+<li><strong>Notify.</strong> The rebuilder publishes on a channel such as <code>ready:product:8412</code> after writing. Waiters subscribe before checking once more. Fewer reads, but more moving parts, and a lost message must still fall back to the deadline.</li>
+<li><strong>Don't wait.</strong> Return a degraded response at once: a stale copy from a local cache, a page without the recommendations strip, or a 503 with <code>Retry-After</code>. This is <a href="#graceful-degradation">graceful degradation</a>, and for anything non-critical it is usually the best answer.</li>
+</ul>
+<p>The one thing a waiter must never do when its deadline passes is go to the database itself. That turns the deadline into a stampede with a delay on it.</p>
+
+<h3 id=dd-cache-stampede-prevention-xfetch level=3>Probabilistic early refresh, with the numbers</h3>
+<p>The XFetch rule is the one-liner in the code above. Each request computes <code>gap = −δ · β · ln(rand)</code> and refreshes if <code>gap</code> is at least the time left before soft expiry. Here δ is the rebuild time and β is a tuning knob, 1 by default. <code>−ln(rand)</code> is an exponential random number with mean 1, so the chance that one request triggers, with <em>t</em> left, is <code>e^(−t / βδ)</code>. It is tiny far from expiry and climbs steeply as expiry gets close.</p>
+<p>Plug in the bestseller: 12,000 requests a second, δ = 50 ms, β = 1. Summed over all requests, the expected number of triggers before expiry is <code>R · β · δ = 600</code>. The chance of reaching expiry with no trigger at all is <code>e^(−600)</code>, which is zero for any practical purpose. The median trigger point comes from <code>R·β·δ·e^(−t/βδ) = ln 2</code>, which gives <em>t</em> = 0.05 · ln(866) ≈ <strong>340 ms before expiry</strong>. That leaves plenty of time for a 50 ms rebuild.</p>
+<p>Now a cold key at 1 request a second. <code>R·β·δ = 0.05</code>, so the chance of any early refresh is <code>1 − e^(−0.05)</code>, about 5%. The rest of the time it simply expires, and there is no crowd to worry about. That is the lesson's point, in numbers: the rule spends work only where traffic is.</p>
+<p>Two practical notes. First, XFetch does not remove the need for the lock. Near the trigger point a hot key can see one or two more triggers during the 50 ms rebuild, so the refresh is still lock-guarded. Second, δ must be measured and stored with the entry. Guess it too low and keys refresh too late. Raise β to 2 or more if rebuild time is noisy. For the bestseller that moves the median trigger to about 750 ms early.</p>
+
+<h3 id=dd-cache-stampede-prevention-proxies level=3>The same tools in proxies and CDNs</h3>
+<p>Often the cheapest place to stop a stampede is in front of the app. nginx has all three hot-key tools as directives:</p>
+<pre><code>proxy_cache_lock on;                 # single flight per cache key
+proxy_cache_lock_timeout 5s;         # after this, waiters go to upstream (uncached!)
+proxy_cache_use_stale updating error timeout http_503;
+proxy_cache_background_update on;    # serve stale, refresh in the background</code></pre>
+<p>Read the comment on <code>proxy_cache_lock_timeout</code> carefully. When it fires, the waiting request goes to the upstream, and nginx does not cache that response. With a slow upstream, every waiter eventually reaches it. That is failure mode 2 below, built into a default.</p>
+<p>HTTP origins can drive the same behaviour in shared caches with <code>Cache-Control: max-age=60, stale-while-revalidate=30, stale-if-error=86400</code>, from RFC 5861. Varnish coalesces concurrent misses for the same object by default and uses its <code>grace</code> setting for stale serving. Most CDNs offer request collapsing and an origin shield tier, though names and defaults vary by vendor.</p>
+
+<h3 id=dd-cache-stampede-prevention-leases level=3>Leases: when the cache itself coordinates</h3>
+<p>Facebook's memcache leases, from the paper the lesson cites, move single flight into the cache server. On a miss, the server hands out a lease token, and only a client holding a valid token may set the key. Other clients are told to wait briefly and retry. The server limits how often it issues tokens per key.</p>
+<p>The clever part is that a delete invalidates any outstanding lease. A rebuilder that read the database before an update can no longer write its now-stale result. One mechanism handles both the thundering herd and the stale-set race. That is exactly what the <code>ver</code> check above does by hand.</p>
+
+<h2 id=dd-cache-stampede-prevention-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions: 12,000 requests a second on the bestseller at peak, 60 app instances, a Redis cluster with consistent hashing, a database that runs comfortably at a few hundred queries a second and degrades past about 2,000.</p>
+
+<h3 id=dd-cache-stampede-prevention-sizing-crowd level=3>The crowd is request rate times rebuild time</h3>
+<p>The lesson's core formula is <code>N = R × d</code>. It is worth tabulating, because the dangerous cell is often not the one people expect:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Key traffic R<th>d = 5 ms (indexed lookup)<th>d = 50 ms (page query)<th>d = 400 ms (recommendations)<th>d = 3 s (LLM answer)<tbody>
+<tr><td>10 / s<td>0.05<td>0.5<td>4<td>30
+<tr><td>1,000 / s<td>5<td>50<td>400<td>3,000
+<tr><td>12,000 / s<td>60<td>600<td>4,800<td>36,000
+</tbody></table></div></div>
+<p>The top-right cell is the AI case from the lesson: a modest 10 requests a second, a 3-second generation, and already 30 duplicate paid generations per expiry. Rebuild cost multiplies the crowd, so slow rebuilds deserve protection at traffic levels where fast ones don't.</p>
+<p>A useful threshold rule: protect a key when <code>R × d</code> is above about 1. Below that, two concurrent misses are rare, and the lock is overhead.</p>
+
+<h3 id=dd-cache-stampede-prevention-sizing-waiters level=3>What waiting costs on the hot shard</h3>
+<p>Take the hard-miss case with a lock and polling at 20 ms. 599 losers each try <code>SET NX</code> once and poll about three times during a 50 ms rebuild. That is roughly 600 + 1,800 = 2,400 extra commands in 50 ms, all on the one shard that owns the bestseller. As a rate, that is about 48,000 commands a second, on top of the 12,000 reads it already serves. For 50 ms, the hot shard runs at five times its normal load.</p>
+<p>Add in-process single flight and the losers drop from 599 to 59 (one per instance, minus the winner). Extra commands fall to about 240. That is the practical case for the two-tier design: it protects the cache, not only the database.</p>
+<p>Now let the rebuild slow to 2 seconds under load, with no stale copy available. Waiters are <code>12,000 × 2 = 24,000</code>, or 400 per instance. If each holds a worker thread or a connection, many servers run out. That is why the hard-miss branch needs a short deadline and a degraded answer, and why the grace period should be long enough that hot keys never land there.</p>
+
+<h3 id=dd-cache-stampede-prevention-sizing-fleet level=3>Fleet numbers: steady expiry, jitter, cold start</h3>
+<p><strong>Steady expiry load.</strong> With <em>K</em> active keys and TTL <em>T</em>, about <code>K / T</code> rebuilds happen each second, even with perfect protection. 30,000 active products at a one-hour TTL is about 8 rebuilds a second. At a 5-minute TTL it is 100. This is the floor that single flight protects. It doesn't make it smaller.</p>
+<p><strong>Jitter.</strong> 10,000 keys warmed in one minute with a 3,600-second TTL all expire in the same minute an hour later: about 170 rebuilds a second for 60 seconds. With ±10% uniform jitter, the expiries spread over 720 seconds, about 14 a second. Same total work, one-twelfth the peak.</p>
+<p><strong>Cold start.</strong> The lesson's drill warms 10,000 keys in about 40 seconds. That is itself 250 database queries a second, so the warmer should be rate-limited like any other client. Product traffic is skewed: if the top 10,000 keys carry 90% of requests, then at 12,000 requests a second the remaining 10% is 1,200 misses a second, mostly on distinct tail keys. Single flight can't merge distinct keys. So the database sees close to 1,200 queries a second, consistent with the lesson's "below 2,000." If that is too many, the traffic ramp is your control: start at 25% of traffic and step up as the hit ratio climbs.</p>
+
+<h3 id=dd-cache-stampede-prevention-sizing-memory level=3>Memory cost of the grace period</h3>
+<p>Stale serving keeps entries past their freshness. With a 600-second grace on a 3,600-second TTL, an entry that nobody reads lives about 17% longer. Expect resident memory to grow by up to that much for keys that would otherwise have expired. Under an LRU policy the cache will evict cold stale entries first anyway, so this is usually a small cost. Check it on the instance graph before and after.</p>
+
+<h2 id=dd-cache-stampede-prevention-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-cache-stampede-prevention-fm-lock-ttl level=3>1. The lock expires under load, and the stampede comes back</h3>
+<p><strong>Symptom.</strong> Protection works in tests and on normal days. During a slowdown, database load still spikes at each hot-key expiry.</p>
+<p><strong>Mechanism.</strong> The lock TTL was 100 ms, sized from the normal 50 ms rebuild. Under load, rebuilds took 600 ms. The lock expired mid-rebuild, a second request took it and started its own rebuild, then a third. The protection failed exactly when the database was slow, which is the only time it mattered. With plain <code>DEL</code> on release, the first rebuilder also deleted the second one's lock, opening the door further.</p>
+<p><strong>Detect.</strong> Rebuilds per key per expiry (should be 1). The compare-and-delete release returning 0. Lock TTL graphed against p99.9 rebuild time.</p>
+<p><strong>Fix.</strong> Size the TTL from the slow tail, renew it for long rebuilds, release with a token check, and make the hot key's normal path serve-stale so expiry of the lock costs latency at most, never a crowd.</p>
+
+<h3 id=dd-cache-stampede-prevention-fm-timeout level=3>2. Waiters give up and go to the database</h3>
+<p><strong>Symptom.</strong> Database queries at an expiry show a delayed spike: one query at 8:00:00.000, then hundreds at 8:00:00.200.</p>
+<p><strong>Mechanism.</strong> Waiters had a 200 ms deadline, and the fallback on timeout was "load it yourself." The rebuild took 250 ms that day, so every waiter hit the database at once, 200 ms late. The nginx version is <code>proxy_cache_lock_timeout</code>: after it fires, waiting requests go upstream and their responses are not cached.</p>
+<p><strong>Detect.</strong> A counter for "waiter deadline exceeded," split by what the waiter did next. Database queries per key per second at sub-second resolution.</p>
+<p><strong>Fix.</strong> On deadline, return stale, a degraded page, or an error with <code>Retry-After</code>. In nginx, pair the lock with <code>proxy_cache_use_stale updating</code> so most waiters never wait, and set the lock timeout above the upstream's slow tail.</p>
+
+<h3 id=dd-cache-stampede-prevention-fm-invalidation level=3>3. A write to a hot key causes the stampede</h3>
+<p><strong>Symptom.</strong> No TTL expired, yet the bestseller's page stalls for a moment every time merchandising edits it.</p>
+<p><strong>Mechanism.</strong> Cache-aside invalidates by deleting the key. Deleting a hot key throws away the stale copy that serve-stale depends on, so every write drops straight into the hard-miss branch: 600 requests, one rebuild, 599 waiting. Expiry was protected. Invalidation was not.</p>
+<p><strong>Detect.</strong> Hard misses on keys that had a value a moment earlier. Correlate latency spikes with write events for that key.</p>
+<p><strong>Fix.</strong> <strong>Soft invalidation.</strong> On write, set <code>soft_exp</code> to now (and bump the expected version) instead of deleting. The next reader serves the old copy for one rebuild time and triggers the locked refresh. For a display price that means about 50 ms of the old price, which is fine while checkout reads the source. For data where even that is unacceptable, write the new value through instead of invalidating.</p>
+
+<h3 id=dd-cache-stampede-prevention-fm-stale-set level=3>4. A slow rebuild puts old data back</h3>
+<p><strong>Symptom.</strong> After a price change, the old price reappears on the page and stays for a full TTL.</p>
+<p><strong>Mechanism.</strong> Rebuild A read the price at 8:00:00.000 and then stalled. At 8:00:00.100 the price changed and the key was invalidated. Rebuild B read the new price and wrote it. At 8:00:00.300 rebuild A woke up and wrote the old price over it. The lock didn't help: A's lock had already expired, which is how B ran at all.</p>
+<p><strong>Detect.</strong> Periodic sampling that compares cached <code>ver</code> to the source version for hot keys. A cached version lower than one already seen for that key is this bug.</p>
+<p><strong>Fix.</strong> Conditional write-back on <code>ver</code>, in one script, as described above. Memcache leases solve the same problem by invalidating the lease on delete.</p>
+
+<h3 id=dd-cache-stampede-prevention-fm-stale-forever level=3>5. Stale forever: refresh keeps failing and nobody notices</h3>
+<p><strong>Symptom.</strong> A product shows a price that was changed six hours ago. Every request is a fast hit.</p>
+<p><strong>Mechanism.</strong> Background refreshes for that key fail, perhaps because the loader throws on a new field. Serve-stale keeps returning the old envelope, exactly as designed, and the grace period was set to "never" because "stale is better than an error." From the outside, everything looks healthy.</p>
+<p><strong>Detect.</strong> Track <strong>age of the value served</strong> (now minus the build time) as a histogram, with a per-data-type alert on its maximum. Count refresh failures per key. A hit ratio of 100% on a key that should refresh every five minutes is a smell, not a success.</p>
+<p><strong>Fix.</strong> Always set a hard expiry. Past it, fail or degrade visibly. Alert on refresh failure rate. <code>stale-if-error</code> is valuable, but give it a bound you would defend in a postmortem.</p>
+
+<h3 id=dd-cache-stampede-prevention-fm-hot-shard level=3>6. A hot key melts one cache shard, with a perfect hit ratio</h3>
+<p><strong>Symptom.</strong> During the sale, one Redis node is at 100% CPU or its network link is saturated. The others are idle. Hit ratio is 99.9%.</p>
+<p><strong>Mechanism.</strong> All traffic for one key goes to one shard, and consistent hashing can't spread a single key. If the bestseller's envelope is 50 KB, then 12,000 reads a second is 600 MB/s, close to 5 Gbit/s from one node. Stampede tools reduce database work. They do nothing for cache-side load.</p>
+<p><strong>Detect.</strong> Per-node CPU and network graphs, not cluster averages. <code>redis-cli --hotkeys</code> lists hot keys when the instance uses an LFU eviction policy. Client-side per-key request counters are more reliable.</p>
+<p><strong>Fix.</strong> A small in-process cache (an L1) for the top keys, with a TTL of 1 to 5 seconds. With 60 instances, the shard then sees about 60 reads a second for that key instead of 12,000. Alternatively, keep several copies under different keys, <code>product:8412#0..7</code>, and read one at random. The L1 adds up to its TTL of staleness, which goes in the staleness sentence.</p>
+
+<h3 id=dd-cache-stampede-prevention-fm-penetration level=3>7. Misses that no tool can merge: cache penetration</h3>
+<p><strong>Symptom.</strong> Database load climbs while the hit ratio on real products is normal. The queries are for product IDs that don't exist.</p>
+<p><strong>Mechanism.</strong> A scraper, or a bug that builds IDs from a counter, requests random IDs. Each one misses, the database returns nothing, nothing is cached, and the next request misses again. Single flight merges duplicates, but these are all distinct. Serve-stale has nothing to serve.</p>
+<p><strong>Detect.</strong> Database queries returning zero rows, as a rate. Miss ratio split by "found" and "not found."</p>
+<p><strong>Fix.</strong> Negative caching: store a "not found" marker with a short TTL, say 30 to 60 seconds. For a known ID space, a Bloom filter of valid IDs in front of the cache rejects most bogus IDs in memory. Rate-limit the client that generates them, through the <a href="#rate-limiting">rate limiting</a> layer.</p>
+
+<h2 id=dd-cache-stampede-prevention-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Where requests are coalesced<td>Edge or proxy (CDN collapsing, nginx <code>proxy_cache_lock</code>, Varnish)<td>Application (in-process plus Redis lock)<td>Responses are whole HTTP objects and the key is the URL. Choose the app when the cached thing is a fragment, depends on the user, or the rebuild is not one upstream call.
+<tr><td>Coalescing scope<td>In-process only (<code>singleflight</code>, Caffeine)<td>In-process plus a distributed lock<td>Instances are few, so instance count times rebuild cost is acceptable. Add the shared lock when that product is still too many rebuilds, or the rebuild is expensive (LLM calls).
+<tr><td>What losers do on a hard miss<td>Wait (poll or notify) with a short deadline<td>Degrade at once<td>Staleness is forbidden and the rebuild is fast. Choose degrade for optional page parts and for anything with a slow rebuild.
+<tr><td>Invalidation on write<td>Soft (mark stale, keep the copy)<td>Hard (delete the key)<td>The key is hot and one rebuild-time of staleness is acceptable. Choose delete for cold keys, or when the old value must never be shown again.
+<tr><td>Refresh trigger<td>On demand (expiry, XFetch)<td>Pushed (scheduled refresh-ahead, or CDC events that rebuild)<td>The hot set changes over time and you want work only where traffic is. Choose push for a small, known hot set, or when the source can announce changes.
+<tr><td>Grace period<td>Bounded (e.g. 10% of TTL, or a fixed limit per data type)<td>Unbounded <code>stale-if-error</code><td>Almost always. Unbounded is defensible only for data where any old version beats an error page, such as static images.
+<tr><td>TTL jitter<td>Uniform ±10–20%<td>Per-key deterministic (hash of the key)<td>You only need to break synchronized expiry. Choose a hash-based offset when you want repeatable TTLs per key, for example in tests or audits.
+</tbody></table></div></div>
+<p>Two opinions. First, <strong>push coalescing as far out as it will go.</strong> A CDN or proxy that collapses requests protects every service behind it, needs no application code, and is usually already deployed. Application-level locks are for what the edge can't see: fragments, per-user data, multi-source assembly.</p>
+<p>Second, <strong>make serve-stale the default and the lock the backstop</strong>, not the other way round. A lock on its own still makes users wait and still fails ugly when the rebuild is slow. Serve-stale turns most expiries into a non-event. The lock then only has to cover the rare hard miss and keep refreshes to one.</p>
+
+<h2 id=dd-cache-stampede-prevention-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Which keys have <code>R × d</code> above about 1 at peak? Show the measurement, not a guess.</li>
+<li>For each data type, what are the soft TTL, the grace period and the hard TTL? What is the staleness sentence at the end of the grace period?</li>
+<li>How is the lock TTL chosen, relative to p99.9 rebuild time under load? Is there renewal for long rebuilds?</li>
+<li>Does release check a per-attempt token? Is a failed release counted?</li>
+<li>What does a waiter do when its deadline passes? Show that the answer is not "query the database."</li>
+<li>How are writes to hot keys invalidated: delete, soft invalidation, or write-through? What happens to the hot key's traffic in the next 100 ms?</li>
+<li>Is the write-back conditional on a source version, so a slow rebuild can't restore old data?</li>
+<li>Is there in-process coalescing in front of the shared lock, and what extra load does the hard-miss case put on the hot cache shard?</li>
+<li>Are TTLs jittered everywhere, including keys written by bulk warmers and deploy-time preloads?</li>
+<li>What is the cold-start runbook: warm source, warmer rate limit, traffic ramp steps, and the expected database load at each step?</li>
+<li>Which metrics prove it works: concurrent misses per key, rebuilds per expiry, waiter timeouts, age of value served, refresh failures?</li>
+<li>Is there negative caching or a filter for IDs that don't exist?</li>
+</ol>
+
+<h2 id=dd-cache-stampede-prevention-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"You've added a Redis lock. Why do you still need serve-stale?"</summary>
+<p>The lock bounds database work at one query, but everyone else waits. If the rebuild takes 50 ms, that is a blip. If the database is slow and the rebuild takes 2 seconds, 24,000 requests are waiting on the bestseller alone, holding threads and connections. Serve-stale removes the wait: users get the old copy in a millisecond and one refresh runs behind. The lock keeps that refresh to one. Each covers the other's weak spot.</p>
+</details>
+<details>
+<summary>"Isn't a Redis lock unsafe? What about Redlock and clock drift?"</summary>
+<p>It is unsafe as a correctness lock, and that is fine here. If the lock fails, two requests rebuild the same key and the database does a little extra work. Nothing is corrupted, because the write-back is conditional on the source version. You don't need consensus to avoid a duplicate read. If a lock were guarding something like a payment, it would need fencing tokens checked by the resource itself, and a cache lock would be the wrong tool.</p>
+</details>
+<details>
+<summary>"Explain why XFetch refreshes hot keys early but leaves cold keys alone."</summary>
+<p>Each request triggers with probability <code>e^(−t/βδ)</code>, where <em>t</em> is time to expiry. The chance that <em>someone</em> has triggered grows with how many requests arrive. The expected number of triggers before expiry is <code>R·β·δ</code>. At 12,000 requests a second and a 50 ms rebuild that is 600, so the key almost surely refreshes, typically about 340 ms early. At 1 request a second it is 0.05, so 95% of the time the key just expires, which is harmless because there is no crowd. No per-key configuration is needed; traffic picks the keys.</p>
+</details>
+<details>
+<summary>"An editor changes the bestseller's price during the sale. Walk me through the next 100 ms."</summary>
+<p>With delete-on-write: the key vanishes, about 600 requests miss during the rebuild, one takes the lock, the rest wait or degrade, and the shard absorbs a burst of polling. With soft invalidation: the write sets the soft expiry to now. The next request sees a stale entry, triggers one locked refresh, and returns the old price. For about 50 ms, the page shows the old price. Checkout reads the database, so no order uses it. The rebuilt envelope carries the new version, and a straggling rebuild from before the change can't overwrite it.</p>
+</details>
+<details>
+<summary>"Your hit ratio is 99.9%. Why is one Redis node at 100% CPU?"</summary>
+<p>Because the stampede tools protect the database, not the cache. One hot key lives on one shard, and every read for it goes there. Fix it with a short-TTL in-process cache for the top keys, which cuts that shard's load to roughly one read per app instance per TTL, or with replicated copies of the key under different names. Then add the L1's TTL to the staleness budget.</p>
+</details>
+<details>
+<summary>"Requests time out waiting for the lock. What should they do?"</summary>
+<p>Anything except query the database. Return a stale copy if one exists anywhere (local cache, a replica, the CDN), return the page without that fragment, or return an error with <code>Retry-After</code>. If every timed-out waiter fetches for itself, the timeout just reschedules the stampede for later, when the database is already struggling. Also check why they timed out: usually the lock deadline is shorter than the rebuild's slow tail.</p>
+</details>
+<details>
+<summary>"How would you protect an LLM-backed answer cache from stampedes?"</summary>
+<p>The same tools, with the thresholds moved. With a 3-second generation, even 10 requests a second makes 30 duplicates per expiry, and each costs money. Coalesce identical prompts with in-process single flight plus a shared lock, serve the previous answer while one regeneration runs if the content allows, and use long, jittered TTLs. For hot prompts, refresh ahead on a schedule. Track duplicate generations per key as a cost metric. A <a href="#semantic-caching">semantic cache</a> widens what counts as "identical," and it needs single flight on its cluster keys for the same reason.</p>
+</details>
+<details>
+<summary>"When is all of this over-engineering?"</summary>
+<p>When no key has <code>R × d</code> near 1. A service at 100 requests a second spread over thousands of keys never forms a crowd. Jitter on bulk-written TTLs is still worth one line. The rest should wait until metrics show concurrent misses on the same key. The opposite failure is more common: nobody measures until a flash sale does it for them.</p>
+</details>

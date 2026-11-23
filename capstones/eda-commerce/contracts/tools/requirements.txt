@@ -1,0 +1,2 @@
+fastavro>=1.9
+pyyaml>=6

@@ -1,0 +1,201 @@
+<h2 id=dd-minicapstone-the-front-door-assembled-capacity level=2>Deep Dive: The Capacity Plan</h2>
+<p>The capstone decided which job belongs at each layer. A review panel then asks the next question: how big is each layer, and what does it cost? This section sizes every stage from the brief's numbers. Where the brief is silent, the assumptions are stated, so you can swap in your own.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-mix level=3>Traffic mix and the edge</h3>
+<p>The brief gives 40,000 requests per second at peak, about 60% static or publicly cacheable. Assume this client mix at peak:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Client<th>Share of all requests<th>Requests/s<th>Mostly<tbody>
+<tr><td>Mobile (iOS + Android)<td>45%<td>18,000<td>Images, product JSON, cart
+<tr><td>Web<td>35%<td>14,000<td>Static bundles, catalog pages
+<tr><td>TV<td>10%<td>4,000<td>Artwork, small lists
+<tr><td>Partners<td>10%<td>4,000<td>Authenticated API calls, exports
+</tbody></table></div></div>
+<p>The capstone says 24,000 requests per second end at the edge. That is the cacheable share, and it is an upper bound. Real edges miss sometimes: new content, expired entries, cold locations. Assume a 95% hit ratio on cacheable traffic:</p>
+<pre><code>cacheable:            40,000 × 0.60 = 24,000 req/s
+served at edge:       24,000 × 0.95 = 22,800 req/s
+cache misses → origin: 24,000 × 0.05 =  1,200 req/s
+dynamic → origin:                     16,000 req/s
+total at origin:                      17,200 req/s</code></pre>
+<p>Those 1,200 misses matter more than they look. They concentrate on whatever just changed, such as a new product launch, and they arrive in bursts. Request collapsing at the edge (one origin fetch per object, with other requesters waiting for it) keeps a launch from becoming a <a href="#cache-stampede-prevention">stampede</a>.</p>
+<p>Bandwidth at the edge is the CDN bill. At an average of 30 KB per cached object (images pull the average up), 22,800 × 30 KB ≈ 680 MB/s, about 5.5 Gbps at peak. Origin egress is smaller: say 17,200 × 8 KB ≈ 140 MB/s, about 1.1 Gbps. The edge carries roughly five times the bytes of the origin, which is the whole point of it.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-gateway level=3>The gateway fleet</h3>
+<p>Assume one gateway instance can handle about 4,000 requests per second at full CPU with TLS, JWT verification and a rate-limit call. Plan to run at no more than 50% in normal operation, and to survive losing one of three zones.</p>
+<pre><code>needed at 50% target:   17,200 / 2,000      ≈ 9 instances
+spread over 3 zones:    4 per zone          = 12 instances
+after losing a zone:    17,200 / 8          ≈ 2,150 req/s each (54%)</code></pre>
+<p>That is where the capstone's 12 instances come from. The zone-loss line is the one that matters. Twelve instances at 36% looks wasteful until you see that losing a zone takes them to 54%, still comfortable.</p>
+<p>Per-request gateway work, roughly:</p>
+<ul>
+<li><strong>JWT signature check:</strong> about 0.1 to 0.3 ms of CPU for an ECDSA or RSA verify. It is local, with keys cached from the identity provider's key set.</li>
+<li><strong>Revocation check:</strong> this must not be a network call per request. Keep a local set of revoked token IDs, refreshed every few seconds from a shared store or pushed by an event. Revocation then takes effect within seconds, which is the trade being made.</li>
+<li><strong>Rate-limit decision:</strong> one Redis round trip, about 0.3 to 0.5 ms within a zone.</li>
+<li><strong>Routing and header work:</strong> microseconds.</li>
+</ul>
+<p>The total is around 1 to 2 ms per request. That is noise next to the 200 ms ocean crossing, which is the right way round.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-redis level=3>The rate-limit store</h3>
+<p>Every request that reaches the gateway costs one atomic token-bucket operation, usually a short Lua script in Redis. Login adds a second check for its per-account throttle. So the load is about 17,200 operations per second at peak, plus the partner storm from the capstone.</p>
+<p>A single Redis primary handles on the order of 100,000 simple operations per second. Scripts are slower than plain <code>INCR</code>, so budget lower, but 17,000 to 25,000 per second is well within one primary. The real risks are not throughput:</p>
+<ul>
+<li><strong>Latency across zones.</strong> If gateway instances in zone B call a Redis primary in zone A, every request pays the cross-zone round trip. That is often around 1 ms, more than double the in-zone figure.</li>
+<li><strong>Hot keys.</strong> The misbehaving partner's bucket gets 4,000 operations per second on one key. That is fine for Redis, but it means one key's slot carries an outsized share if you later shard with Redis Cluster.</li>
+<li><strong>Availability.</strong> The limiter is now on every request's path. Drill 2 covers what happens when it is gone.</li>
+</ul>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-fanout level=3>BFF fan-out and east-west volume</h3>
+<p>The 16,000 dynamic requests per second split by client. Each BFF fans out to services, and those services call others. Assume these per-request fan-outs:</p>
+<pre><code>mobile BFF:    7,000 req/s × 6 calls   = 42,000
+web BFF:       5,000 req/s × 4 calls   = 20,000
+TV BFF:        1,500 req/s × 2 calls   =  3,000
+partner API:   2,500 req/s × 1.5 calls ≈  3,750
+first-hop internal calls               ≈ 69,000 req/s
+× 1.4 for calls services make onward   ≈ 95,000 req/s east-west</code></pre>
+<p>This is the number people forget. The front door handles 17,200 requests per second, but the services behind it handle more than five times that. Every one of those 95,000 calls crosses two sidecars once step 2 is in place.</p>
+<pre><code>proxy hops:  95,000 × 2              = 190,000 per second
+CPU:         190 × 0.4 vCPU per 1,000 ≈ 76 vCPU at peak
+memory:      ~450 sidecars × 50 MB    ≈ 22 GB</code></pre>
+<p>The 0.4 vCPU per 1,000 requests per hop is a planning figure, as in the <a href="#sidecar">sidecar</a> deep dive. Measure your own. Even if the real figure is half, it is a meaningful line on the infrastructure bill, and it scales with fan-out. A BFF that adds a seventh call raises sidecar CPU across the fleet.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-latency level=3>The Sydney latency budget</h3>
+<p>Follow the mobile product screen from the brief. The phone already has a connection to the Sydney edge, and the edge holds warm connections to the origin.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Step<th>p50<th>p99<th>Notes<tbody>
+<tr><td>Phone → Sydney edge → phone<td>15 ms<td>60 ms<td>Mobile networks dominate the tail
+<tr><td>Edge → origin → edge (warm)<td>200 ms<td>230 ms<td>One round trip across the ocean; fixed by physics
+<tr><td>Gateway: auth, limit, route<td>2 ms<td>5 ms<td>Local JWT verify, one Redis call
+<tr><td>Mobile BFF fan-out (6 parallel, with sidecars)<td>20 ms<td>80 ms<td>Set by the slowest of six calls
+<tr><td>Response shaping and serialisation<td>2 ms<td>5 ms<td>
+<tr><td><strong>Total</strong><td><strong>~240 ms</strong><td><strong>~380 ms</strong><td>p99s do not add exactly; this is a conservative sum
+</tbody></table></div></div>
+<p>Two conclusions follow, and both shape later decisions. First, the ocean is 80% of the p50. No amount of gateway tuning moves this number. Only serving from a closer region does, which is why multi-region is the first item on the evolution path. Second, the BFF's p99 is set by its slowest dependency. Six parallel calls each with a 1% chance of a slow response gives about a 6% chance that the screen waits on at least one. Per-call <a href="#timeout">timeouts</a> with partial responses, the <a href="#graceful-degradation">graceful degradation</a> lesson's tool, are how the BFF keeps its tail honest.</p>
+<p>A first request on a new connection pays the TLS handshake too. With TLS 1.3, that is one extra round trip to the edge, about 15 ms in Sydney, instead of 200 ms to the origin. That is the "accelerates at the edge" benefit put into numbers.</p>
+
+<h2 id=dd-minicapstone-the-front-door-assembled-drills level=2>Deep Dive: Failure Drills</h2>
+<p>A design review runs drills: "it's peak, this breaks, walk me through the next ten minutes." Each drill below gives the symptom, the blast radius, what the design already does, and what still needs work.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-drill1 level=3>Drill 1: A private response gets cached at the edge</h3>
+<p><strong>What happens.</strong> A BFF change adds a personalised "recommended for you" block to the product response but keeps the old <code>Cache-Control: public, s-maxage=60</code>. For up to 60 seconds per edge location, every visitor to that product sees the first visitor's recommendations. With a hundred edge locations, that is a hundred different strangers' data.</p>
+<p><strong>What the design does.</strong> The capstone says <code>private, no-store</code> is set through reviewed configuration. Make that concrete. The gateway, not each BFF, sets the cache header for authenticated routes, and it refuses to pass <code>public</code> on any request that carried an <code>Authorization</code> header or session cookie. The CDN configuration also refuses to cache responses with <code>Set-Cookie</code>.</p>
+<p><strong>Detection and response.</strong> A synthetic check fetches a personalised endpoint as two different test users through the CDN and compares the responses. On a hit, purge the affected paths globally (CDN purges typically complete within seconds to a minute), roll back, and treat it as a data exposure incident with the privacy team. That last step is not optional.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-drill2 level=3>Drill 2: The rate-limit Redis goes down</h3>
+<p><strong>What happens.</strong> The Redis primary fails. Failover to a replica takes 15 to 30 seconds. Every gateway request's rate-limit call now times out.</p>
+<p><strong>The decision to make in advance.</strong> Fail open or fail closed? Failing closed (reject everything) turns a limiter outage into a full outage, which is the wrong trade for a store. Failing open (allow everything) removes protection exactly when a misbehaving partner might be the cause. The usual answer is <strong>fail open to a local limit</strong>. Each gateway instance keeps an in-memory token bucket per key with 1/12th of the global rate, because there are 12 instances. Fairness is approximate during the outage, but no tenant can take more than roughly its share. Keep the Redis call's timeout tight, around 5 ms, so a dead Redis does not add latency to every request.</p>
+<p><strong>Detection.</strong> Limiter timeout rate and fallback-mode counters on the gateway. Alert on fallback mode lasting more than a minute.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-drill3 level=3>Drill 3: A bad gateway config ships</h3>
+<p><strong>What happens.</strong> A routing change sends <code>/v2/orders</code> to the wrong upstream. Because the gateway is the one entrance, every client is affected at once, within seconds of the rollout.</p>
+<p><strong>What the design does.</strong> A thin gateway changes rarely, and that is its first defence. The second is to treat gateway config like code: validate it in CI against a route test suite ("this path, this method, this version goes to this upstream"), then roll it out to one instance in one zone and compare that instance's error rate with its peers before continuing. That is a <a href="#canary-deployment">canary</a> for configuration.</p>
+<p><strong>Detection.</strong> Error rate and upstream distribution per gateway instance, split by config version. A canary instance with a different error profile stops the rollout automatically.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-drill4 level=3>Drill 4: A partner ignores 429s</h3>
+<p><strong>What happens.</strong> The capstone's partner bug sends 4,000 requests per second, and the limiter refuses 3,900 of them cheaply. Now suppose the partner's client retries every 429 immediately, without reading <code>Retry-After</code>. Their rate climbs to 20,000 requests per second, all refused. Refusing is cheap, at about 0.5 ms each, but 20,000 refusals per second is still a full gateway's worth of CPU plus 20,000 Redis operations.</p>
+<p><strong>What the design does.</strong> Add a second, coarser layer for abusive volume. When one key exceeds, say, 10 times its quota for more than a minute, push a temporary block for that key to the edge, so refusals happen at the CDN or WAF without reaching the origin. Notify the partner's technical contact automatically. This is the same principle as the whole capstone: handle each request at the earliest capable layer, including the requests you are refusing.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-drill5 level=3>Drill 5: The origin region is down</h3>
+<p><strong>What happens.</strong> A regional outage takes the origin offline for 20 minutes.</p>
+<p><strong>What the design does.</strong> Cacheable traffic can keep flowing if the CDN is told to use stale copies. <code>stale-if-error=86400</code> on catalog responses lets edges serve their last good copy when the origin fails. Static assets are already cached for a long time. So browsing works, slightly stale, for 60% of traffic. Cart, checkout and partner APIs fail. They return a clear error that the clients render as "ordering is temporarily unavailable", not as a blank screen. That is a deliberate degraded mode, decided before the outage.</p>
+<p><strong>What it does not do.</strong> It does not take orders. That needs a second region (see the evolution path), and the brief does not yet require one. Say so plainly in the review. It is a business decision with a price.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-drill6 level=3>Drill 6: Sidecar certificates expire, with no control plane</h3>
+<p><strong>What happens.</strong> Step 2 puts sidecars in with templated static configuration. mTLS needs certificates, and certificates expire. Without a control plane, who rotates them? If the answer is "a deploy job every 30 days", one failed job or one skipped month gives the mesh lesson's 2 AM outage, across every service at once.</p>
+<p><strong>What the design should do.</strong> Step 2 still needs automated identity, even without a full mesh. Two common ways to get it:</p>
+<ul>
+<li>A certificate controller such as cert-manager issues per-workload certificates from an internal CA into Kubernetes secrets, renews them automatically, and the proxies reload certificate files when they change.</li>
+<li>A standalone workload-identity system such as SPIRE issues SPIFFE certificates to each workload through a local agent, and the proxies fetch them over SDS.</li>
+</ul>
+<p>Either one is far less to run than a full control plane, and it removes the riskiest manual task. Alert on the earliest certificate expiry in the fleet, not on the average. This drill is the strongest argument in the review for how a two-person platform team can run step 2 safely.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-drill7 level=3>Drill 7: Brownout day collides with a partner's peak</h3>
+<p><strong>What happens.</strong> The scheduled 15-minute <code>/v1</code> brownout lands at 09:00 UTC. That is end of day for an Australian partner whose nightly order sync starts then. The sync fails, their warehouse misses a shipping cut-off, and the escalation reaches your CEO.</p>
+<p><strong>What the design does.</strong> The <a href="#api-versioning">versioning</a> deep dive's schedule rotates brownout hours across time zones. Add a per-partner calendar: before each brownout, query which keys used <code>/v1</code> in that hour last week, and email them specifically. Exempt a partner's key only with an explicit, dated agreement that they will migrate. The brownout is a signal, not a punishment. A partner who has already engaged gains nothing from a broken night.</p>
+
+<h2 id=dd-minicapstone-the-front-door-assembled-debates level=2>Deep Dive: The Trade-off Debates</h2>
+<p>These are the arguments a review panel actually has about this design. Each one has a reasonable other side. The capstone's choice is defensible, but it should be defended out loud.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-debate-edge-auth level=3>Should authentication move to the edge?</h3>
+<p><strong>For:</strong> rejecting bad tokens in Sydney saves a 200 ms round trip and protects the origin from unauthenticated floods. Many CDNs can run small functions that verify a JWT signature.</p>
+<p><strong>Against:</strong> revocation is the hard part. The edge has hundreds of locations, each needing the revoked-token set within seconds. Edge code is also harder to test and observe, and it runs on someone else's platform.</p>
+<p><strong>Reasonable position:</strong> do a cheap signature-and-expiry check at the edge to drop obvious garbage early. Keep the authoritative check, including revocation, at the gateway. Two checks cost little, and only one of them has to be perfect.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-debate-global-limits level=3>Global or regional rate limits?</h3>
+<p>Today there is one region, so one Redis gives exact global counts. With a second region, a global count needs a cross-region call on every request, adding 70 to 150 ms or more depending on the regions. That is unacceptable on every request.</p>
+<p>The practical answer is regional counters with a budget split. Give each region a share of each tenant's quota, sized from where that tenant's traffic actually comes from, and rebalance the split every few seconds or minutes through a background sync. Fairness becomes approximate at the boundaries: a tenant can briefly exceed its global quota by up to one region's share. For a store, that is acceptable. For a billing-critical quota, such as paid API calls per month, count exactly in an asynchronous ledger, and enforce approximately on the request path.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-debate-bff-graphql level=3>Three BFFs, or one GraphQL layer?</h3>
+<p><strong>For GraphQL:</strong> one schema, clients ask for exactly what they need, no per-client server code. Field-level usage data also makes deprecation evidence-based.</p>
+<p><strong>For BFFs:</strong> each client team owns its own aggregation and release schedule. Expensive queries are written by people who see their cost. Caching per screen is straightforward.</p>
+<p><strong>Reasonable position:</strong> the capstone's BFFs are right for three internal client teams who ship often. A GraphQL layer becomes more attractive as the number of client experiences grows, or if partners need flexible queries. It brings its own work, though: query cost limits, persisted queries, and per-field authorization. It is not a free simplification.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-debate-partner-api level=3>Is the partner API a BFF after all?</h3>
+<p>Structurally it looks like one: a server shaping responses for one class of client. The capstone says it is not, and the reason is ownership and change rate. A BFF changes as fast as its client team wants, because that team ships both sides. The partner API changes only through the versioning lifecycle, because its clients cannot be updated. Mixing the two leads either to a partner API that breaks partners, or to a BFF that cannot move. Keep them separate in code, in ownership and in deploy pipeline, even if they share libraries.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-debate-mesh-now level=3>Why not adopt the full mesh now and hire later?</h3>
+<p>Because the control plane becomes the most critical shared system on day one, and two people cannot carry its on-call, upgrades, policy review and support. The failure modes in the <a href="#service-mesh">mesh</a> deep dive, such as a deny-all policy pushed fleet-wide, an expired root, or slow convergence, each need someone who understands the system to respond within minutes. Step 2 with automated certificates (drill 6) gets most of the security requirement now. The mesh's added value, central policy and traffic control, can wait for the people who will run it.</p>
+
+<h2 id=dd-minicapstone-the-front-door-assembled-evolution level=2>Deep Dive: The Evolution Path</h2>
+<p>The design is correct for the brief today. A review panel also wants to see what changes as the brief changes, and in what order.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Trigger<th>Change<th>What it costs<tbody>
+<tr><td>Platform team reaches 4 to 6 engineers<td>Step 3: control plane for the existing sidecars, starting with identity and telemetry only<td>Control-plane operations; certificate lifetime chosen against its recovery objective
+<tr><td>Australia and Asia grow past ~30% of revenue<td>Second region in Asia-Pacific: gateways, BFFs and read paths first; regional rate-limit counters<td>Cross-region data replication; approximate global quotas; doubled on-call surface
+<tr><td>Writes must survive a region loss<td>Active-active or warm-standby order path<td>The <a href="#module-7-keeping-data-consistent-distributed-consistency-introduction">consistency</a> module's trade-offs, for real: conflict handling or failover data loss windows
+<tr><td>Partner count grows from 200 to 2,000<td>Self-serve developer portal, per-partner usage dashboards, SDKs that read <code>Deprecation</code> and <code>Retry-After</code><td>A small API-product team; documentation as a product
+<tr><td>Client experiences grow from 3 to 8+<td>Consider a GraphQL layer or a shared BFF framework<td>Query cost control, persisted queries, per-field authorization
+<tr><td>An AI assistant ships<td>Streaming route through every layer, token-based limits, an internal <a href="#llm-gateway">LLM gateway</a><td>Long-lived connections at the edge and gateway; a new cost axis per tenant
+</tbody></table></div></div>
+<p>Notice what is not on the list: a rewrite of the gateway, or a move to a fat gateway with business logic. A thin gateway is the part that should not evolve much. Most of the evolution happens behind it and around it.</p>
+
+<h3 id=dd-minicapstone-the-front-door-assembled-evolution-ai level=3>The streaming route, layer by layer</h3>
+<p>The capstone's extension asks how an SSE-based assistant crosses the layers. The short answer is that every layer that buffers has to be told not to:</p>
+<ul>
+<li><strong>Edge:</strong> the route must not be cached, and the CDN must pass streamed responses through without buffering. Check the CDN's maximum response duration too. Some cut connections after a fixed time.</li>
+<li><strong>Gateway:</strong> turn off response buffering for that route, raise the idle timeout above the longest gap between tokens, and count the stream as one request for request-based limits plus a separate token budget charged as tokens are produced.</li>
+<li><strong>BFF:</strong> stream through instead of assembling the full response. If the BFF must also call other services, it does that before the stream starts.</li>
+<li><strong>Sidecars:</strong> long-lived streams hold connections open, so per-cluster connection limits and idle timeouts need checking for that path.</li>
+</ul>
+<p>Sizing also changes shape. A request that lasts 20 seconds instead of 200 ms holds a connection 100 times longer. At 500 concurrent new chats per second, Little's law gives 500 × 20 s = 10,000 open streams at the gateway at any moment. That is a connection-count problem, not a requests-per-second problem, and it is why the <a href="#serversent-events">SSE</a> lesson's connection sizing applies here.</p>
+
+<h2 id=dd-minicapstone-the-front-door-assembled-review level=2>Deep Dive: Design-Review Questions</h2>
+<ol>
+<li>What is the measured edge hit ratio on cacheable routes, and how much origin traffic do the misses add at peak and during a launch?</li>
+<li>Which layer sets <code>Cache-Control</code> on authenticated routes, and what stops a BFF from marking a personalised response public?</li>
+<li>How many gateway instances run per zone, and what is their CPU after losing one zone at peak?</li>
+<li>How is token revocation propagated to the gateway, and how long can a revoked token still work?</li>
+<li>When the rate-limit store fails, does the gateway fail open, closed, or to a local limit? What is the timeout on the limiter call?</li>
+<li>What happens to a key that ignores 429s and multiplies its traffic? At which layer is it finally blocked?</li>
+<li>What is the east-west request rate behind the front door, and what do the sidecars cost at that rate?</li>
+<li>What is the Sydney p50 and p99 budget per layer, and which single change would move it most?</li>
+<li>How are sidecar certificates issued and rotated before a control plane exists?</li>
+<li>Which responses can the edge serve stale during an origin outage, and what do clients show for the rest?</li>
+<li>For each live API version: what are its sunset date, its distinct clients over the last year, and its next brownout?</li>
+<li>What specific trigger (team size, region share, partner count) starts each step on the evolution path?</li>
+</ol>
+
+<h2 id=dd-minicapstone-the-front-door-assembled-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"The edge handles 60% of requests. Does the origin really see only 16,000 per second?"</summary>
+<p>No, it sees the dynamic 16,000 plus every cache miss on the cacheable 24,000. At a 95% hit ratio, that is another 1,200 per second, and much more during a launch, when new objects miss everywhere at once. Size the gateway for the realistic total, and use request collapsing at the edge so one popular new object costs one origin fetch, not one per edge location.</p>
+</details>
+<details>
+<summary>"Your limiter's Redis is down. Fail open or fail closed?"</summary>
+<p>Neither, strictly. Fail to a local limit. Each gateway instance enforces its share of each key's quota (1/12 with 12 instances) from memory until Redis returns. Fairness is approximate for a minute, but nobody gets an outage and no tenant gets unlimited capacity. The limiter call also needs a tight timeout, so a dead Redis does not add latency to every request in the meantime.</p>
+</details>
+<details>
+<summary>"Where does the time go for a user in Sydney, and what would you change first?"</summary>
+<p>About 200 of roughly 240 ms is the round trip from the Sydney edge to the origin. The gateway is around 2 ms and the BFF fan-out around 20 ms at p50. Tuning the internal stack cannot fix the ocean. The first real change is a regional origin for read paths in Asia-Pacific. Until then, cache everything that can be cached at the edge, and keep connections from the edge to the origin warm.</p>
+</details>
+<details>
+<summary>"You chose sidecars without a control plane. How do certificates rotate?"</summary>
+<p>Not by hand. A certificate controller or a workload-identity system such as SPIRE issues short-lived certificates per workload, renews them automatically, and the proxies reload them without a restart. That gives the security requirement without the operational weight of a full mesh. Alert on the earliest expiry in the fleet. When the platform team grows, the control plane takes over issuance and adds policy and telemetry.</p>
+</details>
+<details>
+<summary>"A second region is added. What happens to the rate limits?"</summary>
+<p>Exact global counting would need a cross-region round trip on every request, which is too slow. Count per region instead, and give each region a share of each tenant's quota based on where its traffic comes from. Rebalance those shares in the background. A tenant can briefly exceed its global quota by up to one region's share. Where that matters (paid quotas), reconcile exactly in an asynchronous ledger and bill from that.</p>
+</details>
+<details>
+<summary>"Why does east-west traffic behind the front door matter for its design?"</summary>
+<p>Because the front door multiplies it. Each mobile request becomes 6 BFF calls, and those services call others. In this design 17,200 requests per second at the gateway turn into roughly 95,000 internal calls per second. Every extra BFF call, every retry, and every sidecar hop is multiplied by that factor. A small change at the front door, like one more call per screen, can be a large change in sidecar CPU and service load.</p>
+</details>
+<details>
+<summary>"How would you add the AI assistant without breaking the front door?"</summary>
+<p>Give it its own route with streaming turned on at every layer: no caching or buffering at the edge, buffering off and longer idle timeouts at the gateway, and a BFF that streams through. Add a token budget per tenant beside the request limit, charged as tokens stream. Size the gateway by concurrent connections, not only requests per second. The model calls themselves go through an internal LLM gateway behind the BFF, so model routing, keys and cost limits stay in one place.</p>
+</details>

@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: local
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # Application metrics (eda.* and spanmetrics), pushed by services to the collector over OTLP.
+  - job_name: otel-collector
+    honor_labels: true
+    static_configs:
+      - targets: ['otel-collector:8889']
+
+  # Consumer lag and topic offsets, read from the brokers. Language-agnostic by construction.
+  - job_name: kafka-exporter
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']

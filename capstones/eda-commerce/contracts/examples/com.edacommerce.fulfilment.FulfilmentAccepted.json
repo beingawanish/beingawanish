@@ -1,0 +1,24 @@
+{
+  "envelope": {
+    "eventId": "97263071-c12f-5ec9-a63e-dee3cb499ed7",
+    "type": "com.edacommerce.fulfilment.FulfilmentAccepted",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "94f8c0aa-7f46-585e-ae7a-257b40c81b48",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "fulfilment-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Fulfilment",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "fulfilmentId": "b266d308-606c-5a21-919a-e71604ae0b70",
+  "warehouseId": "8427234c-ef1a-5422-a3a2-5df6cda7aad5",
+  "acceptedAt": 1795000000000,
+  "estimatedDispatchAt": 1795000000000
+}

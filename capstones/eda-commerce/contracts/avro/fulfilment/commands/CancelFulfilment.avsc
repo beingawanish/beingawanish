@@ -1,0 +1,25 @@
+{
+  "type": "record",
+  "name": "CancelFulfilment",
+  "namespace": "com.edacommerce.fulfilment",
+  "doc": "Command: stop work on an order that has not been dispatched.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "fulfilmentId",
+      "type": "string"
+    },
+    {
+      "name": "reason",
+      "type": "string"
+    }
+  ]
+}

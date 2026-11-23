@@ -1,0 +1,293 @@
+<h2 id=dd-vector-database-sharding-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson explains why a similarity query has no shard key, and the three ways to split around that. This section goes one level down. What does each shard actually hold? How does a vector get from a write to a searchable index? What does the coordinator do with the answers, and why are scores less comparable than they look?</p>
+
+<h3 id=dd-vector-database-sharding-index-types level=3>What a shard holds: three index families</h3>
+<p>Every shard runs an approximate nearest neighbour (ANN) index over its slice of the vectors. Three families cover most real systems, and the choice decides memory, recall and how writes behave.</p>
+<ul>
+<li><strong>HNSW (graph, in RAM).</strong> Each vector is a node linked to about <code>M</code> near neighbours, with sparser layers on top for long jumps. A search enters at the top layer, walks greedily toward the query, drops a layer, and repeats. On the bottom layer it keeps a candidate list of size <code>ef_search</code>. Bigger <code>M</code> and <code>ef_search</code> raise recall and cost memory and time. HNSW gives excellent recall at low latency, but it wants the full vectors and the graph in RAM. Inserts are fairly expensive, and deletes are usually tombstones that the graph routes around until a rebuild.</li>
+<li><strong>IVF and IVF-PQ (clusters, often compressed).</strong> k-means finds <code>nlist</code> centroids. Each vector goes into the list of its nearest centroid. A search compares the query with the centroids, then scans the <code>nprobe</code> nearest lists. Product quantization (PQ) compresses each vector by splitting it into <code>m</code> sub-vectors and replacing each with a one-byte code, so a 1,536-dimension float vector (6 KB) can shrink to 96 bytes. Distances on codes are approximate, so systems usually <strong>rescore</strong> the best few hundred candidates with full vectors fetched from disk. This is the same geometry the lesson's centroid routing uses, applied inside one shard.</li>
+<li><strong>Disk-resident graphs.</strong> A graph index laid out on NVMe SSD, with compressed vectors in RAM to steer the walk and full vectors read from disk for the final ranking (the DiskANN line of work is the best-known example). It holds many times more vectors per node than HNSW in RAM, at the cost of a few SSD reads per query and more careful tuning.</li>
+</ul>
+<p>The sharding decision and the index decision are linked. A compressed or disk-based index can push the single-node limit out by 10× or more, which is why the lesson says to quantize before sharding.</p>
+
+<h3 id=dd-vector-database-sharding-segments level=3>The write path: segments, not one big index</h3>
+<p>Graph and cluster indexes are expensive to update one vector at a time. Most vector databases therefore borrow the log-structured design from search engines and LSM-tree databases. The details differ by product, but the shape is common:</p>
+<ol>
+<li>A write lands in a <strong>write-ahead log</strong> and in a small mutable buffer, often called a growing segment. Queries search it by brute force, which is fine because it is small.</li>
+<li>When the buffer reaches a size or age limit, it is <strong>sealed</strong>. A background job builds a real ANN index for it.</li>
+<li>A query searches every sealed segment's index plus the growing buffer, and merges the results. A shard is really a small scatter-gather of its own.</li>
+<li><strong>Deletes</strong> go into a bitmap or tombstone list checked during search. An update is a delete plus an insert.</li>
+<li><strong>Compaction</strong> merges small segments into larger ones and drops deleted vectors. It rebuilds indexes, so it costs CPU and temporary memory.</li>
+</ol>
+<p>Three operational facts follow from this design. First, <strong>freshness</strong> is "time until searchable", which is usually fast because the growing buffer is searched, but slows if index builds fall behind. Second, many small segments make every query slower, so compaction health is a latency metric. Third, a shard that deleted 30% of its vectors still pays memory for them until compaction runs.</p>
+
+<h3 id=dd-vector-database-sharding-scatter level=3>The scatter-gather protocol</h3>
+<p>The coordinator's job sounds trivial: send the query everywhere, keep the best k. Several details decide whether it is correct and fast.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-vector-database-sharding-svg-title dd-vector-database-sharding-svg-desc" viewBox="0 0 720 290" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-vector-database-sharding-svg-title">Scatter-gather with oversampling, hedging and rescoring</title>
+<desc id="dd-vector-database-sharding-svg-desc">A coordinator embeds nothing itself. It sends the query vector, a filter and a per-shard k of 20 to four shards. Shard 3 is slow, so after a hedge delay the coordinator sends the same request to shard 3's replica and uses whichever answers first. Each shard returns 20 candidates with approximate scores. The coordinator merges 80 candidates with a heap, rescores the best ones with exact distances, and returns the global top 10.</desc>
+<defs><marker id="dd-vector-database-sharding-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="290" fill="#ffffff"/>
+<rect x="20" y="110" width="150" height="70" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="95" y="138" font-size="14" fill="#1c2430" text-anchor="middle">Coordinator</text>
+<text x="95" y="158" font-size="11" fill="#5c6b7c" text-anchor="middle">q, filter, k' = 20</text>
+<rect x="290" y="20" width="140" height="44" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="360" y="47" font-size="13" fill="#1c2430" text-anchor="middle">Shard 1 → 20</text>
+<rect x="290" y="80" width="140" height="44" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="360" y="107" font-size="13" fill="#1c2430" text-anchor="middle">Shard 2 → 20</text>
+<rect x="290" y="140" width="140" height="44" rx="8" fill="#f8ebee" stroke="#c898a4"/>
+<text x="360" y="161" font-size="13" fill="#1c2430" text-anchor="middle">Shard 3 (slow)</text>
+<text x="360" y="177" font-size="11" fill="#5c6b7c" text-anchor="middle">compaction running</text>
+<rect x="450" y="140" width="110" height="44" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="505" y="161" font-size="12" fill="#1c2430" text-anchor="middle">Replica 3</text>
+<text x="505" y="177" font-size="11" fill="#5c6b7c" text-anchor="middle">hedge wins</text>
+<rect x="290" y="200" width="140" height="44" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="360" y="227" font-size="13" fill="#1c2430" text-anchor="middle">Shard 4 → 20</text>
+<line x1="170" y1="130" x2="286" y2="44" stroke="#1c2430" marker-end="url(#dd-vector-database-sharding-arrow)"/>
+<line x1="170" y1="138" x2="286" y2="102" stroke="#1c2430" marker-end="url(#dd-vector-database-sharding-arrow)"/>
+<line x1="170" y1="150" x2="286" y2="160" stroke="#1c2430" marker-end="url(#dd-vector-database-sharding-arrow)"/>
+<line x1="170" y1="162" x2="286" y2="220" stroke="#1c2430" marker-end="url(#dd-vector-database-sharding-arrow)"/>
+<path d="M150,180 C200,270 470,270 500,188" fill="none" stroke="#7eae96" stroke-dasharray="5,4" marker-end="url(#dd-vector-database-sharding-arrow)"/>
+<text x="300" y="275" font-size="11" fill="#1c2430" text-anchor="middle">hedge after ~p95 delay</text>
+<rect x="590" y="90" width="120" height="110" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="650" y="115" font-size="13" fill="#1c2430" text-anchor="middle">Merge 80</text>
+<text x="650" y="135" font-size="11" fill="#5c6b7c" text-anchor="middle">heap, dedupe</text>
+<text x="650" y="155" font-size="11" fill="#5c6b7c" text-anchor="middle">rescore exact</text>
+<text x="650" y="180" font-size="13" fill="#1c2430" text-anchor="middle">→ top 10</text>
+<line x1="430" y1="42" x2="586" y2="110" stroke="#5c6b7c" marker-end="url(#dd-vector-database-sharding-arrow)"/>
+<line x1="430" y1="102" x2="586" y2="130" stroke="#5c6b7c" marker-end="url(#dd-vector-database-sharding-arrow)"/>
+<line x1="560" y1="162" x2="586" y2="155" stroke="#5c6b7c" marker-end="url(#dd-vector-database-sharding-arrow)"/>
+<line x1="430" y1="222" x2="586" y2="180" stroke="#5c6b7c" marker-end="url(#dd-vector-database-sharding-arrow)"/>
+</svg>
+<figcaption>Oversampling (k' above k) protects recall, hedging protects the tail, and rescoring makes scores from different shards comparable.</figcaption>
+</figure>
+
+<ul>
+<li><strong>Per-shard k.</strong> If every shard searched exactly, asking each for k would be enough: the global top k must be inside the union of the local top k. But each shard is approximate. Asking for k' = 2k or so from each shard raises the chance that a true neighbour missed in one shard's top k still makes it into the merge. The cost is small, because the merge handles only N × k' candidates.</li>
+<li><strong>Same parameters everywhere.</strong> The coordinator sends the same filter, metric and <code>ef_search</code> or <code>nprobe</code> to every shard. A shard tuned differently returns a different quality of answer, and the merge cannot tell.</li>
+<li><strong>Hedging.</strong> If a shard has not answered by about its p95 latency, send the same request to its replica and take the first answer. This costs roughly 5% extra shard queries and removes most stragglers.</li>
+<li><strong>Partial results policy.</strong> If a shard and its replica both fail, the coordinator either fails the query or returns results from the other shards with a flag. For RAG, a partial answer is usually better than none, but it must be logged, because it silently lowers recall.</li>
+<li><strong>Merge.</strong> A heap of size k over all candidates, deduplicated by document ID if a vector can exist in two places during a rebalance.</li>
+</ul>
+
+<h3 id=dd-vector-database-sharding-scores level=3>When scores are not comparable</h3>
+<p>The lesson mentions normalising scores across shards. For pure vector search with one model and one metric, raw distances are already comparable, with two exceptions that bite in practice.</p>
+<p>The first is <strong>quantized distances</strong>. A shard using PQ returns approximate distances. If shards use different codebooks, perhaps because one was trained on older data, their errors differ, and the merge ranks by error as much as by meaning. The fix is to rescore the merged candidates with exact distances before the final cut.</p>
+<p>The second is <strong>hybrid search</strong>. Many RAG systems combine vectors with keyword scores such as BM25. BM25 uses inverse document frequency (how rare a term is), and each shard computes it from its own documents. The word "warranty" might be rare on one shard and common on another, so the same document would score differently depending on where it lives. Search engines handle this with a distributed frequency pass (in Elasticsearch and OpenSearch this is the <code>dfs_query_then_fetch</code> search type), or by fusing ranks instead of raw scores. Rank fusion sidesteps the problem because it uses only each shard's ordering.</p>
+
+<h3 id=dd-vector-database-sharding-filters level=3>Filtered search inside a shard</h3>
+<p>The lesson names the pre-filter versus post-filter trade-off. Here is why it is hard. An HNSW graph is navigable because each node links to nearby nodes. If a filter removes 99% of nodes, the walk keeps hitting excluded nodes and the surviving ones are poorly connected to each other. Recall collapses, or the search visits huge numbers of nodes looking for allowed ones.</p>
+<p>Engines handle this in a few ways, and which ones a product uses varies:</p>
+<ul>
+<li><strong>Filter during the walk</strong>, skipping excluded nodes but still traversing through them. Works well when the filter keeps a large share of vectors.</li>
+<li><strong>Switch to brute force</strong> when the filter is very selective. If only 3,000 vectors pass, scanning them exactly takes well under a millisecond and is perfectly accurate.</li>
+<li><strong>Post-filter with oversampling.</strong> Ask the index for k / selectivity candidates, then filter. At 10% selectivity, that is 100 candidates for a top 10. At 0.1%, it is hopeless.</li>
+<li><strong>Partition by the filter.</strong> If one filter appears in almost every query, give it its own index. That is tenant sharding again, one level down.</li>
+</ul>
+
+<h3 id=dd-vector-database-sharding-placement level=3>Placement: directory, not hash</h3>
+<p>For tenant-keyed sharding, a hash of the tenant ID is the obvious placement, and it is usually the wrong one. Tenants differ in size by orders of magnitude. A hash places a giant tenant wherever it lands, and moving it later means changing the hash function.</p>
+<p>Production systems keep a <strong>directory</strong>: a small table mapping tenant to shard group, cached in every coordinator. Small tenants are packed onto shared shards by size, as a bin-packing problem. Giants get dedicated shards. Moving a tenant becomes a controlled operation: build its index on the target, dual-write during the copy, flip the directory entry, drain, delete. The <a href="#consistent-hashing">Consistent Hashing</a> lesson's ring still fits the uniform design, where vectors have no natural owner.</p>
+
+<h3 id=dd-vector-database-sharding-replication level=3>Replication and index builds</h3>
+<p>Replicas give read capacity and availability. They also raise a question relational replicas do not: does each replica build its own index? Two designs exist.</p>
+<ul>
+<li><strong>Each replica applies the write log and builds its own segments.</strong> Simple, but index builds run on every replica, and replicas can briefly disagree about which vectors are searchable.</li>
+<li><strong>One node builds, others copy the finished segment files</strong> from shared object storage. Builds run once, and a new replica joins by downloading files rather than rebuilding. This is the main reason disaggregated designs, with compute separate from storage, have become common for large indexes.</li>
+</ul>
+<p>The difference shows up most when a node dies. Rebuilding a 300 GB HNSW index from raw vectors can take hours. Downloading prebuilt segments takes minutes.</p>
+
+<h2 id=dd-vector-database-sharding-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The lesson's corpus: 500 million embeddings of 1,536 dimensions. The machine assumption: nodes with 512 GB of RAM, of which about 400 GB is usable for the index after the operating system, buffers and compaction headroom.</p>
+
+<h3 id=dd-vector-database-sharding-memory level=3>Memory per vector, by index type</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Layout</th><th>Bytes per vector (approx.)</th><th>500M vectors</th><th>400 GB nodes needed (before replicas)</th></tr></thead><tbody>
+<tr><td>float32 + HNSW (M = 16)</td><td>6,144 + ~150 graph</td><td>~3.1 TB</td><td>8, so 10 to 12 with headroom</td></tr>
+<tr><td>float16 + HNSW</td><td>3,072 + ~150</td><td>~1.6 TB</td><td>4 to 6</td></tr>
+<tr><td>int8 scalar quantization + HNSW</td><td>1,536 + ~150</td><td>~0.85 TB</td><td>3</td></tr>
+<tr><td>Binary (1 bit per dimension), rescore from disk</td><td>192 in RAM</td><td>~96 GB RAM + 3 TB SSD</td><td>1, plus SSD</td></tr>
+<tr><td>IVF-PQ, m = 96, rescore from disk</td><td>96 in RAM</td><td>~48 GB RAM + 3 TB SSD</td><td>1, plus SSD</td></tr>
+</tbody></table></div></div>
+<p>The graph overhead comes from the base layer holding about 2 × M links at 4 bytes each (128 bytes) plus a little for upper layers and IDs. Notice how small it is next to the vectors. The vectors themselves are the memory problem, so compressing them is the big lever.</p>
+<p>Compression costs recall, and how much depends on the model and data. Binary codes work much better on some embedding models than others. Treat the rows as a menu to benchmark on your own data, not a promise. The common pattern is compressed vectors for the search and full vectors on SSD for rescoring the top few hundred candidates, which recovers most of the lost recall.</p>
+<p>With float32 and HNSW, the 12-shard design matches the lesson. With two replicas per shard for reads and availability, that is 36 nodes. With int8 and three shards, it is 9. Quantization does not just postpone sharding. It changes the bill by a factor of four.</p>
+
+<h3 id=dd-vector-database-sharding-tail level=3>Tail amplification under scatter-gather</h3>
+<p>If one shard's latency exceeds its p99 one time in a hundred, and shards are independent, a query that waits for all N shards is slow whenever any of them is:</p>
+<p><code>P(query slow) = 1 − 0.99^N</code></p>
+<ul>
+<li>N = 4: 3.9%</li>
+<li>N = 12: 11.4%</li>
+<li>N = 50: 39.5%</li>
+</ul>
+<p>So at 12 shards, the shard's p99 becomes roughly the coordinator's p89. To keep the coordinator's p99 near a target, each shard has to meet that target at about its p99.9 (1 − 0.999^12 ≈ 1.2%). That is the real cost of fan-out. It is why hedging exists, and why fewer, larger shards beat many small ones for latency.</p>
+<p>The same formula can be run in a few lines, with a hedge added:</p>
+<pre><code>import random
+
+def coordinator_p99(n_shards, hedge_ms=None, trials=100_000):
+    def shard():                     # 99% fast (~8 ms), 1% slow (~80 ms)
+        return random.gauss(8, 2) if random.random() &lt; 0.99 else random.gauss(80, 20)
+    def with_hedge():
+        first = shard()
+        if hedge_ms is None or first &lt;= hedge_ms:
+            return first
+        return min(first, hedge_ms + shard())   # replica asked at hedge_ms
+    lat = sorted(max(with_hedge() for _ in range(n_shards)) for _ in range(trials))
+    return lat[int(0.99 * trials)]
+
+print(coordinator_p99(12))                # roughly 100 ms: the tail dominates
+print(coordinator_p99(12, hedge_ms=12))   # roughly 20-something ms
+</code></pre>
+<p>The exact numbers depend on the distribution you assume. The shape does not: without hedging, the slow tail of any one shard becomes the normal case for the coordinator.</p>
+
+<h3 id=dd-vector-database-sharding-qps level=3>Query capacity</h3>
+<p>Assume one HNSW query on one shard costs about 2 ms of CPU at <code>ef_search</code> = 100 on these dimensions. That number varies a lot with hardware, dimensions and recall targets, so benchmark it. A 32-core node then serves about 16,000 shard-queries per second at full use, call it 8,000 at a safe 50%.</p>
+<ul>
+<li><strong>Uniform scatter-gather, 12 shards:</strong> each user query costs 12 shard-queries, plus 5% for hedges. At 2,000 user queries per second, that is 25,200 shard-queries per second, spread over 12 shards: 2,100 per shard. One copy of each shard handles that. Replicas are for availability and for growth.</li>
+<li><strong>Tenant-keyed:</strong> each query costs one shard-query, so the same 2,000 per second costs 12× less CPU in total. The risk moves to skew: if one tenant sends 30% of traffic, its shard needs about 600 per second plus its replicas.</li>
+<li><strong>Centroid routing, 2 of 16 probed:</strong> about one-eighth of the uniform cost, but traffic follows topic popularity, as failure mode 4 shows.</li>
+</ul>
+<p>The general rule: scatter-gather multiplies cost by N and keeps load even. Routing divides cost by N and concentrates load.</p>
+
+<h3 id=dd-vector-database-sharding-reembed level=3>The re-embedding bill</h3>
+<p>The lesson says re-embedding is a projection rebuild. Here is the size of one. Assume 500 million chunks averaging 300 tokens, which is 150 billion tokens.</p>
+<ul>
+<li><strong>Through an embedding API</strong> at an assumed $0.02 per million tokens: about $3,000. Prices vary widely by provider and model, so recompute with your own. Rate limits usually matter more than price at this volume. Ask for a batch quota before you need it.</li>
+<li><strong>Self-hosted</strong>: assume one GPU embeds 3,000 chunks per second with a small model. That is about 46 GPU-hours, or roughly 2.5 hours on 20 GPUs.</li>
+<li><strong>Index build</strong>: HNSW insert throughput per node is often in the thousands to tens of thousands of vectors per second, depending on parameters. At 10,000 per second per node across 12 nodes, 500 million vectors take about 70 minutes.</li>
+<li><strong>Memory during the dual-run</strong>: v1 and v2 both serve, so you need twice the index memory for the duration. With float32 that is 36 extra nodes. Plan it, or migrate tenant by tenant so only a slice is doubled at once.</li>
+</ul>
+
+<h2 id=dd-vector-database-sharding-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-vector-database-sharding-fm-straggler level=3>1. The p99 that one shard owns</h3>
+<p><strong>Symptom.</strong> Retrieval p99 jumps from 25 ms to 120 ms several times an hour, with no change in traffic. p50 is flat.</p>
+<p><strong>Mechanism.</strong> One shard at a time runs compaction, a segment index build, or a long garbage collection pause. Every query waits for every shard, so whichever shard is busy sets the latency for all queries during that window.</p>
+<p><strong>Detect.</strong> Per-shard latency histograms next to the coordinator's. The coordinator's spikes line up with one shard at a time, and that shard's logs show compaction or GC at the same moment.</p>
+<p><strong>Fix.</strong> Hedge to replicas after about the p95 delay. Throttle compaction and stagger it so only one replica of a shard compacts at a time, and route around it while it does. Keep segment counts low enough that query fan-out inside each shard stays small.</p>
+
+<h3 id=dd-vector-database-sharding-fm-recall level=3>2. Recall that decays without anyone changing anything</h3>
+<p><strong>Symptom.</strong> RAG answer quality slides over months. Retrieval latency is fine. No deploy lines up with the decline.</p>
+<p><strong>Mechanism.</strong> Two slow processes. In HNSW, heavy update and delete churn leaves tombstones that the graph must route around, and newly inserted nodes link less well than the original build. In IVF, the centroids were trained on last year's data. New content (a new product line) lands in lists that do not fit it well, and lists grow uneven.</p>
+<p><strong>Detect.</strong> Measure recall directly. For a small random sample of live queries, run an exact brute-force search on one shard in the background and compare its top 10 with the ANN result. Recall@10 against exact search is a metric you can graph and alert on.</p>
+<p><strong>Fix.</strong> Rebuild indexes on a schedule, or when tombstones exceed a set share. Retrain IVF centroids periodically and rebuild. Because the index is a read model (<a href="#cqrs">CQRS</a>), a rebuild is routine, not risky.</p>
+
+<h3 id=dd-vector-database-sharding-fm-filter level=3>3. The filter that empties the results</h3>
+<p><strong>Symptom.</strong> Some queries return 2 or 3 results instead of 10. The assistant says "I don't have information on that" for products that clearly exist. It happens mostly to small tenants and narrow filters like "in stock, under $50".</p>
+<p><strong>Mechanism.</strong> Post-filtering on a shared index. The ANN search returns 20 candidates from the whole shard, and the tenant or stock filter removes most of them. With pre-filtering inside HNSW, a very selective filter leaves the graph poorly connected and the walk ends early.</p>
+<p><strong>Detect.</strong> A histogram of results returned per query, split by tenant size and filter selectivity. Queries returning fewer than k results should be a tracked metric, not something you hear about from support.</p>
+<p><strong>Fix.</strong> Partition by the filter that appears in every query (tenant). For other filters, use an engine that switches to exact search when the filtered set is small, or oversample by the inverse of selectivity. For range filters like price, a separate structured lookup followed by vector rescoring is sometimes simpler.</p>
+
+<h3 id=dd-vector-database-sharding-fm-hot level=3>4. The hot cluster during a product launch</h3>
+<p><strong>Symptom.</strong> On a centroid-routed index, the day a new phone launches, two shards hit 100% CPU while the rest idle. Latency on every query that probes them climbs.</p>
+<p><strong>Mechanism.</strong> Routing follows meaning. Every query about the new phone probes the same two clusters. Traffic per shard tracks topic popularity, which changes daily, while cluster placement changes only when someone re-clusters.</p>
+<p><strong>Detect.</strong> Per-shard query rate and CPU, and the share of probes landing on each cluster. A Gini coefficient or max/mean ratio of shard load is a useful single number.</p>
+<p><strong>Fix.</strong> Give hot shards more replicas, which can be automated from probe share. Split hot centroids during re-clustering. For predictable events, add replicas ahead of the launch, as the <a href="#autoscaling">Autoscaling</a> lesson does with scheduled scaling.</p>
+
+<h3 id=dd-vector-database-sharding-fm-version level=3>5. Two embedding models in one index</h3>
+<p><strong>Symptom.</strong> During a re-embedding migration, results for some tenants turn to nonsense: a shipping question retrieves password-reset chunks. Other tenants are fine.</p>
+<p><strong>Mechanism.</strong> The migration rewrote vectors in place, tenant by tenant, in the same collection. Queries were embedded with v2 for migrated tenants, but a routing bug sent some of them to a shard that still held v1 vectors. Distances between vectors from different models mean nothing, and nearly random neighbours came back with normal-looking scores.</p>
+<p><strong>Detect.</strong> Store the model version on every vector and every query. Count, at the shard, every comparison whose versions differ. That counter must be zero. A drop in the mean top-1 score for a tenant is a weaker but useful signal.</p>
+<p><strong>Fix.</strong> Never migrate in place. Follow the <a href="#capstone-the-zerodowntime-migration">zero-downtime migration</a> shape. Put the model version in the collection or index name, so a v2 query physically cannot reach a v1 index. Cut over by flipping the directory entry for each tenant.</p>
+
+<h3 id=dd-vector-database-sharding-fm-node-loss level=3>6. The node loss that takes all afternoon</h3>
+<p><strong>Symptom.</strong> One node fails at 13:00. Its shards drop to one copy. By 17:00, replacement replicas are still rebuilding, and a second failure would mean partial results.</p>
+<p><strong>Mechanism.</strong> Each replica builds its own index from the raw vectors and the write log. Rebuilding a 300 GB HNSW index means re-inserting tens of millions of vectors. The rebuild also competes for CPU with live queries on the surviving replica, which slows both.</p>
+<p><strong>Detect.</strong> Under-replicated shard count and time to restore full replication, tracked as an SLO. Run a node-loss drill before the real one and write down how long it took.</p>
+<p><strong>Fix.</strong> Persist built segment files to object storage so new replicas download instead of rebuilding. Keep spare capacity so recovery does not starve queries. For the largest indexes, run three copies rather than two, so one rebuild is not a single point of failure.</p>
+
+<h3 id=dd-vector-database-sharding-fm-hybrid level=3>7. Hybrid ranking that depends on where a document lives</h3>
+<p><strong>Symptom.</strong> The same query returns a different top result after a rebalance. A document moved shards, and its rank changed even though its text did not.</p>
+<p><strong>Mechanism.</strong> Hybrid search combined vector scores with BM25 scores. BM25's term rarity is computed per shard. After the move, "warranty" was common on the document's new shard, so its keyword score fell.</p>
+<p><strong>Detect.</strong> A fixed evaluation set of queries with known best documents, run after every rebalance. Rank changes for unchanged documents are the giveaway.</p>
+<p><strong>Fix.</strong> Fuse by rank (reciprocal rank fusion) rather than by raw score, or compute term statistics globally. Then rescore the merged candidates consistently at the coordinator.</p>
+
+<h2 id=dd-vector-database-sharding-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<p>The lesson's three splits answer "how do queries find shards?". Three other decisions sit beside it: the index type on each shard, the tenant layout, and how replicas get their indexes.</p>
+
+<h3 id=dd-vector-database-sharding-choose-index level=3>Index type per shard</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th></th><th>HNSW in RAM</th><th>IVF-PQ + rescoring</th><th>Disk-resident graph</th><th>Flat (exact)</th></tr></thead><tbody>
+<tr><td>RAM per vector</td><td>Full vector + graph</td><td>Tens of bytes</td><td>Compressed vector</td><td>Full vector</td></tr>
+<tr><td>Latency</td><td>Lowest, about 1 ms</td><td>Low, plus SSD reads for rescoring</td><td>Low single-digit ms, SSD-bound</td><td>Grows linearly with size</td></tr>
+<tr><td>Recall</td><td>High, tuned by <code>ef_search</code></td><td>Depends on <code>nprobe</code> and rescoring depth</td><td>High with rescoring</td><td>Exact</td></tr>
+<tr><td>Writes and deletes</td><td>Inserts costly; deletes as tombstones</td><td>Cheap appends; needs retraining as data drifts</td><td>Usually batch-built</td><td>Trivial</td></tr>
+<tr><td>Fits</td><td>Latency-critical, fits in RAM after quantization</td><td>Very large corpora, cost-sensitive</td><td>Billions of vectors per node</td><td>Small tenants, under about 100K vectors</td></tr>
+</tbody></table></div></div>
+
+<h3 id=dd-vector-database-sharding-choose-tenancy level=3>Tenant layout</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Layout</th><th>Isolation</th><th>Small-tenant recall</th><th>Overhead</th><th>Deletion and compliance</th></tr></thead><tbody>
+<tr><td>Shared index, tenant as filter</td><td>Logical only</td><td>Poor for tiny tenants under selective filtering</td><td>Lowest</td><td>Delete by filter, then compact</td></tr>
+<tr><td>Partition per tenant inside a shared shard</td><td>Good</td><td>Good, each tenant has its own small index</td><td>Per-partition metadata; very many partitions strain some engines</td><td>Drop the partition</td></tr>
+<tr><td>Collection per tenant</td><td>Strong</td><td>Good</td><td>High at thousands of tenants</td><td>Drop the collection</td></tr>
+<tr><td>Dedicated shards for giants, packed partitions for the rest</td><td>Strong where needed</td><td>Good</td><td>Moderate</td><td>Clean per tenant</td></tr>
+</tbody></table></div></div>
+<p>The last row is the usual answer for B2B products, as the lesson's Q2 shows. One detail: tiny tenants with a few thousand vectors do not need an ANN index at all. Exact search over 5,000 vectors is fast and has perfect recall. Some engines do this automatically below a size threshold.</p>
+
+<h3 id=dd-vector-database-sharding-guidance level=3>How to choose, in order</h3>
+<ol>
+<li><strong>Can it fit on one node?</strong> Do the memory table with quantization. If yes, run one node with replicas and stop.</li>
+<li><strong>Does every query carry a filter?</strong> If yes, partition by it with a directory, and give giants dedicated shards.</li>
+<li><strong>Otherwise, uniform plus scatter-gather</strong>, with oversampling, hedging, and as few shards as memory allows.</li>
+<li><strong>Only at very large single-corpus scale</strong>, route by centroids, with recall measured against exact search as an SLO.</li>
+<li><strong>Across all of these</strong>, version the index by embedding model, and make rebuilds cheap through segment files in object storage.</li>
+</ol>
+
+<h2 id=dd-vector-database-sharding-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the memory per vector for the chosen index and precision, and have you checked whether quantization makes sharding unnecessary?</li>
+<li>Does every query carry a filter that could be the shard key? If not, why is scatter-gather acceptable for the cost and the tail?</li>
+<li>How many shards does a query touch, and what per-shard p99.9 does that require to meet the coordinator's p99?</li>
+<li>Is there a hedging policy, with what delay, and what does the coordinator return when a shard and its replica both fail?</li>
+<li>What per-shard k does the coordinator request, and are scores rescored or fused by rank before the final cut?</li>
+<li>How is recall measured in production: against exact search, on what sample, with what alert threshold?</li>
+<li>How are selective filters handled: partitions, exact-search fallback, or oversampling? What happens for the smallest tenants?</li>
+<li>Is placement a directory or a hash? What is the procedure to move a giant tenant, and how long does it take?</li>
+<li>How long does it take to restore full replication after losing a node, and has that been drilled?</li>
+<li>Is the embedding model version part of the index name, and is a cross-version comparison impossible rather than merely unlikely?</li>
+<li>What does a full re-embedding cost in money, GPU-hours, index build time and doubled memory, and is the quota in place?</li>
+<li>What are compaction and rebuild schedules, and do they avoid serving traffic from a node while it compacts?</li>
+</ol>
+
+<h2 id=dd-vector-database-sharding-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"If each shard returns its top 10, is the merged top 10 exact?"</summary>
+<p>Only if each shard's search is exact. The global top 10 is always inside the union of the local exact top 10s, because any vector in the global top 10 is also in its own shard's top 10. But with ANN, each shard may miss some of its true neighbours, and those misses add up across shards. Asking each shard for 20 or 30 and rescoring the merged set raises recall cheaply, because the merge is tiny compared with the searches.</p>
+</details>
+
+<details>
+<summary>"Why not use more, smaller shards so each search is faster?"</summary>
+<p>Because the coordinator waits for the slowest shard. With N independent shards, the chance that at least one is in its slow tail is 1 − 0.99^N, about 11% at 12 shards and 40% at 50. Smaller shards are each faster, but the query's tail gets worse and the total CPU per query rises, since each shard has fixed per-query overhead. Use the fewest shards that memory allows, and get headroom from replicas.</p>
+</details>
+
+<details>
+<summary>"Your recall SLO is 95% at k = 10. How do you measure it in production?"</summary>
+<p>Sample a small share of live queries, say 0.1%, and run each against an exact brute-force search in the background, on one shard or on an offline copy. Compare the ANN top 10 with the exact top 10 and record the overlap. Graph it per shard and per tenant size class. This measures the index, not answer quality, so it catches graph decay, bad centroids and filter problems directly. Answer-level evals then sit on top.</p>
+</details>
+
+<details>
+<summary>"A tenant asks you to delete all their data within 30 days. What actually happens in the index?"</summary>
+<p>In a shared index, deletion usually writes tombstones. The vectors remain in memory and on disk until compaction rewrites the segments, and they may still sit in snapshots and backups. So "deleted" in the API is not "deleted" for compliance. Per-tenant partitions or collections make this simple: drop the partition, then handle backups by retention policy. If you must use a shared index, force compaction for affected segments and document the backup expiry, so the 30 days actually covers every copy.</p>
+</details>
+
+<details>
+<summary>"Pre-filter or post-filter for 'similar to this, in stock, under $50'?"</summary>
+<p>It depends on selectivity. If 60% of products pass, filtering during the graph walk works well. If 0.5% pass, the graph walk struggles, and post-filtering would need about 2,000 candidates for a top 10. The better plan there is to select the matching products first with a structured index, then score that small set exactly against the query vector. Good engines choose between these per query from an estimate of selectivity. If yours does not, the application has to.</p>
+</details>
+
+<details>
+<summary>"How do you move a giant tenant to a dedicated shard without downtime?"</summary>
+<p>With a directory, it is a small migration. Start dual-writing the tenant's new vectors to both the old and new location. Bulk-copy the existing vectors to the new shard and build its index. Verify counts and run the tenant's evaluation queries against both. Flip the directory entry so queries go to the new shard. Keep the old copy briefly for rollback, then delete it. With hash placement you cannot do this cleanly, which is the main reason to keep a directory.</p>
+</details>
+
+<details>
+<summary>"Is the vector database the source of truth?"</summary>
+<p>It should not be. The documents and the embedding model version are the source of truth, and the index is a read model derived from them. That is what makes re-embedding, re-clustering and rebuilding after corruption routine. If the index is the only place a vector or its metadata exists, every rebuild becomes a data recovery problem. Keep the chunk text and metadata in a durable store, and treat the index as something you can throw away and rebuild.</p>
+</details>
+
+<details>
+<summary>"When would you pick centroid routing over uniform scatter-gather?"</summary>
+<p>Only when the corpus is a single huge collection with no filter to route by, and the query rate makes full fan-out too expensive. For example, billions of vectors at thousands of queries per second, where 50-way fan-out would need far more hardware. You accept probabilistic recall, measured as an SLO, and you take on hot clusters and periodic re-clustering. Below that scale, uniform scatter-gather with a handful of large, quantized shards is simpler and more predictable.</p>
+</details>

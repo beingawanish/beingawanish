@@ -1,0 +1,32 @@
+{
+  "type": "record",
+  "name": "RestockItems",
+  "namespace": "com.edacommerce.inventory",
+  "doc": "Command: add returned, inspected items back to sellable stock.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": "string"
+    },
+    {
+      "name": "restockId",
+      "type": "string"
+    },
+    {
+      "name": "lines",
+      "type": {
+        "type": "array",
+        "items": "com.edacommerce.common.StockLine"
+      }
+    }
+  ]
+}

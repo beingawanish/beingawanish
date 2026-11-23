@@ -1,0 +1,40 @@
+{
+  "type": "record",
+  "name": "OrderShipped",
+  "namespace": "com.edacommerce.order",
+  "doc": "The parcel left the warehouse and the payment was captured. This is the saga's pivot: nothing before it is irreversible, nothing after it is compensated.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "shipmentId",
+      "type": "string"
+    },
+    {
+      "name": "carrier",
+      "type": "string"
+    },
+    {
+      "name": "trackingNumber",
+      "type": "string"
+    },
+    {
+      "name": "capturedAmount",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "shippedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

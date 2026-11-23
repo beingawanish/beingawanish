@@ -1,0 +1,210 @@
+<h2 id=dd-design-3-the-payment-platform-capacity level=2>Deep Dive: The Capacity Plan, Box by Box</h2>
+<p>The lesson says 2,000 payments per second is a moderate load and that correctness decides the design. Both are true. A review panel still wants each box sized, because "moderate" hides one very hot spot. Here are the assumptions.</p>
+<h3 id=dd-design-3-the-payment-platform-cap-assume level=3>The extra assumptions</h3>
+<ul>
+<li><strong>Daily volume:</strong> peak is 2,000 per second, the daily average about 600 per second, so roughly 50M payments a day.</li>
+<li><strong>Ledger lines per payment:</strong> four. Card clearing is debited for the gross amount. The seller is credited the net. The platform fee account is credited the fee. The processor-cost account takes the network fee. Refunds, payouts and disputes add more lines later.</li>
+<li><strong>Line size:</strong> about 200 bytes with IDs, amounts, currency, timestamps and the running balance.</li>
+<li><strong>Retention:</strong> financial records are kept for years. The exact period depends on the jurisdiction and the record type, so treat it as "longer than the system's lifetime."</li>
+</ul>
+<h3 id=dd-design-3-the-payment-platform-cap-ledger level=3>The ledger write rate</h3>
+<p>At peak, 2,000 payments × 4 lines is 8,000 ledger lines per second. Per day, 50M × 4 = 200M lines, or about 40 GB. Per year, about 15 TB before replication and indexes. That is a large table, but it is append-only and almost all reads hit the last few days. Partition it by time and by account shard, and old partitions become cold storage that is read for audits and disputes.</p>
+<h3 id=dd-design-3-the-payment-platform-cap-hot level=3>The hot accounts, in numbers</h3>
+<p>Now look at which accounts those 8,000 lines touch. The seller and buyer lines spread across 5M accounts. The other two lines do not. Every payment credits the fee account, and every card payment debits card clearing. That is 2,000 writes per second each to two single accounts.</p>
+<p>The lesson's design gives each account one writer that appends in order. Each append must be durable before it is acknowledged. If a durable commit takes about 1 ms (an fsync plus a synchronous replica acknowledgement in the same region), a strict one-at-a-time writer tops out near 1,000 appends per second. The fee account needs 2,000. The design fails at peak on its two busiest accounts, while the average account sees one write a minute.</p>
+<p>Two mechanisms fix it, and the section on hot accounts below explains which account gets which.</p>
+<ul>
+<li><strong>Group commit.</strong> The writer collects every append that arrives during one commit and makes them durable together. At 1 ms per commit and 20 appends per batch, one writer sustains 20,000 appends per second. Each append still sees its own precondition checked in order.</li>
+<li><strong>Striping.</strong> Split an account that only receives credits into 16 sub-accounts, chosen by hash of the transaction ID. Reports sum the stripes. Each stripe takes about 125 writes per second.</li>
+</ul>
+<h3 id=dd-design-3-the-payment-platform-cap-other level=3>The other boxes</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Box<th>Load at peak<th>Size or count<tbody>
+<tr><td>Idempotency store<td>2,000 inserts/s plus reads on retry<td>50M keys/day × ~500 B, 24–72 h TTL: 25–75 GB
+<tr><td>Payment intents<td>~4 state changes per payment: 8,000 writes/s<td>50M rows/day × ~1 KB: 50 GB/day
+<tr><td>Card network calls<td>2,000 authorisations/s, ~1 s each<td>~2,000 in flight by Little's law; plan connection pools for 2–3× that
+<tr><td>Webhook receiver<td>2–4 events per payment: up to 8,000/s<td>Stateless; dedupe on event ID
+<tr><td>Balance projections<td>~4,000 balance changes/s<td>5M accounts × ~100 B: 500 MB; trivially cached
+<tr><td>Reconciliation<td>Daily join of ~50M internal rows with ~50M settlement rows<td>A sort-merge join of tens of GB; minutes on one large machine
+</table></div></div>
+<p>The card network line is worth a second look. Authorisation takes about a second because the network asks the issuing bank. At 2,000 per second, about 2,000 calls are waiting at any moment. If the network slows to 4 seconds in a brownout, that becomes 8,000. A thread-per-call service would need 8,000 threads just to wait. Use asynchronous I/O, cap concurrency per network, and let the circuit breaker shed the excess. Little's law decides when you open the breaker.</p>
+
+<h2 id=dd-design-3-the-payment-platform-ledger level=2>Deep Dive: Inside the Ledger Append</h2>
+<p>The lesson says each append succeeds only if the projected balance covers the debit. Here is what that looks like in a relational database, which is where most real ledgers live.</p>
+<h3 id=dd-design-3-the-payment-platform-ledger-schema level=3>A running balance with a sequence</h3>
+<p>Each line carries the account's sequence number and its balance after the line. The sequence is unique per account. That one constraint does three jobs.</p>
+<pre>
+CREATE TABLE ledger_line (
+  account_id     bigint      NOT NULL,
+  seq            bigint      NOT NULL,      -- per-account, gap-free
+  txn_id         uuid        NOT NULL,      -- groups the legs of one movement
+  amount_minor   bigint      NOT NULL,      -- signed, in minor units (cents)
+  currency       char(3)     NOT NULL,
+  balance_after  bigint      NOT NULL,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, seq),
+  UNIQUE (account_id, txn_id)               -- one leg per account per movement
+);
+
+-- The single writer for account 42 holds (seq=9001, balance=12500) in memory.
+-- A 4,000-cent debit for txn t:
+INSERT INTO ledger_line VALUES (42, 9002, :t, -4000, 'USD', 8500, now());
+</pre>
+<ul>
+<li><strong>Fencing.</strong> If two writers ever believe they own account 42, both try to insert <code>seq = 9002</code>. One gets a unique-key violation. The loser learns it is stale and stops.</li>
+<li><strong>Idempotency.</strong> A retried append for the same <code>txn_id</code> hits the second unique key and does nothing.</li>
+<li><strong>Audit chain.</strong> Each line's <code>balance_after</code> must equal the previous line's balance plus this amount. A verification job can walk any account's lines and prove its balance, with no trust in the projection.</li>
+</ul>
+<p>The balance precondition is the writer's own check before it inserts: <code>balance + amount ≥ floor</code>. For most accounts the floor is zero. Card clearing and processor accounts are allowed to go negative, because they represent money owed to us by outside parties.</p>
+<p>The double-entry rule needs one more check. The legs of each <code>txn_id</code> must sum to zero per currency. Within one database transaction, check it before commit. Across shards, a continuous verifier sums legs by transaction and pages someone if any total is not zero after a short grace window.</p>
+<h3 id=dd-design-3-the-payment-platform-ledger-xshard level=3>What "one ledger event" means across shards</h3>
+<p>The lesson says a cross-shard transfer is written as one ledger event, both legs in one record. The mechanism under that sentence is worth saying out loud, because a panel will ask where the record lives.</p>
+<p>The event is written once, atomically, on the shard of the account with the precondition. That is the debited account. The debit leg is applied there, in the same commit. The credit leg is applied to the other account's shard afterwards, by a consumer reading the event stream, with <code>(account_id, txn_id)</code> as its idempotency key.</p>
+<p>That is safe for one reason: a credit has no precondition. It cannot fail for lack of funds. So applying it a few milliseconds later, at least once, with dedupe, always succeeds eventually. Until it does, the seller's balance shows the money as incoming but not available. The atomic part is the single write on the debit side. Everything after it is guaranteed delivery of a step that cannot be refused. That is why no 2PC is needed.</p>
+<p>The verifier then watches the gap. Every event's credit leg should appear within seconds. A credit leg missing after a minute is a page, not a report.</p>
+<h3 id=dd-design-3-the-payment-platform-ledger-money level=3>Representing money</h3>
+<ul>
+<li><strong>Integers in minor units.</strong> Never floating point. 0.1 + 0.2 is not 0.3 in binary floating point, and a ledger that drifts by a fraction of a cent per line drifts by real money over 200M lines a day.</li>
+<li><strong>Minor units vary by currency.</strong> Most currencies use two decimal places, some use zero (the Japanese yen) and some use three. Store the currency on every line and look up its exponent. Do not assume cents.</li>
+<li><strong>Every split has a remainder.</strong> A $10.00 order split three ways is 333, 333 and 334 cents. Decide in code which party gets the extra cent (often the largest share, or the platform), and make the legs sum exactly. A rounding rule that is not written down becomes a reconciliation break.</li>
+<li><strong>Currency conversion is two movements.</strong> USD from the buyer to an FX account, then EUR from the FX account to the seller. Each balances in its own currency. The FX account's position is then visible risk instead of an implied one.</li>
+</ul>
+
+<h2 id=dd-design-3-the-payment-platform-hot level=2>Deep Dive: Hot Accounts, Done Properly</h2>
+<p>The lesson gives the fee account "entry batching and a dedicated shard." The deeper rule is about which accounts need a single, ordered writer at all.</p>
+<p>An account needs strict ordering only if it is debited with a precondition. A seller paying out must not overdraw. A buyer's wallet must not go negative. These accounts need one writer that checks each debit against the true balance.</p>
+<p>An account that only receives credits, or is allowed to go negative, has no precondition to protect. The fee account receives credits on every payment and is debited rarely, by finance, in bulk. Card clearing is debited on every payment and may be negative. Neither needs one serial writer.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Account type<th>Precondition?<th>Write pattern<th>Treatment<tbody>
+<tr><td>Seller balance, wallet<td>Yes, must not go below zero (or a reserve)<td>Low rate, a few hot sellers<td>One writer, group commit for hot sellers
+<tr><td>Platform fee<td>No<td>Credit on every payment<td>Stripe into sub-accounts; sum for reporting
+<tr><td>Card clearing<td>No, may be negative<td>Debit on every payment<td>Stripe; reconcile stripes together against settlement
+<tr><td>Payout clearing<td>Yes, against the bank instruction<td>Batched daily<td>One writer per payout batch
+</table></div></div>
+<p>Striping changes nothing an auditor cares about. The fee account's balance is the sum of its stripes, and every line is still there. What it changes is the write rate per stripe, from 2,000 per second to about 125.</p>
+<p>The hot seller is the harder case. A marketplace's largest seller during a sale might take 300 payments a second. Its account does need a precondition, but only for debits (refunds and payouts). Credits from sales can be applied to a stripe of "incoming" sub-accounts and swept into the main account every few seconds. The main account's single writer then sees one sweep credit per few seconds, plus its occasional debits. The seller's displayed balance is the main account plus unswept incoming, labelled as pending.</p>
+
+<h2 id=dd-design-3-the-payment-platform-lifecycle level=2>Deep Dive: The Long Tail of a Payment's Life</h2>
+<p>The lesson's state machine ends around captured and recorded. Real payments live for months after that, and each later event changes the ledger.</p>
+<h3 id=dd-design-3-the-payment-platform-life-timers level=3>The timers on an intent</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Event<th>Typical timing<th>What the platform does<tbody>
+<tr><td>Authorisation<td>~1–2 s<td>Hold on the card. No money has moved yet
+<tr><td>Authorisation expiry<td>Days; the window varies by network and card type<td>An uncaptured intent must capture or release before expiry, or it fails
+<tr><td>Capture<td>Seconds to days after authorisation<td>Ledger lines written; seller credited as pending
+<tr><td>Settlement<td>Usually one to a few business days<td>Network's file says money moved; reconciliation matches it
+<tr><td>Payout<td>On a schedule, after a hold<td>Saga with the bank, idempotent instruction per batch
+<tr><td>Refund<td>Any time, often within weeks<td>Reverse lines, then a refund call to the network
+<tr><td>Dispute (chargeback)<td>Weeks to months; card-network rules set the window<td>Debit the seller, possibly after payout, which can make their balance negative
+</table></div></div>
+<p>Every row with a time window needs a timer in the intent's saga. An authorised payment that nobody captures is a bug that shows up as a customer complaint a week later. Run a sweeper that finds intents near their expiry and either captures, releases or alerts.</p>
+<h3 id=dd-design-3-the-payment-platform-life-reserve level=3>Paying out money that may come back</h3>
+<p>The dispute row creates a credit risk problem. If a seller is paid out on day 2 and a chargeback arrives on day 40, the platform must recover the money from a seller who may have left. The ledger handles this honestly: the seller's balance goes negative, and the next sales repay it.</p>
+<p>The design control is a reserve. Hold a share of each new seller's balance, or delay payouts by a rolling window, until their dispute rate is known. In the ledger it is just another account per seller, "reserve," with its own lines. Its rules belong to the risk team. The ledger only makes them visible and auditable.</p>
+
+<h2 id=dd-design-3-the-payment-platform-idem level=2>Deep Dive: Idempotency Keys, End to End</h2>
+<p>The gateway requires a key on every mutating request. The interesting part is the record behind the key, because three different retries need three different answers.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Stored state for the key<th>Retry has the same body<th>Retry has a different body<tbody>
+<tr><td>None<td>Process it; store the key first<td>Process it; store the key first
+<tr><td>In progress<td>Return 409 "still processing," retry later<td>Return 422: key reused with different parameters
+<tr><td>Completed<td>Return the stored response, exactly<td>Return 422: key reused with different parameters
+</table></div></div>
+<p>To tell "same" from "different," store a hash of the request body with the key. A client that reuses one key for two different payments has a bug, and silently returning the first payment's result would hide it.</p>
+<p>The "in progress" row has a trap. The gateway inserts the key, calls the intent service, and crashes. The key is now in progress forever, and every retry gets 409. So the in-progress marker must carry a lease, say 60 seconds. A retry after the lease expires may take over. It then checks the intent's durable state before doing anything: the intent knows whether authorisation was already sent.</p>
+<p>Keys expire. Stripe, for example, documents a 24-hour window for its API keys. After that, a retry is a new request. That is fine for client retries, which happen in seconds. It is not fine for anything slower. That is why the inner layers have their own idempotency, which never expires: the intent's state machine, and the <code>(account_id, txn_id)</code> unique key on ledger lines. The gateway key protects the front door. The ledger key protects the money.</p>
+<p>The same thinking applies outward. Every call to the card network carries the intent's ID as the network's idempotency or reference field, where the network supports one. Every bank payout instruction carries a batch ID the bank will reject if seen twice. If an external party offers no idempotency, the platform must query before retrying. Silence from a bank is not a failure.</p>
+
+<h2 id=dd-design-3-the-payment-platform-recon level=2>Deep Dive: Inside Reconciliation</h2>
+<p>The lesson calls reconciliation the subsystem that assumes we are wrong. Here is how the matching works, and where its false alarms come from.</p>
+<h3 id=dd-design-3-the-payment-platform-recon-match level=3>The match</h3>
+<p>Each settlement record from the network carries a reference that the platform sent at authorisation, plus the amount, currency and settlement date. The matcher joins internal captured intents to settlement records on the reference. Each pair lands in one of four buckets.</p>
+<ol>
+<li><strong>Matched.</strong> Same reference, same amount, same currency. Most records, ideally over 99.9%.</li>
+<li><strong>Amount mismatch.</strong> Same reference, different amount. Often a partial capture, a currency conversion, or a fee netted out. Each has a rule, and anything left over is a break.</li>
+<li><strong>Internal only.</strong> We recorded a capture the network did not settle. Either the capture failed silently, or it settles tomorrow.</li>
+<li><strong>External only.</strong> The network settled something we never recorded. This is the worst bucket. Money moved and our ledger does not know.</li>
+</ol>
+<h3 id=dd-design-3-the-payment-platform-recon-cutoff level=3>Timing differences are not errors</h3>
+<p>The biggest source of false breaks is the day boundary. The platform's day might end at midnight UTC. The network's settlement day might end at a different hour in a different time zone. A capture at 23:58 UTC can appear in tomorrow's file.</p>
+<p>So unmatched items do not become breaks at once. They carry forward for a window, often two or three days, and are rematched against each new file. Only items that age out of the window become work items. Break counts are reported by age: under a day, one to three days, over three days. The last bucket is the real one.</p>
+<p>Ingestion of the files needs idempotency too. Networks sometimes resend a file or send a corrected one. Store each file's identifier and hash, and treat a second copy as a no-op. A file whose totals do not match its own header is quarantined, not processed.</p>
+
+<h2 id=dd-design-3-the-payment-platform-drills level=2>Deep Dive: Failure Drills</h2>
+<p>The lesson's failure walk covers the classic cases. These six are the ones that show up in payment postmortems.</p>
+<h3 id=dd-design-3-the-payment-platform-drill1 level=3>Drill 1: A ledger failover loses an acknowledged line</h3>
+<p><strong>Symptom.</strong> After a database failover, a seller's balance is $400 lower than the payment confirmation they received. <strong>Mechanism.</strong> The ledger primary used asynchronous replication. It committed the line, acknowledged the client, and died before the replica received it. The promoted replica never saw the line. <strong>Detection.</strong> The credit-leg verifier finds an event with no matching line, and the next reconciliation shows a settled capture with no ledger entry. <strong>Fix.</strong> The ledger must not acknowledge until a second copy is durable: synchronous replication to at least one replica, or a quorum-replicated store. Accept the extra latency, usually a millisecond or two within a region. Every other store in the design can lose seconds. The ledger's tolerance for loss is zero.</p>
+<h3 id=dd-design-3-the-payment-platform-drill2 level=3>Drill 2: A client reuses idempotency keys</h3>
+<p><strong>Symptom.</strong> A merchant integration reports that some customers were never charged, but got order confirmations. <strong>Mechanism.</strong> The merchant's code generated the idempotency key from the cart ID, not the checkout attempt. A customer who changed their cart and paid again reused the key. A gateway that returned the first stored response would show success for a payment that never happened. <strong>Detection.</strong> Count 422 "key reused with different parameters" responses per merchant. <strong>Fix.</strong> Store and compare the body hash, and reject mismatches loudly. Document what a key should identify: one attempt at one operation.</p>
+<h3 id=dd-design-3-the-payment-platform-drill3 level=3>Drill 3: The settlement file arrives twice, then corrected</h3>
+<p><strong>Symptom.</strong> Reconciliation reports 50,000 external-only breaks in one morning. <strong>Mechanism.</strong> The network sent a corrected file after the original. Ingestion processed both. Half the records now look settled twice. <strong>Detection.</strong> Break volume many times the normal rate. <strong>Fix.</strong> File-level idempotency on the file ID and hash, plus explicit handling of correction files (replace, not append). Never auto-adjust the ledger from reconciliation output when break volume is abnormal. A sudden spike of breaks is almost always a problem with the comparison, not with money.</p>
+<h3 id=dd-design-3-the-payment-platform-drill4 level=3>Drill 4: A chargeback after payout</h3>
+<p><strong>Symptom.</strong> A seller's balance is −$2,300, and they have stopped selling. <strong>Mechanism.</strong> They were paid out daily from day 2. Disputes on their early orders arrived weeks later. The ledger correctly debited them, and there was nothing left to debit. <strong>Detection.</strong> Negative-balance accounts by age and amount, and dispute rate per seller cohort. <strong>Fix.</strong> Reserves and payout delays for new or risky sellers, owned by the risk team and expressed as ledger accounts. The ledger did its job. The policy around it was missing.</p>
+<h3 id=dd-design-3-the-payment-platform-drill5 level=3>Drill 5: A rounding rule nobody wrote down</h3>
+<p><strong>Symptom.</strong> Reconciliation shows the fee account off by a few hundred dollars a month, always in the same direction. <strong>Mechanism.</strong> One service computed the fee as <code>round(amount × 0.029)</code> and another as <code>floor</code>. Splits disagreed by one cent on a fraction of payments. At 50M payments a day, a cent on 1% of them is $5,000 a day. <strong>Detection.</strong> The verifier's zero-sum check catches it only if both sides are in one transaction. When they are not, reconciliation catches it as a slow drift. <strong>Fix.</strong> One shared money library with an explicit rounding mode and remainder rule, used by every service that splits money. A rounding rule is part of the ledger's contract.</p>
+<h3 id=dd-design-3-the-payment-platform-drill6 level=3>Drill 6: The intent stuck in "authorising"</h3>
+<p><strong>Symptom.</strong> A few hundred intents a day sit in authorising for hours. Some customers see a pending hold on their card statement for a purchase that "failed." <strong>Mechanism.</strong> The authorisation call timed out. The network may or may not have approved it. Nobody asked. <strong>Detection.</strong> Count intents in any non-terminal state older than their expected step time. <strong>Fix.</strong> A recovery worker queries the network by reference for every intent past its step deadline. If authorised, it either continues or explicitly voids the authorisation. Customers see holds released within minutes instead of days. Every unknown outcome is a query waiting to happen.</p>
+
+<h2 id=dd-design-3-the-payment-platform-alternatives level=2>Deep Dive: Alternatives the Panel Will Debate</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>How to choose<tbody>
+<tr><td>Ledger storage<td>Relational database, append-only tables, sync replication<td>Purpose-built ledger database<td>A is well understood and auditors know it. B can be much faster on hot accounts; choose it only if A's limits are measured, not imagined
+<tr><td>Event log as the ledger<td>Ledger table is the source; stream derived from it<td>Kafka topic is the source<td>A. A log cannot check a balance precondition before accepting a record. Use the log to distribute, not to decide
+<tr><td>Balance reads<td>Projection, eventually consistent<td>Read the ledger's last line<td>Projection for display; the writer's in-memory balance (or the last line) for any decision
+<tr><td>Card processing<td>One payment service provider<td>Several acquirers with routing<td>Start with one. Add a second for resilience and cost once volume justifies two integrations and two reconciliations
+<tr><td>Reconciliation<td>Daily batch<td>Streaming, per event<td>Batch matches how settlement files arrive. Streaming catches missing webhooks within minutes. Most mature platforms run both
+<tr><td>Hot accounts<td>Group commit on one writer<td>Striped sub-accounts<td>Group commit when the account has a debit precondition; stripes when it does not
+</table></div></div>
+<p>The debate that matters most is the second row. Event sourcing invites the idea that the log is the ledger. But the ledger must refuse an overdraft, and refusing requires knowing the current balance before accepting the record. A log accepts whatever it is given. So the ledger is a database with a precondition on every append, and the stream is a copy of what it accepted. That is the lesson's "one writer per account" in its concrete form.</p>
+<p>The build-versus-buy debate also comes up, and it deserves a straight answer. Almost every marketplace should use a payment service provider for card acceptance. The ledger, the payout logic and the reconciliation are what the platform builds, because they encode its own money: seller balances, fees and reserves. A PSP's dashboard is a fourth book to reconcile against, not a replacement for your own.</p>
+
+<h2 id=dd-design-3-the-payment-platform-evolution level=2>Deep Dive: The Evolution Path</h2>
+<ol>
+<li><strong>Stage 1: PSP plus a ledger table.</strong> Card acceptance through one provider. One Postgres database with append-only ledger lines, integer money, and per-account sequence numbers. Daily reconciliation can be a script. At 20 payments per second, one database is plenty. Build the double-entry structure now; retrofitting it onto a balances table is painful.</li>
+<li><strong>Stage 2: intents, idempotency, webhooks.</strong> Triggered by the first double charge or the first "did this payment go through?" ticket.</li>
+<li><strong>Stage 3: automated reconciliation and a verifier.</strong> Triggered when manual reconciliation takes someone more than an hour a day, or the first break that took a week to find.</li>
+<li><strong>Stage 4: sharding by account, striped system accounts.</strong> Triggered when the fee account or the database's write rate becomes the bottleneck, which happens long before 5M sellers.</li>
+<li><strong>Stage 5: multiple acquirers and currencies.</strong> Routing by cost and approval rate, FX accounts, a reconciliation per acquirer.</li>
+<li><strong>Stage 6: multi-region.</strong> Each account has one home region where its writer runs. The region pairs with a synchronous standby. Cross-region active-active writes for one account are avoided, because the precondition needs one place to decide. Data residency rules may decide which region is home.</li>
+</ol>
+
+<h2 id=dd-design-3-the-payment-platform-review level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Which accounts receive a write on every payment, and what is their peak write rate?</li>
+<li>Which accounts have a debit precondition, and which can be striped?</li>
+<li>Can the ledger lose an acknowledged line on failover? Show the replication mode.</li>
+<li>Where is the zero-sum check for each transaction, and what checks cross-shard legs?</li>
+<li>How is money represented, and where is the one rounding rule?</li>
+<li>What happens to an idempotency key that is stuck in progress? What happens when a key is reused with a different body?</li>
+<li>Which idempotency survives after the gateway's key expires?</li>
+<li>What timer acts on an authorisation nearing expiry, and on an intent stuck in an unknown state?</li>
+<li>How does reconciliation tell a timing difference from a real break?</li>
+<li>What happens when a settlement file is duplicated or corrected?</li>
+<li>How are disputes after payout covered, and who owns the reserve policy?</li>
+<li>Can an auditor rebuild any account's balance from lines alone, without the projection?</li>
+</ol>
+
+<h2 id=dd-design-3-the-payment-platform-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Your single writer per account caps out at 1,000 appends a second. What do you do for the fee account?"</summary>
+<p>First ask whether it needs a single writer. The fee account has no debit precondition on the hot path, so it can be striped into 16 sub-accounts and summed for reporting. Each stripe takes about 125 writes a second. Group commit is for accounts that do need ordering, like a hot seller paying refunds. The mistake is applying one mechanism to every account. Ordering is only needed where a precondition depends on it.</p>
+</details>
+<details>
+<summary>"The credit leg of a cross-shard transfer is applied asynchronously. Isn't that a consistency bug?"</summary>
+<p>No, because a credit cannot fail. The debit, which can fail, is decided atomically on its own shard, together with the event that records both legs. The credit is then guaranteed to apply, at least once, deduped by <code>(account_id, txn_id)</code>. During the gap, the money is shown as pending to the receiver. The total across the system is never wrong. It is just in flight, the same as money in a real bank transfer. A verifier pages if any credit leg is late.</p>
+</details>
+<details>
+<summary>"Why synchronous replication for the ledger but not for anything else?"</summary>
+<p>Because the ledger is the only store whose loss cannot be rebuilt from somewhere else. Projections rebuild from the ledger. The idempotency store is a front-door optimisation backed by the ledger's own keys. Intents can be reconstructed from network queries. A lost ledger line is a lost fact about money. A millisecond of commit latency on a 2-second payment is nothing to pay for that.</p>
+</details>
+<details>
+<summary>"A capture call times out. Do you retry it or query first?"</summary>
+<p>It depends on what the network offers. If the capture call takes an idempotency key and promises to replay the original outcome, retry with the same key. That is both simpler and faster. If it does not, query by reference first, because a blind retry might capture twice. Either way the intent stays in its "capturing" state until the outcome is known, and a timer escalates if neither works. The answer that loses points is "retry with backoff" without saying how the second call is made safe.</p>
+</details>
+<details>
+<summary>"Reconciliation finds money the network settled that you never recorded. What now?"</summary>
+<p>Do not post a correcting line automatically. First find out why. An external-only item means either a capture we lost (a bug in our write path), a capture made outside our system (a dashboard action at the provider), or a problem in the file. Each has a different fix. Once the cause is known, post the missing lines with a reference to the break, so the correction is itself auditable. Automatic correction is acceptable only for known, rule-based categories like netted fees.</p>
+</details>
+<details>
+<summary>"How do you test a ledger change before it touches real money?"</summary>
+<p>Three ways. Property tests on the money library: every split sums exactly, every transaction balances, for random inputs. Shadow mode: run the new code beside the old on live events, write its lines to a shadow ledger, and diff balances continuously. And replay: rebuild a shadow ledger from months of history and compare every account's final balance. A ledger change ships when the diff has been zero for long enough that you trust it, then behind a flag per account cohort.</p>
+</details>
+<details>
+<summary>"Finance wants to change the fee from 2.9% to 2.7% for some sellers. Where does that live?"</summary>
+<p>Not in the ledger. The ledger records amounts, not rules. A pricing service computes each payment's fee from the seller's plan at capture time and passes the amounts to the ledger. The fee's inputs (plan ID, rate, rounding) are stored with the transaction, so anyone can see later why the fee was what it was. Rules change. Recorded facts do not.</p>
+</details>

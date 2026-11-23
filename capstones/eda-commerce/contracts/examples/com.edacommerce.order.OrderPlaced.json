@@ -1,0 +1,54 @@
+{
+  "envelope": {
+    "eventId": "5e34e874-2d74-5216-be5e-d7f09b34b1f0",
+    "type": "com.edacommerce.order.OrderPlaced",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "50303dcd-bd38-5f24-82a2-82d12ce5773f",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "order-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Order",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "customerId": "cb7719f1-36c5-5e91-ae79-3ce6454ff331",
+  "lines": [
+    {
+      "lineId": "7d3c094f-5360-5b28-8991-f0aac3597571",
+      "sku": "SKU-1001",
+      "productName": "Trail Running Shoe",
+      "quantity": 2,
+      "unitPrice": {
+        "amountMinor": 1999,
+        "currency": "EUR"
+      },
+      "lineTotal": {
+        "amountMinor": 1999,
+        "currency": "EUR"
+      }
+    }
+  ],
+  "total": {
+    "amountMinor": 1999,
+    "currency": "EUR"
+  },
+  "shippingAddress": {
+    "recipientName": "Jane Doe",
+    "line1": "Invalidenstrasse 1",
+    "line2": "example-line2",
+    "city": "Berlin",
+    "region": "example-region",
+    "postalCode": "10115",
+    "countryCode": "DE",
+    "phone": "example-phone"
+  },
+  "contactEmail": "jane.doe@example.com",
+  "shippingMethod": "STANDARD",
+  "placedAt": 1795000000000
+}

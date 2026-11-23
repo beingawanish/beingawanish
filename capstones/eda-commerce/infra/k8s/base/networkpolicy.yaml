@@ -1,0 +1,21 @@
+# Default: only pods of this system may call the service. Egress is left open in this starting
+# point; restrict it to Kafka, Schema Registry, Postgres, object storage and the collector later.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: svc
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: svc
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: eda-commerce
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress
+      ports:
+        - port: http

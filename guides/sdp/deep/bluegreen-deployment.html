@@ -1,0 +1,221 @@
+<h2 id=dd-bluegreen-deployment-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson draws blue-green as a router with a switch. In a design review the switch is the least interesting part. The questions that matter are what exactly flips, how long the flip takes to reach every path into the system, and which parts of the system never flip at all. This section takes those in order.</p>
+
+<h3 id=dd-bluegreen-deployment-where-switch level=3>Where the switch lives</h3>
+<p>There are four common places to put the switch. They differ in how fast the flip spreads and in what happens to connections that are already open.</p>
+<ul>
+<li><strong>An L7 load balancer rule.</strong> An AWS ALB listener rule pointing at a target group, an nginx or Envoy route, an ingress. The balancer picks a backend per request, so after the change new requests go to green almost at once. The change still has to reach every balancer node, which typically takes a few seconds. ALB weighted target groups also let you do the switch as 0/100 to 100/0, or stop halfway.</li>
+<li><strong>A Kubernetes Service selector.</strong> Change <code>selector: {app: shop, slot: blue}</code> to <code>slot: green</code>. The EndpointSlices change and every node's kube-proxy rewrites its rules. This is an L4 switch. It affects new TCP connections only. A connection that was open to a blue pod stays on that blue pod.</li>
+<li><strong>DNS.</strong> Point <code>shop.example.com</code> at the green load balancer. Simple, and the slowest and least predictable option. Resolvers and clients cache past the TTL, and some long-running clients resolve once at start-up and never again. Traffic decays from blue over minutes to hours, never cleanly.</li>
+<li><strong>A deployment controller.</strong> Argo Rollouts' blue-green strategy, AWS CodeDeploy for ECS, or Spinnaker (Netflix called the same idea red/black). These wrap one of the switches above with the steps around it: a preview service for testing green, pre-promotion checks, automatic or manual promotion, and a delay before scaling blue down (Argo's <code>scaleDownDelaySeconds</code>, 30 seconds by default). Look up your tool's version-specific defaults before relying on them.</li>
+</ul>
+<p>The practical rule: choose the switch by what your clients do with connections. Browsers behind a CDN and an L7 balancer flip within seconds. A gRPC service called by other services over long-lived HTTP/2 connections may not flip at all, which is failure mode 1 below.</p>
+
+<h3 id=dd-bluegreen-deployment-atomic level=3>How atomic is "atomic"?</h3>
+<p>The lesson says the switch is atomic and versions never mix. That is true in the sense that matters most: there is no half-hour period where both versions take a large share of traffic. It is not true at the millisecond level, and a senior reviewer should say so.</p>
+<ul>
+<li><strong>Propagation.</strong> For a few seconds, some balancer nodes or kube-proxies send new requests to green while others still send them to blue.</li>
+<li><strong>Draining.</strong> Requests that began on blue finish on blue, after green has started taking new ones.</li>
+<li><strong>Clients.</strong> A browser that loaded v1.41's JavaScript before the switch keeps running it and calls v1.42's API. A mobile app on last month's release calls whatever is live. The client fleet is always mixed.</li>
+<li><strong>Background workers.</strong> Unless they are switched too, blue's queue consumers and scheduled jobs keep running after the web traffic moves.</li>
+</ul>
+<p>So blue-green removes <em>prolonged</em> version mixing in the request path. It does not remove the need for v1.41 and v1.42 to tolerate each other's requests and data for a short period. Teams that believe the switch is perfectly atomic skip compatibility work, and the edges bite them.</p>
+
+<h3 id=dd-bluegreen-deployment-sequence level=3>The full sequence, with the parts the diagram leaves out</h3>
+<ol>
+<li><strong>Expand the schema.</strong> Run the additive migration while blue is live. Blue must run correctly against the expanded schema. This step happens <em>before</em> green exists, and it is the first thing the lesson's expand-contract rule controls.</li>
+<li><strong>Bring up green from the same artefact and config source.</strong> Same image digest that passed CI, same infrastructure-as-code module, environment-specific values only where they must differ. Green scales to full production capacity, not a token size. If green will receive 100% of traffic in one step, it has to be ready for 100%.</li>
+<li><strong>Keep green's background work switched off.</strong> Consumers, schedulers and cron jobs on green stay disabled, or blue and green would both process the same queue and both send the 9 a.m. reminder email.</li>
+<li><strong>Verify through a private route.</strong> Argo calls it a preview service, CodeDeploy a test listener. Smoke tests run against green on real infrastructure, using marked test accounts so that test orders do not mix with real ones.</li>
+<li><strong>Warm.</strong> Readiness gates pass, as in the <a href="#health-check-endpoint">health check lesson</a>. For JIT runtimes and large caches, warm-up traffic or replayed reads bring latency down to steady-state before real users arrive.</li>
+<li><strong>Switch request traffic.</strong> Flip the router. Watch error rate and latency on green for the first minutes, compared with blue's numbers from just before.</li>
+<li><strong>Switch background work.</strong> Pause blue's consumers and schedulers, start green's. Order matters for jobs that must not run twice: stop the old one first, accept a short gap.</li>
+<li><strong>Drain blue and keep it.</strong> Blue finishes in-flight requests, then stays running (or scaled to a warm minimum) for the rollback window.</li>
+<li><strong>Close the window and contract.</strong> When v1.42 is trusted, scale blue down. Only then, in a later release, run the contract migration that removes the old structures.</li>
+</ol>
+<svg role="img" aria-labelledby="dd-bluegreen-deployment-svg-title dd-bluegreen-deployment-svg-desc" viewBox="0 0 720 250" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-bluegreen-deployment-svg-title">One blue-green release on a timeline</title>
+<desc id="dd-bluegreen-deployment-svg-desc">Three horizontal lanes share one timeline. The schema lane shows the expand migration first, then a long dual-compatible period, then the contract migration in a later release. The blue lane shows blue live, then draining after the switch, then idle but warm during the rollback window, then scaled down. The green lane shows green deployed and verified with zero users, then live after the switch. A vertical line marks the switch. A bracket shows that the rollback window must end before the contract migration starts.</desc>
+<text x="10" y="54" style="fill:var(--ink,#1c2430);font-weight:600">Schema</text>
+<text x="10" y="104" style="fill:var(--ink,#1c2430);font-weight:600">Blue v1.41</text>
+<text x="10" y="154" style="fill:var(--ink,#1c2430);font-weight:600">Green v1.42</text>
+<rect x="100" y="36" width="70" height="28" rx="4" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="135" y="55" text-anchor="middle" style="fill:var(--ink,#1c2430)">expand</text>
+<rect x="175" y="36" width="440" height="28" rx="4" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="395" y="55" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">dual-compatible: both versions read and write safely</text>
+<rect x="620" y="36" width="90" height="28" rx="4" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="665" y="55" text-anchor="middle" style="fill:var(--ink,#1c2430)">contract</text>
+<rect x="100" y="86" width="230" height="28" rx="4" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="215" y="105" text-anchor="middle" style="fill:var(--ink,#1c2430)">live: 100% of traffic</text>
+<rect x="335" y="86" width="50" height="28" rx="4" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="360" y="105" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">drain</text>
+<rect x="390" y="86" width="210" height="28" rx="4" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="495" y="105" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">idle, warm: rollback target</text>
+<rect x="185" y="136" width="145" height="28" rx="4" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="257" y="155" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">deploy, verify, warm</text>
+<rect x="335" y="136" width="375" height="28" rx="4" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="522" y="155" text-anchor="middle" style="fill:var(--ink,#1c2430)">live: 100% of traffic</text>
+<line x1="333" y1="24" x2="333" y2="178" style="stroke:var(--accent,#1f5f99);stroke-dasharray:4 3"/>
+<text x="333" y="194" text-anchor="middle" style="fill:var(--ink,#1c2430)">switch</text>
+<path d="M335 208 V216 H600 V208" style="stroke:var(--ink,#1c2430);fill:none"/>
+<text x="467" y="234" text-anchor="middle" style="fill:var(--ink,#1c2430)">rollback window: must close before contract</text>
+</svg>
+
+<h3 id=dd-bluegreen-deployment-shared-state level=3>Everything that does not switch</h3>
+<p>The lesson names the database. In practice there is a list, and each item needs the same two-version rule.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Shared thing<th>What goes wrong<th>The compatibility rule<tbody>
+<tr><td>Database schema<td>Green renames a column; blue fails on rollback<td>Expand-contract, contract after the window closes
+<tr><td>Database <em>data</em><td>Green writes a new enum value, such as <code>status = 'partially_refunded'</code>, that blue's code does not know. Blue crashes reading those rows after rollback.<td>Ship tolerance first: v1.41 must already handle unknown values before v1.42 writes them
+<tr><td>Shared cache (Redis, Memcached)<td>Green writes a new serialised format under the same key. Blue reads it and fails, or green reads blue's old format.<td>Put a version in the key (<code>v42:product:991</code>) or make the format readable by both
+<tr><td>Queues and topics<td>Green publishes a message shape blue's consumers reject, or both versions consume the same queue<td>Additive message schemas. Switch consumers deliberately, as in step 7.
+<tr><td>Sessions and cookies<td>Green changes the session format or signing key, and every user is logged out at the switch, or again at rollback<td>Accept old and new formats in both versions. Rotate keys with an overlap.
+<tr><td>Static assets<td>A page rendered by green references <code>app.9f3c.js</code>, which only green serves. A request that hits blue during propagation returns 404.<td>Content-hashed asset names on a shared CDN or bucket, with old and new kept for days
+<tr><td>External side effects<td>Smoke tests against green send real emails or charge real cards<td>Test accounts flagged end to end, and sandbox modes for providers
+</tbody></table></div></div>
+<p>The enum row is the subtle one. Expand-contract is usually taught as a schema rule. But the schema can be perfectly compatible while the data is not. A new value in a text column, a new JSON field that blue's strict parser rejects, a new row type. The general rule is: <strong>the old version must be able to read anything the new version might write during the window</strong>. Often that means a release before v1.42 that only adds tolerance.</p>
+
+<h2 id=dd-bluegreen-deployment-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Use the bookstore's checkout service: 40 instances at 4 vCPU each in steady state, with a p99 request of 600 ms and a few long requests up to 30 seconds (report exports).</p>
+
+<h3 id=dd-bluegreen-deployment-cost level=3>What 2x actually costs</h3>
+<p>Assume each instance costs about $0.20 per hour on demand. The live environment is <code>40 × $0.20 = $8/hour</code>. The question is how long green and blue overlap.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Policy<th>Overlap per release<th>Releases per month<th>Extra cost per month<tbody>
+<tr><td>Cloud, 3-hour window<td>~3.5 h (start-up, verify, window)<td>40<td>40 × 3.5 × $8 = <strong>$1,120</strong>
+<tr><td>Cloud, 24-hour window<td>~24.5 h<td>40<td>Two releases a day means blue and green almost always both run: close to <strong>$5,800</strong>, a permanent 2x
+<tr><td>On-prem, permanent pair<td>always<td>any<td>The full cost of a second set of hardware, used for minutes a day
+</tbody></table></div></div>
+<p>Now compare with the outage it prevents. If checkout handles $50,000 per hour of orders and the lesson's in-place rollback takes 20 minutes, one bad release costs about $16,000 in lost orders, before counting reputation. One avoided incident a quarter pays for the 3-hour policy several times over. A 24-hour window at two releases a day is where the maths starts to argue for a warm minimum (scale blue down to 25% and scale it up on rollback) or for a <a href="#canary-deployment">canary</a>.</p>
+<p>Note the interaction between release frequency and window length. If you release every 4 hours with a 24-hour window, you would need several old environments to keep every rollback target alive. In practice you keep only the previous version, and the rollback window is effectively "until the next release".</p>
+
+<h3 id=dd-bluegreen-deployment-db-connections level=3>Database connections double too</h3>
+<p>This number catches teams who budgeted for compute but not for the database. Each instance has a connection pool of 20. One environment opens <code>40 × 20 = 800</code> connections. During the overlap, both environments are connected: <strong>1,600</strong>. Postgres' <code>max_connections</code> is often set in the low hundreds to low thousands, and each connection is a backend process with its own memory. A fleet that sat at 60% of the limit now needs 120%.</p>
+<p>Options, in order of preference: put a pooler such as PgBouncer in front, sized for total demand rather than per-environment demand, as in the <a href="#database-connection-pooling">connection pooling lesson</a>. Or make idle blue shrink its pool after draining, since an idle environment needs only a few connections. Or size <code>max_connections</code> for the overlap explicitly. Whatever you choose, the review should see the 1,600.</p>
+
+<h3 id=dd-bluegreen-deployment-switch-time level=3>How long the switch really takes</h3>
+<ul>
+<li>L7 rule change reaching all balancer nodes: typically a few seconds.</li>
+<li>Kubernetes selector change to all kube-proxies: usually a few seconds on a healthy cluster, longer on a large one under load.</li>
+<li>Draining blue: the longest in-flight request. With 30-second exports, about 30 seconds. With SSE or WebSocket connections, as long as you let them live. More on that next.</li>
+<li>DNS: minutes to hours. Treat it as a gradual shift, not a switch.</li>
+</ul>
+<p>Rollback is the same path in reverse, so a "10-second rollback" is honest for an L7 switch with short requests. Promising 10 seconds over DNS is not.</p>
+
+<h3 id=dd-bluegreen-deployment-reconnect level=3>Long-lived connections and the reconnect wave</h3>
+<p>Suppose the bookstore's order-status page holds 200,000 SSE connections on blue. They will not move on their own. To retire blue you must close them, and every client reconnects to green.</p>
+<p>Close them all at once and green receives 200,000 connection attempts within a second or two, each with TLS handshake and authentication. That is a self-inflicted thundering herd. Spread the closes over a drain period instead. At 2,000 closes per second the migration takes 100 seconds and green sees a manageable reconnect rate. Clients should also add jitter to their reconnect delay, as the <a href="#serversent-events">SSE lesson</a> recommends. Size green for the reconnect handshake rate, not only for steady-state connections.</p>
+
+<h2 id=dd-bluegreen-deployment-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+<p>The lesson's Check Yourself covers the destructive migration. These are the failures teams meet after they have learned that one.</p>
+
+<h3 id=dd-bluegreen-deployment-fm-sticky-connections level=3>1. The switch that did not switch</h3>
+<p><strong>Symptom.</strong> Dashboards show green live, yet 30% of requests from internal callers still reach blue an hour later. Scaling blue down causes a burst of errors in those callers.</p>
+<p><strong>Mechanism.</strong> The switch was a Kubernetes Service selector, which is an L4 change. Callers hold long-lived HTTP/1.1 keep-alive or HTTP/2 connections to blue pods, opened before the switch. Those connections are still valid, so requests keep flowing over them. gRPC clients are the classic case. They open a few connections and reuse them for hours.</p>
+<p><strong>Detection.</strong> Request rate on blue after the switch, broken down by caller. It should fall to zero within the drain period. A long tail means sticky connections.</p>
+<p><strong>Fix.</strong> Switch at L7 where possible, so routing happens per request. If not, have servers cap connection lifetime (gRPC's <code>MaxConnectionAge</code> on the server, or an idle and maximum age in the proxy) so clients reconnect regularly. During blue's drain, actively close connections with <code>Connection: close</code> or an HTTP/2 GOAWAY so clients reconnect and land on green.</p>
+
+<h3 id=dd-bluegreen-deployment-fm-enum level=3>2. Rollback crashes on new data, with a compatible schema</h3>
+<p><strong>Symptom.</strong> v1.42 adds partial refunds. Thirty minutes after the switch an unrelated bug forces a rollback. Blue starts throwing on the order history page for some customers only.</p>
+<p><strong>Mechanism.</strong> No column was renamed. The schema was additive and correct. But green wrote <code>status = 'partially_refunded'</code> into an existing text column, and blue's code maps status strings to an enum that throws on unknown values. The data is the incompatibility, not the schema.</p>
+<p><strong>Detection.</strong> Errors on blue after rollback, concentrated on rows created or updated during green's live period. A query for rows whose values are outside blue's known set confirms it.</p>
+<p><strong>Fix.</strong> Short term: roll forward with a fix, or ship a blue patch that tolerates the new value. Long term: any new value, field or message type goes out in two releases. First a release that reads and ignores (or safely displays) the new value. Then the release that writes it. Make the review question explicit: "can the previous version read everything this version writes?"</p>
+
+<h3 id=dd-bluegreen-deployment-fm-double-workers level=3>3. Everything happens twice</h3>
+<p><strong>Symptom.</strong> On release day, customers receive two "your order shipped" emails. A nightly report runs twice and double-counts.</p>
+<p><strong>Mechanism.</strong> Blue-green was applied to the whole deployment, including queue consumers and the scheduler. Green's consumers started as soon as green was deployed, so both versions consumed the same queue. Or both environments ran the same cron schedule during the overlap.</p>
+<p><strong>Detection.</strong> Consumer group membership showing instances from both versions. Duplicate side effects keyed by the same event or job ID.</p>
+<p><strong>Fix.</strong> Separate web traffic switching from background work switching. Background work in green starts disabled and is enabled by the cutover runbook after blue's is stopped. Scheduled jobs take a distributed lock or run from a single scheduler outside both environments. Consumers should be <a href="#idempotency">idempotent</a> anyway, so a short overlap does no harm.</p>
+
+<h3 id=dd-bluegreen-deployment-fm-drift level=3>4. Green passed verification on a different world</h3>
+<p><strong>Symptom.</strong> Green's smoke tests passed. Five minutes after the switch, payment calls fail with TLS errors, or green writes to the wrong database.</p>
+<p><strong>Mechanism.</strong> Environment drift. Blue was hand-patched months ago: a firewall rule, a newer CA bundle, a secret rotated in blue only. Green was built from infrastructure-as-code that never had the patch. Or worse, a copy-paste config gave green the staging database URL, and the smoke tests passed because staging works.</p>
+<p><strong>Detection.</strong> A drift check that diffs the two environments' rendered configuration (excluding the expected slot-specific values) before every switch. Smoke tests that assert identity, such as "which database cluster am I connected to?", not just "does a request succeed?".</p>
+<p><strong>Fix.</strong> Build both environments from the same code with no manual changes allowed. Rebuild blue from scratch periodically rather than patching it in place. Make the smoke test check identity as well as function.</p>
+
+<h3 id=dd-bluegreen-deployment-fm-cold level=3>5. Green is cold, and 100% arrives at once</h3>
+<p><strong>Symptom.</strong> Right after the switch, p99 latency jumps from 600 ms to 3 seconds for several minutes. The database CPU spikes. Then it settles.</p>
+<p><strong>Mechanism.</strong> Green passed readiness, but its local caches were empty and the JIT had not optimised hot paths. Every request missed the local cache and went to the database at once. A rolling deploy hides this, because only a few instances are cold at any moment. Blue-green sends all traffic to an all-cold fleet in one step. It is a small cousin of the <a href="#cache-stampede-prevention">cache stampede</a>.</p>
+<p><strong>Detection.</strong> Latency and cache hit rate on green over the first minutes after each switch, compared with blue's steady state.</p>
+<p><strong>Fix.</strong> Warm before the switch: replay a sample of recent read traffic, or pre-load the hottest keys. Or shift in two steps with weighted target groups, 10% for a few minutes then 100%. That is a small step towards canary, and often worth it.</p>
+
+<h3 id=dd-bluegreen-deployment-fm-assets level=3>6. Broken pages during the switch, and again at rollback</h3>
+<p><strong>Symptom.</strong> For a minute around each switch, a few percent of page loads show unstyled pages or a JavaScript error. Rollback produces the same burst.</p>
+<p><strong>Mechanism.</strong> HTML rendered by green references new hashed asset files. During propagation, or because a CDN fetched from whichever environment answered, some asset requests reach blue, which does not have those files. The same thing happens in reverse after rollback, while browsers still hold green's HTML.</p>
+<p><strong>Detection.</strong> 404 rate on static asset paths, spiking at switch times.</p>
+<p><strong>Fix.</strong> Publish assets to a shared bucket or CDN origin that both environments read, before the switch, and keep old versions for days. Long-lived single-page apps should also tolerate an API that is a version ahead or behind.</p>
+
+<h3 id=dd-bluegreen-deployment-fm-test-data level=3>7. Smoke tests that touched production</h3>
+<p><strong>Symptom.</strong> The finance team finds 30 orders from "Test User" in yesterday's revenue. A partner receives webhook events for orders that never existed.</p>
+<p><strong>Mechanism.</strong> Green shares the production database and integrations, which is the point of blue-green. So smoke tests that place an order really place one. The lesson's "verify against real infrastructure" has a cost: the infrastructure is real.</p>
+<p><strong>Detection.</strong> Orders from known test accounts appearing in reporting or outbound events.</p>
+<p><strong>Fix.</strong> Dedicated test accounts with a flag that every downstream system respects: reporting excludes them, outbound webhooks and emails skip them, payment uses the provider's test mode for them. Prefer read-only smoke tests where possible, and keep write tests small and labelled.</p>
+
+<h2 id=dd-bluegreen-deployment-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<p>The lesson compares blue-green with rolling deploys. In real systems the choice has more axes than that, and many teams end up with a hybrid.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Variation<th>How it works<th>Good for<th>Watch out for<tbody>
+<tr><td>Classic per-service blue-green<td>One service has two slots; L7 or selector switch<td>Stateless services with fast rollback needs<td>Shared state rules; sticky connections at L4
+<tr><td>Whole-stack or whole-cluster blue-green<td>Two complete clusters; switch at DNS or a global balancer<td>Cluster upgrades, platform migrations, Kubernetes version jumps<td>DNS slowness; cost of a second cluster; data stores still shared or replicated
+<tr><td>Blue-green with a weighted first step<td>Switch 5–10% first, watch, then 100%<td>Warming green and catching obvious errors with small exposure<td>It is now a short canary; needs version-mixing tolerance
+<tr><td>Blue-green with shadow traffic<td>Mirror a copy of live requests to green before the switch, discard green's responses<td>Testing performance and error rate on real traffic with zero user impact<td>Writes must not be mirrored, or must go to a sandbox; doubles load on shared dependencies
+<tr><td>Warm-minimum blue<td>After the switch, scale blue to 20–25% and keep it; scale up on rollback<td>Long rollback windows at lower cost<td>Rollback takes as long as scaling up; blue can be overwhelmed if switched back too early
+<tr><td>Rolling deploy plus feature flags<td>Deploy in place; risky behaviour stays behind a flag<td>Large fleets where 2x is expensive; behaviour risk rather than infrastructure risk<td>Mixed versions during rollout; flag debt, as in the <a href="#feature-flags">feature flags lesson</a>
+</tbody></table></div></div>
+
+<h3 id=dd-bluegreen-deployment-choosing level=3>How to choose</h3>
+<p>Ask what risk you are actually managing.</p>
+<ul>
+<li>If the main risk is <strong>the new build not working in production at all</strong> (bad config, missing secret, broken dependency, platform upgrade), blue-green is strong. It verifies the whole environment with zero users, and rolls back in seconds.</li>
+<li>If the main risk is <strong>new behaviour hurting a fraction of users</strong>, you need gradual exposure: canary, or flags. Blue-green sends 100% at once.</li>
+<li>If the main risk is <strong>the data</strong> (migrations, new value types, backfills), the deployment strategy hardly matters. Expand-contract and two-release tolerance do the work, and the <a href="#capstone-the-zerodowntime-migration">zero-downtime migration capstone</a> is the right frame.</li>
+<li>If <strong>versions cannot coexist at all</strong> (a protocol change between tightly coupled components, a license server, a singleton), blue-green's near-atomic switch is the main reason to use it. Be honest that "near" still leaves seconds of overlap.</li>
+</ul>
+<p>A sensible default for many teams: rolling deploys for routine releases, blue-green for platform changes and high-risk releases where instant rollback is worth paying for, and flags for behaviour changes. One release process does not have to fit every release.</p>
+
+<h2 id=dd-bluegreen-deployment-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Where is the switch (L7 rule, selector, DNS, controller), and how long does it take to reach every path into the service?</li>
+<li>What happens to long-lived connections at the switch: keep-alive, HTTP/2, gRPC, SSE, WebSocket? How are they moved, and at what rate?</li>
+<li>Can v1.41 read every row, cache entry, message and cookie that v1.42 might write during the rollback window? Show the tolerance release if one was needed.</li>
+<li>When does the contract migration run, and what enforces that it waits for the rollback window to close?</li>
+<li>Are queue consumers, schedulers and cron jobs switched separately from web traffic? What prevents both versions processing the same work?</li>
+<li>Is green built from the same artefact and infrastructure code as blue? How is drift detected before each switch?</li>
+<li>Do smoke tests prove identity (right database, right region, right secrets) as well as function? What stops test data reaching reports, partners or payments?</li>
+<li>Is green sized and warmed for 100% of traffic, including the reconnect rate of long-lived clients?</li>
+<li>What does the overlap do to shared limits: database connections, rate limits with third parties, licence counts?</li>
+<li>Which metrics decide "keep" or "roll back" in the first minutes, and who or what makes that call?</li>
+<li>How long is the rollback window, what does it cost per month at your release frequency, and is there a warm-minimum option?</li>
+<li>Where do static assets live, and are both versions' assets available throughout the switch and rollback?</li>
+</ol>
+
+<h2 id=dd-bluegreen-deployment-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"You flipped the Kubernetes Service selector to green, but blue still gets traffic an hour later. Why?"</summary>
+<p>A selector change is an L4 switch. It only affects new connections. Callers holding keep-alive or HTTP/2 connections to blue pods keep using them, and gRPC clients may hold connections for hours. Fix it by switching at L7, by capping server connection age so clients reconnect, or by closing connections from blue during its drain with GOAWAY or <code>Connection: close</code>.</p>
+</details>
+<details>
+<summary>"The migration was purely additive. Why did rollback still break blue?"</summary>
+<p>Because compatibility is about data as well as schema. Green can write values blue does not understand into perfectly compatible columns: a new enum value, a new JSON field for a strict parser, a new message type. The rule is that the old version must read anything the new one writes during the window. New values need a release that tolerates them before the release that writes them.</p>
+</details>
+<details>
+<summary>"Is the blue-green switch atomic?"</summary>
+<p>Close enough to remove prolonged mixing, not truly atomic. For a few seconds the routing change is still spreading, requests already on blue finish on blue, and clients running old JavaScript or old mobile builds call the new API anyway. So you still need short-term compatibility between adjacent versions. What blue-green removes is the long period of mixed versions a rolling deploy has.</p>
+</details>
+<details>
+<summary>"How do you handle the queue consumers in a blue-green deploy?"</summary>
+<p>Separately from web traffic. Green's consumers start disabled. After the request switch, stop blue's consumers and start green's. Consumers stay idempotent so a short overlap or a redelivery does no harm. Message formats follow the same additive rule, because during rollback blue's consumers will meet messages green produced.</p>
+</details>
+<details>
+<summary>"Two releases a day, 24-hour rollback window. What does that do to cost and to the design?"</summary>
+<p>The environments almost always overlap, so you pay close to a permanent 2x, and you could need more than one old environment to keep every rollback target. In practice you keep only the previous version, so the effective window is until the next release. To cut cost, scale blue to a warm minimum after the switch and scale it up on rollback, accepting a slower rollback. Or move routine releases to rolling and keep blue-green for risky ones.</p>
+</details>
+<details>
+<summary>"The switch went fine, but latency tripled for five minutes. What happened and how do you prevent it?"</summary>
+<p>Green was ready but cold. Every instance had empty local caches and unoptimised code, and all traffic arrived at once, so cache misses hit the database together. Rolling deploys hide this because only a few instances are cold at a time. Warm green before the switch with replayed reads or preloaded hot keys, or switch in two weighted steps so green warms on a small share first.</p>
+</details>
+<details>
+<summary>"When would you choose blue-green over canary even though canary limits blast radius?"</summary>
+<p>When the risk is the environment rather than the behaviour: a runtime or platform upgrade, a new cluster, new infrastructure. Blue-green tests all of it with zero users and rolls back in seconds. Also when two versions cannot safely serve side by side for long, which a canary requires by design. Many teams combine them: bring up green fully, verify, then shift weight gradually.</p>
+</details>
+<details>
+<summary>"Blue-green doubles your database connections. How do you plan for that?"</summary>
+<p>Count it. Forty instances with pools of 20 is 800 connections per environment, 1,600 during overlap. Either a pooler in front of the database sized for total demand, or shrink idle blue's pool after it drains, or raise <code>max_connections</code> knowingly with the memory that costs. The same overlap applies to anything with a shared limit: third-party rate limits, licence seats, broker connections.</p>
+</details>

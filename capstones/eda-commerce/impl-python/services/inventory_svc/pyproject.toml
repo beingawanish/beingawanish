@@ -1,0 +1,27 @@
+[project]
+name = "inventory-svc"
+version = "0.1.0"
+description = "eda-commerce inventory-svc (Python build)"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "edacommon",
+    "contracts-py",
+]
+
+[project.scripts]
+inventory-svc = "inventory_svc.main:main"
+
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/inventory_svc"]
+
+[tool.uv.sources]
+edacommon = { workspace = true }
+contracts-py = { workspace = true }
+
+[tool.hatch.build.targets.wheel.force-include]
+# Ship the Alembic scripts inside the wheel so a non-editable install (container) can migrate.
+"migrations" = "inventory_svc/_migrations"

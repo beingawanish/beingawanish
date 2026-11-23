@@ -1,0 +1,200 @@
+<h2 id=dd-rate-limiting-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson settles the four big decisions: refusal as a contract, token bucket by default, a trusted identity as the key, and shared counters. This section looks at what is actually stored per key, how a check stays atomic when twenty gateway instances run it at once, and how the same idea shows up in nginx, Envoy and Redis. Most limiter bugs live in these details, not in the choice of algorithm.</p>
+
+<h3 id=dd-rate-limiting-lazy-bucket level=3>A token bucket is two numbers and a clock</h3>
+<p>Nobody runs a timer that drips tokens into a million buckets. A token bucket is computed lazily. Per key you store two values: the token count and the time you last updated it. On each request:</p>
+<ol>
+<li>Compute elapsed time since the stored timestamp.</li>
+<li>Refill: <code>tokens = min(b, tokens + elapsed × r)</code>.</li>
+<li>If <code>tokens ≥ cost</code>, subtract the cost and allow. Otherwise refuse.</li>
+<li>Store the new count and the current time.</li>
+<li>Set the key to expire after <code>b / r</code> seconds (plus a margin). By then a full bucket would have refilled anyway, so an expired key and a full bucket mean the same thing. This is what keeps memory bounded to active callers.</li>
+</ol>
+<p>The refusal also tells you the <code>Retry-After</code> value for free: the time until enough tokens exist is <code>(cost − tokens) / r</code>. And the remaining budget for <code>X-RateLimit-Remaining</code> is just <code>floor(tokens)</code>.</p>
+
+<h3 id=dd-rate-limiting-gcra level=3>GCRA: the same bucket in one number</h3>
+<p>The Generic Cell Rate Algorithm, from ATM networking, gives the same behaviour as a token bucket while storing only one value per key: the <em>theoretical arrival time</em> (TAT). Think of it as "the time at which this caller's bucket would be full again". With emission interval <code>T = 1 / r</code>, a request is allowed if, after charging it, the TAT is no more than <code>b × T</code> ahead of now. One number per key halves storage and makes the atomic update simpler. Libraries such as the redis-cell module and several language limiters use it.</p>
+<pre><code>import time
+
+class GCRA:
+    """Token-bucket behaviour with one stored value per key: the theoretical arrival time."""
+    def __init__(self, rate, burst):
+        self.T = 1.0 / rate          # seconds per token
+        self.window = burst * self.T # how far ahead of now the TAT may run
+        self.tat = {}                # key -&gt; theoretical arrival time
+
+    def check(self, key, cost=1, now=None):
+        now = time.monotonic() if now is None else now
+        tat = max(self.tat.get(key, now), now)
+        new_tat = tat + cost * self.T
+        if new_tat - now &gt; self.window + 1e-9:   # tolerance for float rounding
+            retry_after = new_tat - now - self.window
+            return False, retry_after
+        self.tat[key] = new_tat
+        return True, 0.0
+
+lim = GCRA(rate=100, burst=200)      # the lesson's partner tier
+allowed = sum(lim.check("partner-7", now=0.0)[0] for _ in range(4000))
+print(allowed)                       # 200: the burst, then refusals until time moves</code></pre>
+<p>Check the burst: a fresh key starts with TAT = now. After k requests at the same instant, TAT = now + k × T, and the request is allowed while k × T ≤ b × T, so exactly b requests pass. After that, each new token arrives every T seconds, which is the refill rate.</p>
+
+<h3 id=dd-rate-limiting-redis level=3>Shared counters: atomic in Redis</h3>
+<p>Twenty gateway instances must not each read the bucket, decide, and write it back, because two of them can read the same value and both allow the last token. The check and update must be one atomic step. In Redis that means a Lua script, which runs without interleaving with other commands on that shard:</p>
+<pre><code>-- KEYS[1] = bucket key, e.g. "rl:{partner-7}:search"
+-- ARGV[1] = rate r (tokens/s), ARGV[2] = burst b, ARGV[3] = cost
+local r, b, cost = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local t = redis.call('TIME')                       -- one clock for every gateway
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local s = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(s[1]) or b
+local ts = tonumber(s[2]) or now
+tokens = math.min(b, tokens + (now - ts) * r)
+local allowed = 0
+if tokens &gt;= cost then tokens = tokens - cost; allowed = 1 end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('EXPIRE', KEYS[1], math.ceil(b / r) + 1)
+local retry_ms = 0
+if allowed == 0 then retry_ms = math.ceil((cost - tokens) / r * 1000) end
+return {allowed, math.floor(tokens), retry_ms}</code></pre>
+<p>Three details in that script matter in production.</p>
+<ul>
+<li><strong>The clock comes from Redis.</strong> If each gateway passed its own time, clock skew between instances would add or remove tokens. Calling <code>TIME</code> inside a script that then writes is fine on Redis 5 and later, which replicate script effects rather than the script itself. Older versions needed <code>redis.replicate_commands()</code> first.</li>
+<li><strong>The key has a hash tag</strong> (<code>{partner-7}</code>). In Redis Cluster, a script may touch only keys on one shard. The braces make every key for one tenant hash to the same shard, so a multi-key script (say, a per-endpoint and a per-tenant bucket together) still works.</li>
+<li><strong>Load the script once</strong> with <code>SCRIPT LOAD</code> and call it by hash with <code>EVALSHA</code>, so the gateway does not send the script body on every request.</li>
+</ul>
+<p>The simpler fixed-window version is <code>INCR</code> then <code>EXPIRE</code>. It is only safe if both happen atomically, in a <code>MULTI</code> block or a script. Otherwise a crash between them leaves a counter with no expiry, and that caller stays refused forever. That exact bug is failure mode 2 below.</p>
+
+<h3 id=dd-rate-limiting-sliding level=3>The sliding window counter, as a formula</h3>
+<p>The lesson mentions the sliding window counter as the practical sliding window. It keeps two fixed-window counters, the current one and the previous one, and estimates the count over the last full window by weighting the previous one by how much of it still overlaps:</p>
+<p><code>estimate = previous × (1 − elapsed_in_current / window) + current</code></p>
+<p>Twenty seconds into a one-minute window, with 90 requests in the previous minute and 30 so far: 90 × (40/60) + 30 = 90. The estimate assumes the previous window's requests were evenly spread, so it can be off when traffic is bursty. For protection limits that error is acceptable, and it costs two counters per key instead of a log of every timestamp. The exact alternative, the sliding window log (a sorted set of timestamps per key), costs memory proportional to the limit, which is fine for "5 logins per minute" and wasteful for "10,000 requests per hour".</p>
+
+<h3 id=dd-rate-limiting-proxies level=3>What nginx and Envoy actually do</h3>
+<p><strong>nginx</strong> <code>limit_req</code> is a leaky bucket in shared memory on each server. You declare a zone and a rate, then a burst:</p>
+<pre><code>limit_req_zone $binary_remote_addr zone=anon:10m rate=10r/s;
+limit_req_zone $http_x_api_key    zone=partner:20m rate=100r/s;
+
+server {
+    location /api/ {
+        limit_req zone=partner burst=200 nodelay;
+        limit_req_status 429;          # the default is 503
+    }
+}</code></pre>
+<p>Three things to know. Without <code>nodelay</code>, requests within the burst are <em>delayed</em> to match the rate rather than passed at once, which turns a limiter into a queue and adds latency. The default refusal status is 503, which clients and dashboards read as "server broken", so set <code>limit_req_status 429</code>. And state lives per nginx server: the nginx docs say a 1 MB zone holds about 16,000 states, and each server counts on its own, so N servers allow roughly N times the rate unless traffic is pinned. Also note that the example keys on a raw header; in production you would key on a verified identity set by the auth step, not on what the client sent.</p>
+<p><strong>Envoy</strong> offers two layers. The local rate limit filter is a token bucket per Envoy instance: no network call, approximate across the fleet. The global rate limit filter calls an external rate limit service over gRPC (the open-source one from Envoy's ecosystem is backed by Redis) with <em>descriptors</em>, which are lists of key-value pairs such as <code>(tenant, partner-7), (route, search)</code>. Many deployments use both: a generous local limit to shed floods cheaply, and a global limit for the exact per-tenant budget.</p>
+
+<h3 id=dd-rate-limiting-headers level=3>The response headers, precisely</h3>
+<p><code>Retry-After</code> is standard HTTP and accepts either seconds or an HTTP date. Seconds are safer, because a date depends on the client's clock. The <code>X-RateLimit-*</code> headers are conventions, and providers differ: GitHub sends <code>x-ratelimit-limit</code>, <code>-remaining</code>, <code>-used</code> and <code>-reset</code> as a Unix timestamp, while others send reset as seconds remaining. An IETF draft defines standard <code>RateLimit</code> and <code>RateLimit-Policy</code> fields to end that confusion. Whichever you choose, document whether "reset" is a timestamp or a duration. Client libraries guess wrong otherwise.</p>
+
+<h2 id=dd-rate-limiting-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions for the bookstore's public API:</p>
+<ul>
+<li>20,000 requests per second at peak through 20 gateway instances.</li>
+<li>About 500,000 distinct identities active per day: mobile users, partners and anonymous IPs. Up to 50,000 active in any one minute.</li>
+<li>Each request checks two buckets: one per identity and one per identity-and-endpoint class.</li>
+</ul>
+
+<h3 id=dd-rate-limiting-sizing-redis level=3>Redis operations and shards</h3>
+<p>Two bucket checks in one script call is one Redis round trip and one script execution per request: 20,000 scripts per second at peak. A single Redis shard runs short scripts at tens of thousands per second per core, depending on hardware and script size. One shard could take this load, but with no headroom for a doubling or a flood. Use three shards and the load is under 7,000 per shard. That leaves room for an attack, when the limiter is busiest exactly when you need it most.</p>
+<p>Latency: a same-zone round trip is about 0.3 to 0.5 ms, which matches the lesson's figure. Put the Redis shards in every zone the gateways run in, or the cross-zone hop doubles it.</p>
+
+<h3 id=dd-rate-limiting-sizing-memory level=3>Memory</h3>
+<p>A small Redis hash with two fields and a TTL costs on the order of 100 to 150 bytes including key and overhead; measure your own with <code>MEMORY USAGE</code>. Keys expire after <code>b / r</code> seconds of quiet, so the live set tracks recently active identities, not daily ones. 50,000 active identities × 2 buckets × 150 bytes ≈ 15 MB. Even a million live keys is about 150 MB. Memory is rarely the constraint. Key count during an attack can be: a bot rotating through 1 million IPs creates 1 million anonymous buckets. That is why the anonymous IP limit is cheapest at the edge (CDN or a local limiter), not in your shared Redis.</p>
+
+<h3 id=dd-rate-limiting-sizing-local level=3>The error of local limiting</h3>
+<p>Suppose you skip Redis and give each of 20 instances a local bucket. There are two ways to set it, and both are wrong in a known way.</p>
+<ul>
+<li><strong>Each instance gets the full limit (r = 100/s).</strong> A client whose requests spread across all instances gets up to 20 × 100 = 2,000/s. The limit is 20 times too loose.</li>
+<li><strong>Each instance gets r / N (5/s, burst 10).</strong> With perfect round-robin, the client gets 100/s. But connection reuse pins a client's keep-alive connection to one instance, so a partner with two connections gets about 10/s and is refused at a tenth of their paid limit.</li>
+</ul>
+<p>Approaches in between: give each instance r / N but let it lease extra tokens from a shared store in batches (say 10% of the budget per lease), or sync local counts to Redis every 100 ms. The over-admission is then bounded by the lease size or the sync interval × rate. For a 100/s limit with a 100 ms sync across 20 instances, the worst case is about 20 × 100 × 0.1 = 200 extra requests in a sync interval. That is fine for protection, and wrong for billing.</p>
+
+<h3 id=dd-rate-limiting-sizing-refusal level=3>The economics of refusal</h3>
+<p>The lesson's buggy partner sends 4,000 requests per second and 3,900 are refused. At 0.5 ms of gateway work per refusal, that is about 2 cores of gateway time. Serving them at 50 ms of service time each would be 195 cores. Two caveats. First, refusing still costs TLS, connection handling and logging, so a flood of new connections costs more than the 0.5 ms suggests; push the cheapest limits outward to the CDN. Second, log refusals in aggregate (counts per key per minute), not one line per refusal, or the logging pipeline becomes the next casualty.</p>
+
+<h2 id=dd-rate-limiting-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-rate-limiting-fm-store-down level=3>1. The counter store fails and takes the API with it</h3>
+<p><strong>Symptom:</strong> Redis has a failover, and for 30 seconds every request returns 429 (fail-closed) or 500 (an unhandled error in the limiter path). <strong>Mechanism:</strong> the limiter treated "cannot check" as "over limit", or did not handle the error at all. A protection mechanism became a single point of failure. <strong>Detect:</strong> 429 rate jumping across all tenants at once (real abuse is concentrated in a few keys); limiter error and timeout counters. <strong>Fix:</strong> give the Redis call a tight timeout (a few milliseconds), and on failure fall back to a local bucket per instance with conservative limits. That is fail-open with a safety net. For login and other abuse-sensitive endpoints, fail closed deliberately and document it.</p>
+
+<h3 id=dd-rate-limiting-fm-no-expiry level=3>2. One tenant is refused forever</h3>
+<p><strong>Symptom:</strong> a partner has been getting 429s for three days, though their traffic is tiny. Other tenants are fine. <strong>Mechanism:</strong> a fixed-window limiter did <code>INCR</code>, then <code>EXPIRE</code> in a separate call. A deploy restarted a gateway between the two, leaving a counter with no TTL. It never resets. <strong>Detect:</strong> keys in the limiter namespace with no TTL (<code>TTL</code> returns −1); per-tenant 429 ratio near 100% with a low request rate. <strong>Fix:</strong> make increment and expiry atomic (a script, <code>MULTI</code>, or <code>SET key 0 EX 60 NX</code> before <code>INCR</code>); run a periodic scan that alerts on limiter keys without TTL.</p>
+
+<h3 id=dd-rate-limiting-fm-herd level=3>3. Refused clients come back all at once</h3>
+<p><strong>Symptom:</strong> 429s arrive in waves: quiet, then a spike at the top of every minute, or exactly 30 seconds after an incident. <strong>Mechanism:</strong> synchronisation. A fixed window resets at :00 for everyone, so all waiting clients return together. Or every refused client got <code>Retry-After: 30</code> at the same moment and obeyed it precisely. Polite clients, perfectly synchronised, make a thundering herd. <strong>Detect:</strong> request-rate graphs at one-second resolution show sawtooth patterns aligned to window boundaries or to an incident time plus the Retry-After value. <strong>Fix:</strong> use token buckets or sliding windows, which have no shared reset moment. Add jitter to <code>Retry-After</code> (for example, the computed value plus up to 20%), and make your SDK add its own jitter too.</p>
+
+<h3 id=dd-rate-limiting-fm-hot-key level=3>4. One large tenant slows the limiter for everyone</h3>
+<p><strong>Symptom:</strong> limiter latency on one Redis shard rises to 5 ms; tenants on that shard see slower responses, others do not. <strong>Mechanism:</strong> a hot key. One tenant sends 15,000 requests per second, all hashing to the same shard, which hits its CPU ceiling. Every other tenant on that shard queues behind it. <strong>Detect:</strong> per-shard CPU and command latency; Redis's hot-key tooling (<code>--hotkeys</code> with an LFU eviction policy) or sampling of keys in the gateway. <strong>Fix:</strong> for very large tenants, lease tokens to gateways in batches so most checks are local; or split the tenant's bucket into K sub-buckets each with r/K, chosen by hashing the request. Put a local pre-limiter in front that refuses obvious floods without touching Redis.</p>
+
+<h3 id=dd-rate-limiting-fm-spoofed-key level=3>5. The scraper never hits the limit</h3>
+<p><strong>Symptom:</strong> the catalog scraper is still running at full speed after the anonymous IP limit was deployed. <strong>Mechanism:</strong> the limiter keys on the leftmost <code>X-Forwarded-For</code> entry, which the client writes. The scraper sends a random value on every request, so every request is a new caller with a full bucket. (The reverse proxy lesson covers how to parse this header from the right.) A similar bypass: limits keyed on a client-supplied API key header before the key is validated, so invalid random keys each get a bucket. <strong>Detect:</strong> the number of distinct limiter keys per minute growing much faster than real users; many keys with exactly one request. <strong>Fix:</strong> key only on values the system verified: the authenticated identity, or the client address as computed by your trusted proxy chain. Run anonymous limits after address resolution and identity limits after authentication.</p>
+
+<h3 id=dd-rate-limiting-fm-fleet-size level=3>6. The limit changes when the fleet scales</h3>
+<p><strong>Symptom:</strong> partners report 429s during quiet hours, and a scraper gets more throughput at peak. <strong>Mechanism:</strong> local limits were set as "global limit / instance count" at deploy time. The autoscaler shrinks the fleet at night (each instance still allows only 1/20th, but now there are 8 instances, so the effective limit is 40% of the promise) and grows it at peak (now 40 instances allow twice the promise). <strong>Detect:</strong> effective allowed rate per tenant compared with the configured limit, plotted against instance count. <strong>Fix:</strong> compute the per-instance share from the live instance count, or use a shared store for any limit that is a customer promise. Local limits should be generous flood guards, not the contract.</p>
+
+<h3 id=dd-rate-limiting-fm-autoscaler level=3>7. Refusals page the on-call and scale up the fleet</h3>
+<p><strong>Symptom:</strong> an abusive client triggers an error-rate page at 3 a.m., and the autoscaler adds ten instances to serve traffic that is being refused. <strong>Mechanism:</strong> the SLO counts 429s as errors, and the autoscaler scales on total request rate, which includes refused requests. The limiter is working, and the monitoring treats its success as failure. <strong>Detect:</strong> error budget burn that is entirely 429s from one or two keys; scale-up events with flat accepted traffic. <strong>Fix:</strong> exclude 429s from availability SLOs, or count them only when they hit tenants under their published limit (which means a misconfiguration). Scale on accepted requests or CPU. Alert on 429s per tenant relative to that tenant's normal pattern, and on any 429s for tenants below their limit.</p>
+
+<h2 id=dd-rate-limiting-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Algorithm<td>Token bucket / GCRA<td>Sliding window (counter or log)<td>Almost always: it allows honest bursts and controls the average. Choose a sliding window when limits are stated as "N per period" to customers and must read that way, or for tiny limits like 5 logins per minute, where a log is exact and cheap.
+<tr><td>Over-limit action<td>Reject with 429 now<td>Delay (queue) to the allowed rate<td>Callers are external and can retry later. Delay (traffic shaping) for internal batch callers or outbound calls to a provider, where waiting is better than failing, and bound the queue.
+<tr><td>Counting accuracy<td>Exact (shared atomic store)<td>Approximate (local buckets, leasing, periodic sync)<td>Limits are billed or contractual, or very small. Approximate for protection limits where 10% error is harmless and latency or store dependence matters.
+<tr><td>Store failure<td>Fail open (with local fallback)<td>Fail closed<td>The limit protects capacity and blocking everyone is worse than a brief overrun. Fail closed for security-sensitive limits: login, password reset, OTP, signup.
+<tr><td>What is counted<td>Requests (weighted by cost)<td>Concurrent in-flight requests<td>Work per request is roughly known in advance. Concurrency limits suit long or variable requests (exports, LLM generation, streaming), because they cap resource use directly.
+<tr><td>Where it runs<td>Gateway<td>Edge (CDN/WAF) or service<td>Limits depend on verified identity and tiers. Use the edge for anonymous floods and bots, before traffic costs you anything. Use a service-level limiter for protecting one expensive dependency.
+<tr><td>Limits source<td>Static per tier<td>Adaptive (based on measured latency or load)<td>Limits are part of a product promise. Adaptive concurrency limits (as in Envoy's adaptive concurrency filter or Netflix's concurrency-limits library) suit internal protection, where the right number changes with system health.
+<tr><td>Scope across regions<td>Per-region budget<td>Global budget<td>Almost always: split the budget across regions and accept that a client using two regions may get more. Global exact counting across regions costs a cross-region round trip or a complex sync protocol.
+</tbody></table></div></div>
+<p>Two choices deserve an opinion. First, <strong>rate is not the only thing to limit</strong>. A partner allowed 100 requests per second can still hold 3,000 concurrent requests open if each one is a 30-second export. Pair rate limits with a per-tenant concurrency cap on slow endpoints. It is the bulkhead idea applied per identity.</p>
+<p>Second, <strong>cost-based limits with unknown cost</strong>. For an LLM-style endpoint, the cost (output tokens) is known only after the work is done. The usual answer is reserve-then-settle: before the call, reserve an estimate (the requested maximum output, or a typical value) from the bucket; after the call, refund or charge the difference. If you charge only afterwards, a burst of expensive requests all pass the check before any of them is billed.</p>
+
+<h2 id=dd-rate-limiting-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What exactly is the key for each limit, and is it computed from verified values (authenticated identity, trusted client address) rather than client-supplied headers?</li>
+<li>What are r and b for each tier, and what measurement of real client bursts set b?</li>
+<li>Is the check-and-update atomic, and does every counter key have an expiry set in the same atomic step?</li>
+<li>Where do the counters live, and what happens to traffic when that store is slow or down: fail open, fail closed, local fallback? Is the choice per endpoint?</li>
+<li>Which limits are customer promises (and need exact or bounded-error counting), and which are flood guards?</li>
+<li>If limits are local, how do they change when the fleet scales up or down?</li>
+<li>What does a 429 carry: <code>Retry-After</code> in seconds, remaining budget, reset semantics documented, and jitter?</li>
+<li>Are expensive endpoints weighted by cost, and are slow endpoints also capped by concurrency?</li>
+<li>Which layers limit (CDN, gateway, service), and does each have a distinct job? Which one refuses first, and is that the cheapest one?</li>
+<li>How are limit changes reviewed, staged and rolled back?</li>
+<li>Do dashboards split accepted and refused traffic by tenant, endpoint and tier? Are 429s excluded from availability SLOs and autoscaling signals?</li>
+<li>How does a tenant see their own usage before they hit the limit?</li>
+</ol>
+
+<h2 id=dd-rate-limiting-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Design a token bucket without a background refill timer."</summary>
+<p>Store the token count and the last update time per key. On each request, add <code>elapsed × r</code> tokens capped at b, then spend the request's cost if enough tokens exist, and write both values back with an expiry of about <code>b / r</code>. Refill is computed on read, so idle keys cost nothing and expire. GCRA does the same with one stored value, the theoretical arrival time, and allows a request if it keeps that time within <code>b / r</code> of now.</p>
+</details>
+<details>
+<summary>"Twenty gateways, one Redis. How do you keep the check correct and fast?"</summary>
+<p>Correct: run read, refill, decide and write as one Lua script, so concurrent gateways cannot both spend the last token, and take the time from Redis so gateway clock skew does not matter. Fast: one round trip per request with <code>EVALSHA</code>, Redis in the same zone, both buckets for a request in one script using hash-tagged keys on one shard. For very hot tenants, lease tokens to gateways in batches so most checks are local.</p>
+</details>
+<details>
+<summary>"Redis is down. What does your limiter do?"</summary>
+<p>It depends on the limit, and it should be decided in advance. Protection limits fall back to conservative local buckets per instance, so the API stays up with approximate fairness. Security limits on login, password reset and one-time codes fail closed, because an unlimited window for credential stuffing is worse than a short login outage. Either way, the Redis call has a millisecond-level timeout, so a slow Redis cannot add seconds to every request.</p>
+</details>
+<details>
+<summary>"Why is nginx's limit_req not enough for per-customer limits across a fleet?"</summary>
+<p>Its state is per server in shared memory, so each nginx instance counts separately and N instances allow up to N times the configured rate. It also defaults to 503 rather than 429, and without <code>nodelay</code> it delays burst requests instead of passing them. It is excellent as a local flood guard on anonymous traffic. For per-customer promises, use a shared counter or a global rate limit service.</p>
+</details>
+<details>
+<summary>"All refused clients obey Retry-After: 30. What can go wrong?"</summary>
+<p>They all come back at the same second. A burst of refusals at time t becomes a synchronised burst at t + 30, which may be refused again, producing waves. Add jitter to the value you send, have SDKs add their own, and avoid fixed windows that reset for everyone at the same instant. Token buckets refill continuously, so they do not create a shared reset moment.</p>
+</details>
+<details>
+<summary>"How would you rate limit an LLM API where cost depends on the output length?"</summary>
+<p>Count tokens of text, not requests, and use reserve-then-settle. Before the call, reserve the requested maximum output (or an estimate) from the tenant's token-per-minute bucket. After it, refund the unused part or charge the overrun. Pair that with a concurrency limit per tenant, because generation holds a GPU slot for seconds. Charging only after completion lets a burst of large requests all pass the check before any of them is counted.</p>
+</details>
+<details>
+<summary>"Rate limit, concurrency limit, load shedding: when do you use which?"</summary>
+<p>A rate limit is a per-identity fairness budget over time, set by the product (tiers) and enforced at the entrance. A concurrency limit caps simultaneous work, which matters when request durations vary widely, such as exports, streams and generation. It can be per tenant or per service. Load shedding is a system-wide emergency response: when the whole system is overloaded, drop low-priority work regardless of identity. A healthy design uses all three, and they answer different questions.</p>
+</details>
+<details>
+<summary>"How do you enforce one global limit for a customer who calls you from three regions?"</summary>
+<p>Usually you don't, exactly. Split the budget across regions (statically, or rebalanced every few seconds from observed usage) and accept bounded overrun. Exact global counting needs a cross-region round trip on every request or a replicated counter with its own consistency trade-offs, both expensive in latency. If the limit is billed, count exactly but asynchronously for billing, and enforce approximately in real time.</p>
+</details>

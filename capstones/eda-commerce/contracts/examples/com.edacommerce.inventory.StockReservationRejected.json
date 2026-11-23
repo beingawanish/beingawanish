@@ -1,0 +1,28 @@
+{
+  "envelope": {
+    "eventId": "d3446dcd-b61b-5ba6-84a0-f989b66cd197",
+    "type": "com.edacommerce.inventory.StockReservationRejected",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "d0c601e1-0864-56ce-8350-b57718c0a859",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "inventory-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Reservation",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "reservationId": "f491284b-931f-5f50-998f-af94939a7a17",
+  "shortages": [
+    {
+      "sku": "SKU-1001",
+      "requested": 1,
+      "available": 1
+    }
+  ]
+}

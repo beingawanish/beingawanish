@@ -1,0 +1,197 @@
+<h2 id=dd-bidirectional-streaming-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson puts the hard work in the two tiers above the socket. That is the right priority, but many production incidents start below it, in the handshake, the frames and the buffers.</p>
+<h3 id=dd-bidirectional-streaming-handshake level=3>The WebSocket handshake</h3>
+<p>A WebSocket (RFC 6455) begins life as an ordinary HTTP/1.1 GET. The client sends <code>Upgrade: websocket</code>, <code>Connection: Upgrade</code>, <code>Sec-WebSocket-Version: 13</code> and a <code>Sec-WebSocket-Key</code>, which is 16 random bytes in base64. The server answers <code>101 Switching Protocols</code>. Its <code>Sec-WebSocket-Accept</code> header is the base64 SHA-1 of the client's key joined to a fixed GUID from the RFC.</p>
+<pre><code>import base64, hashlib
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+def accept(key: str) -&gt; str:
+    return base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
+# accept("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="  (RFC 6455 example)</code></pre>
+<p>That accept value is not security. It only proves the server understood the upgrade. Real security happens in the same request, before the 101. Check the <code>Origin</code> header, because browsers send cookies on WebSocket upgrades and a missing check is a cross-site hijack. Authenticate with a short-lived token rather than a long-lived cookie alone. Pick a subprotocol with <code>Sec-WebSocket-Protocol</code> and put your schema version in it (<code>chat.v3</code>), so old clients fail at the handshake instead of mid-conversation.</p>
+<p>After the 101, the HTTP layer is gone: your load balancer logs one "request" that lasted four hours.</p>
+<h3 id=dd-bidirectional-streaming-framing level=3>Frames on the wire</h3>
+<p>Every WebSocket message travels as one or more frames. The header is small: 2 bytes for payloads up to 125 bytes, 4 bytes up to 64 KB, 10 bytes beyond that, plus a 4-byte masking key on every client-to-server frame.</p>
+<figure class="diagram">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 210" width="100%" role="img" aria-labelledby="dd-bidirectional-streaming-svg-t dd-bidirectional-streaming-svg-d" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-bidirectional-streaming-svg-t">WebSocket frame header layout</title>
+<desc id="dd-bidirectional-streaming-svg-d">The first byte holds the FIN bit, three reserved bits and a four-bit opcode. The second byte holds the MASK bit and a seven-bit payload length. Values 126 and 127 mean a 16-bit or 64-bit extended length follows. Client frames then carry a four-byte masking key, and the payload comes last.</desc>
+<rect x="0" y="0" width="720" height="210" fill="#ffffff"/>
+<g font-size="13" fill="#1c2430" text-anchor="middle">
+<rect x="20" y="40" width="40" height="44" fill="#e4eef8" stroke="#1f5f99"/><text x="40" y="67">FIN</text>
+<rect x="60" y="40" width="60" height="44" fill="#eef2f6" stroke="#1f5f99"/><text x="90" y="67">RSV1-3</text>
+<rect x="120" y="40" width="100" height="44" fill="#e4eef8" stroke="#1f5f99"/><text x="170" y="67">opcode (4)</text>
+<rect x="220" y="40" width="50" height="44" fill="#f6f0e4" stroke="#1f5f99"/><text x="245" y="67">MASK</text>
+<rect x="270" y="40" width="130" height="44" fill="#e4eef8" stroke="#1f5f99"/><text x="335" y="67">payload len (7)</text>
+<rect x="400" y="40" width="130" height="44" fill="#eef2f6" stroke="#1f5f99" stroke-dasharray="4 3"/><text x="465" y="60">ext. length</text><text x="465" y="76" font-size="11" fill="#5c6b7c">0, 2 or 8 bytes</text>
+<rect x="530" y="40" width="80" height="44" fill="#f6f0e4" stroke="#1f5f99" stroke-dasharray="4 3"/><text x="570" y="60">mask key</text><text x="570" y="76" font-size="11" fill="#5c6b7c">4 bytes</text>
+<rect x="610" y="40" width="90" height="44" fill="#ffffff" stroke="#1f5f99"/><text x="655" y="67">payload</text>
+</g>
+<g font-size="12" fill="#5c6b7c">
+<text x="20" y="28">byte 0</text><text x="220" y="28">byte 1</text>
+<text x="20" y="115">opcode: 0x1 text, 0x2 binary, 0x0 continuation, 0x8 close, 0x9 ping, 0xA pong</text>
+<text x="20" y="137">len 0-125 = actual length; 126 = next 2 bytes hold it; 127 = next 8 bytes hold it</text>
+<text x="20" y="159">MASK = 1 on every client-to-server frame; servers never mask</text>
+<text x="20" y="181">control frames (close, ping, pong): payload at most 125 bytes, never fragmented</text>
+</g>
+</svg>
+</figure>
+<p>Four details here cause real bugs.</p>
+<ul>
+<li><strong>Masking</strong> stops a malicious page from making socket bytes look like cacheable HTTP to a naive proxy. Servers must reject unmasked client frames.</li>
+<li><strong>Fragmentation</strong> lets one message span many frames, and control frames may arrive between the fragments. This is how a ping can still get through during a 50 MB upload. Your parser must reassemble, and it must enforce a maximum message size while doing so. Otherwise one client can stream a "single message" until the gateway runs out of memory. Close code 1009 (message too big) exists for this.</li>
+<li><strong>Close</strong> is a handshake, not a hang-up. Each side sends a close frame with a code, then the TCP connection ends. Code 1000 is normal, 1001 is going away, 1011 is internal error, and 1012 (service restart) and 1013 (try again later) are what a draining gateway should send. Code 1006 never appears on the wire. A client library reports it when the TCP connection died without a close frame, so a spike in 1006 means networks or crashes, not your drain logic.</li>
+<li><strong>Compression</strong> (<code>permessage-deflate</code>, RFC 7692) can halve chat traffic. With context takeover, each connection keeps a zlib dictionary in both directions, often tens to hundreds of KB per socket depending on window and memory settings. At 50,000 sockets that can exceed everything else in the memory budget below. Either negotiate <code>server_no_context_takeover</code> and smaller window bits, or skip compression for small messages.</li>
+</ul>
+<p>Browsers add one more constraint. JavaScript cannot send a protocol-level ping. The browser answers server pings automatically, but the page has no API to send its own. So the client side of dead-connection detection must be an application message, like <code>{"t":"hb"}</code>.</p>
+<h3 id=dd-bidirectional-streaming-grpc level=3>gRPC bidi streams and HTTP/2 flow control</h3>
+<p>A gRPC bidirectional call is one HTTP/2 stream. Each message is a 5-byte prefix (a compressed flag and a 4-byte length) followed by protobuf bytes, carried in DATA frames. Many calls share one TCP connection, up to the peer's <code>SETTINGS_MAX_CONCURRENT_STREAMS</code>. Many servers set this around 100, but defaults vary by implementation.</p>
+<p>The part that matters for backpressure is HTTP/2's credit-based flow control. Each stream has a receive window, and so does the whole connection. Both start at 65,535 bytes. A sender may only send DATA up to the window. The receiver hands credit back with <code>WINDOW_UPDATE</code> frames as it consumes data. Stream credit typically returns when the application reads the message. Connection credit typically returns sooner, when bytes leave the socket into the stream's buffer, so one stalled stream does not freeze its neighbours.</p>
+<p>The effect is backpressure you get for free. If the receiver's application stops reading, its stream window drains to zero, and the sender's <code>Send()</code> blocks (in grpc-go) or its <code>isReady()</code> goes false (in grpc-java). Contrast this with WebSocket. A WebSocket has no flow control of its own, only TCP's. The gateway's write succeeds into a user-space buffer, and that buffer grows until you cap it.</p>
+<p>A 64 KB window is also a throughput ceiling. Throughput per stream is roughly window ÷ round-trip time. At 64 KB and 100 ms RTT, a stream tops out near 640 KB/s, however fat the link. Most gRPC implementations grow windows automatically by probing the bandwidth-delay product. If yours does not, raise the initial window for cross-region streams.</p>
+<h3 id=dd-bidirectional-streaming-heartbeats level=3>Heartbeats and dead-connection detection</h3>
+<p>TCP will not tell you a peer has vanished. If a phone enters a tunnel, no FIN or RST ever arrives. The server's socket stays "established" until it tries to send and the retransmissions give up, which takes many minutes with Linux defaults. If the server never sends, it waits forever. Linux TCP keepalive does not save you either: the default first probe comes after 7,200 seconds of idle.</p>
+<p>So you run heartbeats at the application layer, and you size them against three numbers:</p>
+<ul>
+<li><strong>The shortest idle timeout on the path.</strong> Load balancers and proxies close idle connections, commonly at 60 seconds (the AWS ALB default and nginx's default <code>proxy_read_timeout</code>). Mobile carrier NATs can be shorter. The heartbeat interval must sit below the smallest of these, or the path kills healthy connections.</li>
+<li><strong>Detection time.</strong> With interval <em>i</em> and declare-dead after <em>k</em> missed beats, detection takes up to <em>k × i</em>. At 25 s and 2 misses, a dead socket is noticed within about 50 s.</li>
+<li><strong>Cost.</strong> A heartbeat is tiny, but 1 million sockets at 25 s is 40,000 frames per second per direction across the fleet. Cheap for gateways, but on phones it costs battery, which is why mobile apps often close the socket in the background and rely on OS push.</li>
+</ul>
+<p>gRPC has the same machinery as HTTP/2 PING frames, configured with keepalive time and timeout. The server side has an enforcement policy. In grpc-go, a client that pings more often than the server's minimum (5 minutes by default) receives <code>GOAWAY</code> with <code>ENHANCE_YOUR_CALM</code>, and the connection closes. Teams hit this when they set aggressive client keepalives without changing the server. Set both ends together.</p>
+<p>One more knob is worth knowing. <code>TCP_USER_TIMEOUT</code> caps how long unacknowledged sent data may sit before the kernel kills the connection. It turns "many minutes of retransmission" into a number you choose.</p>
+<h3 id=dd-bidirectional-streaming-drain level=3>Sticky routing and draining on deploy</h3>
+<p>Stickiness for a socket is not a cookie. Once upgraded, the TCP connection simply stays on its gateway, so the real routing decision happens once per connect. Least-connections is the usual choice. Round-robin looks fine until a deploy: the new gateway joins with zero sockets, every other gateway is full, and round-robin only gives it its share of new arrivals, so imbalance lasts for hours.</p>
+<p>A clean drain has a sequence:</p>
+<ol>
+<li>Fail the readiness check, so the load balancer stops sending new connections.</li>
+<li>Send each client an application "reconnect" message, or a close with 1012, spread across a drain window with random delay per client.</li>
+<li>Clients reconnect elsewhere and resume from their last sequence number.</li>
+<li>After the window, close what is left and exit.</li>
+</ol>
+<p>For gRPC, the equivalent is <code>GOAWAY</code>: the server tells the client to finish in-flight streams and open new ones on a fresh connection. A related setting, <code>max_connection_age</code>, makes servers send GOAWAY periodically. Use it behind L4 load balancers. Without it, long-lived HTTP/2 connections never rebalance after you scale out.</p>
+<h3 id=dd-bidirectional-streaming-presence level=3>Presence and session state</h3>
+<p>Presence looks like a boolean and behaves like a write-heavy distributed counter. A user can have three devices, so "online" means "at least one live connection." The usual shape is a key per user in a shared store (often Redis). The key holds the set of connection IDs, each with an expiry refreshed by heartbeats. A connection that dies silently simply ages out. You never depend on a disconnect event arriving.</p>
+<p>The expensive part is fan-out. If each user has 200 contacts and every change is pushed to all of them, one phone flapping in a tunnel produces 400 messages a minute. Two habits keep this bounded:</p>
+<ul>
+<li><strong>Subscribe to presence lazily.</strong> A client only tracks users currently on screen, like the open conversation or the visible part of the member list.</li>
+<li><strong>Debounce offline transitions.</strong> Mark "away" only after a grace period, say 30 to 60 s, so a reconnect is invisible.</li>
+</ul>
+<p>Session state is what resume needs: user ID, rooms, and last sequence per room. The client holds the authoritative "last sequence I saw," so a crashed gateway loses nothing anyone needs.</p>
+<h3 id=dd-bidirectional-streaming-backplane level=3>The backplane, concretely</h3>
+<p><strong>Redis Pub/Sub</strong> and core <strong>NATS</strong> are fire-and-forget: a message reaches whoever is subscribed at that instant and is never stored. That is fine here, because history lives elsewhere. In a Redis Cluster, classic <code>PUBLISH</code> goes to every node. Redis 7's sharded pub/sub (<code>SPUBLISH</code>/<code>SSUBSCRIBE</code>) keeps a channel on its own shard. <strong>Kafka</strong> is a poor per-room router, because consumers read whole partitions, so it belongs behind the backplane, feeding history.</p>
+<p>Whatever you pick, each gateway keeps a reference count per room. It subscribes when its first local member joins and unsubscribes when its last one leaves. A count that drifts too high wastes traffic. One that drifts too low makes members silently stop receiving.</p>
+<h2 id=dd-bidirectional-streaming-numbers level=2>Deep Dive: Sizing and the Numbers</h2>
+<h3 id=dd-bidirectional-streaming-memory level=3>Per-connection memory</h3>
+<p>The lesson's 50,000 sockets per gateway is a planning number. Here is where it comes from. The figures below are assumptions for an async gateway with TLS terminated in-process. Measure your own stack, because every runtime differs.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Component<th>Idle socket (assumed)<th>Notes<tbody>
+<tr><td>Kernel TCP state and buffers<td>~4-10 KB<td>Linux grows buffers on demand. A busy socket can take hundreds of KB (<code>tcp_wmem</code> max is 4 MB by default).
+<tr><td>TLS session state<td>~20-40 KB<td>Mostly record buffers. Libraries that release buffers on idle (OpenSSL's <code>SSL_MODE_RELEASE_BUFFERS</code>) cut this.
+<tr><td>Read and write buffers in the app<td>~8 KB<td>Common library defaults are 4 KB each.
+<tr><td>Connection object, subscriptions, session<td>~2-5 KB<td>Grows with rooms per user.
+<tr><td>Goroutine or task stacks<td>~4-16 KB<td>Go starts stacks at 2 KB, and they grow. Two goroutines per socket is typical.
+<tr><td>Outbound queue (average)<td>~1-2 KB<td>Near zero for healthy clients.
+<tr><td><strong>Total</strong><td><strong>~40-80 KB</strong><td>Without per-message compression context.
+</table></div></div>
+<p>At 60 KB average, 50,000 sockets use 3 GB. That fits comfortably on a 16 GB machine, which leaves room for the part that actually kills gateways: the tail. Suppose the per-connection outbound cap is 1 MB and a backplane hiccup makes 5% of clients fall behind at once. That is 2,500 × 1 MB = 2.5 GB, nearly doubling the footprint in seconds. Add <code>permessage-deflate</code> with full context at 200 KB per socket and the baseline alone becomes 13 GB.</p>
+<p>So you need two caps. One is per connection (1 MB, or less). The other is a gateway-wide outbound budget, like 4 GB. When the gateway crosses it, it starts shedding the slowest connections with a resync hint before the garbage collector or the OOM killer decides for you.</p>
+<p>File descriptors are the other hard limit. 50,000 sockets need <code>ulimit -n</code> well above 50,000, plus headroom for backplane and store connections. There is also a subtle port limit when an L7 proxy sits in front of the gateways. Each proxy-to-gateway connection uses one source port, and one source IP talking to one destination IP and port gets roughly 28,000 to 64,000 ports depending on the ephemeral range. A single proxy IP cannot carry 100,000 sockets to one gateway port. Add source IPs or gateway listeners.</p>
+<h3 id=dd-bidirectional-streaming-fanout level=3>Fan-out through the backplane</h3>
+<p>Assume 1 million connected users on 20 gateways, 50,000 each. Users send on average one durable message per minute, about 16,700 messages per second fleet-wide. Average room size is 8 members.</p>
+<ul>
+<li><strong>Publishes into the backplane:</strong> 16,700/s. Each one is also a history write, so the history store must take 16,700 writes/s plus resume reads.</li>
+<li><strong>Deliveries out of the backplane:</strong> one per gateway that holds at least one member. Eight members spread over 20 gateways usually touch 6 to 8 gateways, so about 7 × 16,700 ≈ 117,000 backplane deliveries/s.</li>
+<li><strong>Socket writes:</strong> 8 × 16,700 ≈ 134,000/s fleet-wide, or 6,700/s per gateway. Easy.</li>
+</ul>
+<p>Now add one 100,000-member all-hands room that gets 10 messages per second during a launch. Every gateway is subscribed. That is 20 backplane deliveries per message, which is nothing. But each gateway then writes about 5,000 sockets per message, or 50,000 writes/s each, on top of normal load. The pressure moves from the backplane to gateway CPU and outbound buffers. Large rooms often get special handling: slower typing indicators, no read receipts, and several messages batched into one frame.</p>
+<h3 id=dd-bidirectional-streaming-reconnect level=3>Reconnect storms and drain math</h3>
+<p>A gateway with 50,000 sockets drained over 5 minutes produces about 170 reconnects per second: a TLS handshake, a token check, a presence write and a history query per room, each. Spread over 19 gateways, that is under 10 per second each. Trivial.</p>
+<p>Now the bad version. A gateway crashes, and its 50,000 clients all retry within one second. That is 50,000 handshakes and perhaps 250,000 history queries (5 rooms each) in one second, mostly aimed at the history store. Jitter over 30 s brings that to about 8,300 history queries per second.</p>
+<p>State the rolling deploy's duration too. Twenty gateways, one at a time, at 5 minutes of drain plus a minute to start, take two hours. Four at a time takes 30 minutes but removes 20% of capacity while it runs.</p>
+<h2 id=dd-bidirectional-streaming-failures level=2>Deep Dive: Failure Modes in Production</h2>
+<h3 id=dd-bidirectional-streaming-f1 level=3>1. The thundering reconnect</h3>
+<p><strong>Symptom.</strong> One gateway dies, then two more fall over within a minute. The history database's CPU hits 100%.</p>
+<p><strong>Mechanism.</strong> Clients reconnect with fixed or no backoff. The surviving gateways take the handshake load, and every client fires its resume queries at the same moment. Slow resumes time out, clients retry, and the load compounds.</p>
+<p><strong>Detect.</strong> Watch the connection-accept rate per gateway, TLS handshakes per second, and resume-query latency. A spike in close code 1006 shows the original crash.</p>
+<p><strong>Fix.</strong> Use full jitter on the first retry, not only later ones. Add a server-sent "retry after" hint during overload, and admission control on the accept path. Cap resume to "last N messages per room, then refetch," so a long gap is one bounded query.</p>
+<h3 id=dd-bidirectional-streaming-f2 level=3>2. Disconnects at exactly 60 seconds</h3>
+<p><strong>Symptom.</strong> Quiet users drop and reconnect once a minute, while busy rooms are fine.</p>
+<p><strong>Mechanism.</strong> A proxy or load balancer on the path has a 60-second idle timeout, and the heartbeat interval is longer, or heartbeats are sent only from one side.</p>
+<p><strong>Detect.</strong> Plot a histogram of connection lifetimes. A sharp spike at one value is always a timeout somewhere.</p>
+<p><strong>Fix.</strong> Set the heartbeat well under the smallest idle timeout on the path, and raise the proxy timeouts deliberately (for nginx, <code>proxy_read_timeout</code> and <code>proxy_send_timeout</code> on the WebSocket location).</p>
+<h3 id=dd-bidirectional-streaming-f3 level=3>3. Ghost presence and half-open sockets</h3>
+<p><strong>Symptom.</strong> Users appear online for minutes after closing a laptop lid. Messages "delivered" to them never arrive.</p>
+<p><strong>Mechanism.</strong> The connection is half-open. The server's socket is still established, and writes succeed into kernel buffers, so the gateway believes the client is there.</p>
+<p><strong>Detect.</strong> Compare heartbeat-age distributions with the set of connections marked live. Rising socket send-queue bytes (<code>ss -tn</code> shows Send-Q) on idle connections is the signature.</p>
+<p><strong>Fix.</strong> Use application heartbeats with a hard deadline, presence keys with a TTL, and <code>TCP_USER_TIMEOUT</code>. Remember that a successful socket write never means "delivered." Client acks do.</p>
+<h3 id=dd-bidirectional-streaming-f4 level=3>4. The slow consumer that becomes a GC outage</h3>
+<p><strong>Symptom.</strong> Gateway latency climbs for everyone. Then the process is OOM-killed, taking 50,000 users with it.</p>
+<p><strong>Mechanism.</strong> A few slow clients in a hot room accumulate megabytes of queued frames each. Heap growth makes garbage-collection pauses longer. Longer pauses slow every socket, which makes more clients fall behind.</p>
+<p><strong>Detect.</strong> Track the per-connection outbound queue as a histogram (p99 and max, not the mean), gateway heap, and GC pause time.</p>
+<p><strong>Fix.</strong> Use the per-connection and gateway-wide caps from the sizing section. Coalesce ephemeral messages before they enter the queue, not after.</p>
+<h3 id=dd-bidirectional-streaming-f5 level=3>5. The backplane silently drops a gateway</h3>
+<p><strong>Symptom.</strong> Every user on one gateway stops receiving room messages. Sending still works, and nothing logs an error at the application level.</p>
+<p><strong>Mechanism.</strong> With Redis Pub/Sub, a subscriber that reads too slowly hits <code>client-output-buffer-limit pubsub</code> (default 32 MB hard, or 8 MB sustained for 60 s). Redis disconnects it. If the gateway's client reconnects but does not resubscribe to every room, those rooms go dark for its users.</p>
+<p><strong>Detect.</strong> Watch Redis's client-disconnect logs, and compare the subscribed-channel count per gateway with its local room count. A synthetic canary that publishes to a test room every few seconds and checks delivery on every gateway catches it directly.</p>
+<p><strong>Fix.</strong> Resubscribe the full room set on every backplane reconnect. Then trigger a client resync for affected rooms, since messages in the gap were lost. Give the gateway's backplane reader its own thread or task, so socket writes cannot stall it.</p>
+<h3 id=dd-bidirectional-streaming-f6 level=3>6. Gaps and reordering on resume</h3>
+<p><strong>Symptom.</strong> After reconnect, a client occasionally misses one message or shows two in the wrong order.</p>
+<p><strong>Mechanism.</strong> There are two common races. First, the gateway publishes to the backplane before the history write commits, and a resuming client queries history in between. Second, sequence numbers are assigned by each gateway instead of one authority per room, so two senders produce the same number or an order that conflicts with history.</p>
+<p><strong>Detect.</strong> Have clients report gaps they cannot fill (a sequence jump after resume) as a metric. It should be zero.</p>
+<p><strong>Fix.</strong> Assign sequence numbers in one place per room, such as an atomic counter or the history store's insert. Write history first, then publish. During resume, subscribe to the live stream first, buffer it, fetch history up to the first buffered sequence, then drain the buffer. That ordering closes the window.</p>
+<h3 id=dd-bidirectional-streaming-f7 level=3>7. gRPC streams that never rebalance</h3>
+<p><strong>Symptom.</strong> After scaling a backend from 4 to 8 replicas, the 4 new replicas sit nearly idle for days.</p>
+<p><strong>Mechanism.</strong> An L4 load balancer balances connections, and HTTP/2 puts every stream on the same long-lived connection. A related failure is <code>GOAWAY ENHANCE_YOUR_CALM</code> from mismatched keepalive settings, which drops streams in bursts.</p>
+<p><strong>Detect.</strong> Compare active streams and requests per replica, and count GOAWAY reasons in client logs.</p>
+<p><strong>Fix.</strong> Set <code>max_connection_age</code> (with a grace period) on servers, use client-side or L7 balancing that understands streams, and align keepalive policy across both ends.</p>
+<h2 id=dd-bidirectional-streaming-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when<th>Choose B when<tbody>
+<tr><td>Transport to clients<td>WebSocket<td>SSE plus POST<td>The client sends often and latency matters (typing, cursors, games)<td>The client sends occasionally. You keep HTTP tools and lose nothing.
+<tr><td>Transport between services<td>gRPC bidi stream<td>Queue or log<td>Both sides are live, and loss on restart is acceptable or recoverable<td>Work must survive restarts or be replayed
+<tr><td>Backplane<td>Redis or NATS pub/sub (at-most-once)<td>Durable log (Kafka, JetStream)<td>History is stored separately, and you want low latency and simple subscriptions<td>You need replay from the bus itself, or the router is also the history pipeline
+<tr><td>Placement<td>Any gateway (least-connections)<td>Room affinity (hash room to gateway)<td>Rooms are long-lived, users join many rooms, and rooms can be large<td>Rooms are small and short-lived, and fan-out cost dominates (game sessions)
+<tr><td>Delivery guarantee<td>Live best-effort plus history resume<td>Per-message client acks and redelivery<td>The client is a viewer, and gaps are filled by sequence on reconnect<td>The server must know each message was received (commands to devices, trading)
+<tr><td>Presence<td>Push changes to subscribers<td>Pull on demand<td>Small, visible audiences (the open conversation)<td>Large rosters. Fetch when a list is opened, and refresh periodically.
+<tr><td>Compression<td>permessage-deflate with context<td>No compression, or no context takeover<td>Large, repetitive messages and few sockets per gateway<td>Many sockets with small messages, where memory dominates
+</table></div></div>
+<p>Two choices deserve a stronger opinion.</p>
+<p><strong>Do not make the backplane durable just because durability sounds safer.</strong> If history is written before publish, the backplane can lose messages and resume still repairs every gap. A durable bus adds latency and cost for nothing, unless it is also your history pipeline.</p>
+<p><strong>Per-message acks are a protocol you will maintain forever:</strong> ack IDs, redelivery timers, an outstanding window per client. Sequence-based resume gets at-least-once with far less machinery. Use acks when the sender must act on non-receipt.</p>
+<h2 id=dd-bidirectional-streaming-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Does the client actually send often enough to justify a socket? What fraction of traffic is client-to-server?</li>
+<li>Where is the single source of truth for messages, and is it written before the backplane publish?</li>
+<li>Who assigns sequence numbers, and is it one authority per room?</li>
+<li>What are the heartbeat interval and dead threshold, and how do they compare with every idle timeout on the path (load balancer, proxy, carrier NAT)?</li>
+<li>What is the per-connection outbound cap, the gateway-wide cap, and the shedding order when the gateway-wide cap is hit?</li>
+<li>What is the per-connection memory budget, measured, including TLS and any compression context?</li>
+<li>How are reconnects jittered, and what happens to the history store when a full gateway's clients reconnect at once?</li>
+<li>What does a drain look like, step by step, and how long does a full rolling deploy take?</li>
+<li>How does a gateway recover its backplane subscriptions after a backplane disconnect, and how do you detect a gateway that silently stopped receiving?</li>
+<li>How are authentication and authorization rechecked during a session that lasts hours? What happens when a user is removed from a room or banned?</li>
+<li>What is the largest room you support, and has it been load-tested separately from total message volume?</li>
+<li>How is the protocol versioned, and how do old clients fail?</li>
+</ol>
+<h2 id=dd-bidirectional-streaming-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>Why can't you rely on TCP to tell you a client has gone away?</summary>
+<p>A vanished peer sends nothing, so there is no FIN or RST to observe. The server only learns when it sends and retransmissions run out, which takes many minutes by default. If it never sends, it never learns. Linux keepalive starts probing after two hours by default. So you need application heartbeats with a deadline on both sides, and optionally <code>TCP_USER_TIMEOUT</code> to bound how long unacknowledged data can sit.</p>
+</details>
+<details>
+<summary>gRPC has flow control and WebSocket does not. What does that change in your gateway design?</summary>
+<p>With gRPC, a slow receiver drains its stream window, and the sender's Send blocks or its readiness flips. Backpressure reaches the producer automatically, and you decide whether to block, buffer or drop. With WebSocket, a write succeeds into your own buffer until TCP's send buffer fills, so slow clients turn into growing memory. You must build the cap, the coalescing and the disconnect-with-resync yourself.</p>
+</details>
+<details>
+<summary>Your gateway holds 50,000 sockets at 60 KB each. Why is that not the number you size the machine for?</summary>
+<p>Because the average hides the tail. A burst that makes a few percent of clients fall behind fills their outbound queues to the cap. At a 1 MB cap, 5% of 50,000 is 2.5 GB in seconds. Compression context can multiply the baseline. Size for baseline plus a gateway-wide outbound budget, and enforce that budget by shedding the slowest clients first.</p>
+</details>
+<details>
+<summary>A client reconnects and resumes from history. How do you guarantee no gap and no duplicate?</summary>
+<p>Sequence numbers come from one authority per room. History is committed before publish. On reconnect, the client subscribes to the live stream first and buffers it. It fetches history after its last sequence, up to the first buffered sequence, then drains the buffer and drops anything at or below the highest sequence it has applied. Subscribe-then-fetch closes the race that fetch-then-subscribe leaves open.</p>
+</details>
+<details>
+<summary>Why might Redis Pub/Sub be a better backplane than Kafka here, even though Kafka is durable?</summary>
+<p>The backplane only routes. Durability already lives in the history store, and resume repairs any gap. Redis or NATS give per-room channels that are cheap to create and destroy, and the latency is low. Kafka topics are heavyweight, and consumers read whole partitions, so per-room routing turns into "every gateway reads everything" or a room-assignment scheme. Kafka shines behind the backplane, feeding history, search and analytics.</p>
+</details>
+<details>
+<summary>How do you deploy 20 gateways without a reconnect storm or a two-hour rollout?</summary>
+<p>Fail readiness, then spread reconnect notices over a drain window with random delay per client. Each client resumes from its sequence. Drain several gateways at once, sized to the spare capacity you keep: with 25% headroom you can drain four of 20 at a time. Watch accept rate and resume latency as the gate for the next batch. Graceful drain is planned work. A crash is the case your jitter and admission control must survive.</p>
+</details>

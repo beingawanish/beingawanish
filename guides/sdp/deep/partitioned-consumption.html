@@ -1,0 +1,243 @@
+<h2 id=dd-partitioned-consumption-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's contract rests on two promises. The producer puts every event for a key in the same lane. The group lets only one consumer read a lane at a time. Each promise is kept by a specific piece of code with specific defaults, and each one can be broken quietly. This section follows Kafka closely, then shows how other systems keep the same contract with different trade-offs.</p>
+
+<h3 id=dd-partitioned-consumption-partitioner level=3>The partitioner: which bytes get hashed</h3>
+<p>In the Java client, the default partitioner takes the <em>serialized key bytes</em>, hashes them with murmur2, clears the sign bit, and takes the result modulo the partition count. Three details hide in that sentence.</p>
+<ul>
+<li><strong>It hashes bytes, not values.</strong> Customer 8412 as the string <code>"8412"</code> and as a 64-bit integer are different bytes, so they land in different partitions. So does the same value serialized by a different serializer. Many schema-registry serializers prefix the payload with a schema ID. If the key's schema changes, the prefix changes, and every key moves.</li>
+<li><strong>Different clients use different hashes.</strong> librdkafka, the C library behind most Python, Go, .NET and Node clients, defaults to a CRC32-based partitioner called <code>consistent_random</code>. A Java producer and a Python producer writing the same key to the same topic will usually choose different partitions. librdkafka offers <code>murmur2_random</code> to match Java.</li>
+<li><strong>No key means no lane.</strong> A record with a null key is not hashed. Since Kafka 2.4 the client uses a "sticky" partitioner that fills a batch for one partition, then moves to another, which is good for throughput and useless for ordering.</li>
+</ul>
+<p>So the key is not just "customer ID". It is "customer ID, serialized by this exact serializer, hashed by this exact partitioner". Write that down in the topic's contract, because every producer must agree on all three.</p>
+
+<h3 id=dd-partitioned-consumption-group-protocol level=3>The group protocol: how the exclusive lease is granted</h3>
+<p>Every consumer group has a <strong>group coordinator</strong>. It is the broker that leads the partition of the internal <code>__consumer_offsets</code> topic chosen by hashing the group's name. In the classic protocol, a rebalance works like this:</p>
+<ol>
+<li>Something changes: a consumer joins, leaves, misses heartbeats, or the topic gains partitions.</li>
+<li>Every member sends <code>JoinGroup</code>. The coordinator waits for all of them, picks one as the group leader, and starts a new <strong>generation</strong>, a counter that increases with each rebalance.</li>
+<li>The leader runs the <strong>assignor</strong> on the client side and computes who owns what.</li>
+<li>Every member sends <code>SyncGroup</code> and receives its partitions.</li>
+<li>Members commit offsets tagged with their generation. A commit from an older generation is rejected, which is what keeps a consumer that lost a partition from committing for it.</li>
+</ol>
+<p>Failure detection runs on three timers, and confusing them causes most rebalance trouble:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Setting<th>Default (recent Java client)<th>What it detects<th>Trade-off<tbody>
+<tr><td><code>heartbeat.interval.ms</code><td>3 s<td>Nothing by itself; it is how often a background thread proves liveness<td>Must be well below the session timeout<tr><td><code>session.timeout.ms</code><td>45 s<td>A dead or partitioned process<td>Lower detects crashes faster, but GC pauses and network blips cause false evictions<tr><td><code>max.poll.interval.ms</code><td>5 min<td>A live process whose processing loop is stuck or too slow<td>Higher tolerates slow batches, but a hung consumer holds its partitions longer</table></div></div>
+<p>The <strong>assignor</strong> decides what happens to ownership during the rebalance.</p>
+<ul>
+<li><strong>Eager</strong> assignors (range, round-robin, the original sticky) make every member give up <em>all</em> partitions, then hand them out again. The whole group stops processing for the duration.</li>
+<li><strong>Cooperative</strong> rebalancing (<code>CooperativeStickyAssignor</code>) takes two rounds instead. Only partitions that actually move are revoked. Everyone else keeps processing.</li>
+<li><strong>Static membership</strong> gives each consumer a fixed <code>group.instance.id</code>. A member that restarts within the session timeout gets its old partitions back, with no rebalance at all. That is the tool for rolling deploys.</li>
+</ul>
+<p>Kafka 4.0 made a new group protocol generally available (enabled on the client with <code>group.protocol=consumer</code>). The broker computes assignments and moves them incrementally, without the group-wide join barrier. It removes much of the classic protocol's fragility, but check that your clients and any tooling support it before you rely on it.</p>
+
+<h3 id=dd-partitioned-consumption-range level=3>Why the range assignor still matters: co-partitioning</h3>
+<p>The range assignor sorts partitions per topic and gives each consumer a contiguous range. For two topics with the same partition count, consumer A gets partitions 0 to 3 of <em>both</em>. That is co-partitioning: if <code>orders</code> and <code>payments</code> are both keyed by customer ID, with the same partitioner and the same count, customer 8412's orders and payments reach the same consumer. A local join then needs no network lookup.</p>
+<p>Kafka Streams depends on this. A join between two streams requires both inputs to have the same number of partitions and the same key, and it refuses to start otherwise. If you re-key a stream, for example from <code>session_id</code> to <code>product_id</code>, Kafka Streams writes it to an internal <em>repartition topic</em> first. That is a full extra produce-and-consume hop, and it is often the biggest hidden cost in a topology.</p>
+
+<h3 id=dd-partitioned-consumption-offsets level=3>Offsets: what is stored and for how long</h3>
+<p>A committed offset is the offset of the <em>next</em> record to read, stored per (group, topic, partition) in <code>__consumer_offsets</code>. That topic is compacted, so only the latest commit per partition survives. Three defaults deserve attention.</p>
+<ul>
+<li><strong><code>enable.auto.commit=true</code></strong>, every 5 seconds. The commit happens inside <code>poll()</code> and covers everything the previous poll returned. If your code hands records to another thread and polls again, auto-commit will commit work that has not finished. With a simple poll-process loop it is at-least-once. With anything asynchronous it is not.</li>
+<li><strong><code>auto.offset.reset=latest</code></strong>. A group with no committed offset starts at the end of the log and skips everything already there.</li>
+<li><strong><code>offsets.retention.minutes</code></strong>, 7 days by default on recent brokers. A group with no active members for longer than that loses its committed offsets. When it comes back, <code>auto.offset.reset</code> applies.</li>
+</ul>
+<p>Put the second and third together and a consumer group that was switched off for a long holiday comes back, silently skips a week, and reports zero lag.</p>
+
+<h3 id=dd-partitioned-consumption-state level=3>Stateful consumers: what moves with the partition</h3>
+<p>For a stateless consumer, a rebalance moves an offset, which is a few bytes. For a stateful one, it moves the state.</p>
+<p>In Kafka Streams, each input partition becomes a <strong>task</strong>. Each task owns a local state store, usually RocksDB, and every write to it is also sent to a compacted <strong>changelog topic</strong>. When a task moves, the new owner rebuilds the store by reading the changelog from the start. <strong>Standby replicas</strong> (<code>num.standby.replicas</code>, 0 by default) keep warm copies on other instances, so a failover only replays the tail.</p>
+<p>Flink adds a layer that solves the modulo problem. Keys are hashed into a fixed number of <strong>key groups</strong>, equal to the job's <em>maximum parallelism</em>. Key groups, not keys, are assigned to subtasks, in contiguous ranges. When you rescale from 8 subtasks to 12, whole key groups move between subtasks. No key ever changes key group, so state moves cleanly and no key is split. The price is that maximum parallelism is fixed when the job's state is first created. Changing it later means rewriting the state offline.</p>
+<p>This is the same idea as virtual nodes in <a href="#consistent-hashing">consistent hashing</a>: route keys to a large, fixed number of buckets, and move buckets between workers. Kafka's partitions are those buckets for the <em>log</em>. Flink's key groups are those buckets for the <em>processing</em>. Kafka has no equivalent layer between key and partition, which is why adding partitions moves keys.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-partitioned-consumption-svg-title dd-partitioned-consumption-svg-desc" viewBox="0 0 720 280" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-partitioned-consumption-svg-title">How adding partitions breaks per-key order</title>
+<desc id="dd-partitioned-consumption-svg-desc">A timeline for customer 8412. Before the change, with 12 partitions, events e1 to e3 go to partition 7, which has a backlog of 30 seconds. At time T the topic grows to 24 partitions, and the key now hashes to partition 19, which is empty. Events e4 and e5 go to partition 19. Consumer of partition 19 processes e4 immediately, while e1 to e3 are still waiting in partition 7's backlog. So e4 is processed before e1, breaking per-key order.</desc>
+<defs><marker id="dd-partitioned-consumption-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="280" fill="#ffffff"/>
+<text x="20" y="30" font-size="14" fill="#1c2430">customer 8412: hash % 12 = 7, then hash % 24 = 19</text>
+<line x1="20" y1="140" x2="700" y2="140" stroke="#5c6b7c"/>
+<line x1="380" y1="50" x2="380" y2="250" stroke="#b5475e" stroke-dasharray="5 4"/>
+<text x="386" y="64" font-size="12" fill="#b5475e">T: partitions 12 → 24</text>
+<rect x="40" y="80" width="300" height="44" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="54" y="100" font-size="13" fill="#1c2430">partition 7 (backlog 30 s)</text>
+<rect x="210" y="104" width="34" height="16" rx="3" fill="#fdf3e1" stroke="#d6a74f"/><text x="227" y="116" font-size="11" fill="#1c2430" text-anchor="middle">e1</text>
+<rect x="250" y="104" width="34" height="16" rx="3" fill="#fdf3e1" stroke="#d6a74f"/><text x="267" y="116" font-size="11" fill="#1c2430" text-anchor="middle">e2</text>
+<rect x="290" y="104" width="34" height="16" rx="3" fill="#fdf3e1" stroke="#d6a74f"/><text x="307" y="116" font-size="11" fill="#1c2430" text-anchor="middle">e3</text>
+<rect x="400" y="160" width="300" height="44" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="414" y="180" font-size="13" fill="#1c2430">partition 19 (new, empty)</text>
+<rect x="560" y="184" width="34" height="16" rx="3" fill="#fdf3e1" stroke="#d6a74f"/><text x="577" y="196" font-size="11" fill="#1c2430" text-anchor="middle">e4</text>
+<rect x="600" y="184" width="34" height="16" rx="3" fill="#fdf3e1" stroke="#d6a74f"/><text x="617" y="196" font-size="11" fill="#1c2430" text-anchor="middle">e5</text>
+<path d="M577,206 C577,236 520,246 470,246" fill="none" stroke="#1c2430" marker-end="url(#dd-partitioned-consumption-arrow)"/>
+<text x="300" y="250" font-size="12" fill="#1c2430">e4 processed now</text>
+<text x="40" y="150" font-size="12" fill="#5c6b7c">e1 to e3 still waiting, processed in ~30 s</text>
+<text x="360" y="272" font-size="12" fill="#b5475e" text-anchor="middle">Result: e4, e5, e1, e2, e3. The refund can overtake its charge.</text>
+</svg>
+<figcaption>The reorder window equals the old partition's backlog at the moment of the change. With zero lag it is tiny; under load it is the whole lag.</figcaption>
+</figure>
+
+<h3 id=dd-partitioned-consumption-other-systems level=3>The same contract elsewhere</h3>
+<p>Other systems keep "order per key, parallelism across keys" while moving the trade-offs.</p>
+<ul>
+<li><strong>Amazon Kinesis Data Streams</strong> uses <em>shards</em>, each with a fixed write limit (1 MB/s or 1,000 records per second) and read limit (2 MB/s shared across standard consumers). Keys hash into a 128-bit space, and each shard owns a range of it. Resharding splits or merges ranges, and the shards keep a parent-child lineage. The Kinesis Client Library finishes a parent shard before it starts the children, so per-key order survives a reshard. That is the piece Kafka's partition increase lacks.</li>
+<li><strong>Apache Pulsar</strong> offers a <em>Key_Shared</em> subscription. Many consumers share one topic or partition, and the broker assigns hash ranges of keys to consumers. Order per key holds, and the number of consumers is not capped by the number of partitions.</li>
+<li><strong>SQS FIFO</strong> orders messages within a <em>message group ID</em>. While a group has messages in flight, no other consumer gets that group's later messages. You never see partitions at all. Throughput is governed by quotas instead, and FIFO has a high-throughput mode that raises them.</li>
+<li><strong>Key-level concurrency inside a partition.</strong> Libraries such as Confluent's Parallel Consumer process many keys from one partition at once while keeping each key in order. The offset to commit is then the lowest offset not yet finished, and the library tracks the completed offsets above it.</li>
+</ul>
+
+<h2 id=dd-partitioned-consumption-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>The lesson sized the partition count from consumer throughput. That is the first number. A review also wants the skew, the rebalance cost, the per-partition latency limit and the cost of growing later.</p>
+
+<h3 id=dd-partitioned-consumption-skew-math level=3>How hot is the hot partition?</h3>
+<p>Hashing spreads keys evenly, not load. Suppose 50,000 events per second, 48 partitions, and one enterprise customer producing 8% of all events. Everyone else is spread evenly.</p>
+<ul>
+<li>Average partition share: 100% / 48 ≈ 2.1%, about 1,040 events per second.</li>
+<li>Hot partition share: 8% + 92% / 48 ≈ 9.9%, about 4,960 events per second.</li>
+<li>That is 4.8 times the average, and more than twice what one consumer can do at 2,000 per second.</li>
+</ul>
+<p>This partition's lag grows forever, at about 2,960 events per second, no matter how many consumers you add. More partitions do not help either: the 8% is one key and stays in one partition. Only changing the key's routing or making that key's processing faster fixes it.</p>
+<p>Check this before launch. Take a day of real traffic, group by key, and compute the largest key's share. If it exceeds 1 / (partition count) by a lot, you have a hot-key design problem, not a scaling problem.</p>
+
+<h3 id=dd-partitioned-consumption-latency-math level=3>The ceiling inside one partition</h3>
+<p>Strict per-partition processing handles one record at a time. Its throughput is 1 / (processing time per record).</p>
+<ul>
+<li>A handler that makes a 20 ms call to a payment API: 1 / 0.02 = 50 records per second per partition.</li>
+<li>With 96 partitions: 4,800 per second in total, however many machines you have.</li>
+<li>With key-level concurrency, say 100 keys in flight per partition: up to 100 / 0.02 = 5,000 per second per partition, as long as there are enough distinct keys.</li>
+</ul>
+<p>This is the hidden reason teams end up with "too few partitions". The count was sized for CPU-bound processing. Then the handler gained an I/O call, and per-partition throughput fell by a factor of 50. Batch the I/O, or move to key-level concurrency, before you repartition.</p>
+
+<h3 id=dd-partitioned-consumption-rebalance-math level=3>What a rebalance costs</h3>
+<p>Take a stateful job: 96 partitions on 12 instances, 8 tasks each, with 5 GB of state per task. Restoring from a changelog runs at about 100 MB/s per instance, which is an assumption; measure yours.</p>
+<ul>
+<li><strong>A crash, no standbys.</strong> Detection takes up to the 45-second session timeout. The 8 orphaned tasks move to other instances, which together must restore 40 GB. Spread over 11 instances that is about 3.6 GB each, roughly 36 seconds. Those 8 partitions are down for about 80 seconds plus the join time.</li>
+<li><strong>A rolling deploy, eager assignor, no static membership.</strong> Each of the 12 restarts causes two rebalances: one when the instance leaves and one when it comes back. That is 24 group-wide stops. If tasks also move and restore each time, a deploy takes most of an hour of degraded processing.</li>
+<li><strong>The same deploy with static membership, cooperative rebalancing and one standby.</strong> Each instance returns within the session timeout and keeps its tasks. There are no rebalances, no restores, and a short pause per instance.</li>
+</ul>
+
+<h3 id=dd-partitioned-consumption-growth-math level=3>The cost of growing later</h3>
+<p>With modulo routing, a key keeps its partition only if hash mod new = hash mod old.</p>
+<ul>
+<li>12 → 24 partitions: a key stays where it is only if hash mod 24 is below 12. Half the keys move.</li>
+<li>12 → 13: almost every key moves, about 12 out of 13.</li>
+<li>Any key that moves risks the reorder in the diagram and loses its local state on the consumer.</li>
+</ul>
+<p>Compare that with the cost of extra partitions now. Each partition is replicated, typically 3 times, so 128 partitions are 384 replicas, each with open log segments and some metadata on the controller. A cluster handles tens of thousands of replicas, with the practical limit depending on version and hardware. For one topic, 128 instead of 32 is a rounding error. The asymmetry is the whole argument for overprovisioning.</p>
+<p>One caution: do not overprovision without limit. Very high counts slow down leader elections and rebalances, raise end-to-end latency when producers spread small batches thinly, and multiply consumer fetch memory. Size for about three years of growth, not for forever.</p>
+
+<h3 id=dd-partitioned-consumption-memory-math level=3>Consumer memory per partition</h3>
+<p>A consumer can buffer up to <code>max.partition.fetch.bytes</code> (1 MiB by default) per assigned partition, capped by <code>fetch.max.bytes</code> (50 MiB) per fetch request. A consumer that owns 40 partitions after a failover can therefore hold tens of megabytes of fetched data before processing any of it. For stateful consumers, add the local state store's block cache and memtables per task. When a failover doubles the tasks on an instance, its memory needs roughly double too, so size instances for the post-failure assignment, not the steady one.</p>
+
+<h2 id=dd-partitioned-consumption-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-partitioned-consumption-fm-partitioner level=3>1. Two producers, two partitioners</h3>
+<p><strong>Symptom.</strong> A new Python service starts publishing order updates next to the old Java service. A week later, some customers' refunds are processed before their charges, and the keyed fraud state shows two different running totals for the same card.</p>
+<p><strong>Mechanism.</strong> The Java producer hashes key bytes with murmur2. The Python client, built on librdkafka, defaulted to its CRC32-based partitioner. The same customer ID went to two different partitions, read by two different consumers. Order and state locality both broke for every customer the two services touched.</p>
+<p><strong>Detect.</strong> An audit job that reads a sample and records which partitions each key appears in. Any key in more than one partition is a routing bug. Keyed state that should be unique per key appearing on two instances.</p>
+<p><strong>Fix.</strong> Set <code>partitioner=murmur2_random</code> in librdkafka clients, or compute the partition explicitly in a shared library that every producer uses. Make the partitioner part of the topic's documented contract.</p>
+
+<h3 id=dd-partitioned-consumption-fm-key-bytes level=3>2. A key schema change that moved every key</h3>
+<p><strong>Symptom.</strong> After a deploy that "only added an optional field to the key schema", per-key order breaks for a few minutes across all customers, and stateful consumers start rebuilding state for keys they already had.</p>
+<p><strong>Mechanism.</strong> The key was serialized with a schema-registry serializer. The new schema got a new ID. The ID is part of the serialized bytes, the partitioner hashes the bytes, and so every key hashed to a new partition. It was a repartition with no partition count change.</p>
+<p><strong>Detect.</strong> The key-to-partition audit above. A sudden jump in state store misses on stateful consumers.</p>
+<p><strong>Fix.</strong> Use simple, stable key encodings, such as a UTF-8 string or a fixed-width integer, for partition keys. Keep rich schemas in the value. If a structured key is unavoidable, partition on an explicit, stable field rather than on the serialized bytes.</p>
+
+<h3 id=dd-partitioned-consumption-fm-grow level=3>3. Growing the partition count under load</h3>
+<p><strong>Symptom.</strong> Ops raised the topic from 12 to 24 partitions during a busy afternoon to get more parallelism. Over the next half hour, the ledger service rejected thousands of events as out of order.</p>
+<p><strong>Mechanism.</strong> Half the keys moved to new partitions. The new partitions were empty, so their consumers processed new events immediately. The old partitions still had 30 minutes of backlog for the same keys. Newer events overtook older ones, as in the diagram. Stateful consumers for the moved keys also started with empty state.</p>
+<p><strong>Detect.</strong> Sequence checks per key in consumers (a per-key version or sequence number in each event). A spike in out-of-order rejections right after a partition change.</p>
+<p><strong>Fix.</strong> Treat the partition count as a migration, not a setting. One safe recipe: pause producers briefly, let consumers drain the old partitions to zero lag, change the count, then resume. Another: create a new topic with the larger count, switch producers over, and let consumers finish the old topic before they read the new one, like Kinesis's parent-before-child rule. Better still, size the count so that you never do this.</p>
+
+<h3 id=dd-partitioned-consumption-fm-deploy level=3>4. Every deploy is a rebalance storm</h3>
+<p><strong>Symptom.</strong> Each rolling deploy of a stateful consumer takes 40 minutes. Lag climbs throughout, and dashboards lag by tens of minutes during every release.</p>
+<p><strong>Mechanism.</strong> No static membership, an eager assignor, and no standbys. Every instance restart triggered two group-wide stop-the-world rebalances. Tasks moved, and each moved task restored gigabytes of state from its changelog before it could process again.</p>
+<p><strong>Detect.</strong> Rebalances per deploy, which should be close to zero. Restore time and restoring-task count per instance. Lag correlated with deploy times.</p>
+<p><strong>Fix.</strong> Static membership with a session timeout longer than one instance's restart time. Cooperative rebalancing, or the newer broker-side protocol. One standby replica per task. Deploy one instance at a time and wait for it to rejoin before moving on.</p>
+
+<h3 id=dd-partitioned-consumption-fm-offset-expiry level=3>5. The group that came back and skipped a week</h3>
+<p><strong>Symptom.</strong> A monthly reconciliation consumer is started after being stopped for 10 days. It reports zero lag right away. The reconciliation then finds nothing to reconcile.</p>
+<p><strong>Mechanism.</strong> The group had no active members for longer than <code>offsets.retention.minutes</code> (7 days by default), so the broker deleted its committed offsets. On return, <code>auto.offset.reset=latest</code> sent every partition to the end of the log. The skipped data was still there. The consumer just never looked.</p>
+<p><strong>Detect.</strong> A group that starts with no committed offsets when you expected some (log the starting offsets on assignment). Zero lag immediately after a long stop is suspicious, not reassuring.</p>
+<p><strong>Fix.</strong> For consumers that must not skip, set <code>auto.offset.reset=none</code>, so a missing offset is an error a human must resolve. Keep infrequent jobs' groups alive, or store their offsets externally. Know your broker's offset retention.</p>
+
+<h3 id=dd-partitioned-consumption-fm-async-commit level=3>6. Parallel processing that committed past unfinished work</h3>
+<p><strong>Symptom.</strong> To speed things up, a team added a thread pool inside the consumer. Throughput rose sharply. After the next crash, about 200 events were never processed, and a few customers saw events applied out of order.</p>
+<p><strong>Mechanism.</strong> The poll loop handed records to the pool and polled again, and auto-commit committed the offsets returned by the previous poll. When offset 1,000 was committed, offsets 950 to 999 were still running on slow threads. The crash lost them. And because the pool ran records from one partition in parallel, two events for the same key could finish in either order.</p>
+<p><strong>Detect.</strong> Gaps between committed offsets and the offsets that handlers actually completed (log both). Per-key sequence violations after the change.</p>
+<p><strong>Fix.</strong> Commit only the lowest offset below which everything has completed. Keep per-key order by routing records to workers by key hash, not round-robin. Or use a library that does both. Turn auto-commit off whenever processing is asynchronous.</p>
+
+<h3 id=dd-partitioned-consumption-fm-stuck-lane level=3>7. One stuck lane hidden by total lag</h3>
+<p><strong>Symptom.</strong> Customers on one partition see their order status frozen for two hours. Total consumer lag looked normal, so no alert fired.</p>
+<p><strong>Mechanism.</strong> A poison message at the head of partition 31 failed on every attempt, and the consumer was configured to pause-and-fix. Partition 31 stopped. The other 95 partitions were healthy, so total lag rose only about 1%. That is well inside normal noise.</p>
+<p><strong>Detect.</strong> Lag per partition, as time rather than messages. Alert on the <em>maximum</em> per-partition backlog age, not the sum. Alert separately on a partition whose committed offset has not moved while new data arrives.</p>
+<p><strong>Fix.</strong> Per-partition alerts, plus a clear runbook: inspect, fix or skip the poison record with an audit trail, then resume. Where the ordering requirement allows it, dead-letter the record and park later events for the <em>same key</em> only, so the rest of the lane keeps moving. See <a href="#dead-letter-queue">Dead Letter Queue</a>.</p>
+
+<h2 id=dd-partitioned-consumption-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-partitioned-consumption-choose-key level=3>Choosing the partition key</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Key<th>Order you get<th>Skew risk<th>Good for<th>Watch out for<tbody>
+<tr><td><code>customer_id</code><td>All of a customer's events<td>High: enterprise accounts<td>Ledgers, refunds after charges, per-customer state<td>One huge tenant owning a lane<tr><td><code>order_id</code><td>Per order only<td>Low<td>Order lifecycle (placed → shipped)<td>Anything that needs cross-order order for one customer<tr><td><code>session_id</code><td>Per browsing session<td>Low, except bots<td>Funnels, clickstream sessionization<td>Bot sessions with millions of events<tr><td>Composite (<code>customer_id</code> + <code>region</code>)<td>Per (customer, region)<td>Lower than customer alone<td>Splitting a big tenant where its regions are independent<td>Only valid if order across the parts is truly not needed<tr><td>Salted (<code>key</code> + random 0..k)<td>None within the key<td>Lowest<td>Aggregations that are re-combined later<td>Needs a second stage to merge the k partial results<tr><td>Null / round-robin<td>None<td>None<td>Independent events with no keyed state<td>Silently breaks any later ordering assumption</table></div></div>
+<p>Choose the key from the smallest entity whose events must stay in order, then check its skew with real data. If the natural key is too skewed, split only the hot keys: keep a small list of large tenants and route them to a composite key or their own topic, and leave everyone else on the simple key.</p>
+
+<h3 id=dd-partitioned-consumption-choose-system level=3>Choosing the ordering mechanism</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Mechanism<th>Unit of order<th>Parallelism ceiling<th>Rescaling<th>Replay<tbody>
+<tr><td>Kafka partitions + consumer group<td>Partition<td>Partition count<td>Adding partitions moves keys<td>Yes, by offset<tr><td>Kinesis shards<td>Shard (hash range)<td>Shard count; per-shard limits<td>Split/merge with parent-before-child order<td>Yes, within retention<tr><td>Pulsar Key_Shared<td>Key (hash range per consumer)<td>Number of keys, not partitions<td>Add consumers freely<td>Yes, by cursor<tr><td>SQS FIFO message groups<td>Message group<td>Number of active groups; quotas<td>Managed for you<td>No<tr><td>Flink <code>keyBy</code> (key groups)<td>Key, inside the job<td>Max parallelism, fixed with the state<td>Moves whole key groups, no rehash<td>From the source's offsets<tr><td>Key-level concurrency within a partition<td>Key<td>Distinct keys in flight<td>Change concurrency at runtime<td>Yes, by offset (with gap tracking)</table></div></div>
+<p>In practice: Kafka partitions are the default for keyed facts that need replay. Add key-level concurrency when handlers are I/O-bound. Consider Pulsar Key_Shared or SQS FIFO when the parallelism ceiling is the main pain and you do not need Kafka's ecosystem. Inside a stream processor, let <code>keyBy</code> handle re-keying, and pick its maximum parallelism generously on day one.</p>
+
+<h2 id=dd-partitioned-consumption-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the smallest entity whose events must stay in order, and does the partition key match it exactly?</li>
+<li>Is the key's serialized form stable, and do all producers, in every language, use the same serializer and partitioner?</li>
+<li>What share of traffic does the largest key carry, from real data? Is it below one partition's capacity, with headroom?</li>
+<li>How was the partition count derived: throughput per consumer, growth rate, years of headroom? What is the plan if it must change?</li>
+<li>What is the per-record processing time, and does one partition's sequential throughput still meet the target if a handler gains an I/O call?</li>
+<li>Which assignor, static membership settings and timeouts are used? How many rebalances does one rolling deploy cause?</li>
+<li>For stateful consumers: how big is state per partition, how long does restoration take, and are there standby replicas?</li>
+<li>Are offsets committed only after processing completes, including with any internal concurrency? Is auto-commit off where processing is asynchronous?</li>
+<li>What happens if a group's offsets are missing: is <code>auto.offset.reset</code> a deliberate choice for this consumer?</li>
+<li>What is the poison-message policy per topic, pause-and-fix or dead-letter, and who is paged when a lane stops?</li>
+<li>Is lag monitored per partition, in time, with alerts on the maximum rather than the total?</li>
+<li>Do joins rely on co-partitioning, and is it enforced (same count, same key, same partitioner)?</li>
+</ol>
+
+<h2 id=dd-partitioned-consumption-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"You need more parallelism, and partitions are maxed out. What are your options short of repartitioning?"</summary>
+<p>First check where the time goes. If handlers are I/O-bound, process several keys from one partition at once while keeping each key in order, and commit the lowest fully completed offset. If the work is CPU-bound, make each record cheaper or batch the sink writes. If one hot key is the limit, split that key alone. Only after those, migrate to a topic with more partitions by draining or by a new topic, rather than changing the count in place.</p>
+</details>
+
+<details>
+<summary>"Why does adding partitions break order, when Kafka doesn't move existing data?"</summary>
+<p>Existing records stay where they are. But new records for a moved key go to a different partition, read by a different consumer with its own lag. If the old partition still has a backlog for that key, the new partition's consumer can process newer events first. The reorder window equals the old partition's backlog at the moment of the change. Keyed state on the consumer is also split between the old and new owners.</p>
+</details>
+
+<details>
+<summary>"How does Flink rescale a keyed job without breaking per-key state?"</summary>
+<p>Keys are hashed into a fixed number of key groups, equal to the job's maximum parallelism. Subtasks own ranges of key groups. Rescaling reassigns whole key groups, so a key never changes group and its state moves as a unit. The catch is that the maximum parallelism is fixed when state is first created, so it must be chosen with growth in mind.</p>
+</details>
+
+<details>
+<summary>"What's the difference between session.timeout.ms and max.poll.interval.ms?"</summary>
+<p>The session timeout detects a dead process: a background thread sends heartbeats, and if none arrive for that long, the member is evicted. The poll interval detects a live process that has stopped making progress: if the application does not call <code>poll()</code> in time, the client leaves the group itself. Slow processing triggers the second, not the first, which is why raising the session timeout does not fix evictions caused by slow batches.</p>
+</details>
+
+<details>
+<summary>"A Java and a Go service both produce to the same keyed topic. What do you check?"</summary>
+<p>That they produce identical key bytes and use the same hash. The Java client hashes with murmur2. librdkafka-based clients default to a CRC32-based partitioner, and some native Go clients have their own defaults. Use the murmur2-compatible option everywhere, or compute partitions in a shared library. Then verify it: sample the topic and check that every key appears in exactly one partition.</p>
+</details>
+
+<details>
+<summary>"How do you make rolling deploys of a stateful consumer cheap?"</summary>
+<p>Static membership, so a restarting instance keeps its identity and partitions within the session timeout and no rebalance happens. Cooperative rebalancing, so if one does happen only moved partitions pause. A standby replica per task, so a moved task restores only the tail of its changelog. Then deploy one instance at a time and wait for it to rejoin. Count rebalances per deploy; the target is zero.</p>
+</details>
+
+<details>
+<summary>"Total lag is fine, but some customers say their orders are stuck. What's going on?"</summary>
+<p>Probably one lane is stopped, by a poison message under a pause-and-fix policy, or by a hot key. With many partitions, one stuck partition barely moves the total. Look at lag per partition, as time, and at partitions whose committed offset has not moved. Alert on the maximum backlog age across partitions, never on the sum alone.</p>
+</details>
+
+<details>
+<summary>"Can you have exactly-once with partitioned consumption when a consumer processes records concurrently?"</summary>
+<p>Yes, if the commit point is right and the effects are idempotent or transactional. You may only commit an offset when every record before it has finished, so you track completions and commit the lowest contiguous point. A crash then replays the records after it, including some that already finished, so their effects must be safe to repeat, as in <a href="#exactlyonce-semantics">Exactly-Once Semantics</a>. Per-key order also needs routing by key to workers, never round-robin.</p>
+</details>

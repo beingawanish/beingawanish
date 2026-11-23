@@ -1,0 +1,25 @@
+{
+  "type": "record",
+  "name": "VoidPayment",
+  "namespace": "com.edacommerce.payment",
+  "doc": "Command: cancel an authorisation that will never be captured.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "paymentId",
+      "type": "string"
+    },
+    {
+      "name": "reason",
+      "type": "string"
+    }
+  ]
+}

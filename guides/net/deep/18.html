@@ -1,0 +1,559 @@
+<h2 id="d18-deep-dive">Deep dive: what the ladder hid</h2>
+<p>The dependency ladder is the right <em>method</em>. Scope, then climb, then bisect. But it quietly assumes each rung is a yes-or-no question: the gateway pings or it doesn't, the port connects or it doesn't. The incidents that eat whole days rarely look like that. They are partial. Small requests work and large ones stall. Lookups succeed, but one in twenty takes five seconds. New connections fail while old ones are fine. Traffic works from one subnet and not another.</p>
+<p>Partial failures live in <em>state</em>: a cached path MTU, a resolver's search list, a full connection-tracking table, a routing decision that differs by source address. The module's tools answer "is it up?" This deep dive is about the tools that read that state, and about four incidents, worked end to end, where reading state is the only way through.</p>
+<p>The commands are Linux first, because that's where production servers, containers and cloud nodes run. Where macOS differs, the text says so.</p>
+<h2 id="d18-mental-model">Deep dive: the real mental model</h2>
+<p>A packet's trip through a host is a fixed sequence of stages. Each stage keeps its own state and its own counters, and each one can drop a packet for its own reasons. Socket buffers, the routing table and its cache of path MTUs, netfilter rules and the connection-tracking table, the neighbour (ARP/ND) table, the queueing discipline, the NIC's rings. Every troubleshooting tool reads exactly one of these stages. That is the real mental model: <strong>a symptom is a drop or a delay in one stage, and a tool is a window onto one stage.</strong></p>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 456" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="d18-path-title d18-path-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
+<title id="d18-path-title">Where each troubleshooting tool looks on a Linux host's packet path</title>
+<desc id="d18-path-desc">Two rows of boxes. Egress, left to right: socket (ss), routing and PMTU cache (ip route get), netfilter OUTPUT and POSTROUTING with conntrack, neighbour table (ip neigh), qdisc (tc), the AF_PACKET tap (tcpdump), driver and NIC (ethtool -S), wire. Ingress, right to left: wire, driver and NIC, the tap, netfilter PREROUTING and conntrack, routing with the rp_filter check, netfilter INPUT, socket, application. Notes explain that tcpdump sees inbound packets before the firewall and outbound packets after it.</desc>
+<defs>
+<marker id="d18-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M 0 1 L 9 5 L 0 9 z" fill="#6b7280"/>
+</marker>
+</defs>
+<text x="24" y="28" font-size="12" fill="#6b7280" letter-spacing="2">EGRESS · APP WRITES → WIRE</text>
+<rect x="24" y="40" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="64" y="60" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">socket</text>
+<text x="64" y="78" font-size="10" fill="#6b7280" text-anchor="middle">send buffer</text>
+<text x="64" y="100" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">ss -tni</text>
+<line x1="104" y1="77" x2="112" y2="77" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="114" y="40" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="154" y="60" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">routing</text>
+<text x="154" y="78" font-size="10" fill="#6b7280" text-anchor="middle">FIB + PMTU</text>
+<text x="154" y="100" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">ip route get</text>
+<line x1="194" y1="77" x2="202" y2="77" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="204" y="40" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="244" y="60" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">netfilter</text>
+<text x="244" y="78" font-size="10" fill="#6b7280" text-anchor="middle">OUTPUT/POST</text>
+<text x="244" y="100" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">conntrack -L</text>
+<line x1="284" y1="77" x2="292" y2="77" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="294" y="40" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="334" y="60" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">neighbour</text>
+<text x="334" y="78" font-size="10" fill="#6b7280" text-anchor="middle">ARP / ND</text>
+<text x="334" y="100" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">ip neigh</text>
+<line x1="374" y1="77" x2="382" y2="77" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="384" y="40" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="424" y="60" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">qdisc</text>
+<text x="424" y="78" font-size="10" fill="#6b7280" text-anchor="middle">queue, shaping</text>
+<text x="424" y="100" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">tc -s qdisc</text>
+<line x1="464" y1="77" x2="472" y2="77" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="474" y="40" width="80" height="74" rx="6" fill="none" stroke="#bf4520" stroke-width="2"/>
+<text x="514" y="60" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">packet tap</text>
+<text x="514" y="78" font-size="10" fill="#6b7280" text-anchor="middle">AF_PACKET</text>
+<text x="514" y="100" font-size="10" fill="#bf4520" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">tcpdump</text>
+<line x1="554" y1="77" x2="562" y2="77" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="564" y="40" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="604" y="60" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">driver/NIC</text>
+<text x="604" y="78" font-size="10" fill="#6b7280" text-anchor="middle">rings, offload</text>
+<text x="604" y="100" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">ethtool -S</text>
+<line x1="644" y1="77" x2="652" y2="77" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="654" y="40" width="80" height="74" rx="6" fill="none" stroke="#6b7280" stroke-width="1" stroke-dasharray="4,3"/>
+<text x="694" y="82" font-size="12" fill="#6b7280" text-anchor="middle">wire</text>
+<text x="24" y="168" font-size="12" fill="#6b7280" letter-spacing="2">INGRESS · WIRE → APP READS (RIGHT TO LEFT)</text>
+<rect x="24" y="180" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="64" y="200" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">app</text>
+<text x="64" y="218" font-size="10" fill="#6b7280" text-anchor="middle">read() / recv()</text>
+<text x="64" y="240" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">app logs</text>
+<rect x="114" y="180" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="154" y="200" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">socket</text>
+<text x="154" y="218" font-size="10" fill="#6b7280" text-anchor="middle">listen, rcvbuf</text>
+<text x="154" y="240" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">ss -lnt</text>
+<line x1="114" y1="217" x2="106" y2="217" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="204" y="180" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="244" y="200" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">netfilter</text>
+<text x="244" y="218" font-size="10" fill="#6b7280" text-anchor="middle">INPUT</text>
+<text x="244" y="240" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">nft · nstat</text>
+<line x1="204" y1="217" x2="196" y2="217" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="294" y="180" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="334" y="200" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">routing</text>
+<text x="334" y="218" font-size="10" fill="#6b7280" text-anchor="middle">rp_filter here</text>
+<text x="334" y="240" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">nstat</text>
+<line x1="294" y1="217" x2="286" y2="217" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="384" y="180" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="424" y="200" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">netfilter</text>
+<text x="424" y="218" font-size="10" fill="#6b7280" text-anchor="middle">PREROUTING</text>
+<text x="424" y="240" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">conntrack -S</text>
+<line x1="384" y1="217" x2="376" y2="217" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="474" y="180" width="80" height="74" rx="6" fill="none" stroke="#bf4520" stroke-width="2"/>
+<text x="514" y="200" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">packet tap</text>
+<text x="514" y="218" font-size="10" fill="#6b7280" text-anchor="middle">AF_PACKET</text>
+<text x="514" y="240" font-size="10" fill="#bf4520" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">tcpdump</text>
+<line x1="474" y1="217" x2="466" y2="217" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="564" y="180" width="80" height="74" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="604" y="200" font-size="11" fill="#2d3142" text-anchor="middle" font-weight="600">driver/NIC</text>
+<text x="604" y="218" font-size="10" fill="#6b7280" text-anchor="middle">rings, drops</text>
+<text x="604" y="240" font-size="10" fill="#2d3142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">ip -s link</text>
+<line x1="564" y1="217" x2="556" y2="217" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<rect x="654" y="180" width="80" height="74" rx="6" fill="none" stroke="#6b7280" stroke-width="1" stroke-dasharray="4,3"/>
+<text x="694" y="222" font-size="12" fill="#6b7280" text-anchor="middle">wire</text>
+<line x1="654" y1="217" x2="646" y2="217" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d18-arr)"/>
+<text x="24" y="316" font-size="13" fill="#2d3142" font-weight="600">Where tcpdump sits decides what a capture proves.</text>
+<text x="24" y="342" font-size="12" fill="#6b7280">Ingress: the tap runs before netfilter and before the rp_filter check. A SYN in the capture proves it</text>
+<text x="24" y="362" font-size="12" fill="#6b7280">reached the host, not that the kernel accepted it. Drops after the tap show up only in counters.</text>
+<text x="24" y="382" font-size="12" fill="#6b7280">Egress: the tap runs after routing, netfilter and the qdisc. A packet your OUTPUT rule drops never appears;</text>
+<text x="24" y="402" font-size="12" fill="#6b7280">a packet you see leave has been routed, NATed and queued, though the NIC can still drop it (ethtool -S).</text>
+<text x="24" y="436" font-size="13" fill="#2d3142" font-weight="600">Debugging is picking the box your hypothesis lives in, and reading that box's state.</text>
+</svg>
+
+<p>The single most useful fact in that diagram is where <code>tcpdump</code> sits. On Linux, packet capture taps the path at the device. Inbound packets are copied to the capture <em>before</em> netfilter and before the reverse-path check. Outbound packets are copied <em>after</em> routing, netfilter and the qdisc, just before the driver. So two common inferences are wrong:</p>
+<ul>
+<li>"I can see the SYN in tcpdump, so the server received it." It reached the interface. The firewall, <code>rp_filter</code> or a full queue can still discard it, and only counters will tell you.</li>
+<li>"My packet isn't in the capture, so the app never sent it." It may have been dropped by an OUTPUT rule or failed routing before it reached the tap.</li>
+</ul>
+<p>macOS works the same way in spirit: BPF taps at the interface, and <code>pf</code> filters on either side of it. The difference is tooling. macOS has no <code>ip</code>, <code>ss</code> or <code>conntrack</code>. You use <code>netstat -rn</code>, <code>route -n get</code>, <code>arp -an</code>, <code>ndp -an</code>, <code>netstat -an -p tcp</code>, <code>lsof -i</code> and <code>nettop</code>.</p>
+<p>The second piece of the model is that <strong>timers are fingerprints</strong>. Networking stacks retry on fixed schedules, so a delay of a suspiciously round size usually names its own cause before you've run a single command. You'll find the table in the "by the numbers" section. Learn it, and half your hypotheses come for free.</p>
+<h2 id="d18-toolbox">Deep dive: the toolbox, with real output</h2>
+<p>Each tool below is shown with output and read line by line. The <code>curl</code> and <code>openssl</code> outputs are real, captured against a local TLS server running on this guide's build machine. The others are constructed to be consistent with the incidents later in this section, using documentation and private address ranges. Your output will differ.</p>
+<h3 id="d18-ip"><code>ip</code>: addresses, routes, neighbours</h3>
+<pre class="text"><code>$ ip -br addr
+lo               UNKNOWN        127.0.0.1/8 ::1/128
+eth0             UP             10.0.1.20/24 fe80::4a3:9ff:fe2c:11a0/64
+
+$ ip route
+default via 10.0.1.1 dev eth0 proto dhcp src 10.0.1.20 metric 100
+10.0.1.0/24 dev eth0 proto kernel scope link src 10.0.1.20 metric 100
+
+$ ip route get 172.20.4.11
+172.20.4.11 via 10.0.1.1 dev eth0 src 10.0.1.20 uid 1000
+    cache expires 412sec mtu 1400
+
+$ ip neigh
+10.0.1.1 dev eth0 lladdr 02:42:0a:00:01:01 REACHABLE
+10.0.1.31 dev eth0 lladdr 02:42:0a:00:01:1f STALE
+10.0.1.44 dev eth0  FAILED</code></pre>
+<p><code>ip route</code> shows the table you configured. <code>ip route get</code> shows the decision the kernel makes <em>for one destination right now</em>, including the route cache. The <code>cache expires 412sec mtu 1400</code> line means this host received an ICMP "fragmentation needed" for that destination and has learned a smaller path MTU. That exception lasts 600 seconds by default (<code>net.ipv4.route.mtu_expires</code>). Seeing it is direct proof that PMTU discovery is working <em>toward</em> that host.</p>
+<p><code>ip route get</code> also takes a source address: <code>ip route get 192.168.50.10 from 10.1.0.5</code>. That form is how you prove asymmetric routing, as the fourth incident shows. The macOS equivalent of the plain form is <code>route -n get 172.20.4.11</code>.</p>
+<p>In <code>ip neigh</code>, REACHABLE means the entry was confirmed recently (the base time is 30 seconds, randomised). STALE means it's still usable but will be re-verified on next use. FAILED means ARP or neighbour discovery got no answer. A FAILED next hop is a layer-2 fault that no amount of IP debugging will fix.</p>
+<h3 id="d18-ss"><code>ss</code>: sockets and TCP internals</h3>
+<pre class="text"><code>$ ss -tni dst 172.20.4.11
+State  Recv-Q Send-Q   Local Address:Port    Peer Address:Port
+ESTAB  0      0           10.0.1.20:51022    172.20.4.11:443
+     cubic wscale:7,7 rto:232 rtt:31.4/0.9 ato:40 mss:1348 pmtu:1400 rcvmss:1348
+     advmss:1448 cwnd:10 bytes_sent:517 bytes_acked:518 bytes_received:4132
+     segs_out:9 segs_in:8 data_segs_out:1 data_segs_in:4 send 3.4Mbps
+     lastsnd:2210 lastrcv:2180 lastack:2180 delivery_rate 1.1Mbps rcv_space:14480</code></pre>
+<p>This is the <code>tcp_info</code> structure the kernel keeps for every connection. The fields that answer real questions:</p>
+<ul>
+<li><code>rtt:31.4/0.9</code>: smoothed RTT and its variation, in milliseconds. Compare it with ping. If TCP's RTT is far above ICMP's, the delay is in queues, not distance.</li>
+<li><code>rto:232</code>: the current retransmission timeout. Linux uses RTT plus a variance term with a 200 ms floor.</li>
+<li><code>mss:1348 pmtu:1400</code>: the path MTU TCP is using for this connection, and the resulting segment size (1400 minus 40 bytes of headers and 12 of timestamps).</li>
+<li><code>retrans:</code> (absent here) shows retransmissions in flight and in total. <code>cwnd</code> collapsing to 1 or 2 with a large <code>backoff</code> means repeated timeouts.</li>
+<li><code>Send-Q</code> on an established socket is bytes sent but not yet acknowledged, plus bytes not yet sent. If it's large and not moving, the peer or the path has stopped acknowledging.</li>
+</ul>
+<p><code>ss -s</code> gives a one-screen summary of socket counts by state, and <code>ss -lnt</code> shows listeners with their accept-queue length (<code>Recv-Q</code>) and limit (<code>Send-Q</code>). On macOS, <code>netstat -an -p tcp</code> lists sockets and <code>netstat -s -p tcp</code> prints protocol counters. There's no direct <code>tcp_info</code> view.</p>
+<h3 id="d18-tcpdump"><code>tcpdump</code>: filters worth knowing by heart</h3>
+<pre class="text"><code>tcpdump -nn -i any &#39;host 172.20.4.11 and tcp port 443&#39;      # one conversation, all interfaces
+tcpdump -nn &#39;tcp[tcpflags] &amp; (tcp-syn|tcp-rst) != 0&#39;          # only handshakes and resets
+tcpdump -nn &#39;icmp[icmptype] == icmp-unreach and icmp[icmpcode] == 4&#39;   # IPv4 &quot;frag needed&quot;
+tcpdump -nn &#39;icmp6 and ip6[40] == 2&#39;                          # ICMPv6 Packet Too Big (no ext hdrs)
+tcpdump -nn &#39;ip[6:2] &amp; 0x4000 != 0 and greater 1400&#39;          # DF set and big: PMTU suspects
+tcpdump -nn &#39;udp port 53&#39;                                     # every DNS query and answer
+tcpdump -nn -i any -w /tmp/x.pcap -C 100 -W 5 &#39;port 5432&#39;     # ring buffer: 5 files of 100 MB</code></pre>
+<p>Three habits matter more than any filter. Always pass <code>-nn</code>, or tcpdump does reverse DNS for every address and the capture itself becomes DNS traffic. Capture on <code>-i any</code> when you suspect asymmetry: on current tcpdump versions each line is tagged with the interface and the direction (<code>In</code> / <code>Out</code>). And capture on <em>both ends</em> when you can, because a packet that leaves one side and never arrives at the other has been dropped by something in between.</p>
+<h3 id="d18-mtr"><code>mtr</code>: a path, measured over time</h3>
+<pre class="text"><code>$ mtr -rwzbc 100 172.20.4.11
+Start: 2026-10-16T10:12:03+0000
+HOST: build-07                           Loss%   Snt   Last   Avg  Best  Wrst StDev
+  1. AS???    10.0.1.1                    0.0%   100    0.5   0.4   0.3   1.1   0.1
+  2. AS???    169.254.10.1                0.0%   100    1.9   1.6   1.2   4.0   0.4
+  3. AS???    100.64.12.9                38.0%   100   12.4  12.9  12.1  19.8   1.1
+  4. AS???    169.254.10.2                0.0%   100   28.8  29.1  28.4  33.0   0.7
+  5. AS???    172.20.4.11                 0.0%   100   30.1  30.3  29.8  34.2   0.6</code></pre>
+<p>Read <code>mtr</code> from the bottom. The destination shows 0% loss. So the 38% at hop 3 is not packet loss on the path. That router is rate-limiting the ICMP time-exceeded replies it generates, because generating ICMP runs on its control-plane CPU, while forwarding your traffic runs in hardware. Loss is real only if it <em>starts</em> at some hop and <em>persists to the end</em>. The same rule applies to latency: a jump that persists to the destination is real, and a spike at one hop that disappears at the next is that router being slow to answer.</p>
+<p>Use <code>-r</code> for report mode, <code>-w</code> for wide names, <code>-z</code>/<code>-b</code> for AS numbers and both names and IPs. <code>-T -P 443</code> sends TCP SYNs instead of ICMP, which follows the same path and firewall rules your application does. On macOS, install it with Homebrew; it needs <code>sudo</code>.</p>
+<h3 id="d18-dig"><code>dig</code>: what DNS says, and what it doesn't</h3>
+<pre class="text"><code>$ dig api.partner.example A
+
+; &lt;&lt;&gt;&gt; DiG 9.18.28 &lt;&lt;&gt;&gt; api.partner.example A
+;; global options: +cmd
+;; Got answer:
+;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: NOERROR, id: 30981
+;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 1232
+;; QUESTION SECTION:
+;api.partner.example.       IN  A
+
+;; ANSWER SECTION:
+api.partner.example.    27  IN  A   198.51.100.40
+
+;; Query time: 14 msec
+;; SERVER: 10.96.0.10#53(10.96.0.10) (UDP)
+;; WHEN: Fri Oct 16 11:20:03 UTC 2026
+;; MSG SIZE  rcvd: 64</code></pre>
+<p><code>status</code> is the verdict (NOERROR, NXDOMAIN, SERVFAIL). The flags tell you who answered: no <code>aa</code> flag means a recursive resolver answered from cache or recursion, not the authoritative server. The TTL of 27 is the <em>remaining</em> cache time. Run it again and it counts down, which proves you're hitting a cache. <code>SERVER</code> shows which resolver actually answered.</p>
+<p>Then remember what <code>dig</code> doesn't do. It doesn't use your resolver library. It ignores <code>/etc/nsswitch.conf</code>, <code>/etc/hosts</code>, and, unless you pass <code>+search</code>, the <code>search</code> and <code>ndots</code> settings. So "dig works but the app can't resolve" is a real and common split. To test what the application sees, use the system resolver: <code>getent ahosts api.partner.example</code> on Linux, <code>dscacheutil -q host -a name api.partner.example</code> on macOS.</p>
+<h3 id="d18-curl"><code>curl -w</code>: where the milliseconds go</h3>
+<p><code>curl</code> can print a timestamp for every phase of a request. All values are cumulative seconds since the start. This run is real, against a local TLS server whose handler sleeps 120 ms to stand in for application work:</p>
+<pre class="text"><code>$ curl -s -o /dev/null --cacert cert.pem --resolve api.internal.test:8443:127.0.0.1 \
+    -w &#39;    time_namelookup:  %{time_namelookup}s\n       time_connect:  %{time_connect}s\n    time_appconnect:  %{time_appconnect}s\n time_starttransfer:  %{time_starttransfer}s\n         time_total:  %{time_total}s\n          http_code:  %{http_code}\n&#39; \
+    https://api.internal.test:8443/health
+    time_namelookup:  0.000026s
+       time_connect:  0.001026s
+    time_appconnect:  0.009440s
+ time_starttransfer:  0.132682s
+         time_total:  0.132750s
+          http_code:  200</code></pre>
+<p>Subtract adjacent values to get each phase. DNS took nothing (<code>--resolve</code> skipped it). The TCP handshake took 1.0 ms. TLS took 8.4 ms, which on loopback is pure CPU for key exchange and signatures. Then 123 ms passed between the end of the handshake and the first response byte: that's the application's 120 ms sleep plus a little. Over a real network, each phase also includes round trips. With a 30 ms RTT and TLS 1.3 you'd expect roughly: connect ≈ DNS + 30 ms, appconnect ≈ connect + 30 ms, starttransfer ≈ appconnect + 30 ms + server time.</p>
+<p>That gives you a sharp triage rule. Big <code>time_namelookup</code>: DNS. Big gap to <code>time_connect</code>: path or SYN loss (look for exactly 1 s or 3 s, the SYN retransmit timers). Big gap to <code>time_appconnect</code>: TLS, a slow handshake, an OCSP fetch, or a PMTU problem with the certificate chain. Big gap to <code>time_starttransfer</code>: the server. The same <code>-w</code> string works on macOS.</p>
+<h3 id="d18-openssl"><code>openssl s_client</code>: the TLS layer, isolated</h3>
+<p>Real output against the same local server:</p>
+<pre class="text"><code>$ openssl s_client -connect 127.0.0.1:8443 -servername api.internal.test -CAfile cert.pem -brief &lt;/dev/null
+CONNECTION ESTABLISHED
+Protocol version: TLSv1.3
+Ciphersuite: TLS_AES_256_GCM_SHA384
+Peer certificate: CN = api.internal.test
+Hash used: SHA256
+Signature type: ECDSA
+Verification: OK
+Server Temp Key: X25519, 253 bits
+DONE</code></pre>
+<p>And the same server checked against the wrong hostname, also real:</p>
+<pre class="text"><code>$ openssl s_client -connect 127.0.0.1:8443 -servername api.internal.test \
+    -verify_hostname wrong.example -CAfile cert.pem -brief &lt;/dev/null
+depth=0 CN = api.internal.test
+verify error:num=62:hostname mismatch
+CONNECTION ESTABLISHED
+Protocol version: TLSv1.3
+...
+Verification error: hostname mismatch</code></pre>
+<p>Notice "CONNECTION ESTABLISHED" next to a verification error. <code>s_client</code> reports problems but carries on, so read the <code>Verification</code> line, never just the first line. The flags that earn their place: <code>-servername</code> sets SNI (without it, many servers return a default certificate and you debug the wrong one). <code>-showcerts</code> prints the whole chain, which is how you catch a missing intermediate. <code>-alpn h2,http/1.1</code> shows which protocol the server picks. <code>-cert</code>/<code>-key</code> let you test mTLS by hand. Without <code>-brief</code>, the line "SSL handshake has read 814 bytes and written 399 bytes" tells you how big the server's flight is, which matters for the first incident below. macOS ships LibreSSL as <code>openssl</code>; most of these flags work, but <code>-brief</code> may not, so install OpenSSL from Homebrew for parity.</p>
+<h2 id="d18-numbers">Deep dive: by the numbers</h2>
+<h3 id="d18-timers">Timer fingerprints</h3>
+<p>When a delay has a round number in it, look it up here before you form any other hypothesis. These are defaults and they vary by OS and version; the point is the shape.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Delay you see</th>
+<th>Usual cause</th>
+<th>Where it comes from</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>~40 ms or ~200 ms extra per exchange</td>
+<td>Nagle's algorithm meeting delayed ACK</td>
+<td>Linux delayed-ACK minimum 40 ms; many stacks up to 200 ms</td>
+</tr>
+<tr class="even">
+<td>1 s, then 3 s, 7 s, 15 s to connect</td>
+<td>SYN lost, retransmitted</td>
+<td>Initial RTO 1 s (RFC 6298), doubling. Linux gives up after <code>tcp_syn_retries = 6</code>, about 127 s</td>
+</tr>
+<tr class="odd">
+<td>3 s to connect</td>
+<td>SYN lost on an older stack</td>
+<td>Initial RTO 3 s (old RFC 2988 value)</td>
+</tr>
+<tr class="even">
+<td>5 s, sometimes 10 s, on a name lookup</td>
+<td>DNS query or reply lost</td>
+<td>glibc <code>timeout:5</code>, <code>attempts:2</code>; each attempt walks the nameserver list</td>
+</tr>
+<tr class="odd">
+<td>~200 ms+ then recovery mid-transfer</td>
+<td>Retransmission timeout</td>
+<td>Linux RTO floor 200 ms</td>
+</tr>
+<tr class="even">
+<td>60 s idle, then the connection dies</td>
+<td>Idle timeout on a NAT or load balancer</td>
+<td>Many cloud LBs and NAT gateways default to 60 s to 350 s; varies by product</td>
+</tr>
+<tr class="odd">
+<td>Up to 2 min of new connections failing after a burst</td>
+<td>Conntrack or TIME_WAIT exhaustion</td>
+<td>Conntrack TIME_WAIT timeout 120 s; Linux socket TIME_WAIT 60 s</td>
+</tr>
+</tbody>
+</table>
+<h3 id="d18-budgets">Two budgets: MTU and conntrack</h3>
+<p>Two numbers cause more partial outages than any others: how many bytes fit through a tunnel, and how many flows a stateful box can remember. Both are simple arithmetic.</p>
+<p><code>d18_budgets.py</code>:</p>
+<div class="sourceCode" id="d18-cb9"><pre class="sourceCode python"><code class="sourceCode python"><span id="d18-cb9-1"><a href="#d18-cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Two budgets every troubleshooter should be able to compute on paper.&quot;&quot;&quot;</span></span>
+<span id="d18-cb9-2"><a href="#d18-cb9-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb9-3"><a href="#d18-cb9-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. MTU budget: what fits inside a tunnel on a 1500-byte path.</span></span>
+<span id="d18-cb9-4"><a href="#d18-cb9-4" aria-hidden="true" tabindex="-1"></a>IP4, IP6, TCP, TS_OPT <span class="op">=</span> <span class="dv">20</span>, <span class="dv">40</span>, <span class="dv">20</span>, <span class="dv">12</span></span>
+<span id="d18-cb9-5"><a href="#d18-cb9-5" aria-hidden="true" tabindex="-1"></a>overheads <span class="op">=</span> {                       <span class="co"># bytes added in front of the inner packet</span></span>
+<span id="d18-cb9-6"><a href="#d18-cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;none (plain Ethernet)&quot;</span>: <span class="dv">0</span>,</span>
+<span id="d18-cb9-7"><a href="#d18-cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;GRE over IPv4&quot;</span>: IP4 <span class="op">+</span> <span class="dv">4</span>,</span>
+<span id="d18-cb9-8"><a href="#d18-cb9-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;VXLAN over IPv4&quot;</span>: IP4 <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">14</span>,   <span class="co"># outer IP + UDP + VXLAN + inner Ethernet</span></span>
+<span id="d18-cb9-9"><a href="#d18-cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;WireGuard over IPv4&quot;</span>: IP4 <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">32</span>,   <span class="co"># outer IP + UDP + WG header and tag</span></span>
+<span id="d18-cb9-10"><a href="#d18-cb9-10" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;WireGuard over IPv6&quot;</span>: IP6 <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">32</span>,</span>
+<span id="d18-cb9-11"><a href="#d18-cb9-11" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="d18-cb9-12"><a href="#d18-cb9-12" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;encapsulation&#39;</span><span class="sc">:&lt;24}{</span><span class="st">&#39;inner MTU&#39;</span><span class="sc">:&gt;10}{</span><span class="st">&#39;TCP MSS&#39;</span><span class="sc">:&gt;9}{</span><span class="st">&#39;payload/seg&#39;</span><span class="sc">:&gt;13}</span><span class="ss">&quot;</span>)</span>
+<span id="d18-cb9-13"><a href="#d18-cb9-13" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> name, oh <span class="kw">in</span> overheads.items():</span>
+<span id="d18-cb9-14"><a href="#d18-cb9-14" aria-hidden="true" tabindex="-1"></a>    mtu <span class="op">=</span> <span class="dv">1500</span> <span class="op">-</span> oh</span>
+<span id="d18-cb9-15"><a href="#d18-cb9-15" aria-hidden="true" tabindex="-1"></a>    mss <span class="op">=</span> mtu <span class="op">-</span> IP4 <span class="op">-</span> TCP</span>
+<span id="d18-cb9-16"><a href="#d18-cb9-16" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">:&lt;24}{</span>mtu<span class="sc">:&gt;10}{</span>mss<span class="sc">:&gt;9}{</span>mss <span class="op">-</span> TS_OPT<span class="sc">:&gt;13}</span><span class="ss">&quot;</span>)</span>
+<span id="d18-cb9-17"><a href="#d18-cb9-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb9-18"><a href="#d18-cb9-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. Conntrack budget: entries = arrival rate x lifetime (Little&#39;s law).</span></span>
+<span id="d18-cb9-19"><a href="#d18-cb9-19" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>()</span>
+<span id="d18-cb9-20"><a href="#d18-cb9-20" aria-hidden="true" tabindex="-1"></a>max_entries <span class="op">=</span> <span class="dv">262_144</span></span>
+<span id="d18-cb9-21"><a href="#d18-cb9-21" aria-hidden="true" tabindex="-1"></a>flows <span class="op">=</span> [  <span class="co"># (label, new flows per second, seconds each entry lives)</span></span>
+<span id="d18-cb9-22"><a href="#d18-cb9-22" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;HTTP, pooled keep-alive&quot;</span>,        <span class="dv">5</span>, <span class="dv">600</span>),             <span class="co"># 10-min conn lifetime</span></span>
+<span id="d18-cb9-23"><a href="#d18-cb9-23" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;HTTP, new conn per request&quot;</span>,  <span class="dv">2_500</span>, <span class="dv">120</span>),            <span class="co"># TIME_WAIT 120 s</span></span>
+<span id="d18-cb9-24"><a href="#d18-cb9-24" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;DNS over UDP to CoreDNS&quot;</span>,     <span class="dv">4_000</span>, <span class="dv">30</span>),             <span class="co"># UDP, answered &lt; 2 s</span></span>
+<span id="d18-cb9-25"><a href="#d18-cb9-25" aria-hidden="true" tabindex="-1"></a>]</span>
+<span id="d18-cb9-26"><a href="#d18-cb9-26" aria-hidden="true" tabindex="-1"></a>total <span class="op">=</span> <span class="dv">0</span></span>
+<span id="d18-cb9-27"><a href="#d18-cb9-27" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> label, rate, life <span class="kw">in</span> flows:</span>
+<span id="d18-cb9-28"><a href="#d18-cb9-28" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> rate <span class="op">*</span> life</span>
+<span id="d18-cb9-29"><a href="#d18-cb9-29" aria-hidden="true" tabindex="-1"></a>    total <span class="op">+=</span> n</span>
+<span id="d18-cb9-30"><a href="#d18-cb9-30" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>label<span class="sc">:&lt;28}</span><span class="ss"> </span><span class="sc">{</span>rate<span class="sc">:&gt;6}</span><span class="ss">/s x </span><span class="sc">{</span>life<span class="sc">:&gt;6.0f}</span><span class="ss"> s = </span><span class="sc">{</span>n<span class="sc">:&gt;9,.0f}</span><span class="ss"> entries&quot;</span>)</span>
+<span id="d18-cb9-31"><a href="#d18-cb9-31" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;total&#39;</span><span class="sc">:&lt;28}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;&#39;</span><span class="sc">:&gt;21}</span><span class="ss"> </span><span class="sc">{</span>total<span class="sc">:&gt;11,.0f}</span><span class="ss">  vs nf_conntrack_max </span><span class="sc">{</span>max_entries<span class="sc">:,}</span><span class="ss">&quot;</span></span>
+<span id="d18-cb9-32"><a href="#d18-cb9-32" aria-hidden="true" tabindex="-1"></a>      <span class="ss">f&quot;  -&gt; </span><span class="sc">{</span>total <span class="op">/</span> max_entries<span class="sc">:.0%}</span><span class="ss"> full&quot;</span>)</span></code></pre></div>
+<p>Real output:</p>
+<pre class="text"><code>encapsulation            inner MTU  TCP MSS  payload/seg
+none (plain Ethernet)         1500     1460         1448
+GRE over IPv4                 1476     1436         1424
+VXLAN over IPv4               1450     1410         1398
+WireGuard over IPv4           1440     1400         1388
+WireGuard over IPv6           1420     1380         1368
+
+HTTP, pooled keep-alive           5/s x    600 s =     3,000 entries
+HTTP, new conn per request     2500/s x    120 s =   300,000 entries
+DNS over UDP to CoreDNS        4000/s x     30 s =   120,000 entries
+total                                                  423,000  vs nf_conntrack_max 262,144  -&gt; 161% full</code></pre>
+<p>The MTU table is why "small things work, big things hang" points at tunnels. Every encapsulation steals bytes. If nobody tells TCP about the smaller MTU, full-size 1500-byte packets don't fit. (WireGuard's default interface MTU is 1420 precisely because it budgets for an IPv6 outer header.)</p>
+<p>The conntrack line is Little's law: entries in the table equal the rate of new flows times how long each entry lives. The killer is the row in the middle. A client that opens a new TCP connection per request, at only 2,500 requests per second, holds 300,000 entries, because each closed connection lingers in conntrack's TIME_WAIT state for 120 seconds. Switch to pooled keep-alive connections and the same traffic needs a few thousand.</p>
+<h3 id="d18-ndots-math">Search-list amplification</h3>
+<p>Kubernetes sets <code>ndots:5</code> in every pod's <code>/etc/resolv.conf</code> so that short names like <code>payments-db.data</code> resolve inside the cluster. The side effect is that any name with fewer than five dots — which is nearly every external hostname — is first tried with every search domain appended. This script applies the resolver's rules from <code>resolv.conf(5)</code>:</p>
+<p><code>d18_ndots.py</code>:</p>
+<div class="sourceCode" id="d18-cb11"><pre class="sourceCode python"><code class="sourceCode python"><span id="d18-cb11-1"><a href="#d18-cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;What glibc&#39;s stub resolver sends for one getaddrinfo() call, per resolv.conf.</span></span>
+<span id="d18-cb11-2"><a href="#d18-cb11-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb11-3"><a href="#d18-cb11-3" aria-hidden="true" tabindex="-1"></a><span class="co">Rules (resolv.conf(5)): a name ending in &quot;.&quot; is absolute. Otherwise, if it has</span></span>
+<span id="d18-cb11-4"><a href="#d18-cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co">at least `ndots` dots it is tried as-is first; if fewer, the search list is</span></span>
+<span id="d18-cb11-5"><a href="#d18-cb11-5" aria-hidden="true" tabindex="-1"></a><span class="co">tried first. Each candidate is asked for A and AAAA (sent in parallel).</span></span>
+<span id="d18-cb11-6"><a href="#d18-cb11-6" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d18-cb11-7"><a href="#d18-cb11-7" aria-hidden="true" tabindex="-1"></a>SEARCH <span class="op">=</span> [<span class="st">&quot;payments.svc.cluster.local&quot;</span>, <span class="st">&quot;svc.cluster.local&quot;</span>, <span class="st">&quot;cluster.local&quot;</span>,</span>
+<span id="d18-cb11-8"><a href="#d18-cb11-8" aria-hidden="true" tabindex="-1"></a>          <span class="st">&quot;eu-west-1.compute.internal&quot;</span>]</span>
+<span id="d18-cb11-9"><a href="#d18-cb11-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb11-10"><a href="#d18-cb11-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb11-11"><a href="#d18-cb11-11" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> candidates(name, ndots, search<span class="op">=</span>SEARCH):</span>
+<span id="d18-cb11-12"><a href="#d18-cb11-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> name.endswith(<span class="st">&quot;.&quot;</span>):</span>
+<span id="d18-cb11-13"><a href="#d18-cb11-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> [name]</span>
+<span id="d18-cb11-14"><a href="#d18-cb11-14" aria-hidden="true" tabindex="-1"></a>    expanded <span class="op">=</span> [<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">.</span><span class="sc">{</span>d<span class="sc">}</span><span class="ss">.&quot;</span> <span class="cf">for</span> d <span class="kw">in</span> search]</span>
+<span id="d18-cb11-15"><a href="#d18-cb11-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> name.count(<span class="st">&quot;.&quot;</span>) <span class="op">&gt;=</span> ndots:</span>
+<span id="d18-cb11-16"><a href="#d18-cb11-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> [name <span class="op">+</span> <span class="st">&quot;.&quot;</span>] <span class="op">+</span> expanded</span>
+<span id="d18-cb11-17"><a href="#d18-cb11-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> expanded <span class="op">+</span> [name <span class="op">+</span> <span class="st">&quot;.&quot;</span>]</span>
+<span id="d18-cb11-18"><a href="#d18-cb11-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb11-19"><a href="#d18-cb11-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb11-20"><a href="#d18-cb11-20" aria-hidden="true" tabindex="-1"></a>EXISTS <span class="op">=</span> {<span class="st">&quot;api.partner.example.&quot;</span>, <span class="st">&quot;payments-db.data.svc.cluster.local.&quot;</span>}</span>
+<span id="d18-cb11-21"><a href="#d18-cb11-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb11-22"><a href="#d18-cb11-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb11-23"><a href="#d18-cb11-23" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> lookup(name, ndots):</span>
+<span id="d18-cb11-24"><a href="#d18-cb11-24" aria-hidden="true" tabindex="-1"></a>    tries <span class="op">=</span> []</span>
+<span id="d18-cb11-25"><a href="#d18-cb11-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> c <span class="kw">in</span> candidates(name, ndots):</span>
+<span id="d18-cb11-26"><a href="#d18-cb11-26" aria-hidden="true" tabindex="-1"></a>        tries.append(c)</span>
+<span id="d18-cb11-27"><a href="#d18-cb11-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> c <span class="kw">in</span> EXISTS:                  <span class="co"># first positive answer ends the walk</span></span>
+<span id="d18-cb11-28"><a href="#d18-cb11-28" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span></span>
+<span id="d18-cb11-29"><a href="#d18-cb11-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> tries</span>
+<span id="d18-cb11-30"><a href="#d18-cb11-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb11-31"><a href="#d18-cb11-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb11-32"><a href="#d18-cb11-32" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> name, nd <span class="kw">in</span> [(<span class="st">&quot;api.partner.example&quot;</span>, <span class="dv">5</span>), (<span class="st">&quot;api.partner.example&quot;</span>, <span class="dv">2</span>),</span>
+<span id="d18-cb11-33"><a href="#d18-cb11-33" aria-hidden="true" tabindex="-1"></a>                 (<span class="st">&quot;api.partner.example.&quot;</span>, <span class="dv">5</span>), (<span class="st">&quot;payments-db.data&quot;</span>, <span class="dv">5</span>)]:</span>
+<span id="d18-cb11-34"><a href="#d18-cb11-34" aria-hidden="true" tabindex="-1"></a>    tries <span class="op">=</span> lookup(name, nd)</span>
+<span id="d18-cb11-35"><a href="#d18-cb11-35" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">!r}</span><span class="ss"> ndots:</span><span class="sc">{</span>nd<span class="sc">}</span><span class="ss"> -&gt; </span><span class="sc">{</span><span class="bu">len</span>(tries)<span class="sc">}</span><span class="ss"> attempt(s), </span><span class="sc">{</span><span class="dv">2</span> <span class="op">*</span> <span class="bu">len</span>(tries)<span class="sc">}</span><span class="ss"> queries&quot;</span>)</span>
+<span id="d18-cb11-36"><a href="#d18-cb11-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> t <span class="kw">in</span> tries:</span>
+<span id="d18-cb11-37"><a href="#d18-cb11-37" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;    A+AAAA </span><span class="sc">{</span>t<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d18-cb11-38"><a href="#d18-cb11-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d18-cb11-39"><a href="#d18-cb11-39" aria-hidden="true" tabindex="-1"></a><span class="co"># Tail latency: each attempt is one UDP round trip pair. If either packet of</span></span>
+<span id="d18-cb11-40"><a href="#d18-cb11-40" aria-hidden="true" tabindex="-1"></a><span class="co"># the pair is lost, glibc waits `timeout` (default 5 s) before retrying.</span></span>
+<span id="d18-cb11-41"><a href="#d18-cb11-41" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">chance that one lookup hits a 5 s retry, per-attempt loss p:&quot;</span>)</span>
+<span id="d18-cb11-42"><a href="#d18-cb11-42" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> p <span class="kw">in</span> (<span class="fl">0.001</span>, <span class="fl">0.01</span>):</span>
+<span id="d18-cb11-43"><a href="#d18-cb11-43" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> n <span class="kw">in</span> (<span class="dv">1</span>, <span class="dv">5</span>):</span>
+<span id="d18-cb11-44"><a href="#d18-cb11-44" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  p=</span><span class="sc">{</span>p<span class="sc">:&lt;5}</span><span class="ss">  attempts=</span><span class="sc">{</span>n<span class="sc">}</span><span class="ss">:  </span><span class="sc">{</span><span class="dv">1</span> <span class="op">-</span> (<span class="dv">1</span> <span class="op">-</span> p) <span class="op">**</span> n<span class="sc">:6.2%}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+<p>Real output:</p>
+<pre class="text"><code>&#39;api.partner.example&#39; ndots:5 -&gt; 5 attempt(s), 10 queries
+    A+AAAA api.partner.example.payments.svc.cluster.local.
+    A+AAAA api.partner.example.svc.cluster.local.
+    A+AAAA api.partner.example.cluster.local.
+    A+AAAA api.partner.example.eu-west-1.compute.internal.
+    A+AAAA api.partner.example.
+&#39;api.partner.example&#39; ndots:2 -&gt; 1 attempt(s), 2 queries
+    A+AAAA api.partner.example.
+&#39;api.partner.example.&#39; ndots:5 -&gt; 1 attempt(s), 2 queries
+    A+AAAA api.partner.example.
+&#39;payments-db.data&#39; ndots:5 -&gt; 2 attempt(s), 4 queries
+    A+AAAA payments-db.data.payments.svc.cluster.local.
+    A+AAAA payments-db.data.svc.cluster.local.
+
+chance that one lookup hits a 5 s retry, per-attempt loss p:
+  p=0.001  attempts=1:   0.10%
+  p=0.001  attempts=5:   0.50%
+  p=0.01   attempts=1:   1.00%
+  p=0.01   attempts=5:   4.90%</code></pre>
+<p>One external lookup becomes ten queries, eight of them for names that don't exist but still have to be answered. Two fixes remove the amplification entirely: a lower <code>ndots</code>, or a trailing dot on the name. The tail-latency lines matter more than the query count. Every attempt is another chance for a UDP packet to be lost, and each loss costs a fixed 5 seconds. At 1% loss per attempt, five attempts put almost one lookup in twenty into a 5-second stall. That's exactly what a p95 or p99 graph shows.</p>
+<h2 id="d18-incidents">Deep dive: four incidents, end to end</h2>
+<p>Each incident follows the same shape: <strong>symptom → hypothesis → proof → fix.</strong> The proof step is the part to copy. A hypothesis isn't done until a command shows the mechanism directly.</p>
+<h3 id="d18-pmtu">Incident 1: the PMTU black hole</h3>
+<p><strong>Symptom.</strong> After the office's traffic to the cloud VPC moved onto a new site-to-site tunnel, engineers in the office can still SSH to the internal Git server <code>172.20.4.11</code> and run small API calls against it. But <code>git clone</code> over HTTPS hangs. So does <code>curl https://git.internal</code>, and it hangs after the TCP connect, during the TLS handshake. From a laptop on home Wi-Fi, through the client VPN, everything works.</p>
+<p><strong>Hypothesis.</strong> Small packets pass and large ones vanish, and a path just changed. That points at MTU. The tunnel takes bytes from each packet, so full-size 1500-byte packets from the server don't fit. The router at the tunnel should send an ICMP "fragmentation needed" back to the server, and the server should shrink its packets. Something is eating that ICMP. A TLS handshake fails first because the server's first flight (certificate chain included) is several kilobytes: its full-size packets are the first ones that don't fit. An interactive SSH session sends mostly small packets, so it gets away with it.</p>
+<p><strong>Proof, step 1: the capture on the client.</strong></p>
+<pre class="text"><code>$ sudo tcpdump -nn -i eth0 &#39;host 172.20.4.11 and tcp port 443&#39;
+10:02:11.400112 IP 10.0.1.20.51022 &gt; 172.20.4.11.443: Flags [S], seq 2087211001, win 64240, options [mss 1460,sackOK,TS val 1123 ecr 0,nop,wscale 7], length 0
+10:02:11.431507 IP 172.20.4.11.443 &gt; 10.0.1.20.51022: Flags [S.], seq 914822337, ack 2087211002, win 65160, options [mss 1460,sackOK,TS val 77120 ecr 1123,nop,wscale 7], length 0
+10:02:11.431566 IP 10.0.1.20.51022 &gt; 172.20.4.11.443: Flags [.], ack 1, win 502, options [nop,nop,TS val 1155 ecr 77120], length 0
+10:02:11.432010 IP 10.0.1.20.51022 &gt; 172.20.4.11.443: Flags [P.], seq 1:518, ack 1, win 502, options [nop,nop,TS val 1156 ecr 77120], length 517
+10:02:11.463702 IP 172.20.4.11.443 &gt; 10.0.1.20.51022: Flags [.], ack 518, win 507, options [nop,nop,TS val 77152 ecr 1156], length 0
+10:02:11.464120 IP 172.20.4.11.443 &gt; 10.0.1.20.51022: Flags [P.], seq 2897:4133, ack 518, win 507, options [nop,nop,TS val 77153 ecr 1156], length 1236
+10:02:11.464151 IP 10.0.1.20.51022 &gt; 172.20.4.11.443: Flags [.], ack 1, win 502, options [nop,nop,TS val 1188 ecr 77153,nop,nop,sack 1 {2897:4133}], length 0
+              ... 30 s of silence; curl eventually times out ...</code></pre>
+<p>Read it in order. Both sides advertise MSS 1460, so both think the path carries 1500-byte packets. Nobody clamped the MSS at the tunnel. The ClientHello (517 bytes) goes out and is acknowledged. Then the server sends its 4,132-byte first flight as three segments: 1448 + 1448 + 1236 bytes of payload. Only the <em>third</em> one arrives. With its IP and TCP headers it's 1,288 bytes, small enough to fit the tunnel. The client says so with a SACK: "I have 2897–4133, I'm missing everything before it." The two full-size segments, and every retransmission of them, never arrive.</p>
+<p>That capture is close to a signature by itself: small segments delivered, a SACK hole exactly the size of the full-size segments, and nothing else.</p>
+<p><strong>Proof, step 2: measure the path MTU from the client side.</strong> The client's direction is healthy, so the router's ICMP reaches it:</p>
+<pre class="text"><code>$ tracepath -n 172.20.4.11
+ 1?: [LOCALHOST]                      pmtu 1500
+ 1:  10.0.1.1                                              0.512ms
+ 1:  10.0.1.1                                              0.401ms
+ 2:  10.0.1.1                                              0.388ms pmtu 1400
+ 2:  169.254.10.2                                         28.914ms
+ 3:  172.20.4.11                                          30.122ms reached
+     Resume: pmtu 1400 hops 3 back 3
+
+$ ping -M do -s 1372 -c 1 172.20.4.11      # 1372 + 8 ICMP + 20 IP = 1400: fits
+$ ping -M do -s 1373 -c 1 172.20.4.11      # 1401: the router answers &quot;frag needed (mtu = 1400)&quot;</code></pre>
+<p>On macOS the don't-fragment flag is <code>-D</code>: <code>ping -D -s 1372 172.20.4.11</code>.</p>
+<p><strong>Proof, step 3: find who eats the ICMP.</strong> On the server, watch for the one ICMP message that should be arriving:</p>
+<pre class="text"><code>$ sudo tcpdump -nn -i eth0 &#39;icmp[icmptype] == icmp-unreach and icmp[icmpcode] == 4&#39;
+(nothing, while the client retries)
+
+$ ip route get 10.0.1.20
+10.0.1.20 via 172.20.4.1 dev eth0 src 172.20.4.11 uid 0
+    cache</code></pre>
+<p>No ICMP arrives, and the server's route has no learned MTU: it still believes 1500 is fine. A capture on the tunnel router's VPC-facing interface shows it <em>sending</em> those ICMP messages. So the drop sits between the router and the server. Here it was the cloud firewall in front of the server, which allowed <code>tcp/443</code> inbound and nothing else. Some stateful firewalls pass ICMP errors that relate to an existing flow. Several cloud security-group implementations need an explicit rule for them.</p>
+<p><strong>Fix.</strong> Do two things, because each covers the other's gap.</p>
+<ol type="1">
+<li>Clamp the MSS on the tunnel router, so TCP never sends packets that don't fit. On Linux: <code>iptables -t mangle -A FORWARD -o tun0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu</code>. This rewrites the MSS option in SYNs entering the tunnel to 1360 (1400 − 40), so the server never builds a segment bigger than the tunnel can carry. It only helps TCP.</li>
+<li>Allow ICMP "fragmentation needed" (IPv4 type 3 code 4) and ICMPv6 "Packet Too Big" (type 2) through every firewall on the path, so PMTU discovery works for everything else: UDP, QUIC, and any TCP that bypasses the clamp. Blocking ICMPv6 Packet Too Big breaks IPv6 outright, because IPv6 routers never fragment.</li>
+</ol>
+<p>On servers you can also set <code>net.ipv4.tcp_mtu_probing=1</code>. It enables packetization-layer PMTU discovery (RFC 4821), where TCP probes with smaller segments after repeated losses instead of relying on ICMP. It's a safety net, not a fix. Verify the fix with the same <code>curl</code> and capture: the handshake completes, and the server's capture shows the client's SYN arriving with <code>mss 1360</code>.</p>
+<h3 id="d18-ndots">Incident 2: the 5-second DNS tail in Kubernetes</h3>
+<p><strong>Symptom.</strong> A checkout service calls a payment partner's API at <code>api.partner.example</code>. Median latency is 40 ms. p99 is just over 5 seconds, and the spikes cluster at 5.0x seconds. The partner's own dashboards show nothing slower than 50 ms. Curling the API from the node itself is always fast.</p>
+<p><strong>Hypothesis.</strong> A delay of exactly 5 s matches the resolver timeout in the timer table. Pods and nodes resolve differently: pods get <code>ndots:5</code> and a cluster search list. So each lookup becomes many queries, and losing any one of them costs 5 seconds.</p>
+<p><strong>Proof, step 1: the resolver configuration the application actually uses.</strong></p>
+<pre class="text"><code>$ kubectl exec deploy/checkout -- cat /etc/resolv.conf
+search payments.svc.cluster.local svc.cluster.local cluster.local eu-west-1.compute.internal
+nameserver 10.96.0.10
+options ndots:5</code></pre>
+<p><code>api.partner.example</code> has two dots, fewer than five, so the search list runs first. <code>d18_ndots.py</code> above predicts ten queries.</p>
+<p><strong>Proof, step 2: count them on the wire.</strong> Capture inside the pod's network namespace, or on the node filtering by pod IP:</p>
+<pre class="text"><code>$ sudo tcpdump -nn -i any &#39;udp port 53 and host 10.244.3.17&#39;
+11:20:03.101220 IP 10.244.3.17.40312 &gt; 10.96.0.10.53: 18211+ A? api.partner.example.payments.svc.cluster.local. (64)
+11:20:03.101243 IP 10.244.3.17.40312 &gt; 10.96.0.10.53: 52144+ AAAA? api.partner.example.payments.svc.cluster.local. (64)
+11:20:03.101871 IP 10.96.0.10.53 &gt; 10.244.3.17.40312: 18211 NXDomain*- 0/1/0 (118)
+11:20:03.101902 IP 10.96.0.10.53 &gt; 10.244.3.17.40312: 52144 NXDomain*- 0/1/0 (118)
+      ... the same pair for svc.cluster.local, cluster.local, eu-west-1.compute.internal ...
+11:20:03.104410 IP 10.244.3.17.40312 &gt; 10.96.0.10.53: 30981+ A? api.partner.example. (37)
+11:20:03.104433 IP 10.244.3.17.40312 &gt; 10.96.0.10.53: 41207+ AAAA? api.partner.example. (37)
+11:20:03.118802 IP 10.96.0.10.53 &gt; 10.244.3.17.40312: 30981 1/0/0 A 198.51.100.40 (53)
+      ... 5.0 s: no AAAA answer ...
+11:20:08.109921 IP 10.244.3.17.40312 &gt; 10.96.0.10.53: 30981+ A? api.partner.example. (37)
+11:20:08.110514 IP 10.96.0.10.53 &gt; 10.244.3.17.40312: 30981 1/0/0 A 198.51.100.40 (53)
+11:20:08.110602 IP 10.244.3.17.40312 &gt; 10.96.0.10.53: 41207+ AAAA? api.partner.example. (37)
+11:20:08.121377 IP 10.96.0.10.53 &gt; 10.244.3.17.40312: 41207 0/1/0 (88)</code></pre>
+<p>The numbers in parentheses are DNS message sizes, and they check out: a 12-byte header, the encoded name, and 4 bytes of type and class give 37 bytes for <code>api.partner.example.</code> and 64 for the longest search-list name. The <code>*</code> marks an authoritative answer: CoreDNS owns <code>cluster.local</code>, so it answers NXDOMAIN itself, instantly. glibc sends A and AAAA in parallel from the same socket. On the final attempt the A answer came back, the AAAA answer never did, and after 5 seconds glibc retried. Note the shape of the retry. After a timeout in which one answer <em>did</em> arrive, glibc switches to sending the two queries one after the other — a built-in workaround for exactly this kind of loss.</p>
+<p><strong>Proof, step 3: where was the packet lost?</strong> Both queries share one 5-tuple. On the node, the Service IP <code>10.96.0.10</code> is DNAT-ed to a CoreDNS pod by conntrack. Two packets of a new flow arriving at the same moment race to create the same conntrack entry, and the loser can be dropped:</p>
+<pre class="text"><code>$ sudo conntrack -S | head -2
+cpu=0       found=0 invalid=1253 ignore=0 insert=0 insert_failed=8841 drop=8841 early_drop=0 error=0 search_restart=0
+cpu=1       found=0 invalid=1190 ignore=0 insert=0 insert_failed=9102 drop=9102 early_drop=0 error=0 search_restart=0</code></pre>
+<p><code>insert_failed</code> climbing in step with DNS traffic is the race. Newer kernels resolve most of these clashes (they show up in a separate <code>clash_resolve</code> counter instead), so on a current node the loss may be elsewhere. The other usual suspects are CoreDNS CPU throttling under its limits, and per-interface packet limits on the cloud provider's DNS endpoint. On AWS, the ENA driver counts those drops as <code>linklocal_allowance_exceeded</code> in <code>ethtool -S</code>. Either way the mechanism is the same: loss times attempts.</p>
+<p><strong>Fix.</strong> Remove the amplification first, because it multiplies every other problem:</p>
+<ul>
+<li>Set <code>ndots</code> lower for workloads that mostly call external names. In the pod spec: <code>dnsConfig: {options: [{name: ndots, value: "2"}]}</code>. Short in-cluster names like <code>payments-db.data</code> still work, because they have fewer than two dots.</li>
+<li>Use fully qualified names with a trailing dot (<code>api.partner.example.</code>) in configuration where you can.</li>
+<li>Run NodeLocal DNSCache, so every pod queries a cache on its own node. That shortens the path, and in its usual setup it reaches the cluster DNS over TCP, which sidesteps the UDP conntrack race.</li>
+<li>Where you can't change the image or the platform, <code>options single-request-reopen</code> in resolv.conf makes glibc use a separate socket for the second query.</li>
+</ul>
+<p>Verify by counting again: two queries per lookup in the capture, and the p99 step at 5 s disappears from the latency histogram.</p>
+<h3 id="d18-conntrack">Incident 3: conntrack exhaustion</h3>
+<p><strong>Symptom.</strong> On one group of Kubernetes nodes, roughly 1 in 50 new outbound connections times out. Established connections are fine. Retries usually work. It started right after a deploy of a new HTTP client library, and it gets worse at the hourly traffic peak.</p>
+<p><strong>Hypothesis.</strong> "New connections fail, existing ones are fine" means a per-new-flow resource is exhausted. The timing points at a change in connection behaviour. If the new library stopped reusing connections, each request now creates a new flow, and every flow occupies a conntrack entry for 120 seconds after it closes.</p>
+<p><strong>Proof.</strong></p>
+<pre class="text"><code>$ dmesg -T | grep conntrack | tail -2
+[Fri Oct 16 14:00:12 2026] nf_conntrack: nf_conntrack: table full, dropping packet
+[Fri Oct 16 14:00:12 2026] nf_conntrack: nf_conntrack: table full, dropping packet
+
+$ cat /proc/sys/net/netfilter/nf_conntrack_count /proc/sys/net/netfilter/nf_conntrack_max
+262144
+262144
+
+$ sudo conntrack -L -p tcp -o extended 2&gt;/dev/null | awk &#39;{print $6}&#39; | sort | uniq -c | sort -rn | head -4
+ 214877 TIME_WAIT
+  27160 ESTABLISHED
+   1806 CLOSE
+    412 SYN_SENT
+
+$ sudo conntrack -L -p tcp --state TIME_WAIT | head -1
+tcp      6 117 TIME_WAIT src=10.244.3.17 dst=10.96.112.40 sport=48812 dport=8080 src=10.244.7.9 dst=10.244.3.17 sport=8080 dport=48812 [ASSURED] mark=0 use=1</code></pre>
+<p>The table is exactly full, and more than four-fifths of it is TCP TIME_WAIT entries for connections that already finished. (The remaining 17,889 entries are UDP.) The sample entry shows both directions of the flow: the original tuple to the Service IP, and the reply tuple from the backend pod after DNAT. The <code>117</code> is seconds left before it expires. A packet the kernel can't track is dropped. For a new connection, that's a SYN, which the client retransmits after 1 s — hence "retries usually work."</p>
+<p>To tie it to the deploy, compare the connection rate before and after: <code>nstat -az TcpActiveOpens</code> sampled twice, a minute apart, gives new outbound connections per second. A jump from tens to thousands per second at the same request rate is the missing connection pool. The Little's-law budget from earlier is the arithmetic: 2,500 new connections per second times 120 seconds is 300,000 entries, more than the table holds.</p>
+<p><strong>Fix.</strong> In order of preference:</p>
+<ol type="1">
+<li>Fix the cause. Restore connection pooling and keep-alive in the client. This cuts the entry count by orders of magnitude and saves a TCP and TLS handshake on every request.</li>
+<li>Buy headroom. Raise <code>net.netfilter.nf_conntrack_max</code> and the hash table size together (<code>/sys/module/nf_conntrack/parameters/hashsize</code>), so lookups stay short chains. Budget memory: each entry costs a few hundred bytes of kernel memory (check the <code>nf_conntrack</code> line in <code>/proc/slabinfo</code>), so a million entries is a few hundred megabytes.</li>
+<li>Shorten the lifetime. <code>net.netfilter.nf_conntrack_tcp_timeout_time_wait</code> can come down from 120 s. Lowering it moderately is safe, since the endpoints keep their own TIME_WAIT state.</li>
+<li>Don't track what doesn't need tracking. High-volume flows that need no NAT or stateful filtering can skip conntrack with a <code>notrack</code> rule in the raw table. Node-local DNS caches often do this for their own traffic.</li>
+</ol>
+<p>Then add an alert on <code>nf_conntrack_count / nf_conntrack_max</code> above 75%. The <code>table full</code> message arrives only after users are already affected.</p>
+<p><strong>The second table.</strong> On cloud VMs there may be another connection table you don't control. AWS security groups are stateful and enforced in the hypervisor, with a per-interface limit on tracked connections. When that fills, the ENA driver's <code>conntrack_allowance_exceeded</code> counter climbs in <code>ethtool -S eth0</code>, while the kernel's table looks fine. Same symptom, different table, different fix: a larger instance size, or security-group rules that let the provider skip tracking for those flows.</p>
+<h3 id="d18-asymmetric">Incident 4: asymmetric routing</h3>
+<p><strong>Symptom.</strong> A PostgreSQL server <code>db-07</code> has two interfaces. <code>eth0</code> is on the management network, <code>10.0.0.0/24</code>, and carries the default route. <code>eth1</code> is on the data network, <code>10.1.0.0/24</code>, and the database listens on <code>10.1.0.5:5432</code>. Application servers in the same data subnet connect fine. A new analytics cluster in <code>192.168.50.0/24</code>, routed in through the data network's firewall, gets connection timeouts. <code>nc -vz 10.1.0.5 5432</code> from an analytics host hangs and never says "refused."</p>
+<p><strong>Hypothesis.</strong> Timeout, not refused: packets are being swallowed. Same-subnet clients work and routed clients don't. The difference between them is the return path. Replies to <code>192.168.50.10</code> don't match any connected route on <code>db-07</code>, so they follow the default route out of <code>eth0</code>. They leave through a different interface, and a different firewall, from the one the SYN came in on. The management firewall never saw the SYN, so it treats the SYN-ACK as an invalid packet and drops it.</p>
+<p><strong>Proof, step 1: watch both interfaces at once.</strong></p>
+<pre class="text"><code>$ sudo tcpdump -nn -i any &#39;host 192.168.50.10 and tcp port 5432&#39;
+10:14:02.331207 eth1  In  IP 192.168.50.10.53344 &gt; 10.1.0.5.5432: Flags [S], seq 3011849210, win 64240, options [mss 1460,sackOK,TS val 99120 ecr 0,nop,wscale 7], length 0
+10:14:02.331251 eth0  Out IP 10.1.0.5.5432 &gt; 192.168.50.10.53344: Flags [S.], seq 1201733905, ack 3011849211, win 65160, options [mss 1460,sackOK,TS val 51117 ecr 99120,nop,wscale 7], length 0
+10:14:03.355190 eth1  In  IP 192.168.50.10.53344 &gt; 10.1.0.5.5432: Flags [S], seq 3011849210, win 64240, options [mss 1460,sackOK,TS val 100144 ecr 0,nop,wscale 7], length 0
+10:14:03.355226 eth0  Out IP 10.1.0.5.5432 &gt; 192.168.50.10.53344: Flags [S.], seq 1201733905, ack 3011849211, win 65160, options [mss 1460,sackOK,TS val 52141 ecr 100144,nop,wscale 7], length 0</code></pre>
+<p>There it is in two lines: the SYN arrives on <code>eth1</code>, the SYN-ACK leaves on <code>eth0</code>. The client never gets the SYN-ACK, so it retransmits the SYN after about one second (the first timer fingerprint). The server answers each one again, out of the wrong door.</p>
+<p><strong>Proof, step 2: ask the kernel why.</strong></p>
+<pre class="text"><code>$ ip route get 192.168.50.10 from 10.1.0.5
+192.168.50.10 from 10.1.0.5 via 10.0.0.1 dev eth0 uid 0
+    cache</code></pre>
+<p>Linux routes by destination. The source address <code>10.1.0.5</code> doesn't change the decision, so replies follow the default route. The management firewall's logs confirm it with a run of "invalid state" drops for SYN-ACKs from <code>10.1.0.5:5432</code>.</p>
+<p><strong>A variation you'll also meet.</strong> If <code>net.ipv4.conf.eth1.rp_filter</code> is 1 (strict), the symptom changes. Now no SYN-ACK appears at all. The capture still shows the SYN arriving on <code>eth1</code>, because the tap runs before the reverse-path check, as the diagram above shows. The kernel then drops it: the best route back to <code>192.168.50.10</code> points out <code>eth0</code>, not the interface the SYN came in on. The only evidence is a counter:</p>
+<pre class="text"><code>$ nstat -az TcpExtIPReversePathFilter
+TcpExtIPReversePathFilter       1873               0.0</code></pre>
+<p>This is Module 17's uRPF (the BCP 38 mechanism), running on a single host and doing exactly what it was designed to do.</p>
+<p><strong>Fix.</strong> Make replies leave through the interface their address belongs to, with source-based policy routing:</p>
+<pre class="text"><code># a routing table for traffic sourced from the data address
+sudo ip route add 10.1.0.0/24 dev eth1 src 10.1.0.5 table 101
+sudo ip route add default via 10.1.0.1 dev eth1 table 101
+sudo ip rule add from 10.1.0.5/32 lookup 101 priority 1000
+
+$ ip route get 192.168.50.10 from 10.1.0.5
+192.168.50.10 from 10.1.0.5 via 10.1.0.1 dev eth1 table 101 uid 0
+    cache</code></pre>
+<p>Make it persistent in the host's network configuration (netplan, NetworkManager and systemd-networkd all support routing policy rules). If <code>rp_filter</code> is strict, either set it to 2 (loose) on both interfaces or rely on the policy routes. The policy routes satisfy the strict check too, because the kernel's reverse lookup for traffic to <code>10.1.0.5</code> now finds <code>eth1</code>. Verify with the same <code>tcpdump -i any</code>: SYN in on <code>eth1</code>, SYN-ACK out on <code>eth1</code>.</p>
+<p>The same failure shows up all over the cloud: VMs with a second network interface, which typically need the same policy routing; Kubernetes services where a load balancer sends traffic to a node that replies directly; and hybrid links where BGP prefers one path out and another path in. Any stateful device that sees only one direction of a flow will drop it.</p>
+<h2 id="d18-2026">Deep dive: 2026 context</h2>
+<p><strong>Most of your vantage points are virtual.</strong> On a Kubernetes node, a packet can cross a pod's veth, a bridge or eBPF program, iptables or nftables rules for Services, an overlay encapsulation and the host NIC before it leaves. Capture at more than one of these points. With eBPF-based networking, the iptables view is empty and the state lives in eBPF maps. Use the CNI's own tooling: Cilium, for example, has <code>cilium monitor</code> and Hubble to show verdicts and drops per flow, with a reason.</p>
+<p><strong>Cloud networks hide the middle of the path.</strong> You can't run <code>tcpdump</code> on the VPC router or the managed NAT gateway. Your evidence is flow logs (which record accept or reject per flow, without payloads), provider metrics, and per-interface counters like ENA's <code>bw_in_allowance_exceeded</code>, <code>pps_allowance_exceeded</code>, <code>conntrack_allowance_exceeded</code> and <code>linklocal_allowance_exceeded</code>. Learn which counters your platform exposes before an incident. They are often the only proof that the provider dropped the packet and not you.</p>
+<p><strong>QUIC changes the toolbox.</strong> HTTP/3 runs over UDP with almost every header encrypted, so <code>tcpdump</code> shows you sizes and timing, not sequence numbers or ACKs. To see inside QUIC you need endpoint data: qlog files from the client or server, or a key log (<code>SSLKEYLOGFILE</code>) loaded into Wireshark. QUIC also changes the PMTU story. It needs at least 1,200 bytes per datagram, and it discovers the path MTU itself with probes (RFC 9000 and RFC 8899). When UDP is blocked or black-holed, browsers fall back to TCP, so "HTTP/3 is broken" often looks like slightly slower page loads rather than an outage. Compare <code>curl --http3</code> against <code>curl --http2</code> to tell the two apart.</p>
+<p><strong>Encrypted DNS moves the evidence.</strong> With DNS over HTTPS or TLS on the client, <code>tcpdump 'udp port 53'</code> shows nothing, and the resolver your app actually uses may not be the one in <code>resolv.conf</code>. Check the application's or browser's DNS settings. On macOS, look at <code>scutil --dns</code> for per-domain resolvers that VPN and MDM profiles install.</p>
+<p><strong>The one-command answer is still the packet.</strong> None of this changes the module's last word: captures don't lie. What changes is <em>where</em> you have to stand to take one, and how often the honest answer is a counter rather than a capture.</p>
+<h2 id="d18-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: tcpdump on the server shows the client's SYN arriving, but no SYN-ACK goes out. List the places it could have died, and how you'd tell them apart.</strong></p>
+<p>The capture tap is before the firewall, so the SYN can still be dropped by netfilter (check rule counters with <code>nft list ruleset</code> or <code>iptables -L -v</code>, or add a log rule), by the reverse-path filter (<code>TcpExtIPReversePathFilter</code>), or by a full conntrack table (<code>table full</code> in dmesg, drops in <code>conntrack -S</code>). It can die at the listener when the accept queue is full (<code>TcpExtListenOverflows</code>). Or the SYN-ACK <em>was</em> generated and an OUTPUT rule dropped it before the tap. (No listener at all would produce a RST, which you'd see.) Each of these has its own counter. Read the counter; don't guess.</p>
+<p><strong>Q2: Why does a PMTU black hole break TLS handshakes and <code>git clone</code> but not SSH logins or small API calls?</strong></p>
+<p>Only packets larger than the path MTU are dropped. Small requests and interactive SSH fit. The server's TLS first flight, with its certificate chain, and any bulk transfer fill full-size segments, so they're the first to vanish. It shows up as a stall right after the ClientHello, with SACK holes in the capture.</p>
+<p><strong>Q3: <code>curl -w</code> shows <code>time_connect</code> at 31 ms and <code>time_appconnect</code> at 3.1 s. What are your hypotheses?</strong></p>
+<p>The TCP handshake was fine, so the path works for small packets. Three seconds inside TLS points to one of three things. A packet in the server's large flight was lost and retransmission timeouts followed (PMTU, or plain loss on a congested link). The server did slow work during the handshake, such as a remote key operation or an OCSP fetch. Or a TLS-inspecting middlebox was slow to fetch and mint certificates. <code>openssl s_client</code> from the same host plus a capture separates them: missing segments versus a quiet server.</p>
+<p><strong>Q4: mtr shows 40% loss at hop 6 and 0% at the destination. Is there a problem?</strong></p>
+<p>Not at hop 6. That router rate-limits the ICMP time-exceeded messages it generates, because they're handled by its control-plane CPU, while transit traffic is forwarded in hardware. Real loss starts at a hop and continues to the destination. The same goes for latency spikes that don't persist.</p>
+<p><strong>Q5: Latency spikes of exactly 5 seconds appear in a service's p99, only from inside Kubernetes pods. Walk me through it.</strong></p>
+<p>5 seconds is the glibc resolver timeout, so the first suspect is a lost DNS packet. Pods use <code>ndots:5</code> with a long search list, so external names generate around ten queries per lookup, multiplying the chance of a loss. Prove it by reading <code>/etc/resolv.conf</code> in the pod and counting queries in a capture. Then find the drop: conntrack <code>insert_failed</code>, CoreDNS throttling, or provider DNS packet limits. Fix by lowering <code>ndots</code> or using FQDNs, and add a node-local DNS cache.</p>
+<p><strong>Q6: The conntrack table is full. Why isn't raising <code>nf_conntrack_max</code> the whole answer?</strong></p>
+<p>It treats the symptom. Entries equal new-flow rate times lifetime, so you need to know which of those changed: usually lost connection reuse, or a flood of short UDP flows. Raising the max costs kernel memory and needs a matching hash table size, and the alert must fire well before the table is full. The durable fixes are connection pooling, shorter timeouts where safe, and <code>notrack</code> for flows that don't need state.</p>
+<p><strong>Q7: How do you prove asymmetric routing on a single Linux host?</strong></p>
+<p>Capture on <code>-i any</code> and look at the interface tags: request in on one interface, reply out of another. Then <code>ip route get &lt;client&gt; from &lt;server-address&gt;</code> shows the kernel's choice and why. If <code>rp_filter</code> is strict you may see no reply at all, and <code>TcpExtIPReversePathFilter</code> climbing is the evidence. Fix with source-based policy routing (<code>ip rule</code> plus a per-interface table).</p>
+<p><strong>Q8: A colleague says "ping works and dig works, so it's not the network." What would you ask?</strong></p>
+<p>Which protocol, which size, and which resolver. Ping proves small ICMP packets get through, not large TCP ones (PMTU) or this TCP port (firewall). <code>dig</code> bypasses the system resolver, its search list and <code>/etc/hosts</code>, so test with <code>getent ahosts</code> or <code>dscacheutil</code>. Then I'd ask for the <code>curl -w</code> breakdown, which names the slow phase in one command.</p>

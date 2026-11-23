@@ -1,0 +1,36 @@
+{
+  "type": "record",
+  "name": "StockLevelChanged",
+  "namespace": "com.edacommerce.inventory",
+  "doc": "Network-wide availability of a SKU. Snapshot semantics on the compacted topic inventory.stock-level.v1 keyed by sku.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "sku",
+      "type": "string"
+    },
+    {
+      "name": "onHand",
+      "type": "int"
+    },
+    {
+      "name": "reserved",
+      "type": "int"
+    },
+    {
+      "name": "available",
+      "type": "int"
+    },
+    {
+      "name": "asOf",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

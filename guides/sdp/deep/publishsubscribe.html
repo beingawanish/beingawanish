@@ -1,0 +1,256 @@
+<h2 id=dd-publishsubscribe-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson treats a topic as one stream and a subscription as one team's copy. That is the right mental model. Underneath, the two big families of brokers build it in very different ways, and the difference explains almost every operational surprise you will meet. Kafka is the log-based case. SNS feeding SQS is the copy-per-subscriber case. We will take them in turn.</p>
+
+<h3 id=dd-publishsubscribe-partitions-and-offsets level=3>Kafka: a topic is a set of partitioned logs</h3>
+<p>A Kafka topic is not one log. It is a fixed number of <strong>partitions</strong>, and each partition is an ordered, append-only log on disk. Our <code>order.placed</code> topic might have 12 partitions. Each partition is stored as a series of segment files, and Kafka deletes or compacts whole segments, never single records.</p>
+<p>Every record in a partition gets an <strong>offset</strong>, a number that only goes up: 0, 1, 2, and so on. Offsets are per partition. Offset 500 in partition 3 has nothing to do with offset 500 in partition 7. There is no global order across the topic, and Kafka never claims one.</p>
+<p>Which partition does a record land in? The producer decides. With a key, the default partitioner hashes the key (murmur2) and takes it modulo the partition count. So every event keyed <code>ord_7f3a</code> lands in the same partition, in the order the producer sent them. That is the whole of Kafka's ordering promise: <strong>order per key, because order per partition</strong>. Records without a key get spread across partitions, with no ordering relationship at all.</p>
+<p>Here is the consequence people miss. The key-to-partition mapping depends on the partition count. Grow the topic from 12 to 24 partitions and most keys move to a new partition. Events for one order can then sit in two partitions at once, and a consumer can read the newer one first. Pick the partition count with headroom on day one, because changing it later breaks per-key ordering during the transition.</p>
+
+<svg role="img" aria-labelledby="dd-publishsubscribe-svg-title dd-publishsubscribe-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-publishsubscribe-svg-title">One topic, three partitions, two consumer groups</title>
+<desc id="dd-publishsubscribe-svg-desc">The order.placed topic has three partitions, each an append-only log of offsets. The fraud consumer group has two workers splitting the partitions and is committed further back than the email group, which has three workers, one per partition. Each group tracks its own committed offset per partition.</desc>
+<rect x="0" y="0" width="720" height="300" fill="var(--paper, #ffffff)"/>
+<text x="20" y="24" fill="var(--ink, #1c2430)" font-weight="bold">Topic order.placed (3 partitions, replication factor 3)</text>
+<g fill="var(--bg, #f4f7fa)" stroke="var(--line, #d5dee8)">
+<rect x="20" y="44" width="380" height="34" rx="4"/>
+<rect x="20" y="96" width="380" height="34" rx="4"/>
+<rect x="20" y="148" width="380" height="34" rx="4"/>
+</g>
+<g fill="var(--muted, #5c6b7c)">
+<text x="28" y="66">P0</text><text x="28" y="118">P1</text><text x="28" y="170">P2</text>
+</g>
+<g stroke="var(--line, #d5dee8)">
+<line x1="100" y1="44" x2="100" y2="78"/><line x1="160" y1="44" x2="160" y2="78"/><line x1="220" y1="44" x2="220" y2="78"/><line x1="280" y1="44" x2="280" y2="78"/><line x1="340" y1="44" x2="340" y2="78"/>
+<line x1="100" y1="96" x2="100" y2="130"/><line x1="160" y1="96" x2="160" y2="130"/><line x1="220" y1="96" x2="220" y2="130"/><line x1="280" y1="96" x2="280" y2="130"/><line x1="340" y1="96" x2="340" y2="130"/>
+<line x1="100" y1="148" x2="100" y2="182"/><line x1="160" y1="148" x2="160" y2="182"/><line x1="220" y1="148" x2="220" y2="182"/><line x1="280" y1="148" x2="280" y2="182"/><line x1="340" y1="148" x2="340" y2="182"/>
+</g>
+<g fill="var(--ink, #1c2430)">
+<text x="64" y="66">40</text><text x="124" y="66">41</text><text x="184" y="66">42</text><text x="244" y="66">43</text><text x="304" y="66">44</text><text x="356" y="66">45 →</text>
+<text x="64" y="118">17</text><text x="124" y="118">18</text><text x="184" y="118">19</text><text x="244" y="118">20</text><text x="304" y="118">21</text><text x="356" y="118">22 →</text>
+<text x="64" y="170">88</text><text x="124" y="170">89</text><text x="184" y="170">90</text><text x="244" y="170">91</text><text x="304" y="170">92</text><text x="356" y="170">93 →</text>
+</g>
+<text x="20" y="206" fill="var(--muted, #5c6b7c)">Offsets grow per partition. Same key → same partition → same order.</text>
+<rect x="440" y="44" width="260" height="90" rx="6" fill="var(--paper, #ffffff)" stroke="var(--accent, #1f5f99)"/>
+<text x="452" y="64" fill="var(--accent, #1f5f99)" font-weight="bold">Group fraud (2 workers)</text>
+<text x="452" y="86" fill="var(--ink, #1c2430)">w1: P0 @41, P1 @18</text>
+<text x="452" y="106" fill="var(--ink, #1c2430)">w2: P2 @89</text>
+<text x="452" y="126" fill="var(--muted, #5c6b7c)">lagging after an outage</text>
+<rect x="440" y="148" width="260" height="90" rx="6" fill="var(--paper, #ffffff)" stroke="var(--accent, #1f5f99)"/>
+<text x="452" y="168" fill="var(--accent, #1f5f99)" font-weight="bold">Group email (3 workers)</text>
+<text x="452" y="190" fill="var(--ink, #1c2430)">w1: P0 @45  w2: P1 @22</text>
+<text x="452" y="210" fill="var(--ink, #1c2430)">w3: P2 @93</text>
+<text x="452" y="230" fill="var(--muted, #5c6b7c)">caught up</text>
+<text x="20" y="262" fill="var(--ink, #1c2430)">Each group stores its own committed offset per partition in __consumer_offsets.</text>
+<text x="20" y="284" fill="var(--ink, #1c2430)">Broadcast = one group per service. Compete = workers inside a group share partitions.</text>
+</svg>
+
+<h3 id=dd-publishsubscribe-consumer-groups level=3>Consumer groups, committed offsets and rebalancing</h3>
+<p>A Kafka subscription is a <strong>consumer group</strong>, named by <code>group.id</code>. Within a group, each partition is assigned to exactly one member at a time. That single rule produces both halves of the wiring rule. Two different groups each read every partition, which is broadcast. Workers in one group split the partitions, which is competing consumers.</p>
+<p>It also sets a ceiling. A group can never use more workers than there are partitions. With 12 partitions, worker 13 sits idle. So the partition count is the maximum parallelism for every subscriber, including ones that do not exist yet.</p>
+<p>Progress is a <strong>committed offset</strong> per group per partition, stored in an internal compacted topic called <code>__consumer_offsets</code>. The broker does not track which individual records you processed. It only knows "group fraud has committed offset 41 on partition 0", which means "everything before 41 is done." When the consumer restarts, it resumes from there. This is cheap (one number per partition, not one ack per message), and it is why a single stuck record blocks everything behind it in that partition.</p>
+<p>When the commit happens matters more than any other consumer setting:</p>
+<ul>
+<li><strong>Commit after processing</strong> gives at-least-once. A crash between processing and commit replays the records, so the handler must be idempotent.</li>
+<li><strong>Commit before processing</strong> gives at-most-once. A crash after commit skips records forever.</li>
+<li><strong>Auto-commit</strong> (<code>enable.auto.commit=true</code>, on by default in the Java client) commits on a timer during <code>poll()</code>. If your code hands records to another thread pool and returns, the timer can commit records that have not been processed yet. Turn it off when processing is asynchronous.</li>
+</ul>
+<p>Membership is kept alive two ways. A background heartbeat tells the group coordinator the process is alive, and <code>session.timeout.ms</code> bounds how long silence is tolerated. Separately, <code>max.poll.interval.ms</code> (five minutes by default) bounds the time between <code>poll()</code> calls. If your loop takes longer than that to process one batch, the member is considered stuck and is removed.</p>
+<p>Any change in membership triggers a <strong>rebalance</strong>: partitions are reassigned across the members. The classic "eager" protocol revokes every partition from every member, then hands them back out, so the whole group pauses. The cooperative-sticky assignor moves only the partitions that need to move. Static membership (<code>group.instance.id</code>) lets a restarting pod rejoin as itself within the session timeout, so a rolling deploy does not cause one rebalance per pod. Newer Kafka releases add a broker-side group protocol (KIP-848) that does incremental assignment on the server. Whatever version you run, the goal is the same: fewer, smaller rebalances.</p>
+
+<h3 id=dd-publishsubscribe-isr-and-acks level=3>Durability: replicas, ISR and acks</h3>
+<p>Each partition has a replication factor, usually 3. One replica is the <strong>leader</strong> and takes all writes. The followers fetch from it. The <strong>in-sync replica set (ISR)</strong> is the leader plus every follower that has caught up within <code>replica.lag.time.max.ms</code>. A follower that falls behind drops out of the ISR. It rejoins once it catches up.</p>
+<p>The producer's <code>acks</code> setting chooses when a write counts as done:</p>
+<ul>
+<li><code>acks=0</code>: do not wait at all. Fast, and you will lose data without knowing.</li>
+<li><code>acks=1</code>: the leader has written it. If the leader dies before a follower copies the record, a new leader is elected without it. The producer was told "success" for a record that no longer exists.</li>
+<li><code>acks=all</code>: every member of the current ISR has it. This is the default in modern clients.</li>
+</ul>
+<p>Here is the trap. <code>acks=all</code> means "all of the <em>current</em> ISR." If the ISR has shrunk to just the leader, <code>acks=all</code> is no stronger than <code>acks=1</code>. The topic setting <code>min.insync.replicas</code> closes that gap. With replication factor 3 and <code>min.insync.replicas=2</code>, the broker refuses writes (the producer gets <code>NotEnoughReplicas</code>) whenever fewer than two replicas are in sync. You trade availability for durability, which is the right trade for order events.</p>
+<p>Two more settings finish the picture. <code>unclean.leader.election.enable=false</code> (the default) stops an out-of-sync replica from becoming leader and silently truncating history. And the idempotent producer (<code>enable.idempotence=true</code>, also on by default in modern clients) tags each batch with a producer ID and sequence number. The broker drops duplicate retries and rejects out-of-order batches. That is what lets you keep up to five in-flight requests per connection without retries reordering a key's events.</p>
+<p>Note what Kafka does not do by default: it does not fsync each write before acknowledging. Durability comes from copies on several machines, not from one disk flush. That is a sound design, but only if replicas really are on different machines, racks or zones.</p>
+
+<h3 id=dd-publishsubscribe-retention-compaction level=3>Retention and compaction</h3>
+<p>A Kafka topic keeps records until a cleanup policy removes them. The two policies answer different questions.</p>
+<p><strong>Delete</strong> (<code>cleanup.policy=delete</code>) removes whole segments older than <code>retention.ms</code> (seven days by default) or beyond <code>retention.bytes</code>. This suits <code>order.placed</code>: a history of facts, read in order, replayable for 30 days if you set it so.</p>
+<p><strong>Compact</strong> (<code>cleanup.policy=compact</code>) keeps at least the latest record for each key and removes older ones in the background. A compacted <code>product.current</code> topic is a changelog of the catalog: replay it from the start and you get the current price of every product, not every price it ever had. To delete a key, you publish a <strong>tombstone</strong>, a record with that key and a null value. Tombstones stay readable for <code>delete.retention.ms</code> so slow consumers see them, then they go too.</p>
+<p>You can combine both (<code>compact,delete</code>) to keep the latest value per key but drop anything very old. Compaction is not instant. The active segment is never compacted, and <code>min.compaction.lag.ms</code> holds back recent records, so a consumer may still see several versions of a key. Write consumers that tolerate that.</p>
+
+<h3 id=dd-publishsubscribe-sns-sqs level=3>SNS plus SQS: a copy per subscriber</h3>
+<p>The AWS version works the other way round. SNS keeps no log. When checkout publishes, SNS pushes a copy of the message into every subscribed SQS queue, and each queue holds its own copy until a consumer deletes it. Fan-out happens at publish time, not read time.</p>
+<p>The behaviour follows from that:</p>
+<ul>
+<li><strong>No replay of the past.</strong> A queue created today receives only messages published from today. History has to come from somewhere else, such as an archive in S3.</li>
+<li><strong>Per-message acks.</strong> SQS hides a received message for the <strong>visibility timeout</strong> (30 seconds by default). Delete it and it is gone. Do not, and it reappears for another consumer. After <code>maxReceiveCount</code> attempts, a redrive policy moves it to that queue's dead letter queue. One bad message does not block the others, which is a real advantage over Kafka's offset model.</li>
+<li><strong>Filtering at the topic.</strong> A subscription filter policy lets the fraud queue receive only orders over a threshold. Filtering on message attributes is the classic form, and SNS can also filter on the message body.</li>
+<li><strong>Ordering is opt-in.</strong> Standard topics and queues are at-least-once with best-effort ordering. SNS FIFO feeding SQS FIFO preserves order per <code>MessageGroupId</code>, which plays the same role as a Kafka key. FIFO comes with lower throughput limits than standard, so check the current quotas before choosing it.</li>
+<li><strong>Retention is short.</strong> SQS keeps a message four days by default and 14 days at most. That is a backlog buffer, not a history.</li>
+</ul>
+<p>Use SNS+SQS when you want per-message retries and dead-lettering, managed scaling, and no need to replay months of history. Use Kafka (or a managed log like Kinesis or Pub/Sub with retention) when replay, long retention or very high throughput per topic matters.</p>
+
+<h2 id=dd-publishsubscribe-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Let us size the bookstore's <code>order.placed</code> topic properly. The lesson's 200 orders per second is the normal load. The flash sale from the next lesson peaks at 5,000 per second. Assume 2 KB per event (a full-state event), replication factor 3, five subscriber groups today, and 30 days of retention. Redo the math with your own numbers; the shape of it is what carries over.</p>
+
+<h3 id=dd-publishsubscribe-bandwidth level=3>Bandwidth: fan-out multiplies reads, not writes</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Flow<th>Normal (200/s)<th>Flash sale (5,000/s)<th>How it is computed<tbody>
+<tr><td>Producer ingress<td>0.4 MB/s<td>10 MB/s<td>rate × 2 KB
+<tr><td>Replication traffic<td>0.8 MB/s<td>20 MB/s<td>ingress × (RF − 1)
+<tr><td>Disk writes, whole cluster<td>1.2 MB/s<td>30 MB/s<td>ingress × RF
+<tr><td>Consumer egress, 5 groups<td>2 MB/s<td>50 MB/s<td>ingress × groups
+<tr><td>Consumer egress, 20 groups<td>8 MB/s<td>200 MB/s<td>ingress × groups
+</table></div></div>
+<p>The producer's cost stays flat no matter how many groups subscribe. That is the lesson's promise, and it holds. The broker's cost does not stay flat. Every new group adds a full copy of egress. At 20 groups during the flash sale, the cluster sends 200 MB/s to consumers, which is 1.6 Gbit/s. That is fine spread over several brokers, but it is no longer a rounding error.</p>
+<p>The good news is that a caught-up consumer reads from the operating system's page cache, not the disk. Kafka sends those bytes with very little copying. A lagging group is different. Fraud replaying yesterday's data reads cold segments from disk and competes with everyone else's I/O. A big replay is a capacity event, so schedule it, throttle it, or point it at follower replicas where your setup supports that.</p>
+
+<h3 id=dd-publishsubscribe-storage level=3>Storage: retention sets the bill</h3>
+<p>At a steady 200 events per second, one day is 200 × 86,400 = 17.3 million events, or about 35 GB. Thirty days is about 1 TB. With replication factor 3, the cluster stores about 3.1 TB. Add headroom for the flash-sale days and for disks you never want above roughly 70% full. Plan on 5 TB or more of raw disk for one topic.</p>
+<p>Retention is the dial. Seven days costs about 0.7 TB replicated. Ninety days costs about 9.3 TB. If only data science wants the long history, a cheaper design keeps 7 days in the broker and archives the rest to object storage, either through Kafka's tiered storage or a sink connector. The broker then holds the hot tail. Old history becomes a file read, not a broker read.</p>
+
+<h3 id=dd-publishsubscribe-partition-count level=3>Partition count: work backward from the slowest consumer</h3>
+<p>People size partitions from producer throughput. That is usually the wrong end. A partition can absorb several MB/s of writes, so 10 MB/s of ingress needs only a handful. The constraint is the slowest subscriber, because one partition is processed by one thread at a time (unless the consumer adds its own parallelism).</p>
+<p>Fraud scoring takes 20 ms per event, including a model call. One thread handles 50 events per second. At 5,000 events per second, fraud needs 100 events in flight at once. With one thread per partition, the topic needs at least 100 partitions just for fraud. Plan for 2× growth, and 200 partitions looks right.</p>
+<p>There are three ways out if that number feels too high:</p>
+<ol>
+<li><strong>Parallelism inside the consumer.</strong> Read a partition, then process different keys concurrently while keeping each key in order. Libraries such as Confluent's parallel consumer do this. It decouples processing parallelism from partition count, at the cost of trickier offset tracking.</li>
+<li><strong>Batching.</strong> Score 50 orders in one model call instead of 50 calls.</li>
+<li><strong>Accept lag.</strong> If fraud may run 10 minutes behind during a two-hour sale, compute the backlog and check it fits the retention window comfortably.</li>
+</ol>
+<p>Do not overshoot wildly, either. Every partition adds replicas, open files, leader elections on failover, and metadata. Thousands per topic is a smell unless you know why you need them.</p>
+
+<h3 id=dd-publishsubscribe-lag-math level=3>Lag in time, not messages</h3>
+<p>Lag in messages is hard to reason about. Turn it into time. If fraud is 480,000 events behind and drains at 1,200 per second net (it consumes 1,400 while 200 keep arriving), it catches up in 400 seconds, under seven minutes. Now suppose it is 2 billion events behind, with seven days of retention, and falling further behind every hour. The question is not "how far behind?" It is "when does the oldest unread segment get deleted?" Alert on that time, with a margin of days.</p>
+
+<h2 id=dd-publishsubscribe-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-publishsubscribe-fm-poison level=3>1. A poison message stops one partition</h3>
+<p><strong>Symptom.</strong> Fraud's total lag climbs steadily, but only one partition's lag is growing. The other eleven are at zero.</p>
+<p><strong>Mechanism.</strong> One event fails to deserialize, or it triggers a bug, so the handler throws on every attempt. Kafka's progress is a single committed offset, so the consumer cannot skip that record without deciding to. It retries forever. Every order behind it on that partition waits.</p>
+<p><strong>Detect.</strong> Per-partition lag, not just group totals. A repeating stack trace with the same partition and offset in the logs.</p>
+<p><strong>Fix.</strong> Catch the error, write the raw record plus the error to a dead letter topic, commit past it, and alert. Separate the two kinds of error. Retry transient ones (a timeout from a dependency) in place with backoff. Dead-letter permanent ones (bad schema, validation failure) immediately.</p>
+
+<h3 id=dd-publishsubscribe-fm-rebalance-storm level=3>2. Rebalance storms</h3>
+<p><strong>Symptom.</strong> Throughput collapses. Consumer logs show members joining and leaving every few minutes. The same records get processed again and again.</p>
+<p><strong>Mechanism.</strong> A batch of 500 records takes longer than <code>max.poll.interval.ms</code> to process, perhaps because a dependency slowed down. The member is evicted. Its partitions go to others, who start from the last committed offset and hit the same slow batch. Meanwhile the evicted member rejoins, which triggers another rebalance. With the eager protocol, every rebalance pauses the whole group.</p>
+<p><strong>Detect.</strong> The rebalance rate and the join and sync counts on the consumer coordinator metrics. Log lines saying the poll timeout expired. A rise in duplicate processing at the idempotency layer.</p>
+<p><strong>Fix.</strong> Make each poll loop bounded: lower <code>max.poll.records</code>, put timeouts on downstream calls, and size <code>max.poll.interval.ms</code> to the worst realistic batch. Switch to the cooperative-sticky assignor. Use static membership for rolling deploys.</p>
+
+<h3 id=dd-publishsubscribe-fm-offset-expiry level=3>3. The group that came back to an empty mailbox</h3>
+<p><strong>Symptom.</strong> A batch consumer that runs weekly, or a service that was off for a long outage, starts up and reports zero lag. It has silently skipped a week of events.</p>
+<p><strong>Mechanism.</strong> Committed offsets themselves expire. An empty group loses them after <code>offsets.retention.minutes</code> (seven days by default in current Kafka). With no committed offset, the consumer falls back to <code>auto.offset.reset</code>. The default is <code>latest</code>, which means "start from now."</p>
+<p><strong>Detect.</strong> This one is quiet. Watch for consumer start-up logs that reset offsets, and compare processed counts with produced counts per day.</p>
+<p><strong>Fix.</strong> Set <code>auto.offset.reset=earliest</code> for consumers where missing data is worse than reprocessing. Raise offset retention above your longest planned downtime. Most important, make "the subscriber catalog lists this group" mean someone gets paged when it stops.</p>
+
+<h3 id=dd-publishsubscribe-fm-hot-partition level=3>4. A hot key overloads one partition</h3>
+<p><strong>Symptom.</strong> One broker's CPU and network are much higher than the others. One partition in every subscriber group lags while the rest are idle.</p>
+<p><strong>Mechanism.</strong> The key is skewed. Key by <code>seller_id</code> and one marketplace seller with 30% of the volume puts 30% of the traffic in one partition. Adding partitions does not help: the hot key still hashes to just one of them.</p>
+<p><strong>Detect.</strong> Bytes-in and messages-in per partition, not per topic. A per-key count from a sample of the topic.</p>
+<p><strong>Fix.</strong> Key by the entity whose order actually matters. For orders that is <code>order_id</code>, which spreads evenly. If you truly need per-seller order, split the hot key (<code>seller_42#0</code> to <code>#7</code>) and accept that order now holds only within each sub-key. That is a real semantic change, so make it with the consumers, not to them.</p>
+
+<h3 id=dd-publishsubscribe-fm-retry-order level=3>5. Retries break per-key order</h3>
+<p><strong>Symptom.</strong> A loyalty view shows an order as "placed" even though it was cancelled. The log shows <code>order.cancelled</code> was processed before <code>order.placed</code>.</p>
+<p><strong>Mechanism.</strong> There are two common paths. On the producer, an old client with idempotence off and several requests in flight retries batch 1 after batch 2 succeeded, so the broker stores them reversed. On the consumer, a "retry topic" pattern parks a failing <code>order.placed</code> in <code>order.placed.retry</code> and moves on. The <code>order.cancelled</code> that follows is then processed first.</p>
+<p><strong>Detect.</strong> Store the last applied version or offset per key in the view, and count events that arrive older than what you already have.</p>
+<p><strong>Fix.</strong> Keep the idempotent producer on. On the consumer, a retry-topic design must also park every later event for the same key until the earlier one succeeds, or it must apply events by version and discard stale ones. "Move on and retry later" and "strict order per key" cannot both hold for the same key.</p>
+
+<h3 id=dd-publishsubscribe-fm-isr-shrink level=3>6. ISR shrink turns acks=all into acks=1</h3>
+<p><strong>Symptom.</strong> After a broker failure and a fast leader election, a few hundred orders that the producer logged as acknowledged are missing from the topic.</p>
+<p><strong>Mechanism.</strong> A slow disk dropped two followers out of the ISR. With <code>min.insync.replicas=1</code>, the leader kept accepting <code>acks=all</code> writes alone. When that leader died, a follower without those records became leader. Or unclean leader election was enabled, and an out-of-sync replica took over.</p>
+<p><strong>Detect.</strong> Under-replicated partitions, and partitions under the min ISR. These should be zero in steady state and should page someone when they are not.</p>
+<p><strong>Fix.</strong> Replication factor 3, <code>min.insync.replicas=2</code>, <code>acks=all</code>, unclean election off, replicas spread across zones. Then decide what the producer does when writes are refused. Checkout should fail or buffer the order visibly, never drop the event.</p>
+
+<h3 id=dd-publishsubscribe-fm-competing-subscriptions level=3>7. Two services share a group id by copy-paste</h3>
+<p><strong>Symptom.</strong> This is the lesson's Q3 incident, at the Kafka level. Loyalty receives roughly half the orders. Its logs show partitions being assigned and revoked whenever the analytics team deploys.</p>
+<p><strong>Mechanism.</strong> The loyalty service was started from analytics' template and kept <code>group.id=analytics</code>. Kafka sees one group with more members and splits the partitions between two different programs.</p>
+<p><strong>Detect.</strong> List the group's members and look at the client IDs and hosts. Two different applications in one group is always a bug.</p>
+<p><strong>Fix.</strong> Derive the group id from the service name in config, never from a template default. Use broker ACLs so a service may join only its own group.</p>
+
+<h2 id=dd-publishsubscribe-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-publishsubscribe-broker-families level=3>Log broker or copy-per-subscriber broker</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th>Log-based (Kafka, Kinesis, Pulsar, Redis Streams)<th>Copy per subscriber (SNS+SQS, RabbitMQ fanout exchange)<tbody>
+<tr><td>Where fan-out happens<td>At read time: each group reads the same log<td>At publish time: one copy per queue
+<tr><td>Progress tracking<td>One offset per partition per group<td>One ack per message
+<tr><td>One bad message<td>Blocks its partition until skipped<td>Retries alone, then dead-letters
+<tr><td>Replay of history<td>Yes, within retention<td>No (only what is still queued)
+<tr><td>Ordering<td>Per partition (per key)<td>None, or per group in FIFO mode
+<tr><td>Parallelism limit<td>Partition count<td>Practically none for standard queues
+<tr><td>Cost driver<td>Brokers, disk, network<td>Requests per delivery
+<tr><td>Best for<td>Replayable facts, high throughput, many readers<td>Per-message work with retries, modest volume
+</table></div></div>
+
+<h3 id=dd-publishsubscribe-delivery-semantics level=3>At-least-once, at-most-once, "exactly-once"</h3>
+<p>Every serious pub/sub system gives you at-least-once by default, and that is what you should design for. Kafka's transactions add exactly-once for a specific shape: read from Kafka, process, write to Kafka, and commit the input offsets in the same transaction. Consumers then read with <code>isolation.level=read_committed</code>. The guarantee stops at Kafka's edge. The moment your handler sends an email or charges a card, you are back to at-least-once plus idempotency. The <a href="#exactlyonce-semantics">Exactly-Once Semantics</a> lesson goes through the details. In a design review, "we use Kafka so it is exactly-once" is a claim to challenge.</p>
+
+<h3 id=dd-publishsubscribe-key-choice level=3>Choosing the partition key</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Key<th>Order you get<th>Spread<th>Use when<tbody>
+<tr><td>None<td>None<td>Even<td>Events are independent (page views, logs)
+<tr><td><code>order_id</code><td>All events of one order<td>Even<td>Consumers track order lifecycle
+<tr><td><code>customer_id</code><td>All events of one customer<td>Mostly even, some heavy users<td>Consumers build per-customer state (loyalty points)
+<tr><td><code>seller_id</code><td>All events of one seller<td>Skewed<td>Rarely. Only with a hot-key plan
+<tr><td>Constant<td>Total order<td>One partition<td>Almost never. Throughput caps at one partition
+</table></div></div>
+<p>Choose the key by asking which consumer state must never see events out of order, and key by the entity that owns that state. If two consumers need different keys, that is a sign you have two topics, or one topic plus a stream processor that re-keys it.</p>
+
+<h3 id=dd-publishsubscribe-push-pull level=3>Push or pull</h3>
+<p>Kafka consumers pull, so a slow consumer simply reads less. Backpressure is free. SNS pushes into SQS, and SQS consumers then pull, so the queue absorbs bursts. Pure push to HTTP endpoints (SNS to HTTPS, or <a href="#webhooks">webhooks</a>) needs the receiver to keep up or the sender's retry policy decides your fate. Prefer pull wherever the consumer is your own service.</p>
+
+<h3 id=dd-publishsubscribe-topic-granularity level=3>One topic per event type, or one per entity</h3>
+<p>Separate topics (<code>order.placed</code>, <code>order.cancelled</code>) are easy to subscribe to selectively. But order across them is not guaranteed, so a consumer can see the cancel before the place. One topic per entity (<code>orders</code>, with an event type field) keeps all of one order's events in one partition and in order. If consumers care about lifecycle order, prefer the entity topic and let them filter by type.</p>
+
+<h2 id=dd-publishsubscribe-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li><strong>What is the partition key, and which consumer's correctness depends on order per that key?</strong> If the answer is "nobody's", why is there a key at all?</li>
+<li><strong>How many partitions, and how was that derived?</strong> Show the slowest consumer's per-event time and the peak rate. What happens to ordering if you grow it later?</li>
+<li><strong>What are <code>acks</code>, replication factor and <code>min.insync.replicas</code>?</strong> What does the producer do when the broker refuses a write?</li>
+<li><strong>When does each consumer commit, relative to its side effects?</strong> Is auto-commit on with asynchronous processing?</li>
+<li><strong>Where is idempotency enforced for each subscriber, and what is the dedup key?</strong> How long does the dedup record live compared to the longest possible redelivery?</li>
+<li><strong>What happens to a message that always fails?</strong> Name the dead letter topic or queue, who is alerted, and how a replay from it works.</li>
+<li><strong>What is the retention, and what is the alert threshold on backlog age?</strong> How many days of margin does that leave?</li>
+<li><strong>What is <code>auto.offset.reset</code>, and what is offset retention?</strong> What happens if this group is down for ten days?</li>
+<li><strong>How is a rebalance kept cheap?</strong> Assignor, static membership, bounded poll loop.</li>
+<li><strong>Who owns each subscription, and where is that written down?</strong> Can a new group join without review if the topic carries personal data?</li>
+<li><strong>What does a full replay cost the cluster?</strong> Is there a throttle or a separate read path so a backfill does not hurt live consumers?</li>
+<li><strong>Is this topic broadcast of facts, or is it secretly a job queue or a request-response channel?</strong></li>
+</ol>
+
+<h2 id=dd-publishsubscribe-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Why can't I just add more consumers to a Kafka group to go faster?"</summary>
+<p>Each partition is owned by one member of a group at a time, so useful parallelism stops at the partition count. Members beyond that sit idle. To go faster you add partitions, which remaps keys and disturbs order during the change, or you add parallelism inside each consumer while keeping per-key order. Batching the expensive call is often the cheapest win.</p>
+</details>
+
+<details>
+<summary>"Does acks=all guarantee no data loss?"</summary>
+<p>Only together with the right topic settings. <code>acks=all</code> waits for the current ISR, which can shrink to the leader alone. You need replication factor 3, <code>min.insync.replicas=2</code>, unclean leader election off, and replicas in different failure domains. Even then, the producer has to handle a refused write correctly, and a correlated failure of every replica can still lose unflushed data, because Kafka acknowledges on replication, not on fsync.</p>
+</details>
+
+<details>
+<summary>"Fraud's group shows zero lag, yet fraud is missing a day of orders. How?"</summary>
+<p>Lag is measured against the committed offset, and the committed offset can be wrong in a way that looks healthy. There are three usual causes. The group was inactive past offset retention and reset to <code>latest</code>. Or auto-commit committed records that an async worker pool then dropped in a crash. Or the service shares its group id with another application, so the other app processed those partitions. Check the reset logs, the commit strategy and the group's member list, in that order.</p>
+</details>
+
+<details>
+<summary>"How do you guarantee order for one order's events and still scale?"</summary>
+<p>Key by <code>order_id</code> so every event of one order shares a partition, keep the idempotent producer on so retries do not reorder, and keep all lifecycle events on one topic. On the consumer, never "skip and retry later" for a key whose order matters: either block that key or apply by version and drop stale events. Scale comes from many orders across many partitions, not from parallelism within one order.</p>
+</details>
+
+<details>
+<summary>"When would you choose SNS plus SQS over Kafka?"</summary>
+<p>When consumers do independent per-message work that needs its own retries and dead-lettering, volume is modest, and nobody needs months of replay. You get per-message acks (no head-of-line blocking), filter policies and no cluster to run. You give up replay, long retention and cheap high throughput. If a new team will want last quarter's events, archive them separately or pick a log.</p>
+</details>
+
+<details>
+<summary>"Is a compacted topic a database?"</summary>
+<p>It is a durable changelog that can rebuild a key-value view: replay it and you get the latest value per key. It is not a query engine. There are no secondary indexes and no reads by key without building a store from it. Compaction is also asynchronous, so readers may see several versions of a key and must handle that. Treat it as the source for a materialised view, which a stream processor or the consumer itself maintains.</p>
+</details>
+
+<details>
+<summary>"The topic must go from 12 to 48 partitions. How do you do it without breaking consumers?"</summary>
+<p>Adding partitions moves most keys, so for a while one key's events can sit in an old and a new partition. If consumers need strict per-key order, create a new topic with 48 partitions instead. Mirror into it, keyed the same way, while keeping order per key. Move consumers one group at a time, each starting from a known point, then cut the producer over and retire the old topic. If consumers apply events by version and ignore stale ones, adding partitions in place is acceptable, with a short window of discarded stale events.</p>
+</details>
+
+<details>
+<summary>"What is the real cost of the twentieth subscriber?"</summary>
+<p>To the producer: nothing. To the broker: one more full copy of egress, so during the flash sale another 10 MB/s, plus a replay's cold reads when it joins. To the organisation: another consumer of the schema, which makes every future change slower, another idempotency boundary, and another backlog that can outrun retention. That last cost is why a subscriber catalog with named owners is part of the pattern, not paperwork.</p>
+</details>

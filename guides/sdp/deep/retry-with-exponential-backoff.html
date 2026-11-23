@@ -1,0 +1,237 @@
+<h2 id=dd-retry-with-exponential-backoff-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson gives the formula. A production retry loop carries more state than that formula suggests. It has to decide, on every failure, four separate things: was this error retryable, was the request safe to send again, is there time left, and is the system as a whole allowed another attempt right now? Each question has its own data, and the real libraries answer them in slightly different ways.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-state level=3>The state one retry loop carries</h3>
+<ul>
+<li><strong>Attempt number</strong>, starting at 0. It drives the backoff window.</li>
+<li><strong>The overall deadline</strong> from the <a href="#timeout">timeout</a> lesson's budget. A retry that cannot finish before the deadline should not start.</li>
+<li><strong>The previous wait</strong>, needed for decorrelated jitter (below).</li>
+<li><strong>Server hints</strong>: a <code>Retry-After</code> header on a 429 or 503, or gRPC's <code>grpc-retry-pushback-ms</code> trailer. A hint overrides your own schedule. A negative pushback in gRPC means "do not retry at all".</li>
+<li><strong>Which hosts have failed</strong>, so the next attempt can go somewhere else.</li>
+<li><strong>A shared retry budget</strong>, outside the loop and common to every call to that dependency. This is what stops one process from joining a storm.</li>
+</ul>
+
+<h3 id=dd-retry-with-exponential-backoff-classify level=3>Classifying errors: retryable is not the same as safe</h3>
+<p>The lesson splits errors into "can change" and "cannot change". A second axis matters just as much: <em>did the server possibly act on the request?</em> The answer depends on where in the call the failure happened.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Failure<th>Could the server have acted?<th>Retry a read?<th>Retry a non-idempotent write?<tbody>
+<tr><td>DNS failure, connection refused, connect timeout<td>No. Nothing was sent.<td>Yes<td>Yes
+<tr><td>HTTP/2 <code>REFUSED_STREAM</code>, or gRPC <code>UNAVAILABLE</code> before sending<td>No. The server rejected the stream unprocessed.<td>Yes<td>Yes
+<tr><td>429, or 503 with <code>Retry-After</code><td>Usually no, by convention<td>Yes, after the hinted wait<td>Usually, but only if the API documents it
+<tr><td>Connection reset or timeout after the request was sent<td>Unknown<td>Yes<td>Only with an <a href="#idempotency">idempotency</a> key
+<tr><td>500, 502, 504<td>Unknown (502 and 504 come from a proxy that may have forwarded it)<td>Yes<td>Only with an idempotency key
+<tr><td>gRPC <code>DEADLINE_EXCEEDED</code><td>Unknown<td>Only if budget remains, which it usually does not<td>No
+<tr><td>400, 401, 403, 404, 409, 422<td>Answered: the request was understood and refused<td>No<td>No
+</tbody></table></div></div>
+<p>The top two rows are the ones teams forget. A failure before the request left the machine is always safe to retry, even for a payment. Some clients track this explicitly. gRPC, for example, treats a stream the server never saw as "transparently retryable" without consuming your retry policy. Everything below the line "after the request was sent" is ambiguous, and only idempotency makes it safe.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-jitter level=3>Three jitter formulas, and what each trades</h3>
+<p>AWS's "Exponential Backoff and Jitter" post compared these by simulating many clients contending for one resource. All three use <code>base</code> and <code>cap</code>.</p>
+<ul>
+<li><strong>Full jitter</strong>: <code>sleep = random(0, min(cap, base × 2^attempt))</code>. The lesson's formula. It spreads clients the most, and in the simulation it did the least total work. Its one weakness: some waits are near zero, so a few clients retry almost at once.</li>
+<li><strong>Equal jitter</strong>: <code>w = min(cap, base × 2^attempt); sleep = w/2 + random(0, w/2)</code>. It guarantees at least half the window, so no instant retries. It spreads clients over half the range, so it did more work than full jitter in the simulation.</li>
+<li><strong>Decorrelated jitter</strong>: <code>sleep = min(cap, random(base, previous_sleep × 3))</code>. Each wait depends on the last one, not on the attempt number. It grows roughly exponentially on average but wanders. It performed about as well as full jitter and keeps a floor of <code>base</code>.</li>
+</ul>
+<p>The practical answer: use full jitter unless you have a reason not to. Use equal jitter when a near-zero retry is itself a problem, such as against a rate limiter that counts every request. Whichever you choose, the version with no jitter at all is the one that fails.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-budgets level=3>Retry budgets: how the real ones work</h3>
+<p>A per-call attempt cap limits one request. It does nothing about a fleet where every request is retrying. A retry budget is a shared counter that answers "is the system allowed another retry right now?" Three common designs:</p>
+<ul>
+<li><strong>gRPC retry throttling.</strong> Configured in the service config as <code>retryThrottling: {maxTokens, tokenRatio}</code>. The client holds a token count starting at <code>maxTokens</code>. Each failed RPC subtracts 1. Each success adds <code>tokenRatio</code>, for example 0.1. Retries and hedges are allowed only while the count is above half of <code>maxTokens</code>. With <code>tokenRatio = 0.1</code>, roughly one failure per ten successes keeps the count level, so retries stop once failures outpace that.</li>
+<li><strong>AWS SDK "standard" retry mode.</strong> A client-wide token bucket, typically starting at 500 tokens. A retry costs 5 tokens, or 10 if the failure was a timeout. A success refunds a token. When the bucket is empty, the SDK stops retrying and surfaces the error. The exact constants are in each SDK's documentation and can vary by version.</li>
+<li><strong>Ratio budgets (Finagle, Linkerd, Envoy).</strong> Retries may be at most a fixed fraction of recent requests, such as 20% over a 10-second window, plus a small floor of retries per second so low-traffic clients can still retry at all. Envoy expresses this through its circuit-breaker settings: <code>retry_budget.budget_percent</code> and <code>min_retry_concurrency</code>.</li>
+</ul>
+<p>All three share an idea: the budget refills from <em>successes</em>. When the dependency is healthy, retries are cheap and plentiful. When it is failing, the budget drains and the client goes quiet on its own. That is the behaviour you want, and a fixed "3 attempts" cannot give it to you.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-config level=3>What it looks like in real config</h3>
+<p>A gRPC service config for the bookstore's inventory service. <code>maxAttempts</code> counts the original call, and gRPC caps it at 5:</p>
+<pre><code>{
+  "methodConfig": [{
+    "name": [{"service": "bookstore.Inventory"}],
+    "timeout": "0.5s",
+    "retryPolicy": {
+      "maxAttempts": 3,
+      "initialBackoff": "0.1s",
+      "maxBackoff": "1s",
+      "backoffMultiplier": 2,
+      "retryableStatusCodes": ["UNAVAILABLE"]
+    }
+  }],
+  "retryThrottling": {"maxTokens": 10, "tokenRatio": 0.1}
+}</code></pre>
+<p>gRPC applies jitter to these backoffs itself. Note that only <code>UNAVAILABLE</code> is listed. <code>DEADLINE_EXCEEDED</code> is left out on purpose, because when the overall deadline has expired there is no time for another attempt.</p>
+<p>The same idea in Envoy, on a route:</p>
+<pre><code>retry_policy:
+  retry_on: "connect-failure,refused-stream,reset,unavailable"
+  num_retries: 2
+  per_try_timeout: 0.15s
+  retry_back_off:
+    base_interval: 0.05s
+    max_interval: 0.5s
+  retry_host_predicate:
+    - name: envoy.retry_host_predicates.previous_hosts
+  host_selection_retry_max_attempts: 3</code></pre>
+<p>The <code>previous_hosts</code> predicate makes each retry avoid the hosts that already failed. Without it, a retry can land on the same bad instance, especially with few hosts.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-code level=3>A complete loop in standard-library Python</h3>
+<p>This puts the four decisions together: classification, deadline, server hint, and a shared budget.</p>
+<pre><code>import random, threading, time
+
+class RetryBudget:
+    """Shared by all calls to one dependency. Retries refill from successes."""
+    def __init__(self, ratio=0.1, max_tokens=10.0):
+        self.tokens, self.max, self.ratio = max_tokens, max_tokens, ratio
+        self.lock = threading.Lock()
+    def on_success(self):
+        with self.lock:
+            self.tokens = min(self.max, self.tokens + self.ratio)
+    def on_failure(self):
+        with self.lock:
+            self.tokens = max(0.0, self.tokens - 1)
+    def can_retry(self):
+        with self.lock:
+            return self.tokens &gt; self.max / 2
+
+class Retryable(Exception):
+    def __init__(self, msg, retry_after=None, sent=True):
+        super().__init__(msg)
+        self.retry_after, self.sent = retry_after, sent
+
+def call_with_retries(op, budget, deadline, idempotent,
+                      base=0.1, cap=2.0, max_attempts=3):
+    for attempt in range(max_attempts):
+        try:
+            result = op(attempt)
+            budget.on_success()
+            return result
+        except Retryable as e:
+            budget.on_failure()
+            last = attempt == max_attempts - 1
+            unsafe = e.sent and not idempotent      # ambiguous write without a key
+            if last or unsafe or not budget.can_retry():
+                raise
+            window = min(cap, base * 2 ** attempt)
+            wait = e.retry_after if e.retry_after is not None else random.uniform(0, window)
+            if time.monotonic() + wait &gt;= deadline:  # no time for another attempt
+                raise
+            time.sleep(wait)
+        # Any other exception (400s, 404s) is not caught: it propagates on the first try.
+</code></pre>
+<p>Two details are easy to miss. Non-retryable errors never enter the loop at all, because only <code>Retryable</code> is caught. And a write that failed <em>before</em> sending (<code>sent=False</code>) is retried even without an idempotency key, while one that failed after sending is not.</p>
+
+<h2 id=dd-retry-with-exponential-backoff-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-retry-with-exponential-backoff-amplification level=3>How much load do retries add?</h3>
+<p>Let <code>f</code> be the probability that one attempt fails and <code>N</code> the maximum attempts. If attempts fail independently, the expected number of attempts per logical call is:</p>
+<pre><code>E[attempts] = 1 + f + f² + … + f^(N-1) = (1 - f^N) / (1 - f)</code></pre>
+<p>Plug in the checkout numbers with <code>N = 3</code>:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Per-attempt failure rate f<th>Expected attempts per call<th>Calls still failing after 3 tries<th>Load at 20,000 calls/s<tbody>
+<tr><td>0.5% (healthy day)<td>1.005<td>about 1 in 8 million (if independent)<td>about 20,100/s
+<tr><td>10% (brownout)<td>1.11<td>0.1%<td>about 22,200/s
+<tr><td>50% (half the fleet down)<td>1.75<td>12.5%<td>35,000/s
+<tr><td>100% (full outage)<td>3.0<td>100%<td>60,000/s
+</tbody></table></div></div>
+<p>Two lessons sit in this table. First, retries are almost free on a healthy day: half a percent of extra load. Second, the load multiplier rises exactly as the dependency's capacity falls. At 50% failures you send 75% more traffic to a service that has lost half its servers. That is why a fixed attempt cap is not enough.</p>
+<p>Now add a 10% retry budget. Retries are capped at 0.1 × 20,000 = 2,000 per second, whatever the failure rate. The worst case drops from 60,000/s to 22,000/s. That is the whole argument for budgets, in one line.</p>
+<p>A caution on the "1 in 8 million" figure. It assumes failures are independent, and they rarely are. A retry 50 ms after a failure often hits the same overloaded host, the same GC pause or the same network fault. Real success-after-retry rates are much worse than the independent model predicts. Measure them instead of trusting the formula.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-herd-math level=3>How much does jitter spread the herd?</h3>
+<p>Suppose 20,000 requests fail together during a one-second blip, and the provider recovers. Count how many retries land in each 10 ms slice:</p>
+<ul>
+<li><strong>No jitter, fixed 100 ms backoff.</strong> All 20,000 retry within the same few milliseconds. One slice receives nearly 20,000 requests, the rate equivalent of 2 million per second.</li>
+<li><strong>Full jitter, first window 100 ms.</strong> Retries spread evenly over ten slices: about 2,000 per 10 ms, an equivalent rate of 200,000 per second for one-tenth of a second.</li>
+<li><strong>Second retry, window 200 ms</strong>, for those that fail again: spread over twenty slices, so half the density again.</li>
+</ul>
+<p>Jitter does not reduce the total number of retries. It reduces the peak. A provider that can absorb a 2x burst for 100 ms survives the jittered case and falls over in the synchronized one.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-latency-math level=3>What retries cost in latency</h3>
+<p>With full jitter, the expected wait for each window is half of it. For base 100 ms and two retries, the expected total wait is 50 + 100 = 150 ms. The worst case is 100 + 200 = 300 ms. Add the failed attempts themselves. If each failed attempt took the full 300 ms timeout, a call that succeeds on the third try costs up to 300 + 300 + 300 + 300 ≈ 1.2 s.</p>
+<p>So retrying a <em>timeout</em> is far more expensive than retrying a fast error such as a connection refusal. This is why many teams give timed-out attempts a smaller allowance, or none, on interactive paths. The AWS SDK's higher token cost for timeout retries reflects the same reasoning.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-layers-math level=3>The layering bill, with a budget</h3>
+<p>The lesson's 3 × 3 × 3 = 27 is the no-budget worst case. With a 10% budget at each of three layers, the worst case is 1.1 × 1.1 × 1.1 ≈ 1.33x. The budget does not just cap one layer. It makes stacked layers almost harmless. Even so, keep retries at one layer: budgets bound the load, but every extra layer still adds its waits to latency.</p>
+
+<h2 id=dd-retry-with-exponential-backoff-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-retry-with-exponential-backoff-fm-metastable level=3>1. The storm that outlives its cause</h3>
+<p><strong>Symptom:</strong> a database failover lasts 10 seconds, but the service behind it stays overloaded for 40 minutes. Turning off the original trigger changes nothing. <strong>Mechanism:</strong> during the failover, retries pushed load to 2x. The new primary started with a cold cache and less capacity. Under 2x load its latency exceeded client timeouts, so nearly every call failed and was retried, which kept load at 2x. The system is stuck in a stable bad state: a <em>metastable failure</em>. <strong>Detect:</strong> the attempts-per-call ratio at the server (attempts counted from a request header such as <code>X-Retry-Attempt</code>) stays high after the trigger is gone. Goodput stays far below throughput. <strong>Fix:</strong> retry budgets, so retries collapse to near zero when failures dominate. A circuit breaker. Server-side load shedding that drops expired requests. In the moment, the fastest exit is often to shed load hard at the edge until the backlog clears.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-fm-hidden-layer level=3>2. The retries nobody knew about</h3>
+<p><strong>Symptom:</strong> an incident review counts 4 attempts per call at the database, but the application is configured for 2. <strong>Mechanism:</strong> the service mesh sidecar also retries. Envoy's route-level default is one retry on certain failures when a retry policy is present, and some meshes add their own defaults. The application's 2 attempts each became 2 at the proxy. The client library may also retry quietly underneath. <strong>Detect:</strong> traces showing repeated child spans under one parent span. Comparing request counts at the client, the sidecar and the server for the same window. <strong>Fix:</strong> pick one layer for retries and switch the others off explicitly. Write the decision down in the service's runbook. Pass an attempt header so each layer can see that a request is already a retry.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-fm-same-host level=3>3. Every retry lands on the same bad instance</h3>
+<p><strong>Symptom:</strong> one of eight backend instances has a broken disk. Its error rate is 100%, but clients see 12% errors instead of the expected 1 in 8 squared (about 1.6%) after one retry. <strong>Mechanism:</strong> the client reuses its pooled keep-alive connection for the retry, so the retry goes to the same instance. Or the load balancer uses a sticky hash. <strong>Detect:</strong> log the backend address for every attempt. Retries hitting the same address as the failed attempt is the signature. <strong>Fix:</strong> retry on a fresh connection or a different host. In Envoy, use the <code>previous_hosts</code> retry predicate. Add outlier detection so the broken instance leaves the pool altogether.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-fm-reorder level=3>4. A retry reorders writes</h3>
+<p><strong>Symptom:</strong> the product catalog shows an old price after an update. Logs show both updates succeeded. <strong>Mechanism:</strong> update A ("price 20") failed transiently and went into backoff. Update B ("price 18") was sent next and succeeded. A's retry then succeeded and overwrote B. Kafka producers had a famous version of this: with retries enabled and <code>max.in.flight.requests.per.connection</code> above 1, a failed batch could be retried after a later batch had landed. <code>enable.idempotence=true</code> (the default in recent Kafka clients) fixes it with sequence numbers, preserving order with up to 5 in-flight requests. <strong>Detect:</strong> version or sequence regressions on the stored object. A count of writes rejected or applied out of order. <strong>Fix:</strong> conditional writes (<code>UPDATE … WHERE version = 6</code>), per-key sequence numbers, or strictly one in-flight write per key.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-fm-429 level=3>5. Retrying 429s burns the shared quota</h3>
+<p><strong>Symptom:</strong> an LLM-backed feature hits rate limits. Within minutes, unrelated features using the same API key also start getting 429s. <strong>Mechanism:</strong> the provider's limit is per account or per key. The first feature's clients ignore <code>Retry-After</code> and retry on their own backoff, which starts at 100 ms. Each rejected retry still counts against some providers' limits, or keeps the account over its limit. <strong>Detect:</strong> 429 rate per caller and per key. The time between a 429 and the next request from the same client, compared with the <code>Retry-After</code> value. <strong>Fix:</strong> honour <code>Retry-After</code> exactly (and parse both its forms: seconds and an HTTP date). Keep a per-provider budget. Better, put a client-side rate limiter in front of the provider so you rarely receive a 429 at all.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-fm-poison level=3>6. A poison message stalls a partition</h3>
+<p><strong>Symptom:</strong> consumer lag on one Kafka partition grows without limit while the others stay at zero. <strong>Mechanism:</strong> one message triggers an error that is not transient, such as a schema the handler cannot parse. The consumer retries it in place, with backoff, forever. Because a partition is consumed in order, nothing behind it moves. <strong>Detect:</strong> per-partition lag, and a log line repeating the same offset. <strong>Fix:</strong> classify errors in consumers just as in HTTP clients. After a few attempts, move the message to a retry topic with a delay, and after that to a <a href="#dead-letter-queue">dead letter queue</a>. The partition keeps moving, and the message is kept for a person to inspect.</p>
+
+<h3 id=dd-retry-with-exponential-backoff-fm-ambiguous level=3>7. "Connection reset" retried as if it were "connection refused"</h3>
+<p><strong>Symptom:</strong> rare duplicate orders, about one a week, always during deploys of the order service. <strong>Mechanism:</strong> during a rolling deploy, old instances close connections. Some requests had already been sent and processed when the connection reset. The client treated every connection error as "nothing happened" and retried the write without an idempotency key. <strong>Detect:</strong> duplicates clustered around deploy times. Client logs distinguishing errors before and after the request was written. <strong>Fix:</strong> only retry non-idempotent writes on errors that prove nothing was sent. Add idempotency keys to every write. Make the server drain gracefully on shutdown: stop accepting, finish in-flight requests, then close.</p>
+
+<h2 id=dd-retry-with-exponential-backoff-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Jitter<td>Full jitter<td>Equal or decorrelated jitter<td>By default. Choose equal jitter when an immediate retry is itself harmful, such as against a request-counting rate limiter.
+<tr><td>Limit<td>Fixed attempt cap only<td>Attempt cap plus shared retry budget<td>Traffic is small and the dependency is yours alone. Any shared, high-volume dependency needs B.
+<tr><td>Layer<td>Client library<td>Service mesh or proxy<td>The client knows which operations are idempotent and which errors were pre-send. Choose the mesh for uniform policy across many languages, restricted to reads and pre-send failures.
+<tr><td>Timing<td>Synchronous, within the request<td>Durable, via a queue with delayed retry<td>Someone is waiting for the answer and the whole retry window fits in the request deadline. Otherwise B.
+<tr><td>Who sets the wait<td>Client schedule<td>Server-directed (<code>Retry-After</code>, pushback)<td>The server sends no hints. When it does, the hint wins.
+<tr><td>Target<td>Same host or connection<td>Different host<td>There is only one host. Otherwise prefer B, to escape a single bad instance.
+<tr><td>Tail latency<td>Retry after failure<td>Hedge: send a second copy after the p95<td>The goal is fixing errors. Choose hedging for idempotent reads where the goal is cutting tail latency, and give it its own budget.
+</tbody></table></div></div>
+<p>Two opinions. <strong>Retry budgets are not optional for anything shared.</strong> The attempt cap feels like a limit, but it multiplies load in exactly the conditions where load does the most damage. A budget costs a few lines of code and turns the worst case from 3x into 1.1x.</p>
+<p>And <strong>the mesh is a poor place to make write decisions</strong>. A proxy cannot know whether a POST is safe to repeat or whether the upstream processed it. Let the mesh retry connection failures and refused streams, which are safe for everything. Leave everything else to code that knows the operation.</p>
+
+<h2 id=dd-retry-with-exponential-backoff-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>At which single layer do retries happen for this call? Have the others (client library, sidecar, gateway, SDK) been checked and explicitly disabled?</li>
+<li>Which errors are retried? Is "failed before sending" distinguished from "failed after sending"?</li>
+<li>Is every retried write idempotent, with a key that stays the same across attempts?</li>
+<li>Which jitter formula is used, and what are the base, multiplier and cap?</li>
+<li>Is there a shared retry budget? What is the worst-case load multiplier during a full outage?</li>
+<li>Does the retry schedule fit inside the request's remaining deadline, and does the loop check before each wait?</li>
+<li>Are <code>Retry-After</code> and pushback hints honoured, in both the seconds and HTTP-date forms?</li>
+<li>Does a retry go to a different host or connection?</li>
+<li>Can a retry reorder writes to the same key? What prevents an older write from overwriting a newer one?</li>
+<li>Are attempts per logical call emitted as a metric, with an alert when the ratio rises?</li>
+<li>In consumers, where does a message go after its last attempt, and does a failing message block the partition?</li>
+<li>Has the policy been tested under a fault-injection drill, such as 50% errors for 60 seconds, with the load at the dependency measured?</li>
+</ol>
+
+<h2 id=dd-retry-with-exponential-backoff-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Your retry policy is 3 attempts with jitter. Why can that still take down a dependency?"</summary>
+<p>Because the attempt cap scales load with the failure rate. At 100% failure every call becomes 3 calls, so the dependency sees 3x traffic while it has the least capacity. Jitter spreads the peak but not the total. A retry budget fixes the total: retries allowed only as a fraction of successes, such as 10%. When failures dominate, the budget drains and retries stop.</p>
+</details>
+<details>
+<summary>"Is it ever safe to retry a payment without an idempotency key?"</summary>
+<p>Yes, when the failure proves the request never reached the server: DNS failure, connection refused, connect timeout, or an HTTP/2 refused stream. Nothing was sent, so nothing can be duplicated. Once the request bytes have left, any failure is ambiguous. A reset, a 502 or a timeout after sending all mean "maybe it happened", and only an idempotency key makes that retry safe.</p>
+</details>
+<details>
+<summary>"Full jitter can produce a near-zero wait. Isn't that the immediate retry you were trying to avoid?"</summary>
+<p>For one client, sometimes. For a fleet, no. The problem with immediate retries is synchronization, thousands of clients at the same instant. With full jitter only a small fraction wait near zero, and they are spread across the window. If even one fast retry is harmful, for example against a limiter that counts it, equal jitter keeps a floor of half the window. Decorrelated jitter keeps a floor of the base delay.</p>
+</details>
+<details>
+<summary>"The trigger was fixed ten minutes ago. Why is the service still down?"</summary>
+<p>It is likely in a metastable state. Retries raised load, latency went past client timeouts, so most calls failed, and those failures generated more retries. The loop sustains itself without the original trigger. You break it by removing load: shed at the edge, let retry budgets and circuit breakers cut retries, and drop requests that have already expired. Then raise traffic back gradually.</p>
+</details>
+<details>
+<summary>"Where should retries live: client, gateway or mesh?"</summary>
+<p>At one layer, and usually the one with the most knowledge about the operation. That is the client code closest to the failing call: it knows whether the operation is idempotent, how much budget remains and whether the failure was pre-send. A mesh can safely retry connection failures and refused streams for every service. Outer layers, such as the mobile app or the gateway, should fail fast and let the user decide.</p>
+</details>
+<details>
+<summary>"How can a retry corrupt data even when the write is idempotent?"</summary>
+<p>By reordering. If write A fails, write B to the same key succeeds, and then A's retry succeeds, A overwrites B. Each write was idempotent on its own; the sequence was not. The fix is a version check on the write (<code>WHERE version = n</code>), per-key sequence numbers as Kafka's idempotent producer uses, or keeping only one in-flight write per key.</p>
+</details>
+<details>
+<summary>"A 503 arrives with <code>Retry-After: 120</code>, but your request has 800 ms left. What do you do?"</summary>
+<p>Fail now. The hint says no retry will succeed within your deadline, so waiting would only hold resources. Return the error, or a fallback, to your caller. If the work does not need an answer now, put it on a queue with a delay of at least 120 seconds. Ignoring the hint and retrying sooner is the worst choice: it adds load the server explicitly asked you not to send.</p>
+</details>
+<details>
+<summary>"How do you know your retry policy is working in production?"</summary>
+<p>Measure three things per dependency. The attempts per logical call, which should sit just above 1.0 on a healthy day. The success rate of retries, which tells you whether failures are really transient. And the budget's state, how often it was exhausted. A rising attempts ratio is an early warning that the dependency is degrading. A low retry success rate means you are adding load for nothing.</p>
+</details>

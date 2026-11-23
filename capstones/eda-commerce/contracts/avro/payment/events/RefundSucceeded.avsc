@@ -1,0 +1,48 @@
+{
+  "type": "record",
+  "name": "RefundSucceeded",
+  "namespace": "com.edacommerce.payment",
+  "doc": "Reply to RefundPayment.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "paymentId",
+      "type": "string"
+    },
+    {
+      "name": "refundId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "amount",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "pspReference",
+      "type": "string"
+    },
+    {
+      "name": "refundedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

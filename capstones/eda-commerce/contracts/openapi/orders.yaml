@@ -1,0 +1,156 @@
+openapi: 3.1.0
+info:
+  title: eda-commerce Orders API
+  version: 1.0.0
+  description: |
+    Order status and order history. Served by order-svc (port 8103).
+
+    Reads come from the order-history read model (ADR-010), which lags the saga by a second or two.
+    For a single order that the read model has not seen yet, order-svc falls back to the saga table
+    so that a client polling right after checkout sees PENDING instead of 404. Every response carries
+    the aggregate version it reflects; clients must never show an older version after a newer one.
+servers:
+  - url: http://localhost:8103
+    description: local
+security:
+  - oidc: [shop]
+tags:
+  - name: orders
+paths:
+  /orders/{orderId}:
+    parameters:
+      - $ref: './common.yaml#/components/parameters/OrderId'
+    get:
+      tags: [orders]
+      operationId: getOrder
+      summary: Current status and timeline of one order
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag: {$ref: './common.yaml#/components/headers/ETag'}
+            Retry-After:
+              $ref: './common.yaml#/components/headers/RetryAfter'
+              description: Present while the order is in a non-terminal saga state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Order'}
+        '304':
+          description: Not modified (If-None-Match matched).
+        '401': {$ref: './common.yaml#/components/responses/Unauthorized'}
+        '404': {$ref: './common.yaml#/components/responses/NotFound'}
+  /orders/{orderId}/invoice:
+    parameters:
+      - $ref: './common.yaml#/components/parameters/OrderId'
+    get:
+      tags: [orders]
+      operationId: getInvoice
+      summary: Redirect to a short-lived pre-signed URL for the invoice PDF
+      description: The PDF lives in object storage (claim check, ADR-009). The API never streams it through the service.
+      responses:
+        '302':
+          description: Redirect to a pre-signed URL valid for 5 minutes.
+          headers:
+            Location: {$ref: './common.yaml#/components/headers/Location'}
+        '404': {$ref: './common.yaml#/components/responses/NotFound'}
+  /customers/me/orders:
+    get:
+      tags: [orders]
+      operationId: listMyOrders
+      summary: Order history of the calling customer, newest first
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor from the previous page's nextCursor.
+          schema: {type: string}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: array
+            items: {$ref: '#/components/schemas/OrderStatus'}
+          style: form
+          explode: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/OrderSummary'}
+                  nextCursor: {type: [string, 'null']}
+        '401': {$ref: './common.yaml#/components/responses/Unauthorized'}
+components:
+  schemas:
+    OrderStatus:
+      type: string
+      description: Customer-facing status. Coarser than the internal saga state.
+      enum: [PENDING, CONFIRMED, CANCELLED, SHIPPED, DELIVERED, RETURN_IN_PROGRESS, RETURNED, PARTIALLY_RETURNED, NEEDS_ATTENTION]
+    OrderSummary:
+      type: object
+      required: [orderId, status, total, placedAt, version]
+      properties:
+        orderId: {$ref: './common.yaml#/components/schemas/Uuid'}
+        status: {$ref: '#/components/schemas/OrderStatus'}
+        total: {$ref: './common.yaml#/components/schemas/Money'}
+        itemCount: {type: integer}
+        placedAt: {type: string, format: date-time}
+        version: {type: integer, format: int64}
+    TimelineEntry:
+      type: object
+      required: [at, kind, eventId]
+      properties:
+        at: {type: string, format: date-time}
+        kind:
+          type: string
+          examples: [ORDER_PLACED, PAYMENT_AUTHORIZED, ORDER_PACKED, SHIPMENT_IN_TRANSIT, REFUND_SUCCEEDED]
+        description: {type: string}
+        eventId: {$ref: './common.yaml#/components/schemas/Uuid'}
+    Order:
+      allOf:
+        - $ref: '#/components/schemas/OrderSummary'
+        - type: object
+          required: [lines, timeline, source]
+          properties:
+            lines:
+              type: array
+              items:
+                type: object
+                required: [lineId, sku, productName, quantity, unitPrice, lineTotal]
+                properties:
+                  lineId: {type: string}
+                  sku: {type: string}
+                  productName: {type: string}
+                  quantity: {type: integer}
+                  unitPrice: {$ref: './common.yaml#/components/schemas/Money'}
+                  lineTotal: {$ref: './common.yaml#/components/schemas/Money'}
+                  returnedQuantity: {type: integer, default: 0}
+            cancellationReason: {type: [string, 'null']}
+            shipment:
+              type: [object, 'null']
+              properties:
+                carrier: {type: string}
+                trackingNumber: {type: string}
+                status: {type: string}
+            invoiceAvailable: {type: boolean}
+            refundedTotal: {$ref: './common.yaml#/components/schemas/Money'}
+            timeline:
+              type: array
+              items: {$ref: '#/components/schemas/TimelineEntry'}
+            source:
+              type: string
+              enum: [READ_MODEL, WRITE_MODEL_FALLBACK]
+              description: Where this answer came from. WRITE_MODEL_FALLBACK only for brand-new orders.
+  securitySchemes:
+    oidc:
+      $ref: './common.yaml#/components/securitySchemes/oidc'

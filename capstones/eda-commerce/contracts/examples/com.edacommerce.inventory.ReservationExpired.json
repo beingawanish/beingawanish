@@ -1,0 +1,22 @@
+{
+  "envelope": {
+    "eventId": "4b7afba1-cd6e-574d-bf61-652f21e39229",
+    "type": "com.edacommerce.inventory.ReservationExpired",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "f32b0f43-7546-56d2-92a7-5a0d1801c7e9",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "inventory-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Reservation",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "reservationId": "3680abdc-1542-5718-b2e1-c2d5e93ff0de",
+  "expiredAt": 1795000000000
+}

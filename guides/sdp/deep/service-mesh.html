@@ -1,0 +1,214 @@
+<h2 id=dd-service-mesh-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The <a href="#sidecar">sidecar</a> deep dive followed one request through two proxies. This one goes up a level, to the control plane. It covers how it builds each proxy's configuration, how that configuration travels over xDS, how identities are minted and rotated, and how authorization and outlier detection actually decide things. Istio and Envoy are used for concrete names, because their knobs are well documented. Other meshes make the same decisions under different names.</p>
+
+<h3 id=dd-service-mesh-model level=3>From cluster state to per-proxy config</h3>
+<p>The control plane is a translator with a cache. In Kubernetes it runs a set of <em>watches</em> on the API server, which are long-lived streams of changes:</p>
+<ul>
+<li><strong>Services and EndpointSlices</strong> tell it which services exist and which pod IPs currently back them, and whether each is ready.</li>
+<li><strong>Pods and service accounts</strong> tell it which identity each workload runs as.</li>
+<li><strong>Mesh resources</strong> (in Istio: <code>VirtualService</code>, <code>DestinationRule</code>, <code>AuthorizationPolicy</code>, <code>PeerAuthentication</code>, <code>Sidecar</code>) carry the declared policy.</li>
+</ul>
+<p>From these it builds one internal model of the mesh. For each connected proxy, it then computes the slice of that model the proxy needs. A checkout sidecar needs listeners for its own ports, routes for the services it calls, endpoint lists for those services, and its own certificate. It does not need the routes for the warehouse's internal batch services.</p>
+<p>The key property is that the control plane is <strong>not on the request path</strong>. It never sees a request. It only changes what proxies believe. That is why the lesson can say the data plane fails static: the proxies already hold everything a request needs.</p>
+
+<h3 id=dd-service-mesh-xds level=3>xDS: five resource types on one stream</h3>
+<p>Envoy's configuration API is a family of discovery services, collectively called xDS. Each one carries one resource type:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Service<th>Carries<th>Changes when<tbody>
+<tr><td>LDS (listeners)<td>Ports the proxy listens on, and their filter chains<td>Ports or protocol settings change; rare
+<tr><td>RDS (routes)<td>HTTP routing: hosts, paths, weights, retries, timeouts<td>Someone edits a traffic policy
+<tr><td>CDS (clusters)<td>Upstream service groups, with load balancing, circuit breakers and outlier detection<td>Services are added or their policy changes
+<tr><td>EDS (endpoints)<td>The current IPs in each cluster, with health and locality<td>Constantly: every deploy, scale event and failing pod
+<tr><td>SDS (secrets)<td>Certificates and trust bundles<td>On every certificate rotation
+</tbody></table></div></div>
+<p>A proxy usually opens one gRPC stream for all of them, the <strong>Aggregated Discovery Service</strong> (ADS). One stream lets the control plane control the order of updates, and order matters. Picture a route pointing at a cluster the proxy has not heard of yet. Requests matching that route fail until the cluster arrives. The safe order is "make before break": send new clusters and their endpoints first, then the routes that use them. Remove old clusters only after no route references them.</p>
+<p>Each response carries a <code>version_info</code> and a <code>nonce</code>. The proxy replies with an ACK (it applied the update) or a NACK (it rejected it, with an error message). A NACKed update is simply not applied. The proxy keeps running on its last accepted config. That is fail-static at the level of a single update, and it is why a malformed config does less damage than a valid but wrong one.</p>
+<p>There are two flavours of protocol. In <em>state of the world</em>, every update for a type resends the full set of resources of that type. In <em>incremental</em> (delta) xDS, only the resources that changed are sent. With 2,000 endpoints in a cluster and one pod restarting, the difference is resending 2,000 entries versus 1. At scale, incremental xDS for endpoints is what keeps pushes cheap.</p>
+
+<h3 id=dd-service-mesh-debounce level=3>Debouncing: batching changes before pushing</h3>
+<p>A rolling deploy of 40 pods produces dozens of endpoint changes within seconds. Pushing after each one would recompute and resend config hundreds of times. Control planes therefore <em>debounce</em>. They wait a short quiet period after a change, typically on the order of 100 ms, and push everything that changed in that window at once, with a ceiling so a constant trickle of changes cannot delay pushes forever. Istio exposes both values as settings.</p>
+<p>That knob trades freshness against load. A longer debounce means fewer, larger pushes and less control-plane CPU. But it also means a terminated pod stays in callers' endpoint lists slightly longer. During that window, readiness-based draining on the pod being removed carries the weight. This is the reason graceful shutdown still matters inside a mesh.</p>
+
+<h3 id=dd-service-mesh-identity level=3>Identity: how a pod gets its certificate</h3>
+<p>The mesh's identity system is a small PKI that runs automatically. In Istio, the flow for each pod is:</p>
+<ol>
+<li>An agent inside the sidecar container generates a private key locally. The key never leaves the pod.</li>
+<li>The agent sends a certificate signing request (CSR) to the control plane's CA. It authenticates with the pod's Kubernetes service-account token.</li>
+<li>The CA verifies the token with the API server, and issues a certificate whose subject alternative name is a SPIFFE ID, such as <code>spiffe://cluster.local/ns/shop/sa/checkout</code>.</li>
+<li>The agent hands the key, the certificate and the trust bundle to Envoy over SDS on a local socket.</li>
+<li>Before the certificate expires, the agent repeats the process and Envoy swaps the new one in without dropping connections.</li>
+</ol>
+<p>Identity is tied to the <em>service account</em>, not the pod or IP. Every checkout replica shares one identity. That is what makes "only checkout may call payments" a short rule. It also means service accounts must be per service. If ten services share the <code>default</code> account, they share one identity, and authorization cannot tell them apart.</p>
+<p>Lifetimes are a policy choice. The lesson uses hourly rotation. Istio's default workload certificate lifetime is 24 hours, with renewal well before expiry. Shorter lifetimes limit how long a stolen key works. They also shorten how long the mesh can survive without its CA, which the sizing section works out.</p>
+<p>Above workload certificates sits the root of trust. Rotating a workload certificate is routine. Rotating the <em>root</em> is not, because every proxy must trust the new root before any workload presents a certificate signed by it. The safe sequence: distribute a trust bundle containing both old and new roots, wait until every proxy has it, switch issuance to the new root, wait for all workload certificates to roll over, then remove the old root. In practice, many organisations plug the mesh CA into their existing PKI as an intermediate, so the root's lifecycle is someone else's well-rehearsed job.</p>
+
+<h3 id=dd-service-mesh-authz level=3>Authorization: how a decision is made</h3>
+<p>The lesson's rule ("only checkout and refunds may call payments") looks like this in Istio:</p>
+<pre><code>apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: payments-callers
+  namespace: payments
+spec:
+  selector:
+    matchLabels:
+      app: payments
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals:
+        - cluster.local/ns/shop/sa/checkout
+        - cluster.local/ns/shop/sa/refunds
+    to:
+    - operation:
+        methods: ["POST"]
+        paths: ["/v1/charges", "/v1/refunds"]</code></pre>
+<p>The payments sidecar evaluates it on every inbound request, after mTLS has verified the caller's certificate. The evaluation order is worth knowing exactly, because it explains several outages. In Istio, CUSTOM policies are checked first, then DENY policies, then ALLOW policies. If any DENY matches, the request is denied. If at least one ALLOW policy applies to the workload, and none of them match, the request is denied. Adding the first ALLOW policy to a workload therefore turns it from "allow everything" into "allow only this". A policy that is meant to add one caller can, by existing, cut off every other caller.</p>
+<p>Mutual TLS itself has a migration mode. <code>PERMISSIVE</code> accepts both plaintext and mTLS on the same port, so pods inside and outside the mesh can both connect. <code>STRICT</code> accepts only mTLS. Every rollout passes through permissive mode first. Moving to strict is the step that breaks things, as failure mode 4 shows.</p>
+
+<h3 id=dd-service-mesh-outlier level=3>Outlier detection and panic mode</h3>
+<p>The lesson describes outlier detection as the mesh's circuit breaker. Envoy's defaults show how it behaves. An endpoint is ejected after 5 consecutive 5xx responses (<code>consecutive_5xx</code>). Detection runs every 10 seconds (<code>interval</code>). The first ejection lasts 30 seconds (<code>base_ejection_time</code>), and it grows each time the same host is ejected again. At most 10% of a cluster's hosts can be ejected at once (<code>max_ejection_percent</code>).</p>
+<p>That 10% cap exists for a reason. Outlier detection is built to remove a few bad hosts, not to react to a whole service failing. A related safety valve, the <strong>panic threshold</strong>, decides what happens when too many hosts look unhealthy. Envoy's default is 50%. Once fewer than half the hosts in a cluster are healthy, Envoy stops trusting its health data and spreads traffic across all hosts, healthy or not. The reasoning is that sending everything to the few remaining hosts would overload them too. Both behaviours surprise people in incidents, and failure mode 5 shows one.</p>
+
+<h2 id=dd-service-mesh-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-service-mesh-sizing-push level=3>Push volume and convergence</h3>
+<p>Take the bookstore at 440 proxies and imagine growth to 5,000 proxies across 300 services. Assume each proxy's full config is around 200 KB when unscoped (every service visible) and around 20 KB when scoped to the dozen services it actually calls. Real sizes vary a lot with features and versions, so treat these as placeholders and measure.</p>
+<pre><code>Full push, unscoped:  5,000 × 200 KB = 1 GB of config to serialise and send
+Full push, scoped:    5,000 ×  20 KB = 100 MB</code></pre>
+<p>A full push happens when global policy changes, or when the control plane restarts and every proxy reconnects. An endpoint change, with incremental xDS and scoping, goes only to proxies that call that service and carries only the changed endpoints. That is kilobytes, not gigabytes.</p>
+<p>Track <strong>convergence time</strong>, which means the time from a change in the cluster to every affected proxy having ACKed it. Istio exports it as <code>pilot_proxy_convergence_time</code>. For a deploy, the budget is simple. Convergence plus the debounce window must stay well inside the terminating pod's drain period. If pods drain for 15 seconds and convergence is at 20 seconds during big rollouts, callers will send traffic to pods that already shut down.</p>
+
+<h3 id=dd-service-mesh-sizing-ca level=3>CA load, and how long fail-static really lasts</h3>
+<p>Certificate issuance is cheap in steady state. At 5,000 pods with 24-hour certificates, that is 5,000 / 86,400 ≈ 0.06 signatures per second. With 1-hour certificates, it is 5,000 / 3,600 ≈ 1.4 per second. Bursts come from deploys and node failures. A 500-pod rollout over 2 minutes asks for about 4 certificates per second on top. All of this is easily handled by one CA replica. The burst that hurts is a control-plane restart, when every agent may try to renew at once.</p>
+<p>The more important number is how long the mesh survives with the control plane down. Existing traffic flows on cached config, but certificates keep ageing. Suppose renewal happens when a certificate reaches 80% of its lifetime. The pod closest to renewal at the moment of the outage has 20% of its lifetime left:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Certificate lifetime<th>Time left on the most urgent pod (20%)<th>What that means for control-plane recovery<tbody>
+<tr><td>24 hours<td>~4.8 hours<td>A bad night, but time to restore from backup or rebuild
+<tr><td>1 hour<td>~12 minutes<td>The control plane is effectively on the request path
+<tr><td>15 minutes<td>~3 minutes<td>Any control-plane outage becomes a mesh-wide mTLS outage
+</tbody></table></div></div>
+<p>So the security goal (short certificates) and the availability goal (long fail-static window) pull against each other. Pick the lifetime from the control plane's recovery time objective, not from a security slogan. That holds for the lesson's hourly rotation too: an hourly scheme needs a control plane you can restore in minutes, which means multiple replicas across zones, tested failover, and a CA key that survives losing them.</p>
+
+<h3 id=dd-service-mesh-sizing-telemetry level=3>Telemetry cardinality</h3>
+<p>"Observability with no extra work" is free for application teams. It is not free for whoever runs the metrics system. Standard mesh request metrics are labelled by source workload, destination workload, response code, reporter (source or destination side) and more. Estimate the series for one latency histogram:</p>
+<pre><code>30 services × 5 callees each      = 150 service pairs
+× 6 distinct response codes        = 900
+× 2 reporters                      = 1,800
+× ~20 histogram buckets            = 36,000 series</code></pre>
+<p>That is manageable. Now add a per-pod label, which the default setup often includes for each scraped proxy. With 40 pods per service it multiplies to around 1.4 million series, and a single Prometheus starts to struggle. The usual remedies are to aggregate per workload before storage (recording rules or federation), drop pod-level labels from request metrics, and trim histogram buckets. Decide this during design. The default is often fine at 11 services and painful at 300.</p>
+
+<h3 id=dd-service-mesh-sizing-team level=3>The team cost, in people</h3>
+<p>The lesson says the main cost is organisational. Put a rough number on it. A mesh at this scale typically needs on-call coverage for the control plane, upgrades every few months (each one a fleet-wide sidecar restart), policy review, and support for application teams. That adds up to two to four engineers' sustained attention. It is also why the <a href="#minicapstone-the-front-door-assembled">capstone</a> defers the full mesh for a team of two. The infrastructure bill is visible on an invoice. The people bill shows up as a platform team that never gets to its roadmap.</p>
+
+<h2 id=dd-service-mesh-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-service-mesh-fm-allow-nothing level=3>1. A new ALLOW policy cuts off every other caller</h3>
+<p><strong>Symptom.</strong> A team adds a policy letting a new reporting service read from inventory. Minutes later, checkout's inventory calls fail with <code>403 RBAC: access denied</code>.</p>
+<p><strong>Mechanism.</strong> Inventory had no authorization policies, so it allowed everything. The first ALLOW policy changed its default to deny-unless-matched. Only the reporting service matched. Checkout, which had always worked without a rule, was now denied.</p>
+<p><strong>Detect.</strong> Denied-request counters on the receiving sidecar, broken out by source principal. A jump in 403s right after a policy apply is unambiguous. Envoy's RBAC filter keeps its own allowed and denied stats.</p>
+<p><strong>Fix.</strong> Write the full caller list for a service in one policy, not one policy per caller. Roll policies out in dry-run mode first: Istio supports an annotation that evaluates and logs a policy without enforcing it. Treat policy as code, with review and a staged rollout, exactly as the lesson's retry incident concludes.</p>
+
+<h3 id=dd-service-mesh-fm-convergence level=3>2. Slow convergence during a large rollout</h3>
+<p><strong>Symptom.</strong> During a big deploy, callers see 503s with "no healthy upstream" or connection failures for 20 to 40 seconds. Small deploys are fine.</p>
+<p><strong>Mechanism.</strong> Hundreds of pods change at once. The control plane is CPU-bound computing and sending config to thousands of proxies, many of which get unscoped, full-size updates. Endpoint updates lag. Callers keep sending to pods that already terminated, and they learn about the new pods late.</p>
+<p><strong>Detect.</strong> Convergence time and push queue time on the control plane. Look also at its CPU during deploys, and at the share of 503s with <code>UF</code> or <code>UH</code> flags at callers, correlated with deploy events.</p>
+<p><strong>Fix.</strong> Scope config so most proxies are not affected by a given change. Use incremental xDS for endpoints. Add control-plane replicas so that proxy connections spread across them. And make terminating pods drain for longer than the worst observed convergence time, so stale endpoints still answer during the gap.</p>
+
+<h3 id=dd-service-mesh-fm-root level=3>3. The root certificate expires</h3>
+<p><strong>Symptom.</strong> On an otherwise quiet day, every mTLS connection in the mesh starts failing with certificate verification errors at once.</p>
+<p><strong>Mechanism.</strong> The mesh was installed with a self-signed root generated at install time. Workload certificates rotated perfectly for years, but nobody owned the root. When it expired, every certificate chaining to it became invalid at the same moment. Early mesh releases that generated short-lived roots made this a real, recurring incident across the industry.</p>
+<p><strong>Detect.</strong> An alert on the expiry date of every root and intermediate in the trust bundle, months in advance. Workload-certificate expiry alerts do not catch this.</p>
+<p><strong>Fix.</strong> Use an intermediate CA issued from the organisation's managed PKI, with a documented rotation runbook. Rehearse a root rotation with overlapping trust bundles in staging before you need it in production.</p>
+
+<h3 id=dd-service-mesh-fm-strict level=3>4. Switching to STRICT mTLS breaks callers outside the mesh</h3>
+<p><strong>Symptom.</strong> After a namespace moves from <code>PERMISSIVE</code> to <code>STRICT</code>, a nightly batch job and the metrics scraper start failing. Everything in the mesh works.</p>
+<p><strong>Mechanism.</strong> Those callers have no sidecar, so they speak plaintext. Permissive mode had been accepting them quietly. Strict mode rejects them.</p>
+<p><strong>Detect.</strong> Before switching, look at the security-policy label on inbound connection metrics (Istio reports whether each connection used mutual TLS or none). Every source still sending plaintext is a client that strict mode will break.</p>
+<p><strong>Fix.</strong> Switch to strict only when plaintext inbound traffic has been at zero for a full business cycle, long enough to cover weekly and monthly jobs. Give out-of-mesh callers a path in, such as an ingress gateway or their own sidecar, or exempt specific ports deliberately and in writing.</p>
+
+<h3 id=dd-service-mesh-fm-panic level=3>5. Outlier detection plus panic mode spreads a failure</h3>
+<p><strong>Symptom.</strong> A bad Inventory release fails on 60% of pods. The errors seen by checkout do not drop to 0% as expected. They stay around 50%, even though 40% of pods are healthy.</p>
+<p><strong>Mechanism.</strong> Outlier detection could eject at most 10% of hosts. The failing pods' readiness checks still passed, because the bug was in one endpoint and the health check never touched it. And because fewer than 50% of hosts looked healthy to some proxies during the churn, panic mode kicked in. Traffic spread evenly across every host, broken ones included.</p>
+<p><strong>Detect.</strong> Ejection counts and the "panic" counters per cluster on caller proxies. Look at error rate per destination pod: if errors cluster on specific pods while traffic is evenly spread, the safety valves are not removing them.</p>
+<p><strong>Fix.</strong> This is a release problem first: a canary would have caught a 60% failure on 5% of traffic. On the mesh side, raise <code>max_ejection_percent</code> for services with many replicas, and make readiness checks exercise the critical path. Know that panic mode exists, so nobody spends an incident wondering why the healthy pods are not getting all the traffic.</p>
+
+<h3 id=dd-service-mesh-fm-skew level=3>6. Version skew during a mesh upgrade</h3>
+<p><strong>Symptom.</strong> After a control-plane upgrade, a new routing feature works for some services and not others. Control-plane logs show config rejections.</p>
+<p><strong>Mechanism.</strong> The new control plane sends config fields that older sidecars do not understand. Those proxies NACK the update and keep their old config, which is fail-static doing its job. But they stay stuck on stale routes until their pods restart with the new proxy version.</p>
+<p><strong>Detect.</strong> The control plane's xDS reject counter (<code>pilot_total_xds_rejects</code> in Istio), and an inventory of proxy versions across the fleet.</p>
+<p><strong>Fix.</strong> Upgrade with revisions. Run the new control plane alongside the old one, move namespaces to it gradually, and restart their pods to pick up the matching proxy. Stay inside the mesh's supported version-skew window, and do not use new features until the fleet has rolled.</p>
+
+<h3 id=dd-service-mesh-fm-cardinality level=3>7. The mesh takes down the metrics system</h3>
+<p><strong>Symptom.</strong> A week after the mesh reaches the last 100 services, Prometheus runs out of memory and dashboards go blank in the middle of an unrelated incident.</p>
+<p><strong>Mechanism.</strong> The series math from the sizing section. Per-pod labels on per-service-pair histograms grow as services × callees × pods × buckets. Each service added to the mesh adds series to everything it calls.</p>
+<p><strong>Detect.</strong> Active series count and ingestion rate in the metrics system, tracked as a capacity metric. Also the top series by label, to see which label is exploding.</p>
+<p><strong>Fix.</strong> Aggregate to workload level before storage, drop pod labels from request metrics, reduce buckets, and set per-job series limits so one source cannot take down the whole system.</p>
+
+<h2 id=dd-service-mesh-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<p>The choice of product matters less than five decisions that every mesh design has to make.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose B when<tbody>
+<tr><td>Data plane shape<td>Sidecar per pod<td>Per-node L4 proxy plus L7 proxies only where needed<td>Most services need only mTLS and identity, and per-pod cost matters
+<tr><td>Feature breadth<td>Broad (many policy types, many knobs)<td>Narrow (mTLS, metrics, retries, little else)<td>The platform team is small and the goal is identity plus observability
+<tr><td>Certificate authority<td>Built-in, self-signed root<td>Intermediate from the organisation's PKI<td>Almost always in production; A is for labs
+<tr><td>Multi-cluster<td>One control plane per cluster, shared root of trust<td>One control plane managing several clusters<td>Clusters are tightly coupled and the team can accept a wider blast radius
+<tr><td>Policy location<td>Mesh enforces coarse service-to-service rules<td>Mesh also enforces fine-grained, per-route, per-user rules<td>Rarely; user-level authorization usually belongs in the service
+</tbody></table></div></div>
+
+<h3 id=dd-service-mesh-var-guidance level=3>How to choose</h3>
+<ul>
+<li><strong>Start narrow.</strong> The lesson says to adopt for one measurable goal. In practice that is usually workload identity with mTLS, plus the standard golden-signal metrics. Every policy type you turn on is one more thing that can push a bad global change.</li>
+<li><strong>Keep user authorization out of the mesh.</strong> The mesh knows <em>which service</em> is calling. It does not know which customer, or whether this customer may refund this order. That logic stays in the service, as the <a href="#api-gateway">gateway</a> lesson says for AuthZ.</li>
+<li><strong>One control plane per cluster is the default.</strong> Each cluster's mesh can fail and be upgraded on its own. Cross-cluster calls use a shared root of trust and an east-west gateway. A single control plane for many clusters makes one bad push global across all of them.</li>
+<li><strong>Sidecar-less modes change the cost curve, not the control plane.</strong> They cut per-pod memory and lifecycle problems. They do not remove convergence, CA management, policy governance or telemetry cardinality, which is where most of the operating work is.</li>
+<li><strong>Retries and timeouts belong to the mesh only after you remove them from the code.</strong> Pick one owner per call path, as the sidecar deep dive explains.</li>
+</ul>
+
+<h2 id=dd-service-mesh-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What is the single measurable goal for phase one, and which features stay off until it is met?</li>
+<li>Who owns the control plane on call? How many replicas run, across how many zones, and what is its recovery time objective?</li>
+<li>What is the workload certificate lifetime, and is the fail-static window it implies longer than that recovery objective?</li>
+<li>Where does the root of trust come from, when does it expire, and has a root rotation been rehearsed?</li>
+<li>Does every service have its own service account, so identities are distinct?</li>
+<li>Is sidecar configuration scoped per workload? What is convergence time during the largest normal rollout, and is it shorter than pod drain time?</li>
+<li>How are policy changes reviewed, dry-run and staged? Can one change reach the whole fleet at once?</li>
+<li>For each authorization policy, is the full caller list in one place? What happens to unlisted callers?</li>
+<li>Which callers are still plaintext, and what is the plan before switching to strict mTLS?</li>
+<li>Are retries owned by exactly one layer, limited to idempotent calls, and capped by a budget?</li>
+<li>How many metric series will mesh telemetry add at full adoption, and which labels are dropped or aggregated?</li>
+<li>What is the upgrade procedure (revisions, skew window), and how often will the fleet restart for proxy upgrades?</li>
+</ol>
+
+<h2 id=dd-service-mesh-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Walk me through what happens between 'a pod is deleted' and 'callers stop sending to it'."</summary>
+<p>The pod is marked terminating, and its readiness drops. The EndpointSlice controller removes or marks the endpoint, and the control plane's watch sees the change. The control plane debounces for a short window, recomputes EDS for proxies that call that service, and pushes. Each proxy ACKs and stops picking the endpoint. Until then, the terminating pod must keep serving, which is why its drain period has to exceed debounce plus push plus convergence. In-flight connections then finish or are closed by the proxies.</p>
+</details>
+<details>
+<summary>"Your certificates are valid for one hour. The control plane is down. How long do you have?"</summary>
+<p>Less than the lifetime, because renewal starts before expiry. If agents renew at 80% of lifetime, the pod closest to renewal has about 12 minutes left when the outage begins. After that, its certificate expires, and its mTLS connections start failing. With one-hour certificates the control plane is nearly on the request path, so it needs multi-zone replicas and a restore measured in minutes. With 24-hour certificates the same calculation gives several hours.</p>
+</details>
+<details>
+<summary>"A team added an AuthorizationPolicy for one new caller and broke all the others. Why?"</summary>
+<p>Because a workload with no ALLOW policies allows everything, and a workload with at least one ALLOW policy allows only what matches. Their policy flipped the default to deny. The fix is to keep each service's complete caller list in one policy, roll out new policies in dry-run first, and alert on denials by source identity.</p>
+</details>
+<details>
+<summary>"What does a NACK do, and why does it matter for safety?"</summary>
+<p>A NACK is the proxy telling the control plane "I rejected this update", along with the error. The proxy keeps its last accepted config. So malformed or unsupported config fails safe: nothing changes. The dangerous case is config that is valid but wrong, such as a bad retry policy or a deny-all rule. That is accepted everywhere at configuration speed. Safety therefore comes from review and staged rollout of policy, not from the protocol.</p>
+</details>
+<details>
+<summary>"Why does the mesh tie identity to service accounts and not IP addresses?"</summary>
+<p>IPs are reused constantly as pods come and go, can be spoofed inside a flat network, and say nothing about what code is running. A service account is a stable name for a workload, and the CA only signs certificates for it after verifying the pod's token with the API server. The certificate proves "this is checkout" wherever the pod runs. That is what lets policy be written in terms of services and survive rescheduling and autoscaling.</p>
+</details>
+<details>
+<summary>"Half of Inventory's pods are broken but readiness passes. What does the mesh do?"</summary>
+<p>Outlier detection ejects hosts that return consecutive 5xx errors, but by default only up to 10% of the cluster. And if too many hosts look unhealthy, Envoy's panic threshold (50% by default) makes it spread traffic across all hosts, because overloading the remaining few would be worse. So the mesh limits the damage but does not fix it. The real fixes are a canary that catches the release at 5% traffic, and readiness checks that cover the critical path.</p>
+</details>
+<details>
+<summary>"Should the mesh enforce that a customer can only see their own orders?"</summary>
+<p>No. The mesh verifies <em>which workload</em> is calling. Whether customer 42 may read order 8412 depends on the user's token and on domain data that only the orders service has. Put coarse service-to-service rules in the mesh ("only the BFFs may call orders"). Keep per-user and per-object authorization in the service. Doing it in the mesh means copying domain data into policy, and that is the drift problem again.</p>
+</details>
+<details>
+<summary>"How would you upgrade the mesh across 5,000 pods without a big-bang risk?"</summary>
+<p>Use revisions. Install the new control plane next to the old one, under a revision label. Move one low-risk namespace to the new revision, restart its pods so they get the matching proxy, and watch error rates, convergence and xDS rejects. Then move namespaces in waves. Keep the old revision running until the last namespace has moved, so rollback is just relabelling and restarting. Stay within the supported skew between control plane and proxy versions throughout.</p>
+</details>

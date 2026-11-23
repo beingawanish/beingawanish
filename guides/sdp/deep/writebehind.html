@@ -1,0 +1,262 @@
+<h2 id=dd-writebehind-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson describes write-behind as four parts: dirty tracking, coalescing, a flush policy and failure handling. That is the right map. A design review needs the street-level view, though, because almost every write-behind bug lives in the gaps between those boxes. What happens to an increment that lands while the flusher is halfway through a batch? What if the flusher commits to the database and then dies before it marks the batch clean? This section builds the view counter as you would really run it on Redis and Postgres, then looks at how packaged products do the same job.</p>
+
+<h3 id=dd-writebehind-keys level=3>The keys: a display total, a pending delta, a dirty index</h3>
+<p>One counter is really three pieces of state, and keeping them apart is what makes the flush safe.</p>
+<ul>
+<li><strong>The display total</strong>, <code>views:{17}:8412</code>. This is what the product page reads. It holds the full count, so the page never has to add anything up.</li>
+<li><strong>The pending delta</strong>, <code>delta:{17}:8412</code>. This holds only the increments the database has not yet received. The flusher drains it. The page never reads it.</li>
+<li><strong>The dirty index</strong>, <code>dirty:{17}</code>, a sorted set. Each member is a product ID. Its score is the time that product <em>first</em> became dirty since its last flush. That score turns out to be the most useful number in the whole design, as you will see under the metrics.</li>
+</ul>
+<p>The <code>{17}</code> is a Redis Cluster hash tag. Cluster places a key by hashing only the text inside the braces, so all three keys for bucket 17 land in the same slot on the same shard. That matters because the write path below runs as one Lua script, and a script may only touch keys in a single slot. The bucket is <code>product_id mod 256</code> or similar. It also gives you per-key ordering for free: one flusher owns each bucket, so no two flushers ever race on the same product.</p>
+
+<h3 id=dd-writebehind-write-path level=3>The write path: one atomic script</h3>
+<p>Each page view runs one script. It bumps the total, bumps the delta and records the dirty time, all in one step that no other command can interleave with:</p>
+<pre><code>-- KEYS[1] = views:{17}:8412   KEYS[2] = delta:{17}:8412   KEYS[3] = dirty:{17}
+-- ARGV[1] = 8412 (product id)  ARGV[2] = now in ms
+local total = redis.call('INCR', KEYS[1])
+redis.call('INCR', KEYS[2])
+redis.call('ZADD', KEYS[3], 'NX', ARGV[2], ARGV[1])   -- NX: keep the FIRST dirty time
+return total</code></pre>
+<p>The <code>NX</code> flag on <code>ZADD</code> is doing real work. Without it, every increment would push the score forward, and a key written constantly would always look freshly dirty. Its oldest unflushed increment could then sit there indefinitely without your metrics noticing.</p>
+<p>The script returns the new total, so the page can show the exact count right after its own view. In practice most teams don't bother: the page renders the total it read a moment ago, and nobody can tell.</p>
+
+<h3 id=dd-writebehind-flush-protocol level=3>The flush protocol, step by step</h3>
+<p>The flusher for bucket 17 wakes every 2 seconds (or sooner, if the dirty index passes a size threshold). It runs four steps. The order is the whole design.</p>
+<ol>
+<li><strong>Pick the batch.</strong> <code>ZRANGE dirty:{17} 0 499</code> returns up to 500 product IDs, oldest first.</li>
+<li><strong>Move the deltas aside, atomically.</strong> A second script, per batch, does this for each ID: <code>GETDEL delta:{17}:id</code>, write the value into a hash <code>inflight:{17}:F</code> (where <code>F</code> is a fresh flush ID, such as a UUID), and <code>ZREM</code> the ID from the dirty index. It also adds <code>F</code> to a small set, <code>inflight-index:{17}</code>. New views that arrive a microsecond later simply create a fresh delta key and re-add the ID to the dirty index. Nothing is lost and nothing is counted twice, because the move is a single script.</li>
+<li><strong>Apply to the database, idempotently.</strong> In one Postgres transaction:
+<pre><code>INSERT INTO applied_flushes (flush_id) VALUES ($F) ON CONFLICT DO NOTHING;
+-- only if that inserted a row:
+UPDATE product_views pv
+   SET views = pv.views + b.d
+  FROM (VALUES (8412, 24000), (113, 3), (9001, 1) /* ... up to 500 */) AS b(id, d)
+ WHERE pv.product_id = b.id;
+COMMIT;</code></pre>
+</li>
+<li><strong>Clean up.</strong> <code>DEL inflight:{17}:F</code> and <code>SREM inflight-index:{17} F</code>.</li>
+</ol>
+<p>Now walk the crashes. If the flusher dies after step 2, the batch is safe in Redis as <code>inflight:{17}:F</code>. On restart, the flusher reads <code>inflight-index:{17}</code> and replays step 3 for every flush ID it finds. If it dies after the commit but before step 4, the replay hits the <code>applied_flushes</code> row and does nothing. The delta is applied exactly once either way.</p>
+<p>That small <code>applied_flushes</code> table is the difference between a counter that drifts and one that doesn't. Prune it after a day or so. A flush ID older than that will never be replayed.</p>
+
+<figure>
+<svg role="img" aria-labelledby="dd-writebehind-svg-title dd-writebehind-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-writebehind-svg-title">Write-behind flush protocol for one bucket of counters</title>
+<desc id="dd-writebehind-svg-desc">Page views run one atomic script in Redis that increments the display total, increments the pending delta, and adds the product to the dirty index with its first-dirty time. Every 2 seconds the flusher picks the oldest dirty products, moves their deltas into an in-flight hash with a flush ID, and removes them from the dirty index. It then applies the in-flight batch to Postgres in one transaction that also records the flush ID in an applied-flushes table, and finally deletes the in-flight hash. A crash at any step is recovered by replaying in-flight batches, which the applied-flushes table makes idempotent.</desc>
+<rect x="10" y="20" width="130" height="64" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="75" y="45" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Page view</text>
+<text x="75" y="64" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">12,000 / s</text>
+<rect x="170" y="10" width="300" height="160" rx="8" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="185" y="30" style="fill:var(--muted,#5c6b7c)">Redis shard, slot for {17}</text>
+<rect x="185" y="40" width="270" height="26" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="320" y="58" text-anchor="middle" style="fill:var(--ink,#1c2430)">views:{17}:8412  (display total)</text>
+<rect x="185" y="72" width="270" height="26" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="320" y="90" text-anchor="middle" style="fill:var(--ink,#1c2430)">delta:{17}:8412  (not yet in DB)</text>
+<rect x="185" y="104" width="270" height="26" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="320" y="122" text-anchor="middle" style="fill:var(--ink,#1c2430)">dirty:{17}  zset, score = first-dirty ms</text>
+<rect x="185" y="136" width="270" height="26" rx="4" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="320" y="154" text-anchor="middle" style="fill:var(--ink,#1c2430)">inflight:{17}:F  (batch being applied)</text>
+<path d="M140 52 H185" style="stroke:var(--ink,#1c2430);fill:none"/>
+<text x="150" y="44" style="fill:var(--muted,#5c6b7c);font-size:11px">Lua</text>
+<rect x="510" y="20" width="200" height="64" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="610" y="45" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Flusher (owns bucket 17)</text>
+<text x="610" y="64" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">every 2 s or 500 dirty</text>
+<path d="M510 52 H470" style="stroke:var(--ink,#1c2430);fill:none"/>
+<text x="476" y="44" style="fill:var(--muted,#5c6b7c);font-size:11px">1, 2</text>
+<path d="M455 149 H560 V84" style="stroke:var(--muted,#5c6b7c);fill:none;stroke-dasharray:4 3"/>
+<rect x="430" y="200" width="280" height="84" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="570" y="222" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Postgres, one transaction</text>
+<text x="570" y="242" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">INSERT applied_flushes(F) ON CONFLICT</text>
+<text x="570" y="260" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">UPDATE product_views += delta</text>
+<text x="570" y="276" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">COMMIT, then DEL inflight:{17}:F</text>
+<path d="M660 84 V200" style="stroke:var(--ink,#1c2430);fill:none"/>
+<text x="668" y="146" style="fill:var(--muted,#5c6b7c);font-size:11px">3</text>
+<text x="20" y="215" style="fill:var(--muted,#5c6b7c)">Crash after 2: inflight hash survives in Redis, replay 3.</text>
+<text x="20" y="235" style="fill:var(--muted,#5c6b7c)">Crash after 3: replay finds F in applied_flushes, no-op.</text>
+<text x="20" y="255" style="fill:var(--muted,#5c6b7c)">New views during a flush: fresh delta key, re-dirtied.</text>
+</svg>
+</figure>
+
+<h3 id=dd-writebehind-deltas-vs-state level=3>Deltas versus absolute values</h3>
+<p>The protocol above leans on one lucky property: increments commute. <code>+3</code> then <code>+5</code> lands in the same place as <code>+5</code> then <code>+3</code>, so a replayed or reordered batch is harmless once it is deduplicated.</p>
+<p>Absolute values do not commute. Suppose the cache buffers a product's <code>status</code> field, and two flushes carry <code>active</code> and then <code>archived</code>. If a retry lets the older flush land second, the product comes back to life. The fix is a version number on every buffered write and a conditional apply:</p>
+<pre><code>UPDATE products SET status = $s, version = $v
+ WHERE id = $id AND version &lt; $v;</code></pre>
+<p>An old flush then changes zero rows. Last-write-wins only works if "last" is decided by a version the writer stamped, never by the order flushes happen to reach the database.</p>
+
+<h3 id=dd-writebehind-pinning level=3>Pinning dirty data in Redis</h3>
+<p>The lesson says dirty entries must be pinned. Redis has no per-key pin, so you get the same effect from the eviction policy and from instance layout.</p>
+<ul>
+<li><code>maxmemory-policy allkeys-lru</code> (or <code>allkeys-lfu</code>) may evict any key, deltas included. That is the wrong policy for a write-behind instance.</li>
+<li><code>volatile-lru</code> and its siblings evict only keys that have a TTL. Give read-cache keys a TTL, give deltas, totals and in-flight hashes none, and the dirty data is never a candidate. This works, but one stray key without a TTL in the read cache now also becomes un-evictable.</li>
+<li><code>noeviction</code> refuses writes once memory is full. For a counter store that is honest: the write path fails loudly and can fall back to a direct, slower path.</li>
+</ul>
+<p>The cleanest answer is a <strong>separate Redis instance</strong> for write-behind state, with <code>noeviction</code> and persistence turned on, apart from the read caches running <code>allkeys-lru</code>. The two jobs want opposite settings, and one shared instance forces you to pick the wrong one for half your data.</p>
+
+<h3 id=dd-writebehind-durability-knobs level=3>The durability knobs, and what each really buys</h3>
+<p>The lesson lists AOF and replicas as ways to shrink the window. Here is what each setting actually covers.</p>
+<ul>
+<li><strong><code>appendonly yes</code> with <code>appendfsync everysec</code>.</strong> Redis appends every write command to a log and fsyncs it about once a second. A crash loses roughly the last second of writes. It can stretch toward two seconds when the disk is slow, because Redis will delay rather than block on a lagging fsync. This is the usual production setting and costs little.</li>
+<li><strong><code>appendfsync always</code>.</strong> Fsync on every write batch. The loss window drops to almost nothing, and throughput becomes disk-bound. At that point you have rebuilt a database's commit path inside the cache. Ask why the database itself wasn't the answer.</li>
+<li><strong>Replicas with Sentinel or Cluster failover.</strong> Replication is asynchronous. A promoted replica is missing whatever the old primary had not yet shipped, usually milliseconds of writes, more when the link lags. <code>min-replicas-to-write 1</code> with <code>min-replicas-max-lag 10</code> makes the primary refuse writes when no replica has acknowledged within 10 seconds, which caps how far a partitioned primary can run ahead.</li>
+<li><strong><code>WAIT 1 50</code> after a write</strong> blocks until one replica confirms it, or 50 ms pass. It narrows the window for that write. It does not make Redis a consensus store: a failover can still pick a replica that missed it, and the Redis documentation is explicit about that.</li>
+</ul>
+<p>Notice that every knob is a dial between "cache" and "database." None of them is free, and none of them is total. That is why the loss sentence comes first and the knob settings follow from it.</p>
+
+<h3 id=dd-writebehind-packaged level=3>Packaged write-behind: data grids and your own kernel</h3>
+<p>Data grids ship this pattern as configuration. In Hazelcast, a map backed by a <code>MapStore</code> becomes write-behind when <code>write-delay-seconds</code> is above zero (zero means write-through). <code>write-batch-size</code> sets how many entries go to one <code>storeAll</code> call. <code>write-coalescing</code>, on by default, keeps only the latest value per key. That last setting is the coalescing from the lesson, and turning it off makes the grid deliver every intermediate update, which is what you want when the store is an audit trail and not a table of current values.</p>
+<p>The friendliest example is the one running under you right now. The Linux page cache is a write-behind cache in front of your disk. A <code>write()</code> returns once the bytes are in memory and the page is marked dirty. Kernel flusher threads write dirty pages back later: by default they wake every 5 seconds (<code>vm.dirty_writeback_centisecs = 500</code>) and write pages that have been dirty for more than 30 seconds (<code>vm.dirty_expire_centisecs = 3000</code>). <code>fsync()</code> is the "flush this now" escape hatch. Every database that promises durability calls it. Write-behind is not exotic. It is what every layer does by default unless someone pays to opt out.</p>
+
+<h2 id=dd-writebehind-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions for this section, so you can redo the math with your own: the flash sale peaks at 18,000 page views per second. 12,000 hit the bestseller, as in the lesson. The other 6,000 are spread over about 30,000 other products, roughly 0.2 views per second each. Counters live in a narrow Postgres table, <code>product_views(product_id, views)</code>.</p>
+
+<h3 id=dd-writebehind-sizing-coalescing level=3>Coalescing works on hot keys, barely on the tail</h3>
+<p>The lesson's 24,000x reduction is real, but it is a property of the bestseller, not of the catalog. A key coalesces only if it gets several writes inside one flush interval. A product with 0.2 views a second gets 0.4 views in a 2-second window. Most windows it is dirty once or not at all.</p>
+<p>For a tail product with rate <em>r</em> and interval <em>T</em>, the chance it is dirty in a window is <code>1 − e^(−rT)</code>. Multiply by 30,000 products and divide by <em>T</em> to get row updates per second:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Flush interval<th>Tail rows dirty per flush<th>Tail row updates / s<th>Tail coalescing factor<th>Bestseller rows / s<th>Views at risk if every node dies<tbody>
+<tr><td>No write-behind<td>n/a<td>6,000<td>1x<td>12,000<td>0
+<tr><td>1 s<td>5,440<td>5,440<td>1.1x<td>1<td>18,000
+<tr><td>2 s<td>9,890<td>4,950<td>1.2x<td>0.5<td>36,000
+<tr><td>10 s<td>25,900<td>2,590<td>2.3x<td>0.1<td>180,000
+<tr><td>30 s<td>29,900<td>1,000<td>6x<td>0.03<td>540,000
+<tr><td>60 s<td>30,000<td>500<td>12x<td>0.02<td>1,080,000
+</tbody></table></div></div>
+<p>Read the 2-second row. The bestseller went from 12,000 row updates a second to 0.5. That was the incident, and it is solved. The tail went from 6,000 to about 4,950. Barely a dent.</p>
+<p>The fix is not to stretch everything to 60 seconds. It is to notice that you can run two policies. Flush hot keys every 2 seconds, because they coalesce anyway and their loss window costs the most views. Flush the tail every 30 seconds, because there the interval is the only thing that buys coalescing. Write both loss sentences. "If we lose 30 seconds of tail views, then 180,000 views spread over 30,000 products go missing, about six each." For view counts that is still fine. For anything else, say it out loud before you agree.</p>
+<p>Batching still helps the tail, just in a different way. At 500 rows per statement, 4,950 rows a second is about 10 statements a second instead of 6,000 single-row transactions. Fewer round trips, fewer commits, far fewer fsyncs. The rows themselves still each cost a new row version and a WAL record.</p>
+
+<h3 id=dd-writebehind-sizing-postgres level=3>What each row update costs in Postgres</h3>
+<p>Postgres never updates a row in place. Each <code>UPDATE</code> writes a new row version and leaves the old one for vacuum. That is why the counter belongs in its own narrow table and not as a <code>views</code> column on the wide <code>products</code> row. On the wide table, every flush rewrites a row that carries the name, description and specs. On the narrow table, the new version is a few dozen bytes.</p>
+<p>Two settings help further. Lower the table's <code>fillfactor</code> (say 70) so each page keeps free space. Keep <code>views</code> out of every index. Together they let most updates be HOT updates: the new version goes on the same page and no index entry has to change. Vacuum cost then stays proportional to what really changed.</p>
+
+<h3 id=dd-writebehind-sizing-redis level=3>Redis: memory is trivial, the hot shard is not</h3>
+<p>Memory first. Each counter is two small keys plus a sorted-set member. Small Redis keys cost on the order of 50 to 100 bytes each, depending on version and encoding. 100,000 products times three entries at 100 bytes is about 30 MB. The dirty index at its fullest holds 30,000 members, a few more MB. This is not where the money goes.</p>
+<p>Throughput next. The write path is one script per view: 18,000 calls a second in total, 12,000 of them on whichever shard owns the bestseller's bucket. Redis runs commands on one main thread, so a single key cannot be spread across cores. A shard handling 12,000 short scripts a second has headroom on ordinary hardware, but the exact ceiling depends on the machine, the script and the client. Measure it, and know your multiple.</p>
+<p>When one key needs more than one shard can give, two moves exist:</p>
+<ul>
+<li><strong>Pre-aggregate in the app.</strong> Each app instance keeps a local map of <code>product → count</code> and sends <code>INCRBY</code> every 100 ms. With 60 instances, the bestseller's shard sees 600 calls a second instead of 12,000. The price is a second, smaller loss window: an app crash loses up to 100 ms of its own views. That is write-behind in front of write-behind, and it is how very large counter systems are usually built.</li>
+<li><strong>Split the counter.</strong> Write to <code>views:8412:#0</code> through <code>#15</code>, chosen at random, with hash tags that send them to different shards. Reads sum the 16 parts. Writes scale out. Reads get 16 times more expensive, so pair this with a short-lived cached sum.</li>
+</ul>
+
+<h3 id=dd-writebehind-sizing-catchup level=3>Catch-up after a database outage</h3>
+<p>Suppose Postgres is unavailable for 10 minutes during the sale. The flusher keeps retrying, and the dirty index grows. How big does the backlog get?</p>
+<p>For counters, the answer is pleasant. Deltas keep merging, so the backlog is bounded by the number of distinct keys, not the number of events. After 10 minutes, the dirty index holds at most the 30,001 products that got views. When the database returns, the flusher drains them. Capped at 5,000 rows a second, that takes about 6 seconds.</p>
+<p>Now imagine the same outage for data that does not coalesce, such as new review submissions at 50 a second. The backlog is 30,000 separate entries, all sitting in cache memory, all acknowledged, all at risk. That asymmetry is the practical reason the lesson sends non-coalescing writes to a queue. A broker is built to hold a growing backlog on disk. A write-behind cache is built to hold a bounded set of hot keys in memory.</p>
+
+<h2 id=dd-writebehind-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+<p>Write-behind failures share one cruel property. They rarely raise errors. Numbers just come out a little wrong, and nobody looks until finance or a partner asks. So each failure below lists the metric that catches it, because without one you will not know.</p>
+
+<h3 id=dd-writebehind-fm-eviction level=3>1. Counts quietly drop during a traffic spike</h3>
+<p><strong>Symptom.</strong> After a busy evening, several tail products show fewer views in the database than their dashboards showed during the day. No errors anywhere.</p>
+<p><strong>Mechanism.</strong> The counters share a Redis instance with the read caches, under <code>allkeys-lru</code>. The sale filled memory with product descriptions, and Redis evicted the least recently used keys. Some of those were pending deltas for quiet products. The flusher found the ID in the dirty index, ran <code>GETDEL</code>, got nothing and moved on.</p>
+<p><strong>Detect.</strong> <code>evicted_keys</code> in <code>INFO stats</code> rising on any instance that holds dirty state. Count "dirty ID with no delta" in the flusher as its own metric. It should be zero, always.</p>
+<p><strong>Fix.</strong> Separate instance for write-behind state, <code>noeviction</code>, memory alarm at 70%. If they must share, use <code>volatile-lru</code> and give every read-cache key a TTL.</p>
+
+<h3 id=dd-writebehind-fm-reset-race level=3>2. Undercounting under load: the read-then-reset race</h3>
+<p><strong>Symptom.</strong> The bestseller's database count trails the cache by a steady few percent, more on busier days.</p>
+<p><strong>Mechanism.</strong> An early flusher did <code>GET delta</code>, wrote the value to the database, then <code>SET delta 0</code>. Every increment that landed between the <code>GET</code> and the <code>SET</code> was wiped. At 12,000 a second and a 3 ms gap, that is about 36 lost views per flush. Classic lost update.</p>
+<p><strong>Detect.</strong> A reconciliation job: for a sample of keys, compare <code>views</code> in the cache against the database value plus pending delta plus any in-flight batches. A steady gap that grows with traffic is a race. A gap that shows up in steps is a crash.</p>
+<p><strong>Fix.</strong> Never read and reset in two commands. Use <code>GETDEL</code> (Redis 6.2 and later), <code>RENAME</code>, or a Lua script that moves the value aside atomically, as in the protocol above.</p>
+
+<h3 id=dd-writebehind-fm-double-apply level=3>3. Overcounting after a flusher restart</h3>
+<p><strong>Symptom.</strong> Counts jump by one batch's worth after deploys of the flusher service. The bestseller suddenly has 24,000 extra views.</p>
+<p><strong>Mechanism.</strong> The flusher committed the batch to Postgres, was killed before it deleted the in-flight hash, and replayed the batch on restart. The database got the same +24,000 twice.</p>
+<p><strong>Detect.</strong> The same reconciliation job, this time showing the database <em>ahead</em> of the cache. Correlate the jumps with flusher restarts in your deploy log.</p>
+<p><strong>Fix.</strong> Flush IDs recorded in the same transaction as the update, as in <code>applied_flushes</code> above. This is the <a href="#idempotency">idempotency</a> lesson applied to your own internal pipeline. At-least-once delivery plus an idempotent apply is how you get "exactly once" in practice.</p>
+
+<h3 id=dd-writebehind-fm-failover level=3>4. A failover loses writes the replica never saw</h3>
+<p><strong>Symptom.</strong> After an automatic Redis failover, the display counters for a few hundred products step backwards by a small amount.</p>
+<p><strong>Mechanism.</strong> Replication is asynchronous. The old primary had acknowledged increments it had not yet shipped. The promoted replica never saw them. Worse, during a network partition, an old primary can keep accepting writes from clients on its side, and those writes are discarded when it rejoins as a replica.</p>
+<p><strong>Detect.</strong> Sentinel or Cluster failover events, plus replication offset lag (<code>master_repl_offset</code> versus each replica's offset) graphed in bytes and seconds. Lag that is usually near zero but spikes under load tells you how big the loss can be.</p>
+<p><strong>Fix.</strong> Decide whether it matters, using the loss sentence. If it does, set <code>min-replicas-to-write</code> and <code>min-replicas-max-lag</code> to bound the partition case, and accept that a few milliseconds of loss remain. If even that is unacceptable, the data does not belong in write-behind.</p>
+
+<h3 id=dd-writebehind-fm-poison level=3>5. One bad row stalls a whole bucket</h3>
+<p><strong>Symptom.</strong> Oldest-dirty age for bucket 17 climbs from 2 seconds to 40 minutes. Other buckets are fine.</p>
+<p><strong>Mechanism.</strong> A schema change added a check constraint to <code>product_views</code>, and one product's row now violates it on every update. The batch statement is all-or-nothing, so the flusher retried the same 500 rows forever. Every later batch in that bucket waited behind it. (A deleted product, by contrast, is harmless: its update simply matches no row. Count those too, so the deltas don't vanish unnoticed.)</p>
+<p><strong>Detect.</strong> Oldest-dirty age per bucket (the <code>ZRANGE … WITHSCORES</code> of the first member), and consecutive flush failures per bucket. Alert on age, not on errors. Age is what the loss sentence is written in.</p>
+<p><strong>Fix.</strong> On a batch failure, split it in half and retry each half, recursively, until the bad row is isolated. Move that row to a quarantine table with its error and keep going. A 500-row batch finds its poison row in about nine splits. This is the <a href="#dead-letter-queue">dead letter queue</a> idea for a flusher.</p>
+
+<h3 id=dd-writebehind-fm-backwards level=3>6. The counter goes backwards on the page</h3>
+<p><strong>Symptom.</strong> A user refreshes and sees "12,483 viewed today" drop to "12,105," then climb back a few seconds later.</p>
+<p><strong>Mechanism.</strong> The display total was lost (a restart without persistence, or a well-meant TTL on the total). The read path treated it as a normal cache miss and reloaded it from the database, cache-aside style. But the database is behind by whatever sits in the delta and in-flight batches. The page showed the lagging value until the next flush caught up. This is truth inversion biting the cache's own refill path.</p>
+<p><strong>Detect.</strong> Log when a display total is rebuilt from the database while a delta exists for the same key. Any such event is this bug.</p>
+<p><strong>Fix.</strong> Rebuild as database value plus pending delta plus in-flight batches, in one script. Better still, never expire display totals on the write-behind instance, and persist it.</p>
+
+<h3 id=dd-writebehind-fm-surge level=3>7. Flush surges: synchronized timers and post-outage catch-up</h3>
+<p><strong>Symptom.</strong> Database CPU shows a sawtooth with a spike every 2 seconds. Separately, after a 10-minute database outage, the database falls over again within a minute of coming back.</p>
+<p><strong>Mechanism.</strong> All 256 bucket flushers started from the same deploy and wake on the same clock tick, so their batches arrive together. After an outage, every flusher has a full backlog and drains it at full speed into a database that is still warming its own caches.</p>
+<p><strong>Detect.</strong> Database transactions per second at one-second resolution (one-minute averages hide the sawtooth). Flush rows per second during recovery.</p>
+<p><strong>Fix.</strong> Add random jitter to each flusher's start offset, and cap the total drain rate with a shared token bucket. Drain hot keys first, oldest dirty first. The catch-up should be paced like any other <a href="#backpressure">backpressure</a> problem: the database sets the speed, not the backlog.</p>
+
+<h3 id=dd-writebehind-metrics level=3>The four numbers to put on one dashboard</h3>
+<ul>
+<li><strong>Oldest dirty age</strong>, per bucket and overall. This is your real durability window, measured. If the design says 2 seconds and this says 90, the design is not what is running.</li>
+<li><strong>Dirty key count</strong>, and in-flight batch count. Rising without traffic rising means the flusher is losing.</li>
+<li><strong>Reconciliation drift</strong>: cache total minus (database + delta + in-flight), sampled. It should be zero. Negative is lost data. Positive is double application.</li>
+<li><strong>Quarantine size</strong> and <code>evicted_keys</code> on the write-behind instance. Both should stay at zero.</li>
+</ul>
+
+<h2 id=dd-writebehind-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>What you buffer<td>Deltas (increments, sums)<td>Absolute state (latest field values)<td>The operation commutes. Replays and reordering are then harmless once deduplicated. Choose B only with a writer-stamped version and a conditional apply.
+<tr><td>Where the buffer lives<td>Redis (shared, survives app restarts)<td>App process memory<td>More than one instance writes the same key, or readers need the live total. Choose in-process as a pre-aggregation tier in front of Redis, with a window of 100 ms or so.
+<tr><td>Buffer technology<td>Cache with dirty tracking (Redis, Hazelcast <code>MapStore</code>)<td>Durable log (Kafka) plus a separate read cache<td>Live reads of the current value matter and the loss sentence is acceptable. Choose the log when no loss is acceptable, or when the same stream also feeds billing, analytics or replays.
+<tr><td>Flush trigger<td>Time only (every <em>T</em> s)<td>Time or size, whichever comes first<td>Write volume is steady. Choose time-or-size when bursts could make one batch huge; a size cap keeps batch latency and memory predictable.
+<tr><td>Apply semantics<td>Idempotent (flush ID in the same transaction)<td>Blind at-least-once<td>Almost always. Blind apply is acceptable only for absolute values that are versioned, where a replay is naturally a no-op.
+<tr><td>Durability add-on<td>AOF <code>everysec</code> + replica<td>None (cache memory only)<td>Losing a full flush interval on a node crash is noticeable. Choose none when a lost window truly costs nothing visible.
+<tr><td>Hot-key scaling<td>Single key per counter<td>Pre-aggregation or split counters<td>One shard handles the key's write rate with room to spare. Move to B before the hot shard's CPU passes about half.
+<tr><td>Interval policy<td>One interval for all keys<td>Short for hot keys, long for the tail<td>The catalog is small or uniform. Choose B when, as in the sizing table, the tail coalesces only at long intervals.
+</tbody></table></div></div>
+<p>The decision that matters most is the third row, and it deserves an opinion. <strong>When the same data feeds both a live display and money, split it.</strong> The token-metering example in the lesson is the template. Every event goes to a durable log first. One consumer keeps the Redis counters current for dashboards. Another computes invoices from the log. Now the display can be as lossy and fast as you like, because it is a view and not the record. The record never lived in a cache.</p>
+<p>A smaller opinion on the second row. <strong>App-side pre-aggregation is underrated.</strong> Teams reach for Redis Cluster resharding or split counters when the cheapest fix is a 100 ms local buffer. It cuts the hot shard's load by the number of app instances, and its loss window is shorter than the flush window you already accepted.</p>
+
+<h2 id=dd-writebehind-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Is the loss sentence written down for every data type in the buffer, with <em>N</em> set to the real worst case: flush interval plus fsync lag plus replica lag plus time to detect a stuck flusher?</li>
+<li>Do the operations commute? If not, where does the version come from, and does the apply refuse older versions?</li>
+<li>What makes the flush idempotent? Show what happens if the flusher dies after the database commit and before it clears the batch.</li>
+<li>How are deltas moved aside without losing increments that arrive mid-flush? Is it one atomic command or script?</li>
+<li>Can any key holding unflushed data be evicted? Which instance, which <code>maxmemory-policy</code>, and what happens at full memory?</li>
+<li>What is the persistence and replication setting, and what loss does a failover add on top of the flush window?</li>
+<li>Who else reads the database copy directly? Do they know it lags, and do their outputs carry an "as of" time?</li>
+<li>How is a lost display total rebuilt? Does the rebuild include pending and in-flight deltas, or will counters go backwards?</li>
+<li>What happens to one batch that keeps failing? Is there a split-and-quarantine path, and an alert on oldest-dirty age per bucket?</li>
+<li>How does the flusher drain a backlog after a database outage, and what caps its rate?</li>
+<li>Do graceful shutdowns flush, and is the shutdown grace period (for example Kubernetes' <code>terminationGracePeriodSeconds</code>, 30 s by default) longer than a worst-case flush?</li>
+<li>Is any of this data ever used for money, limits or compliance, now or in the roadmap? If yes, which durable path does that use carry?</li>
+</ol>
+
+<h2 id=dd-writebehind-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"Your flusher writes to the database and then crashes before it marks the entries clean. What happens?"</summary>
+<p>With a naive flusher, the restart re-sends the batch and the counts are applied twice. The fix is to give each batch an ID and record it in the same database transaction as the update, with a unique key. The replay then inserts nothing and skips the update. The batch itself has to survive the crash too, so it is moved into an in-flight structure in Redis before the database call, not held only in the flusher's memory.</p>
+</details>
+<details>
+<summary>"Can't you make Redis durable with AOF and call it a database?"</summary>
+<p>You can narrow the window, but you can't close it cheaply. <code>appendfsync everysec</code> still allows about a second of loss, sometimes more when the disk lags. <code>always</code> closes most of it but makes throughput disk-bound, which removes the reason you came. Replication is asynchronous, so a failover can drop acknowledged writes, and <code>WAIT</code> narrows that without making it a consensus guarantee. If the data needs every write to survive, keep it on a path designed for that: the database or a replicated log.</p>
+</details>
+<details>
+<summary>"The view count is fine, but now product wants 'top 10 most viewed this hour' computed from the database. Problems?"</summary>
+<p>Two. The database is behind by the flush window, so the ranking lags slightly, which is probably fine if labelled. The bigger one is the tail interval: if tail products flush every 30 seconds, a product that trends in the last 30 seconds is invisible to the database. Either compute the ranking from the cache side, for example a Redis sorted set updated in the same write script, or compute it from the durable event stream if one exists. Don't build it on the lagging copy and then wonder why it misses fast movers.</p>
+</details>
+<details>
+<summary>"Why not just batch in the application and skip Redis?"</summary>
+<p>For a single-instance service, that is fine and simpler. With 60 instances, each holds a partial count, so no single place has the live total for the page to read. You'd need to sum across instances on every read, or accept that the page shows the stale database value. Redis is there to be the one live, shared total. The good design often uses both: a 100 ms in-process buffer to cut write load, and Redis as the shared live view.</p>
+</details>
+<details>
+<summary>"How does write-behind handle updates to the same key arriving out of order from two app servers?"</summary>
+<p>For increments, order doesn't matter, because addition commutes. For absolute values it matters a lot. The writer must stamp a version (a database sequence, a hybrid logical clock, or a per-key counter in Redis assigned by the same script that buffers the write). The flush applies with <code>WHERE version &lt; $v</code>. Ordering by arrival at the cache is not enough, because a slow app server can deliver an older write later.</p>
+</details>
+<details>
+<summary>"Redis memory is full. What should the write path do?"</summary>
+<p>It depends on the policy you chose, and you should have chosen deliberately. With <code>noeviction</code>, writes fail. The client should then fall back to a direct, rate-limited database increment, or drop the view and count the drop, depending on the loss sentence. What must not happen is silent eviction of dirty data, which is what <code>allkeys-lru</code> gives you. Losing data you acknowledged, with no error, is the worst outcome on the menu.</p>
+</details>
+<details>
+<summary>"The 24,000x reduction sounds great. Does it hold across the whole catalog?"</summary>
+<p>No, and saying so is the point of the question. Coalescing depends on how many writes a key gets per flush interval. The bestseller gets 24,000 in 2 seconds. A long-tail product getting 0.2 writes a second gets 0.4, so it barely coalesces at all: catalog-wide, a 2-second flush cuts tail row updates by only about 20%. You either accept that, run a longer interval for cold keys with its own loss sentence, or rely on batching (500 rows per statement) to cut transaction overhead even where coalescing doesn't help.</p>
+</details>
+<details>
+<summary>"When would you pick write-behind over a queue even with no live reads?"</summary>
+<p>Rarely. The one strong case is heavy coalescing on hot keys where the downstream store charges per write, such as a metered database. Merging 24,000 events into one write saves real money, and a queue consumer can do the same merge but holds every event first. Even then, many teams put a log first and coalesce in the consumer, because replay from the log is worth more than the memory saved. If nobody reads the live value, the cache's main advantage is gone.</p>
+</details>

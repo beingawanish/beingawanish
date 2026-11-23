@@ -1,0 +1,28 @@
+{
+  "envelope": {
+    "eventId": "f11d4a91-b665-5293-9bb8-1c915f8bd7f4",
+    "type": "com.edacommerce.order.OrderShipped",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "037dea48-92a2-5e0f-80c3-b4b9e2994c87",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "order-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Order",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "shipmentId": "40c74235-a5c1-56ac-a027-7e14b675c270",
+  "carrier": "fake-carrier",
+  "trackingNumber": "FC123456789DE",
+  "capturedAmount": {
+    "amountMinor": 1999,
+    "currency": "EUR"
+  },
+  "shippedAt": 1795000000000
+}

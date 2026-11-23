@@ -1,0 +1,212 @@
+<h2 id=dd-reverse-proxy-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson lists six jobs a reverse proxy does. In a design review, the useful question is how it does them. Every job is a buffer, a timer or a pool with a size. Each size is a decision someone made, or left at a default. This section follows one request through a proxy such as nginx, HAProxy or Envoy and names the state it touches on the way.</p>
+
+<h3 id=dd-reverse-proxy-event-loop level=3>The process model: few threads, many sockets</h3>
+<p>A modern proxy runs a small number of worker processes or threads, usually one per CPU core. Each worker runs an event loop over <code>epoll</code> (Linux) or <code>kqueue</code> (BSD, macOS). The worker asks the kernel "which of my 20,000 sockets have data?" and handles only those. An idle client therefore costs a file descriptor, a little kernel memory and a few kilobytes of proxy state. It costs no thread.</p>
+<p>That is the whole reason buffering works. The application server has a thread pool, perhaps 200 threads, and every thread is expensive. The proxy has sockets, and sockets are cheap. Whoever holds the slow part of the conversation should be the one for whom waiting is cheap.</p>
+<p>Two limits sit underneath this. nginx caps each worker with <code>worker_connections</code>, and each proxied request uses two connections: one to the client and one to the upstream. The operating system caps open files per process (<code>ulimit -n</code>, or <code>worker_rlimit_nofile</code> in nginx). A proxy that hits either limit stops accepting connections. The symptom looks like a network problem, but it is a configuration number.</p>
+
+<svg role="img" aria-labelledby="dd-reverse-proxy-svg-title dd-reverse-proxy-svg-desc" viewBox="0 0 720 280" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-reverse-proxy-svg-title">One request through a reverse proxy, with its buffers and timers</title>
+<desc id="dd-reverse-proxy-svg-desc">A slow client connection on the left enters the proxy's event loop. The request body fills a memory buffer and spills to a temporary file if it is large. Only when the request is complete does the proxy take an idle keep-alive connection from the upstream pool and send it to an application server in a few milliseconds. The response flows back into response buffers, which release the upstream connection quickly and then trickle the bytes to the slow client. Timers are shown on each leg: client header and body timeouts on the left, connect and read timeouts on the right, and idle keep-alive timeouts on both.</desc>
+<rect x="10" y="40" width="120" height="80" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="70" y="68" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Phone</text>
+<text x="70" y="86" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">2 MB upload</text>
+<text x="70" y="104" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">over 3 s</text>
+<rect x="190" y="20" width="330" height="200" rx="8" style="fill:var(--bg,#eef2f6);stroke:var(--line,#d5dee8)"/>
+<text x="355" y="40" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">Proxy worker (event loop)</text>
+<rect x="205" y="55" width="140" height="50" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="275" y="76" text-anchor="middle" style="fill:var(--ink,#1c2430)">Request buffer</text>
+<text x="275" y="94" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">memory, then temp file</text>
+<rect x="365" y="55" width="140" height="50" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="435" y="76" text-anchor="middle" style="fill:var(--ink,#1c2430)">Upstream pool</text>
+<text x="435" y="94" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">idle keep-alive conns</text>
+<rect x="205" y="140" width="300" height="50" rx="4" style="fill:var(--paper,#fff);stroke:var(--line,#d5dee8)"/>
+<text x="355" y="161" text-anchor="middle" style="fill:var(--ink,#1c2430)">Response buffers</text>
+<text x="355" y="179" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">free the upstream fast, trickle to the client</text>
+<rect x="580" y="40" width="130" height="80" rx="6" style="fill:var(--paper,#fff);stroke:var(--accent,#1f5f99)"/>
+<text x="645" y="68" text-anchor="middle" style="fill:var(--ink,#1c2430);font-weight:600">App server</text>
+<text x="645" y="86" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">sees a complete</text>
+<text x="645" y="104" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">request in ~5 ms</text>
+<path d="M130 80 H205 M345 80 H365 M505 80 H580" style="stroke:var(--ink,#1c2430);fill:none"/>
+<path d="M645 120 V165 H505 M205 165 H70 V120" style="stroke:var(--muted,#5c6b7c);fill:none;stroke-dasharray:4 3"/>
+<text x="160" y="250" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">client timers: header, body, send, keep-alive</text>
+<text x="590" y="250" text-anchor="middle" style="fill:var(--muted,#5c6b7c)">upstream timers: connect, read, idle</text>
+</svg>
+
+<h3 id=dd-reverse-proxy-request-path level=3>Request path: headers, body, and when the upstream is chosen</h3>
+<p>Here is the order of events for one HTTP/1.1 request in nginx, with the knobs that govern each step.</p>
+<ol>
+<li><strong>Accept and TLS.</strong> The worker accepts the TCP connection and runs the TLS handshake. With TLS 1.3 that is one round trip, or zero on resumption. The expensive part is the key exchange and the certificate signature, which is real CPU. Session tickets or a session cache let a returning client skip most of it.</li>
+<li><strong>Read the headers.</strong> A timer, <code>client_header_timeout</code> (60 s by default in nginx), limits how long a client may take to send its headers. Header buffers are small and fixed (<code>large_client_header_buffers</code>). A request with an enormous cookie gets a 400 here, before any application code runs.</li>
+<li><strong>Read the body.</strong> With <code>proxy_request_buffering on</code> (the default), nginx reads the whole body before it contacts the upstream. Bodies up to <code>client_body_buffer_size</code> stay in memory. Larger ones spill to a temporary file. <code>client_max_body_size</code> (1 MB by default) rejects anything bigger with a 413. <code>client_body_timeout</code> limits the gap between two reads, not the total time. A client that sends one byte every 59 seconds keeps the connection open.</li>
+<li><strong>Pick the upstream.</strong> Only now does the proxy choose a backend and take a connection from its pool. If the pool has an idle keep-alive connection, the request goes out at once. If not, the proxy opens a new TCP connection, limited by <code>proxy_connect_timeout</code>.</li>
+<li><strong>Wait for the response.</strong> <code>proxy_read_timeout</code> (60 s by default) is the gap allowed between two reads from the upstream. It is also not a total deadline. A backend that streams a byte every 50 seconds never trips it.</li>
+<li><strong>Buffer the response.</strong> With <code>proxy_buffering on</code> (the default), nginx reads the response into <code>proxy_buffers</code> as fast as the upstream sends it. If the response outgrows them, it goes to a temp file, up to <code>proxy_max_temp_file_size</code>. The upstream connection goes back to the pool as soon as the last byte arrives. The slow client drains the buffer at its own speed.</li>
+<li><strong>Log.</strong> The access log line is written when the client side finishes. That is why the log has two clocks worth comparing: <code>$request_time</code> (the whole exchange as the proxy saw it) and <code>$upstream_response_time</code> (just the backend). A big gap between them means the client was slow, not your service.</li>
+</ol>
+<p>Buffering is not always right. Turn request buffering off for large streaming uploads you want to process as they arrive, and turn response buffering off for Server-Sent Events, long polling and token streams. Otherwise the proxy holds the events until a buffer fills. nginx honours an <code>X-Accel-Buffering: no</code> response header for exactly this, so the application can opt out per response.</p>
+
+<h3 id=dd-reverse-proxy-upstream-pool level=3>The upstream pool and the keep-alive contract</h3>
+<p>Connection reuse toward the backends does not happen by itself in nginx. You need an <code>upstream</code> block with a <code>keepalive</code> directive, HTTP/1.1 to the upstream, and a cleared <code>Connection</code> header. Without those three lines, nginx opens and closes a TCP connection per request. HAProxy and Envoy pool by default, but they have their own limits. Envoy, for example, applies per-cluster circuit-breaker thresholds for connections, pending requests and active requests, and the defaults are modest (1,024 each) for a busy cluster.</p>
+<pre><code>upstream bookstore_app {
+    server 10.0.1.11:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.1.12:8080 max_fails=3 fail_timeout=10s;
+    keepalive 64;              # idle connections kept per worker
+    keepalive_timeout 30s;     # must be SHORTER than the app's idle timeout
+}
+
+server {
+    listen 443 ssl;
+    client_max_body_size 10m;
+    client_body_timeout 15s;   # gap between reads, not a total
+    client_header_timeout 10s;
+
+    location / {
+        proxy_pass http://bookstore_app;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;   # overwrite, never append
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-ID $request_id;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 30s;
+        proxy_next_upstream error timeout;   # retry only failures before a response
+    }
+}</code></pre>
+<p>Pay attention to the <code>keepalive_timeout</code> comment. A pooled connection is a shared contract between two idle timers, and the side with the shorter timer closes first. If the application closes an idle connection at 5 seconds (the default in Node.js's HTTP server, for example) and the proxy keeps it for 30, the proxy will sometimes send a request on a socket the backend is closing at that instant. The result is a sporadic 502 that no load test reproduces. The rule: <strong>the upstream's idle timeout must be longer than the proxy's.</strong> The same rule applies one layer out, between a cloud load balancer and nginx.</p>
+
+<h3 id=dd-reverse-proxy-headers level=3>Client identity: building a trusted X-Forwarded-For</h3>
+<p>The lesson states the rule: one header, set by one party, trusted from one source. The implementation detail that trips people is a chain of proxies. Each hop appends the address it saw, so the header looks like <code>X-Forwarded-For: 203.0.113.9, 198.51.100.4, 10.0.0.5</code>. Only the right-hand entries were written by machines you control. The leftmost entry is whatever the client typed.</p>
+<p>The correct parse walks from the <em>right</em>, skipping addresses that belong to your own proxies, and takes the first address that does not. nginx does this with the realip module:</p>
+<pre><code>set_real_ip_from 10.0.0.0/8;        # our load balancers
+set_real_ip_from 2001:db8::/32;
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;               # walk right-to-left past trusted hops</code></pre>
+<p>Envoy has the same idea as <code>xff_num_trusted_hops</code>: trust exactly N hops from the right. Both work only if the list of trusted sources is complete and stays complete. Add a new load balancer subnet and forget this list, and every request appears to come from the balancer. That is the lesson's 99%-from-one-client incident, caused by an infrastructure change rather than a code change.</p>
+<p>Two alternatives are worth knowing. The standard <code>Forwarded</code> header (RFC 7239) carries the same data in a structured form, but most tooling still reads <code>X-Forwarded-For</code>. For TCP-level proxies that cannot add HTTP headers, the <strong>PROXY protocol</strong> (from HAProxy, supported by nginx, Envoy and most cloud balancers) prepends the original addresses to the TCP stream itself. It must be enabled on both sides at once. A listener that expects it rejects connections that lack it, and a listener that does not expect it treats the prefix as garbage.</p>
+
+<h3 id=dd-reverse-proxy-reload level=3>Configuration reload without dropping traffic</h3>
+<p>A proxy that sits on every request has to change config without a restart. nginx does it by starting new worker processes with the new config on <code>SIGHUP</code>. Old workers stop accepting and drain their in-flight requests. Long-lived connections (WebSockets, SSE, large downloads) keep old workers alive, sometimes for hours, so memory grows with each reload. <code>worker_shutdown_timeout</code> caps how long an old worker may linger before it closes its remaining connections.</p>
+<p>Envoy takes a different path. Its routes, clusters and endpoints arrive over the xDS APIs from a control plane, and it applies them in place, without a new process. That makes changes cheap, which is good. It also means a bad config can reach every proxy in seconds, which is the failure mode to design for.</p>
+
+<h2 id=dd-reverse-proxy-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Take the bookstore at a realistic busy hour. Assumptions, all round numbers you can swap for your own:</p>
+<ul>
+<li>Peak 6,000 requests per second, 30% of them static files served by the proxy itself.</li>
+<li>40,000 concurrent client connections, most of them idle keep-alive connections from browsers and apps.</li>
+<li>Median client is fast, but the p95 mobile client takes 2 s to send its request or receive a 200 KB response.</li>
+<li>Application processing time 40 ms; two application servers behind the proxy pair.</li>
+</ul>
+
+<h3 id=dd-reverse-proxy-sizing-conns level=3>Connections and memory</h3>
+<p>An idle keep-alive connection in nginx costs a few kilobytes of user-space state plus kernel socket memory. A TLS connection costs more, because the TLS library keeps its own read and write buffers. Budget in the range of 20 to 50 KB per idle TLS connection, and measure your own build, because it varies a lot with library and settings. At 40 KB, 40,000 connections is 1.6 GB. That is comfortable on one machine and a reason not to run the proxy on a 1 GB container.</p>
+<p>Active requests cost buffer memory on top. With the default <code>proxy_buffers 8 4k</code> (or 8k on some platforms), a request that is streaming a large response holds 32 to 64 KB. If 2,000 requests are in flight, that is 64 to 128 MB. The thing that can surprise you is temp files: if 500 users download 50 MB reports through a proxy with buffering on, the proxy writes 25 GB to local disk. Either serve large downloads from object storage, raise the buffers for that one route, or turn buffering off there.</p>
+
+<h3 id=dd-reverse-proxy-sizing-threads level=3>What buffering buys the application</h3>
+<p>The lesson's formula is threads = rate × time a thread is held. Apply it to the 4,200 dynamic requests per second:</p>
+<ul>
+<li>Without buffering, a thread is held for the client's transfer time. If 5% of clients take 2 s and the rest take 50 ms on top of the 40 ms of work: 4,200 × (0.95 × 0.09 + 0.05 × 2.04) ≈ 4,200 × 0.188 ≈ 790 threads.</li>
+<li>With buffering, a thread is held only for the 40 ms of work plus about 1 ms of fast internal transfer: 4,200 × 0.041 ≈ 172 threads.</li>
+</ul>
+<p>Notice where the 790 comes from: the 5% of slow clients account for about 430 of them. Tail clients, not average clients, size an unbuffered thread pool. That is the general shape of this whole pattern.</p>
+
+<h3 id=dd-reverse-proxy-sizing-ports level=3>Ephemeral ports: the number that bites without keep-alive</h3>
+<p>Every new TCP connection from the proxy to a backend uses a local port. On Linux the default ephemeral range is 32768 to 60999, about 28,000 ports per destination address and port. When the proxy closes a connection first, the socket sits in <code>TIME_WAIT</code> for 60 seconds and keeps its port.</p>
+<p>Now run the numbers with upstream keep-alive switched off. 4,200 dynamic requests per second across 2 backends is 2,100 new connections per second to each. Over 60 seconds that is 126,000 sockets in <code>TIME_WAIT</code> per backend, against 28,000 ports. The proxy runs out in about 13 seconds of peak traffic and starts failing connects with "cannot assign requested address".</p>
+<p>With a pool of 64 idle connections per worker on an 8-worker proxy, the steady-state count is a few hundred long-lived connections and almost no churn. This is why "reuses connections" is not a nice-to-have. You can widen the port range, add backend IPs or enable <code>tcp_tw_reuse</code>, but those treat the symptom.</p>
+
+<h3 id=dd-reverse-proxy-sizing-cpu level=3>CPU: TLS dominates</h3>
+<p>Plain HTTP forwarding is cheap: a proxy core can move many thousands of small requests per second. TLS changes the picture in two ways. New handshakes cost a signature and a key exchange each, so a burst of new connections (an app release, a reconnect wave) costs far more CPU than the same number of requests on warm connections. Bulk encryption is cheap on CPUs with AES instructions, so long downloads cost little.</p>
+<p>The practical sizing rule: measure handshakes per second per core on your hardware with your certificate type, then size the proxy for the reconnect storm, not the steady state. An ECDSA certificate is usually much cheaper to sign with than a 2048-bit RSA one, which is why many sites serve both and let the client choose. Session resumption turns most of the returning traffic into cheap handshakes.</p>
+
+<h3 id=dd-reverse-proxy-sizing-latency level=3>Latency: the hop is small, the misconfigured hop is not</h3>
+<p>On the same network, a warm proxy hop adds tens to a few hundred microseconds. The real latency costs come from misconfiguration: a new upstream TCP connection per request (one extra round trip, plus a TLS handshake if the upstream is TLS), request buffering that waits for a 10 MB body before forwarding, or response buffering that holds an event stream. If your proxy adds more than a millisecond at p50, look for one of those before blaming the proxy.</p>
+
+<h2 id=dd-reverse-proxy-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-reverse-proxy-fm-keepalive-race level=3>1. Sporadic 502s that no load test reproduces</h3>
+<p><strong>Symptom:</strong> a steady trickle of 502s, perhaps 0.01% of requests, worse at low traffic, and none in the application logs. <strong>Mechanism:</strong> the keep-alive race from the mechanism section. The backend's idle timer fires and it closes a pooled connection just as the proxy sends a request on it. Low traffic makes it worse, because connections sit idle long enough to hit the backend's timer. <strong>Detect:</strong> proxy error logs show "upstream prematurely closed connection" or "connection reset by peer" on reused connections. Compare the 502 rate against connection idle time; it rises with idle time. <strong>Fix:</strong> make the proxy's upstream idle timeout shorter than the backend's (for example, proxy 30 s, app 65 s). Allow a retry on a connection error only for idempotent requests.</p>
+
+<h3 id=dd-reverse-proxy-fm-slowloris level=3>2. A handful of clients exhausts the proxy</h3>
+<p><strong>Symptom:</strong> the proxy stops accepting new connections. CPU is idle and bandwidth is low. <strong>Mechanism:</strong> a slow-read or slow-send attack (Slowloris and relatives). Each attacker connection sends headers or reads responses one byte at a time, just under the per-read timeout. Because the timers measure gaps between reads, not totals, each connection lives for minutes. A few thousand of them fill <code>worker_connections</code>. <strong>Detect:</strong> active connections near the limit while requests per second fall; many connections in the "reading" state in nginx's stub_status; connection age histograms with a fat tail. <strong>Fix:</strong> short header and body timeouts on the public listener (10 to 15 s), per-IP connection limits (<code>limit_conn</code>), a minimum data rate where your proxy supports one, and enough connection headroom. A CDN or managed edge in front absorbs most of this before it reaches you.</p>
+
+<h3 id=dd-reverse-proxy-fm-timeout-ladder level=3>3. Duplicate orders from a timeout and a retry</h3>
+<p><strong>Symptom:</strong> customers occasionally see two identical orders, both placed within a few seconds. <strong>Mechanism:</strong> the timeouts are in the wrong order. The proxy's read timeout is 30 s, the app's database call takes 35 s under load, so the proxy gives up and returns 504 while the app is still working. The app finishes and commits the order. Meanwhile the client retries, or the proxy is configured to retry on timeout for all methods, and a second order is created. <strong>Detect:</strong> 504s at the proxy that line up with 200s or commits in application logs for the same request ID. <strong>Fix:</strong> order the timeouts so each inner layer gives up before the outer one (client &gt; CDN &gt; proxy &gt; app &gt; database). Never retry non-idempotent requests at the proxy; nginx refuses to by default unless you add <code>non_idempotent</code> to <code>proxy_next_upstream</code>, and that default is right. Use idempotency keys on order creation so a client retry is safe.</p>
+
+<h3 id=dd-reverse-proxy-fm-smuggling level=3>4. Request smuggling through a header disagreement</h3>
+<p><strong>Symptom:</strong> strange requests in backend logs that no client sent. One user occasionally receives another user's response. <strong>Mechanism:</strong> HTTP/1.1 has two ways to mark where a body ends: <code>Content-Length</code> and <code>Transfer-Encoding: chunked</code>. If a crafted request contains both, or a malformed one, the proxy and the backend may disagree on where the first request ends. The leftover bytes become the start of the "next" request on a pooled, shared connection, so the attacker's prefix is glued to a victim's request. <strong>Detect:</strong> hard to spot in metrics. Look for 400s at the backend with odd request lines, mismatched request IDs between proxy and app logs, and run a desync scanner in security testing. <strong>Fix:</strong> keep the proxy patched; configure it to reject ambiguous framing rather than normalise it; use HTTP/2 to the backend where you can, because it frames requests explicitly. Make sure every hop in the chain uses the same HTTP parser rules, which is one more reason not to stack proxies.</p>
+
+<h3 id=dd-reverse-proxy-fm-buffered-stream level=3>5. The live feed arrives in lumps</h3>
+<p><strong>Symptom:</strong> the order-tracking page, built on SSE, updates in bursts every 30 seconds instead of live. Locally it works perfectly. <strong>Mechanism:</strong> response buffering. The proxy waits to fill a buffer before sending anything to the client, and a 200-byte event does not fill 4 KB. Compression on the proxy can do the same, because gzip waits for enough data to compress. <strong>Detect:</strong> time to first byte equals the buffer fill time; events arrive at the client in batches. <strong>Fix:</strong> disable proxy buffering and compression for the streaming route (<code>proxy_buffering off</code> or the <code>X-Accel-Buffering: no</code> header), and raise <code>proxy_read_timeout</code> above your heartbeat interval so the proxy does not cut idle streams.</p>
+
+<h3 id=dd-reverse-proxy-fm-reload-memory level=3>6. Memory climbs with every deploy</h3>
+<p><strong>Symptom:</strong> proxy memory grows after each config reload and only falls hours later. Eventually the out-of-memory killer takes a proxy. <strong>Mechanism:</strong> each reload starts a fresh set of workers, and the old set lingers until its last long-lived connection closes. Ten reloads in an hour with WebSocket traffic means eleven generations of workers. <strong>Detect:</strong> count proxy worker processes over time, and alert when old-generation workers exist more than N minutes after a reload. <strong>Fix:</strong> set <code>worker_shutdown_timeout</code> so old workers close their connections after a bounded time, and make clients reconnect gracefully (with jitter). Batch config changes instead of reloading on every small edit.</p>
+
+<h3 id=dd-reverse-proxy-fm-body-limit level=3>7. Uploads fail with a 413 nobody can explain</h3>
+<p><strong>Symptom:</strong> a customer's 12 MB book-cover upload fails. The application allows 20 MB. <strong>Mechanism:</strong> each layer has its own body limit, and the smallest one wins. The CDN might allow 100 MB, the cloud balancer has its own cap, nginx defaults to 1 MB, and the framework has another. The error page often comes from whichever layer refused, so its format is a clue. <strong>Detect:</strong> look at which server produced the 413 (headers, page body, the <code>Server</code> header); proxy logs record a 413 with no upstream time. <strong>Fix:</strong> keep a single table of limits (body size, header size, timeouts) for every layer, owned by one team and checked in CI. Set each limit deliberately, per route, rather than raising the global default.</p>
+
+<h2 id=dd-reverse-proxy-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Option A<th>Option B<th>Choose A when…<tbody>
+<tr><td>Layer<td>L7 (HTTP) proxy<td>L4 (TCP/UDP) proxy<td>You need routing by path or host, header rewriting, buffering, caching or HTTP-aware retries. Choose L4 when traffic is not HTTP, when you want end-to-end TLS to the backend, or when raw throughput matters most.
+<tr><td>TLS<td>Terminate at the proxy<td>Pass through (SNI routing) to the backend<td>You want one certificate store and the proxy must inspect HTTP. Choose pass-through when compliance requires the backend to hold the key, or the proxy must not see plaintext.
+<tr><td>Proxy-to-backend link<td>Plain HTTP inside the network<td>Re-encrypt (TLS or mTLS to the backend)<td>The network segment is genuinely private and you accept that risk. Re-encrypt when traffic crosses shared networks or zero-trust policy applies; the cost is CPU and certificate management, mostly removed by pooling.
+<tr><td>Request buffering<td>Buffer the full body<td>Stream the body through<td>Bodies are modest and the app uses threads per request. Stream for very large uploads you process incrementally, and protect the app with its own timeouts.
+<tr><td>Response buffering<td>Buffer<td>Stream (unbuffered)<td>Ordinary request/response traffic. Stream for SSE, long polling, token streams and any response where latency of the first byte matters more than freeing the upstream.
+<tr><td>Backend protocol<td>HTTP/1.1 with keep-alive pool<td>HTTP/2 or gRPC to the backend<td>Backends are simple and pools are sized well. Choose HTTP/2 for gRPC, for many small concurrent requests, and to avoid HTTP/1.1 framing ambiguity.
+<tr><td>Who runs it<td>Self-managed (nginx, HAProxy, Envoy)<td>Platform-provided (cloud LB, PaaS edge)<td>You need features or tuning the platform does not expose. Otherwise use the platform's and do not stack your own behind it without a separate job for it.
+<tr><td>Config delivery<td>Static files + reload<td>Dynamic control plane (xDS)<td>Backends change rarely and a reload a day is fine. Choose dynamic config when endpoints churn constantly (containers, autoscaling), and invest in config validation and staged rollout.
+</tbody></table></div></div>
+<p>The decision that most often goes wrong is the one in the last row of the lesson's "When Not to Use It": stacking. Before adding a proxy, write down its one job that no existing layer does. If you cannot name it, every layer you add multiplies the timeout table, the body-size table and the header trust chain, and adds one more parser for request smuggling to exploit.</p>
+<p>On L4 versus L7, a practical rule: put an L4 balancer (or anycast) at the very front for scale and DDoS absorption, and L7 proxies behind it where HTTP decisions happen. That split is what most large edges converge on, and it keeps TLS keys on a tier you control.</p>
+
+<h2 id=dd-reverse-proxy-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What single job does this proxy do that no layer in front of or behind it already does?</li>
+<li>Write out the timeout ladder from client to database. Does each inner layer give up before the layer outside it?</li>
+<li>Is upstream keep-alive enabled, and is the proxy's upstream idle timeout shorter than every backend's idle timeout?</li>
+<li>Which addresses are trusted to set <code>X-Forwarded-For</code>? Where is that list maintained, and what updates it when a new balancer subnet appears?</li>
+<li>Does the proxy overwrite or strip client-supplied identity headers (<code>X-Forwarded-*</code>, <code>X-User-*</code>, <code>X-Real-IP</code>)?</li>
+<li>Which routes stream (SSE, WebSockets, large downloads), and is buffering off for exactly those routes?</li>
+<li>What are the body and header size limits at every layer, and is there one table that lists them?</li>
+<li>What does the proxy retry, on which errors, and is any non-idempotent method in that list?</li>
+<li>How many handshakes per second can the fleet absorb in a reconnect storm, and what is that number at peak?</li>
+<li>How is config changed, validated and rolled back? How long do old workers or old config versions live after a change?</li>
+<li>Are the proxy instances spread across failure domains, and what happens to in-flight connections when one dies?</li>
+<li>Do access logs record request time, upstream time, upstream address and a request ID, so a slow client can be told apart from a slow service?</li>
+</ol>
+
+<h2 id=dd-reverse-proxy-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<details>
+<summary>"The proxy has a 60-second read timeout. Does that mean no request takes longer than 60 seconds?"</summary>
+<p>No. In nginx, <code>proxy_read_timeout</code> and <code>client_body_timeout</code> limit the gap between two successive reads, not the whole exchange. A backend or client that sends a byte every 50 seconds can keep a request open indefinitely. If you need a total deadline, enforce it in the application or with a feature that measures total time, and protect the public side with short header timeouts and connection limits.</p>
+</details>
+<details>
+<summary>"You see 502s only at night, when traffic is lowest. Why would low traffic cause errors?"</summary>
+<p>Most likely the keep-alive race. At low traffic, pooled upstream connections sit idle longer, long enough to cross the backend's idle timeout. The backend closes the socket while the proxy is sending on it. The fix is to make the proxy's idle timeout shorter than the backend's, so the proxy always closes first, and to allow a retry on connection reset only for idempotent requests.</p>
+</details>
+<details>
+<summary>"Why not just take the leftmost address in X-Forwarded-For? That is the original client."</summary>
+<p>Because the leftmost entry is the only one the client wrote. Each proxy appends to the right, so you can trust entries only from the right-hand side, back to the first address that is not one of your own proxies. Take the leftmost and any client can claim any address, which bypasses IP rate limits and poisons audit logs. Walk right to left over a known list of trusted hops, as nginx's <code>real_ip_recursive</code> or Envoy's <code>xff_num_trusted_hops</code> do.</p>
+</details>
+<details>
+<summary>"Upstream keep-alive is off. What breaks first as traffic grows?"</summary>
+<p>Usually ephemeral ports. Every request opens a new connection to the backend, and each closed connection sits in <code>TIME_WAIT</code> for 60 seconds. With about 28,000 ports per backend address, a little under 470 new connections per second per backend is the steady-state ceiling. Above it, connects fail with "cannot assign requested address". You also pay an extra round trip per request, and TLS handshakes if the backend link is encrypted. Turn on pooling; port tuning only buys time.</p>
+</details>
+<details>
+<summary>"When would you turn response buffering off, and what do you lose?"</summary>
+<p>For streaming responses: SSE, long polling, chunked token streams, and live progress. Buffering would hold small events until a buffer fills. You lose the protection buffering gives the backend. A slow client now holds the upstream connection, and an app thread if the backend is threaded, for the life of the stream. That is fine when the streaming backend is built on an event loop and sized for long connections, and a problem when it is a thread-per-request server.</p>
+</details>
+<details>
+<summary>"L4 or L7 for the front of a large public site?"</summary>
+<p>Both, in layers. An L4 tier (or anycast with ECMP) at the front spreads connections and absorbs volumetric attacks cheaply, because it does not parse HTTP. L7 proxies behind it terminate TLS and make HTTP decisions: routing, buffering, header policy. Choosing only L7 at the front makes every packet pay for HTTP parsing. Choosing only L4 means no path routing, no buffering and no HTTP-aware retries. If the L4 tier hides client addresses, pass them with the PROXY protocol.</p>
+</details>
+<details>
+<summary>"How can a reverse proxy cause one user to receive another user's response?"</summary>
+<p>Two ways. Request smuggling: the proxy and backend disagree on where a request ends on a shared pooled connection, so an attacker's bytes are prefixed to the next user's request and responses get misaligned. And caching: if the proxy caches responses and the cache key does not include what makes the response personal (a cookie or authorization header), it serves one user's page to another. Fix the first with strict framing, consistent parsers and HTTP/2 to the backend. Fix the second by never caching authenticated responses unless the key is designed for it.</p>
+</details>
+<details>
+<summary>"A colleague wants to add nginx behind the cloud load balancer 'for flexibility'. How do you decide?"</summary>
+<p>Ask for the one job the cloud balancer cannot do: per-route buffering, a specific rewrite, local static serving, a module you need. If there is one, add nginx and own the consequences: a second timeout ladder, a second body limit, a second trusted-header hop, a second idle-timeout pair to align. If the answer is "flexibility", decline. Every unowned layer adds incident time, because during an outage someone has to check its config too.</p>
+</details>

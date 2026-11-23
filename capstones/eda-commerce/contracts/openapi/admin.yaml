@@ -1,0 +1,270 @@
+openapi: 3.1.0
+info:
+  title: eda-commerce operations and test-control API
+  version: 1.0.0
+  description: |
+    Internal endpoints. Never exposed through the public ingress (the k8s base binds them to the
+    same port but the ingress only routes public paths). Locally they are open; in any shared
+    environment they require an ops-scoped token.
+
+    Three groups:
+    - Seed: inventory stock levels (products are seeded through the Catalog API).
+    - Fakes: runtime behaviour of the fake PSP, warehouse (WMS) and carrier. The Makefile chaos
+      targets call these. Both implementations must expose identical endpoints so the same drills
+      run against Python and Java.
+    - DLQ and saga operations: present on every service, implemented once in the shared library.
+servers:
+  - url: http://localhost:8100
+    description: Placeholder. Each path lists the service and port that serves it.
+security:
+  - oidc: [ops]
+tags:
+  - name: seed
+  - name: fakes
+  - name: ops
+paths:
+  /admin/stock/{sku}:
+    put:
+      tags: [seed]
+      operationId: setStock
+      summary: Set on-hand stock for a SKU (inventory-svc, 8105)
+      servers:
+        - url: http://localhost:8105
+      parameters:
+        - name: sku
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [onHand]
+              properties:
+                onHand: {type: integer, minimum: 0}
+      responses:
+        '200': {description: Stored; StockLevelChanged written to the outbox.}
+  /admin/fakes/psp:
+    get:
+      tags: [fakes]
+      operationId: getFakePsp
+      summary: Current fake PSP behaviour (payment-svc, 8104)
+      servers: [{url: 'http://localhost:8104'}]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FakePspConfig'}
+    put:
+      tags: [fakes]
+      operationId: setFakePsp
+      summary: Change fake PSP behaviour at runtime (payment-svc, 8104)
+      servers: [{url: 'http://localhost:8104'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FakePspConfig'}
+      responses:
+        '200': {description: Applied.}
+  /admin/fakes/wms:
+    put:
+      tags: [fakes]
+      operationId: setFakeWms
+      summary: Change fake warehouse behaviour (fulfilment-svc, 8106)
+      servers: [{url: 'http://localhost:8106'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FakeWmsConfig'}
+      responses:
+        '200': {description: Applied.}
+  /admin/fakes/carrier:
+    put:
+      tags: [fakes]
+      operationId: setFakeCarrier
+      summary: Change fake carrier behaviour (shipping-svc, 8107)
+      servers: [{url: 'http://localhost:8107'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FakeCarrierConfig'}
+      responses:
+        '200': {description: Applied.}
+  /admin/fakes/carrier/shipments/{trackingNumber}/advance:
+    post:
+      tags: [fakes]
+      operationId: advanceShipment
+      summary: Force the fake carrier to send the next tracking webhook now (shipping-svc, 8107)
+      servers: [{url: 'http://localhost:8107'}]
+      parameters:
+        - name: trackingNumber
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                toStatus: {type: string, enum: [PICKED_UP, IN_TRANSIT, OUT_FOR_DELIVERY, DELIVERED, EXCEPTION]}
+      responses:
+        '202': {description: Webhook scheduled.}
+  /ops/dlq:
+    get:
+      tags: [ops]
+      operationId: listDlq
+      summary: Peek at this service's DLQ (every service)
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, default: 50, maximum: 500}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/DlqEntry'}
+  /ops/dlq/replay:
+    post:
+      tags: [ops]
+      operationId: replayDlq
+      summary: Move messages from <group>.dlq to <group>.retry.10s (every service)
+      description: |
+        Replays into this group's own first retry topic, not the original topic, so that only this
+        consumer group sees the message again. Other groups that already processed it are not disturbed.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                maxMessages: {type: integer, default: 100, maximum: 10000}
+                eventType: {type: string, description: Only replay this ce_type.}
+                eventIds:
+                  type: array
+                  items: {type: string}
+      responses:
+        '202':
+          description: Replay started.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  replayed: {type: integer}
+  /ops/sagas/{sagaId}:
+    get:
+      tags: [ops]
+      operationId: getSaga
+      summary: Saga instance state, history and pending deadline (order-svc, returns-svc)
+      parameters:
+        - name: sagaId
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SagaView'}
+        '404': {$ref: './common.yaml#/components/responses/NotFound'}
+  /ops/sagas/{sagaId}/retry-step:
+    post:
+      tags: [ops]
+      operationId: retrySagaStep
+      summary: Re-send the command of the current step (order-svc, returns-svc)
+      parameters:
+        - name: sagaId
+          in: path
+          required: true
+          schema: {type: string}
+        - $ref: './common.yaml#/components/parameters/IdempotencyKey'
+      responses:
+        '202': {description: Command re-issued with a new eventId and the same business id.}
+        '409': {description: Saga is terminal.}
+components:
+  schemas:
+    FakePspConfig:
+      type: object
+      description: |
+        Probabilities apply to tokens without a magic prefix. Magic tokens are deterministic:
+        tok_decline, tok_insufficient_funds, tok_fraud, tok_timeout (no answer until reconciliation),
+        tok_slow (webhook after slowWebhookMs), tok_dup_webhook (every webhook sent 3 times),
+        tok_capture_fails (authorisation ok, capture fails with authorization_expired).
+      properties:
+        declineRate: {type: number, minimum: 0, maximum: 1, default: 0.05}
+        timeoutRate: {type: number, minimum: 0, maximum: 1, default: 0.02}
+        duplicateWebhookRate: {type: number, minimum: 0, maximum: 1, default: 0.1}
+        webhookDelayMs: {type: integer, default: 300}
+        slowWebhookMs: {type: integer, default: 90000}
+        apiLatencyMs: {type: integer, default: 80}
+    FakeWmsConfig:
+      type: object
+      description: The warehouse is slow and lossy on purpose.
+      properties:
+        dropRequestRate:
+          type: number
+          default: 0.1
+          description: Fraction of RequestFulfilment the warehouse silently "loses" (never accepts). The saga deadline must recover.
+        acceptDelayMs: {type: integer, default: 2000}
+        pickDelayMs: {type: integer, default: 20000}
+        packDelayMs: {type: integer, default: 20000}
+        failRate: {type: number, default: 0.02, description: Fraction that end in FulfilmentFailed(STOCK_DAMAGED).}
+        manifestLines: {type: integer, default: 2000, description: Size of the generated packing manifest; large on purpose to exercise the claim check.}
+        inspectionDamagedRate: {type: number, default: 0.2}
+    FakeCarrierConfig:
+      type: object
+      properties:
+        duplicateRate: {type: number, default: 0.2}
+        outOfOrderRate: {type: number, default: 0.2}
+        exceptionRate: {type: number, default: 0.02}
+        stepDelayMs: {type: integer, default: 30000}
+        bookingFailureRate: {type: number, default: 0.02}
+    DlqEntry:
+      type: object
+      properties:
+        eventId: {type: string}
+        eventType: {type: string}
+        originalTopic: {type: string}
+        originalPartition: {type: integer}
+        originalOffset: {type: integer, format: int64}
+        attempts: {type: integer}
+        errorClass: {type: string}
+        errorMessage: {type: string}
+        failedAt: {type: string, format: date-time}
+    SagaView:
+      type: object
+      properties:
+        sagaId: {type: string}
+        sagaType: {type: string, enum: [ORDER, RETURN]}
+        state: {type: string}
+        version: {type: integer}
+        deadlineAt: {type: [string, 'null'], format: date-time}
+        attempts: {type: integer}
+        history:
+          type: array
+          items:
+            type: object
+            properties:
+              at: {type: string, format: date-time}
+              from: {type: string}
+              to: {type: string}
+              trigger: {type: string}
+              eventId: {type: string}
+  securitySchemes:
+    oidc:
+      $ref: './common.yaml#/components/securitySchemes/oidc'

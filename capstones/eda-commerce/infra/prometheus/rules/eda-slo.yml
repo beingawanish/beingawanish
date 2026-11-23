@@ -1,0 +1,67 @@
+# Alerts that encode the SLOs in docs/architecture.md section "SLOs".
+# Metric names follow the contract in docs/implementation-guide.md section "Metrics".
+groups:
+  - name: eda-backbone
+    rules:
+      - alert: ConsumerLagHigh
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 1000
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Consumer group {{ $labels.consumergroup }} is {{ $value }} messages behind on {{ $labels.topic }}'
+          runbook: docs/architecture.md#runbook-consumer-lag
+
+      - alert: EventAgeSloBreach
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, consumer_group) (rate(eda_event_age_seconds_bucket{topic!~".*\\.retry\\..*"}[5m]))
+          ) > 2
+        for: 10m
+        labels: {severity: page}
+        annotations:
+          summary: 'p99 event age for {{ $labels.consumer_group }} is {{ $value | humanizeDuration }} (SLO 2s)'
+
+      - alert: DeadLetterReceived
+        expr: sum by (consumer_group, event_type) (increase(eda_dlq_messages_total[15m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: '{{ $value }} message(s) of {{ $labels.event_type }} dead-lettered by {{ $labels.consumer_group }}'
+          runbook: docs/architecture.md#runbook-dlq
+
+  - name: eda-sagas
+    rules:
+      - alert: SagaOverdue
+        expr: max by (saga_type) (eda_saga_overdue) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: '{{ $value }} {{ $labels.saga_type }} saga(s) are past their deadline and not being handled'
+
+      - alert: OrderCancellationRateHigh
+        expr: |
+          sum(rate(eda_saga_outcomes_total{saga_type="ORDER", outcome="CANCELLED"}[15m]))
+            /
+          clamp_min(sum(rate(eda_saga_outcomes_total{saga_type="ORDER"}[15m])), 1e-9)
+          > 0.2
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: 'More than 20% of orders are ending CANCELLED. Check PSP decline rate and stock.'
+
+      - alert: SagaNeedsHuman
+        expr: sum by (saga_type) (increase(eda_saga_outcomes_total{outcome="MANUAL_REVIEW"}[30m])) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: '{{ $labels.saga_type }} saga(s) escalated to manual review'
+
+  - name: eda-http
+    rules:
+      - alert: CheckoutLatencySloBreach
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(traces_span_metrics_duration_milliseconds_bucket{service_name="checkout-svc", span_kind="SPAN_KIND_SERVER", span_name=~"POST /checkouts.*"}[5m]))
+          ) > 300
+        for: 10m
+        labels: {severity: page}
+        annotations:
+          summary: 'POST /checkouts p99 is {{ $value }}ms (SLO 300ms)'

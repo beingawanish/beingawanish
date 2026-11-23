@@ -1,0 +1,24 @@
+# shipping-svc. Infrastructure variables (guide §7) are mapped by edacommon; only defaults and
+# service-specific settings live here.
+eda:
+  service-name: shipping-svc
+  consumer:
+    topics: [fulfilment.events.v1, shipping.commands.v1]
+  idempotency:
+    paths: [/ops/dlq/replay]
+server:
+  port: 8107
+shipping:
+  carrier:
+    webhook-secret: ${CARRIER_WEBHOOK_SECRET:dev-carrier-secret}
+    webhook-url: ${CARRIER_WEBHOOK_URL:http://localhost:8107/webhooks/carrier}
+  booking-retry-interval: 5s
+  tracking-interval: 1s
+  carrier-tick-interval: 500ms
+  # admin.yaml FakeCarrierConfig, as FAKE_CARRIER_* (upper snake case)
+  fake-carrier:
+    duplicate-rate: ${FAKE_CARRIER_DUPLICATE_RATE:0.2}
+    out-of-order-rate: ${FAKE_CARRIER_OUT_OF_ORDER_RATE:0.2}
+    exception-rate: ${FAKE_CARRIER_EXCEPTION_RATE:0.02}
+    step-delay-ms: ${FAKE_CARRIER_STEP_DELAY_MS:30000}
+    booking-failure-rate: ${FAKE_CARRIER_BOOKING_FAILURE_RATE:0.02}

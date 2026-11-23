@@ -1,0 +1,53 @@
+{
+  "type": "record",
+  "name": "OrderPlaced",
+  "namespace": "com.edacommerce.order",
+  "doc": "The order aggregate exists and the saga has started.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "customerId",
+      "type": "string"
+    },
+    {
+      "name": "lines",
+      "type": {
+        "type": "array",
+        "items": "com.edacommerce.common.LineItem"
+      }
+    },
+    {
+      "name": "total",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "shippingAddress",
+      "type": "com.edacommerce.common.Address",
+      "pii": true
+    },
+    {
+      "name": "contactEmail",
+      "type": "string",
+      "pii": true
+    },
+    {
+      "name": "shippingMethod",
+      "type": "com.edacommerce.common.ShippingMethod"
+    },
+    {
+      "name": "placedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

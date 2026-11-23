@@ -1,0 +1,44 @@
+{
+  "type": "record",
+  "name": "ShipmentDelivered",
+  "namespace": "com.edacommerce.shipping",
+  "doc": "Carrier confirmed delivery (to the customer, or to the warehouse for returns).",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "shipmentId",
+      "type": "string"
+    },
+    {
+      "name": "direction",
+      "type": "com.edacommerce.common.ShipmentDirection"
+    },
+    {
+      "name": "returnId",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "carrierEventId",
+      "type": "string"
+    },
+    {
+      "name": "deliveredAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

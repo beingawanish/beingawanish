@@ -1,0 +1,272 @@
+<h2 id=dd-thinking-in-patterns-inside-the-reasoning level=2>Deep Dive: Inside the Reasoning</h2>
+<p>The lesson says a pattern is a problem, a standard solution and a cost. That definition is right, but it hides the hard part. In a real design review nobody hands you the problem. You get a requirement, a few numbers and a deadline. Turning that into named problems is the skill, and it has steps you can practise.</p>
+
+<h3 id=dd-thinking-in-patterns-forces level=3>Start from forces, not features</h3>
+<p>A feature is what the product does: "send the driver an SMS." A force is a pressure the feature puts on the system: "a third party we don't control," "a limit of 100 messages a second," "a report that may arrive twice." Patterns answer forces. They never answer features.</p>
+<p>This is why the second candidate in the lesson could adapt. They did not hear "SMS." They heard four forces, and each force has a short list of known answers. The word "SMS" could change to "email," "fax" or "a bank's settlement API," and the forces would be the same.</p>
+<p>Most forces fall into a small set of families. Learn to hear them in plain product language:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>What you hear<th>The force underneath<th>Where the answers live<tbody>
+<tr><td>"The user doesn't need to wait for that."<td>Work that can be deferred<td><a href="#message-queue">Message queue</a>, <a href="#backpressure">backpressure</a>
+<tr><td>"Finance, search and email all need to know."<td>One fact, many independent readers<td><a href="#publishsubscribe">Pub/sub</a>, <a href="#eventdriven-architecture">event-driven architecture</a>, <a href="#change-data-capture">CDC</a>
+<tr><td>"It's the same page for everyone."<td>Repeated identical reads<td><a href="#cacheaside">Cache-aside</a>, <a href="#cdn">CDN</a>
+<tr><td>"The provider sometimes takes 30 seconds."<td>A slow or unreliable dependency<td><a href="#timeout">Timeout</a>, <a href="#circuit-breaker">circuit breaker</a>, <a href="#bulkhead">bulkhead</a>
+<tr><td>"We must never charge twice."<td>An effect that must happen once despite retries<td><a href="#idempotency">Idempotency</a>, <a href="#exactlyonce-semantics">exactly-once semantics</a>
+<tr><td>"One celebrity has 40 million followers."<td>Skewed load on one key<td><a href="#sharding">Sharding</a> with key splitting, caching, fan-out choices in <a href="#design-1-the-news-feed">the news feed</a>
+<tr><td>"Auditors need to see every change."<td>History is part of the data<td><a href="#event-sourcing">Event sourcing</a>, <a href="#writeahead-log">write-ahead log</a>
+<tr><td>"Two warehouses both think they reserved the last copy."<td>Concurrent writers to shared state<td><a href="#quorum">Quorum</a>, <a href="#saga">saga</a>, <a href="#twophase-commit">two-phase commit</a>
+</table></div></div>
+<p>Notice the middle column never mentions a technology. "Repeated identical reads" is true of a bookstore's product page, a DNS resolver and a model's embedding lookup. That generality is what makes sixty patterns enough.</p>
+
+<h3 id=dd-thinking-in-patterns-loop level=3>The decomposition loop</h3>
+<p>Senior engineers run the same loop on every requirement, usually without saying so. Made explicit, it looks like this.</p>
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-thinking-in-patterns-svg-title dd-thinking-in-patterns-svg-desc" viewBox="0 0 720 300" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-thinking-in-patterns-svg-title">The decomposition loop</title>
+<desc id="dd-thinking-in-patterns-svg-desc">A requirement is broken into forces. Each force names a problem. Each problem gets a candidate pattern. Each pattern brings its own new problems, such as duplicates from retries, which loop back to be named as problems. The loop ends when no new problem is worth its cost, and the output is a list of cost statements.</desc>
+<defs><marker id="dd-thinking-in-patterns-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="300" fill="#ffffff"/>
+<rect x="20" y="40" width="120" height="56" rx="8" fill="#eef2f6" stroke="#d5dee8"/>
+<text x="80" y="66" font-size="14" fill="#1c2430" text-anchor="middle">Requirement</text>
+<text x="80" y="84" font-size="12" fill="#5c6b7c" text-anchor="middle">"notify by SMS"</text>
+<rect x="190" y="40" width="120" height="56" rx="8" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="250" y="66" font-size="14" fill="#1c2430" text-anchor="middle">Forces</text>
+<text x="250" y="84" font-size="12" fill="#5c6b7c" text-anchor="middle">limit, 3rd party</text>
+<rect x="360" y="40" width="120" height="56" rx="8" fill="#e4eef8" stroke="#1f5f99" stroke-width="2"/>
+<text x="420" y="66" font-size="14" fill="#1c2430" text-anchor="middle">Problems</text>
+<text x="420" y="84" font-size="12" fill="#5c6b7c" text-anchor="middle">named, general</text>
+<rect x="530" y="40" width="170" height="56" rx="8" fill="#e5f3ec" stroke="#7eae96"/>
+<text x="615" y="66" font-size="14" fill="#1c2430" text-anchor="middle">Candidate patterns</text>
+<text x="615" y="84" font-size="12" fill="#5c6b7c" text-anchor="middle">queue, breaker, ...</text>
+<rect x="530" y="170" width="170" height="56" rx="8" fill="#f8ebee" stroke="#c898a4"/>
+<text x="615" y="196" font-size="14" fill="#1c2430" text-anchor="middle">Problems they create</text>
+<text x="615" y="214" font-size="12" fill="#5c6b7c" text-anchor="middle">duplicates, lag, stale</text>
+<rect x="190" y="170" width="200" height="56" rx="8" fill="#fbf6e4" stroke="#c4b56e"/>
+<text x="290" y="196" font-size="14" fill="#1c2430" text-anchor="middle">Stop: cost statements</text>
+<text x="290" y="214" font-size="12" fill="#5c6b7c" text-anchor="middle">when the next fix isn't worth it</text>
+<line x1="140" y1="68" x2="186" y2="68" stroke="#1c2430" marker-end="url(#dd-thinking-in-patterns-arrow)"/>
+<line x1="310" y1="68" x2="356" y2="68" stroke="#1c2430" marker-end="url(#dd-thinking-in-patterns-arrow)"/>
+<line x1="480" y1="68" x2="526" y2="68" stroke="#1c2430" marker-end="url(#dd-thinking-in-patterns-arrow)"/>
+<line x1="615" y1="96" x2="615" y2="166" stroke="#1c2430" marker-end="url(#dd-thinking-in-patterns-arrow)"/>
+<path d="M560,170 C520,130 460,130 430,100" fill="none" stroke="#c898a4" stroke-width="2" marker-end="url(#dd-thinking-in-patterns-arrow)"/>
+<text x="470" y="150" font-size="12" fill="#1c2430" text-anchor="middle">loop back</text>
+<line x1="530" y1="210" x2="394" y2="210" stroke="#1c2430" marker-end="url(#dd-thinking-in-patterns-arrow)"/>
+<text x="462" y="242" font-size="12" fill="#1c2430" text-anchor="middle">nothing left worth fixing</text>
+<text x="360" y="280" font-size="12" fill="#5c6b7c" text-anchor="middle">Most designs need two or three trips round the loop. The second trip is where juniors stop and seniors keep going.</text>
+</svg>
+<figcaption>Every pattern you add is a new input to the loop. The loop ends on a judgment, not on a diagram being "complete."</figcaption>
+</figure>
+<ol>
+<li><strong>Restate the requirement as forces.</strong> Write down who waits, what crosses a boundary, what must happen exactly once and what is skewed. Do this out loud in an interview.</li>
+<li><strong>Name each force as a general problem.</strong> "The provider is slow" becomes "a synchronous dependency whose latency we don't control." The general name is what lets you search your memory.</li>
+<li><strong>Pick a candidate pattern per problem.</strong> Usually there are two or three candidates. Pick on the forces, not on familiarity. The design-variations section below has the common choices.</li>
+<li><strong>Ask what the pattern breaks.</strong> This is the step people skip. A queue creates duplicates and delay. A cache creates staleness. A replica creates lag. Each of those is a new problem, so it goes back to step 2.</li>
+<li><strong>Stop when the next fix costs more than the problem.</strong> A one-in-a-million duplicate email may not justify a deduplication store. A one-in-a-million duplicate charge does. Say which you chose and why.</li>
+</ol>
+<p>The output of the loop is not a diagram. It is a short list of sentences of the form "we chose X because of force F; it costs C; we accept C because of number N." The diagram is a drawing of those sentences.</p>
+
+<h3 id=dd-thinking-in-patterns-dependency-graph level=3>Patterns come in chains</h3>
+<p>Step 4 is predictable, because patterns create the same follow-on problems every time. A senior engineer carries this graph in their head. When someone says "retry," they already hear "idempotency" coming.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>If you add<th>You have created<th>Which needs<tbody>
+<tr><td><a href="#retry-with-exponential-backoff">Retries</a><td>Duplicate requests, and load multiplication during outages<td><a href="#idempotency">Idempotency keys</a>, a retry budget, jitter, a <a href="#circuit-breaker">circuit breaker</a>
+<tr><td>A <a href="#message-queue">queue</a><td>At-least-once delivery, poison messages, invisible backlog<td>Idempotent consumers, a <a href="#dead-letter-queue">dead letter queue</a>, an age-of-oldest-message alarm
+<tr><td>A <a href="#cacheaside">cache</a><td>Stale reads, cold starts, stampedes on hot keys<td>A staleness budget per data type, invalidation, <a href="#cache-stampede-prevention">stampede prevention</a>
+<tr><td><a href="#primaryreplica">Replicas</a><td>Replication lag and read-your-writes surprises<td>Routing of "just wrote it" reads to the primary, a lag alarm
+<tr><td><a href="#sharding">Sharding</a><td>Cross-shard queries, hot shards, painful resharding<td>A shard key that matches the main query, <a href="#consistent-hashing">consistent hashing</a> or directory-based placement
+<tr><td><a href="#eventdriven-architecture">Events between services</a><td>Dual-write gaps, ordering questions, hard-to-follow flows<td>An outbox or <a href="#change-data-capture">CDC</a>, per-key ordering, <a href="#distributed-tracing">distributed tracing</a>
+<tr><td>Async work of any kind<td>"Did it happen?" becomes a question<td>Status endpoints, observability, reconciliation jobs
+</table></div></div>
+<p>Read the right-hand column again. Almost every entry is itself a pattern from a later module. This is why the course's lessons link to each other so much. It is also why an interviewer's follow-up questions are predictable: they walk this graph one edge at a time.</p>
+
+<h3 id=dd-thinking-in-patterns-cost-statement level=3>What a complete cost statement contains</h3>
+<p>The lesson's rule is "name the cost in the same sentence." A good cost statement has four parts, and most candidates give only the first.</p>
+<ol>
+<li><strong>The cost itself.</strong> "The cache can serve stale prices."</li>
+<li><strong>Its size.</strong> "Up to 60 seconds stale, because that's the TTL."</li>
+<li><strong>Who feels it.</strong> "A shopper may see yesterday's price on the product page."</li>
+<li><strong>Why it is acceptable, or how it is contained.</strong> "Checkout re-reads the price from the database, so nobody pays the stale price."</li>
+</ol>
+<p>Part 2 is where numbers enter. A cost without a size can't be compared with anything. "Replicas add lag" is true and useless. "Replicas add about 50 ms of lag at normal load and several seconds during a bulk import" tells the reviewer exactly which reads to worry about.</p>
+
+<h3 id=dd-thinking-in-patterns-levels level=3>Patterns at three altitudes</h3>
+<p>One more piece of internal structure helps. Patterns live at different altitudes, and mixing them up makes a design hard to discuss.</p>
+<ul>
+<li><strong>Architecture level:</strong> how the big pieces relate. <a href="#eventdriven-architecture">Event-driven architecture</a>, <a href="#cqrs">CQRS</a>, <a href="#lambda-and-kappa">Lambda and Kappa</a>. These shape team boundaries and are expensive to change.</li>
+<li><strong>Component level:</strong> how one piece behaves. <a href="#cacheaside">Cache-aside</a>, <a href="#sharding">sharding</a>, <a href="#message-queue">a queue</a>. These can usually change within a quarter.</li>
+<li><strong>Call level:</strong> how one interaction behaves. <a href="#timeout">Timeouts</a>, <a href="#retry-with-exponential-backoff">retries</a>, <a href="#idempotency">idempotency keys</a>. These change with a config push, but they must be set on every arrow.</li>
+</ul>
+<p>A design review should move down the altitudes in order. Arguing about retry counts before agreeing on whether the flow is synchronous wastes the room's time. Equally, a design with a beautiful architecture and no timeouts is unfinished.</p>
+
+<h2 id=dd-thinking-in-patterns-numbers level=2>Deep Dive: The Numbers That Pick a Pattern</h2>
+<p>Patterns are not chosen by taste. Each one becomes worth its cost at a particular scale, and below that scale it is pure overhead. This section gives rough thresholds and then walks the bookstore through three sizes.</p>
+<p>Every threshold below is a planning number, not a benchmark. Real limits depend on hardware, query shape, row size and tuning, and can differ by ten times in either direction. Measure your own system before you trust any of them.</p>
+
+<h3 id=dd-thinking-in-patterns-thresholds level=3>Rough thresholds where patterns start to pay</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Pattern<th>Usually not needed while...<th>Starts to pay when...<th>The number to check<tbody>
+<tr><td><a href="#cacheaside">Cache</a><td>The database answers reads well inside the latency budget with headroom<td>Repeated reads are a large share of database load, or the p99 budget can't absorb a 10 ms query<td>Read QPS, share of reads that repeat, DB CPU
+<tr><td><a href="#primaryreplica">Read replicas</a><td>One machine serves reads at under ~50% CPU at peak<td>Read load at peak approaches what one machine can serve, or you need a warm standby anyway<td>Peak read QPS vs. one node's measured capacity
+<tr><td><a href="#sharding">Sharding</a><td>Data fits on one large machine with room to grow for 18-24 months, and writes fit too<td>Write rate or data size will exceed the biggest affordable machine within your planning horizon<td>Peak write QPS, data growth per month
+<tr><td><a href="#message-queue">Queue</a><td>The work is fast and the caller needs the result<td>The work is slow, spiky, rate-limited downstream, or nobody waits for it<td>Work duration vs. latency budget, burst size
+<tr><td><a href="#circuit-breaker">Circuit breaker</a><td>The dependency is in-process or never slow<td>A slow dependency can tie up threads that other features need<td>Threads held = rate x timeout (Little's law)
+<tr><td><a href="#cdn">CDN</a><td>Users are near one region and assets are small<td>Static bytes dominate egress, or users are far from the origin<td>Egress per second, share of static bytes, user geography
+</table></div></div>
+<p>The pattern of the table is the point. Each row has a measurable crossover. A design that adds a pattern below its crossover pays the cost and gets nothing back.</p>
+
+<h3 id=dd-thinking-in-patterns-bookstore-scales level=3>One bookstore, three sizes</h3>
+<p>Take the course's online bookstore and grow it. Assume 20 page views per visit, a read-to-write ratio near 100:1, peak at 4x average and 1 KB per order row.</p>
+<p><strong>Size 1: a regional shop, 20,000 visits a day.</strong> That is 400,000 page views a day, or about 4 per second on average and 16 at peak. Orders: maybe 1,000 a day, about one every 90 seconds. One application server and one Postgres instance handle this with enormous headroom. The patterns worth having are the call-level ones: timeouts on the payment provider, an idempotency key on checkout, and a backup. A cache, a queue or a replica here is a cost with no benefit. Even email confirmations can be sent inline with a timeout, though a simple job table is cheap if you already have one.</p>
+<p><strong>Size 2: a national store, 2 million visits a day.</strong> Page views reach 40 million a day: about 400 per second, 1,600 at peak. If each page makes 5 queries, the database sees 8,000 queries a second at peak. Most are product and category reads that repeat. Now a cache earns its place. At a 95% hit ratio, database reads drop to about 400 a second. Orders reach perhaps 100,000 a day, about 1 a second on average and 4 at peak. That is trivial for writes. Email, search indexing and the warehouse feed should move to a queue, because a slow email provider must not slow checkout. One replica is justified as a failover target, and it can take reporting queries too.</p>
+<p><strong>Size 3: a global marketplace, 200 million visits a day.</strong> Page views reach 4 billion a day: 40,000 per second, 160,000 at peak. Reads are dominated by cache and <a href="#cdn">CDN</a> hits. Orders reach perhaps 10 million a day: 100 per second, 400 at peak, with each order writing 5 to 10 rows across orders, items, payments and inventory. That is a few thousand row writes a second at peak, which one well-sized primary can usually still take. Storage is the more interesting number: 10 million orders x 10 rows x 1 KB is about 100 GB a day, or 36 TB a year before indexes. That is the force that pushes toward <a href="#sharding">sharding</a> by customer or archiving old orders. Inventory for one hot bestseller on launch day is a skewed-key problem, which needs its own answer.</p>
+<p>The lesson to take from this: at size 1, the hard part is correctness on the payment call. At size 2, it is read load and isolating slow side effects. At size 3, it is data volume and hot keys. The same product needs different patterns because the forces changed size.</p>
+
+<h3 id=dd-thinking-in-patterns-cost-in-numbers level=3>Putting numbers on the costs</h3>
+<p>Costs need sizes too. Here are the common ones worked out, so you can quote them in a review.</p>
+<p><strong>Retry amplification.</strong> Say a request passes through three layers, and each layer retries a failed call 3 times (4 attempts in total). When the bottom dependency is down, one user request becomes 4 x 4 x 4 = 64 calls to it. At 500 requests a second, the failing dependency receives 32,000 calls a second just as it is trying to recover. That is why retries belong at one layer, with a budget, and why the <a href="#circuit-breaker">circuit breaker</a> exists.</p>
+<p><strong>Queue delay.</strong> A queue adds at least one poll interval and one broker round trip, usually tens of milliseconds when healthy. During a backlog, delay is backlog divided by spare drain rate. A 600,000-message backlog drained at 500 messages a second of spare capacity takes 20 minutes. If "order confirmed" emails sit behind that, customers wait 20 minutes. Say so.</p>
+<p><strong>Cache staleness.</strong> With a TTL and no invalidation, the worst-case staleness is the TTL. The average is about half of it for data that changes at random times. With delete-on-write invalidation, staleness is usually milliseconds but becomes unbounded if the delete is lost. That is the real reason teams keep a TTL as a backstop even with invalidation.</p>
+<p><strong>Replica lag.</strong> Healthy asynchronous replication often lags by milliseconds to around a second. Long transactions, bulk updates or a saturated replica can push it to minutes. Any read that must see the user's own last write has to go to the primary or wait for the replica to catch up.</p>
+<p><strong>Operational cost.</strong> Every stateful component adds monitoring, backups, upgrades and an on-call runbook. A rough rule many teams use: each new stateful system costs a meaningful fraction of an engineer's time for as long as it exists. That number varies a lot by team and tooling, but it is never zero. Include it.</p>
+
+<h2 id=dd-thinking-in-patterns-reasoning-errors level=2>Deep Dive: Reasoning Errors in Practice</h2>
+<p>In a pattern lesson, this section covers how the system fails. Here it covers how the <em>reasoning</em> fails. Each of these shows up in real design reviews, not only in interviews, and each has a tell you can catch.</p>
+
+<h3 id=dd-thinking-in-patterns-err-keyword level=3>1. Keyword matching</h3>
+<p><strong>Symptom.</strong> The design reaches for a pattern the moment a word appears. "Real-time" becomes WebSockets. "Events" becomes Kafka. "Scale" becomes microservices.</p>
+<p><strong>Mechanism.</strong> The engineer matched a feature word to a technology, skipping the force in between. "Real-time" might mean "within 200 ms" or "within 5 seconds." Those need different things. A dashboard that refreshes every 5 seconds is fine with polling or <a href="#serversent-events">server-sent events</a>, and a full-duplex socket adds connection state for no reason.</p>
+<p><strong>How you detect it.</strong> Ask "what number made you choose that?" If the answer is a word, not a number, it was a keyword match.</p>
+<p><strong>Fix.</strong> Restate the requirement as a measurable force first: latency target, direction of data, how many clients, how often it changes. Then choose.</p>
+
+<h3 id=dd-thinking-in-patterns-err-cargo level=3>2. Copying a big company's architecture</h3>
+<p><strong>Symptom.</strong> A 20-person company proposes the architecture from a famous engineering blog: dozens of services, a service mesh, multi-region active-active.</p>
+<p><strong>Mechanism.</strong> That architecture was the answer to forces the big company had: thousands of engineers, millions of requests per second, regulatory regions. The small company has different forces. They pay all the costs (operational load, distributed debugging, consistency headaches) and feel none of the benefits.</p>
+<p><strong>How you detect it.</strong> Ask what problem each component solves <em>for this system at this scale</em>. Components that are justified only by "that's how X does it" are the tell.</p>
+<p><strong>Fix.</strong> Run the bookstore-sizes exercise above for the real numbers. Write down the scale at which each borrowed pattern would start to pay, and add it then.</p>
+
+<h3 id=dd-thinking-in-patterns-err-no-second-trip level=3>3. Stopping after the first trip round the loop</h3>
+<p><strong>Symptom.</strong> The design has retries but no idempotency, a queue but no dead letter queue, a cache but no invalidation story.</p>
+<p><strong>Mechanism.</strong> The engineer solved the original problems and didn't ask what the solutions created. This is the most common gap, and production finds it fast: the first network blip produces duplicate charges or duplicate emails.</p>
+<p><strong>How you detect it.</strong> Walk the dependency-graph table above against the diagram. Every left-hand pattern present without its right-hand partner is a finding.</p>
+<p><strong>Fix.</strong> Make step 4 of the loop a habit. For every pattern you add, say its follow-on problem out loud before moving on.</p>
+
+<h3 id=dd-thinking-in-patterns-err-one-sla level=3>4. One reliability target for every path</h3>
+<p><strong>Symptom.</strong> Every endpoint gets the same timeouts, retries and availability target. Or every write is treated as if it were a payment.</p>
+<p><strong>Mechanism.</strong> Paths have different costs of failure. A bookstore's product page can show a cached version during an outage. Checkout cannot fake a successful charge. "Add to wishlist" can fail and ask the user to try again. Treating them the same either over-engineers the cheap paths or under-protects the expensive one.</p>
+<p><strong>How you detect it.</strong> Ask "what does the user see if this fails?" for three different endpoints. If the answer is identical, the design didn't think about it.</p>
+<p><strong>Fix.</strong> Classify paths by cost of failure. Spend reliability patterns on the expensive ones. Use <a href="#graceful-degradation">graceful degradation</a> on the ones with a useful partial answer.</p>
+
+<h3 id=dd-thinking-in-patterns-err-premature level=3>5. Solving next year's problem today</h3>
+<p><strong>Symptom.</strong> Sharding, multi-region or a custom consensus layer on a system with 50 GB of data and 200 writes a second.</p>
+<p><strong>Mechanism.</strong> Growth is real, but the cost of the pattern lands now and the benefit lands later, if at all. Meanwhile the system pays cross-shard query pain on every feature. Many products change shape before they reach the predicted scale, and the shard key chosen early turns out to be wrong.</p>
+<p><strong>How you detect it.</strong> Ask when, at current growth, the simpler design runs out. If the answer is "in three years," the pattern is premature.</p>
+<p><strong>Fix.</strong> Design the seam, not the solution. Pick and document the future shard key, keep queries that would cross it rare, and set an alert at 50% of the single machine's capacity. That buys the option cheaply.</p>
+
+<h3 id=dd-thinking-in-patterns-err-technology level=3>6. Treating a technology as a pattern</h3>
+<p><strong>Symptom.</strong> "We'll use Redis" stands in for a decision. Nobody can say whether Redis is a cache, a queue, a lock service or the system of record.</p>
+<p><strong>Mechanism.</strong> One tool can implement several patterns, each with different costs. Redis as a cache can lose data and that's fine. Redis as the only copy of user sessions or a job queue has very different durability needs. The same goes for Postgres as a queue or Kafka as a database.</p>
+<p><strong>How you detect it.</strong> Ask "what happens if this component loses all its data?" The answer reveals which pattern it is really playing. If nobody knows, that is the finding.</p>
+<p><strong>Fix.</strong> Name the pattern first, then the tool, then the configuration that makes the tool fit the pattern (persistence mode, replication, eviction policy).</p>
+
+<h3 id=dd-thinking-in-patterns-err-local level=3>7. Optimizing one pattern, breaking another</h3>
+<p><strong>Symptom.</strong> A change that looked good locally causes an incident elsewhere. A longer cache TTL makes a price bug last an hour. A higher retry count turns a 2-minute blip into a 20-minute outage.</p>
+<p><strong>Mechanism.</strong> Patterns interact through shared resources and shared assumptions. Tuning one changes the forces on the others. A longer timeout raises the number of threads held per second (Little's law), which can exhaust the <a href="#bulkhead">bulkhead</a> next door.</p>
+<p><strong>How you detect it.</strong> For any tuning change, ask what other pattern reads the value being changed. Timeouts, TTLs, retry counts and pool sizes are the usual suspects.</p>
+<p><strong>Fix.</strong> Set related knobs together and write down the relationship. "Client timeout must exceed server timeout plus one retry" is a rule worth putting next to the config.</p>
+
+<h2 id=dd-thinking-in-patterns-choosing level=2>Deep Dive: Competing Patterns and How to Choose</h2>
+<p>Most problems have more than one standard answer. The skill is picking among them on the forces, and being able to say what would change your mind. Here are the choices that come up most often.</p>
+
+<h3 id=dd-thinking-in-patterns-choose-repeated-reads level=3>Repeated reads</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Option<th>Best when<th>Main cost<th>Choose against it when<tbody>
+<tr><td><a href="#cacheaside">Cache-aside</a><td>Reads repeat, the app can tolerate a short staleness window<td>Stale data, miss storms, invalidation code in the app<td>Every read must be exact
+<tr><td><a href="#readthrough">Read-through</a><td>Many services read the same data and you want one loading path<td>Cache layer becomes critical infrastructure<td>Only one service reads it
+<tr><td><a href="#primaryreplica">Read replicas</a><td>Reads are varied (low repeat rate) but heavy<td>Replication lag, more machines to run<td>Reads are highly repetitive (a cache is cheaper)
+<tr><td><a href="#cqrs">CQRS read model</a><td>The read shape differs a lot from the write shape<td>Two models to keep in sync, eventual consistency<td>The same table serves both well
+<tr><td><a href="#cdn">CDN</a><td>Public, identical bytes for many users, far away<td>Purge delays, cost per GB, harder personalization<td>Responses are per-user
+</table></div></div>
+<p>The deciding question is usually the repeat rate. If 1% of products get 50% of views, a small cache wins. If every query is a different search filter, a cache hit ratio will be low and replicas or a search index are the better tool.</p>
+
+<h3 id=dd-thinking-in-patterns-choose-deferred level=3>Deferred work</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Option<th>Best when<th>Main cost<tbody>
+<tr><td>A job table in the main database<td>Low volume, and the job must be created atomically with business data<td>Polling load, limited throughput, hand-built retry logic
+<tr><td><a href="#message-queue">Message queue</a><td>Each task is done by one worker, volume is moderate to high<td>A new system to run, duplicates, poison messages
+<tr><td>Log (Kafka-style) with <a href="#partitioned-consumption">partitioned consumption</a><td>Many consumers, replay needed, per-key order matters<td>Partition planning, consumer-group rebalances
+<tr><td>Scheduled batch (<a href="#mapreduce">MapReduce</a>-style)<td>Freshness of hours is fine, volume is huge<td>Latency in hours, large blast radius per failed run
+</table></div></div>
+<p>A senior engineer often starts with the job table at small scale. It is transactional with the order, so there is no dual-write problem. It becomes the <a href="#message-queue">outbox</a> later, when a real broker is added.</p>
+
+<h3 id=dd-thinking-in-patterns-choose-unreliable level=3>An unreliable dependency</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Failure shape<th>First answer<th>Add when<tbody>
+<tr><td>Occasional slow call<td><a href="#timeout">Timeout</a> set from its p99<td>Always. Every remote call needs one.
+<tr><td>Occasional transient error<td><a href="#retry-with-exponential-backoff">Retry with backoff and jitter</a><td>The call is idempotent or carries a key
+<tr><td>Long outage<td><a href="#circuit-breaker">Circuit breaker</a><td>Failing calls waste resources or delay users
+<tr><td>Slowness that spreads<td><a href="#bulkhead">Bulkhead</a><td>Several features share a thread or connection pool
+<tr><td>Dependency is optional to the result<td><a href="#graceful-degradation">Graceful degradation</a><td>A partial answer is still useful
+<tr><td>Call need not be synchronous at all<td><a href="#message-queue">Queue</a> the call<td>Nobody waits for the result
+</table></div></div>
+<p>These stack rather than compete. The choice is how far up the table to go. A recommendation widget might stop at timeout plus degradation. A payment call needs every row except the last.</p>
+
+<h3 id=dd-thinking-in-patterns-choose-guidance level=3>How to make the call in the room</h3>
+<ul>
+<li><strong>Choose on the force with the hardest number.</strong> If staleness must be under one second and reads repeat heavily, that rules out long TTLs before anything else is discussed.</li>
+<li><strong>Prefer the option you can undo.</strong> A cache can be removed in a day. A sharded schema can take a year to unwind. When two options are close, pick the reversible one.</li>
+<li><strong>Say what would change your mind.</strong> "Cache-aside, unless the repeat rate turns out below 50%, in which case replicas." This shows you chose on a number, and it gives the reviewer something to check.</li>
+<li><strong>Prefer fewer kinds of thing.</strong> If the team already runs Postgres well, a job table may beat a new broker even at moderate volume. The operational cost of a new system is real.</li>
+</ul>
+
+<h2 id=dd-thinking-in-patterns-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<p>Use these questions on any design, your own or someone else's. They test the reasoning, not the diagram.</p>
+<ol>
+<li>For each component, which force does it answer, and what number shows that force is real at our scale?</li>
+<li>Which patterns are present without their partners (retries without idempotency, queue without DLQ, cache without invalidation)?</li>
+<li>For each cost, do we know its size: how stale, how delayed, how many duplicates, how much lag?</li>
+<li>Who feels each cost, and is any of it on a path where failure is expensive (money, data loss, safety)?</li>
+<li>Which paths have different costs of failure, and do they get different reliability treatment?</li>
+<li>Is anything here justified only by what another company does?</li>
+<li>At current growth, when does the simplest version of this design run out? Are we adding patterns before that date?</li>
+<li>For each technology, which pattern is it playing, and what happens if it loses all its data?</li>
+<li>Which tuning knobs depend on each other (timeouts, TTLs, retry counts, pool sizes), and is the relationship written down?</li>
+<li>Which decision here is hardest to reverse, and did it get the most scrutiny?</li>
+<li>What would change our choice for the biggest decision, and how would we notice that it had changed?</li>
+</ol>
+
+<h2 id=dd-thinking-in-patterns-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+<p>These are the follow-ups that test whether the method is real or rehearsed.</p>
+
+<details>
+<summary>"You said 'add a cache.' What's the smallest scale at which you'd remove it?"</summary>
+<p>When the database can serve the read load inside the latency budget with comfortable headroom, and the cache's costs are biting: stale-data bugs, invalidation code, or an extra system to run. For example, if read QPS fell to a few hundred and the queries are indexed point lookups, the database alone is fine. The point of the question is that a pattern has a crossover in both directions. Being able to name the number that would remove it shows you added it for a reason.</p>
+</details>
+
+<details>
+<summary>"Your design has retries at the API gateway, in the service and in the client SDK. Is that OK?"</summary>
+<p>No. Retries multiply across layers. With 3 retries at each of three layers, one user action can become 64 calls to the failing dependency, arriving exactly when it is least able to cope. Retry at one layer, usually the one closest to the failing call, with a retry budget (for example, retries capped at 10% of requests) and jittered backoff. Other layers should fail fast and pass the error up. And every retried call needs to be idempotent.</p>
+</details>
+
+<details>
+<summary>"How do you know a problem needs a pattern at all, rather than just a bigger machine?"</summary>
+<p>Compare the cost of scaling up with the cost of the pattern, including its operational and complexity cost. Vertical scaling is often cheaper than people think, and it adds no new failure modes. A pattern is justified when the bigger machine doesn't exist, costs far more than the pattern, or fails to fix the force. A bigger database does nothing for a third-party provider that is slow, for instance. And it doesn't remove a single point of failure.</p>
+</details>
+
+<details>
+<summary>"Two patterns both fit. How do you choose in front of a panel?"</summary>
+<p>Name the force with the hardest constraint and show which option it rules out. If both survive, prefer the reversible one, then the one the team already operates. Finally, say what measurement would make you switch. That last sentence is what panels look for: it shows the decision rests on a number you can check, not on preference.</p>
+</details>
+
+<details>
+<summary>"Give an example where adding a reliability pattern made things less reliable."</summary>
+<p>Aggressive retries are the classic one: a brief overload becomes a sustained one because retries keep the load above capacity. Another is a long timeout added "to be safe." By Little's law, a 30-second timeout on a call receiving 200 requests a second can hold 6,000 threads during a stall, exhausting the pool for every other feature. A third is a health check that tests a shared dependency, so one database blip makes the load balancer remove every instance at once.</p>
+</details>
+
+<details>
+<summary>"What's the difference between a pattern and a best practice?"</summary>
+<p>A best practice claims to be good everywhere. A pattern claims to be good under specific forces, and it states its cost. "Always use a cache" is a best practice, and it's wrong for write-heavy data that's rarely re-read. Cache-aside is a pattern: it fits repeated reads that tolerate bounded staleness, and it costs invalidation work and stale reads. If you can't say when not to use something, you're holding a best practice, not a pattern.</p>
+</details>
+
+<details>
+<summary>"The interviewer changes a requirement halfway through. What do you do with the existing design?"</summary>
+<p>Don't redraw it. Identify which forces the change touches, and rerun the loop only for those. "Drivers are notified by SMS through a rate-limited provider" changes the data-movement and failure answers for one arrow. It leaves storage and caching alone. Saying "this affects these two decisions and not the others" shows the design is a set of independent decisions, which is the whole point of thinking in patterns.</p>
+</details>
+
+<details>
+<summary>"Which pattern do engineers most often add too early, and why?"</summary>
+<p>Sharding, and its architectural cousin, splitting into microservices. Both are hard to reverse and both tax every future feature with cross-boundary work. They get added early because growth feels inevitable and the pain of not having them is vivid. The cheaper move is to design the seam: choose and document the future shard key or service boundary, keep code that crosses it rare, and alert at a capacity threshold. You keep the option without paying for it yet.</p>
+</details>

@@ -1,0 +1,580 @@
+<h2 id="d12-deep-dive">Deep dive: what "request/response over a byte stream" hides</h2>
+<p>The module's model is correct: a client sends a message, a server sends one back, usually on the same connection. What it hides is that the <em>connection</em> is the expensive, stateful object, and the message is cheap. Before the first byte of <code>GET</code> leaves your machine, a client has resolved a name, completed a TCP handshake, run a TLS 1.3 key exchange, validated a certificate chain against a trust store, and negotiated an HTTP version through ALPN. Each step has its own state, its own timers and its own way to fail. Every layer above it, from connection pools to HTTP/2 streams, exists to pay that setup cost as rarely as possible.</p>
+<p>This deep dive follows one HTTPS request through its whole life. It shows where the time goes, measured with <code>curl</code> and with a localhost script you can run. It then covers what pools and keep-alive actually keep, why HTTP/1.1, HTTP/2 and HTTP/3 block differently when a packet is lost, what TLS 1.3 sends field by field (and what 0-RTT gives away), how a client really validates a certificate chain, and the production failures that come out of each piece. QUIC has its own module, <a href="#module-20--quic--http3">Module 20 — QUIC &amp; HTTP/3</a>; here it appears only where HTTP/3 needs it.</p>
+<h2 id="d12-mental-model">Deep dive: the real mental model — a connection is a pooled, stateful object</h2>
+<h3 id="d12-lifecycle">The lifecycle, phase by phase</h3>
+<p>A cold HTTPS request has four phases before any useful data arrives. <code>curl</code> exposes a cumulative timer at the end of each one, and the diagram maps them onto the round trips underneath.</p>
+<div style="overflow-x:auto">
+<svg viewBox="0 0 800 500" style="min-width:800px;width:100%;height:auto;background:#f5f5f5;border:1px solid rgba(45,49,66,0.12);border-radius:6px" role="img" aria-labelledby="d12-life-title d12-life-desc">
+<title id="d12-life-title">Lifecycle of a cold HTTPS request and curl's timers</title>
+<desc id="d12-life-desc">Sequence diagram with client, resolver and server lifelines. DNS query and answer end at time_namelookup; SYN and SYN-ACK end at time_connect; ClientHello and the server's encrypted flight end at time_appconnect; client Finished travels with the HTTP request, the server thinks, and the first response byte marks time_starttransfer; the last byte marks time_total. A cold request costs three round trips plus DNS and server time; a pooled request costs one.</desc>
+<defs>
+<marker id="d12-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4f5d75"/></marker>
+<marker id="d12-arr-acc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#bf4520"/></marker>
+</defs>
+<text x="24" y="28" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" letter-spacing="2" fill="#4f5d75">D12 · ONE COLD HTTPS REQUEST — WHERE CURL'S TIMERS FIRE</text>
+<g font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">
+<rect x="250" y="44" width="120" height="32" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/><text x="310" y="65">CLIENT</text>
+<rect x="430" y="44" width="120" height="32" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/><text x="490" y="65">RESOLVER</text>
+<rect x="620" y="44" width="120" height="32" rx="6" fill="#f5f5f5" stroke="#bfc0c0"/><text x="680" y="65">SERVER</text>
+</g>
+<line x1="310" y1="76" x2="310" y2="420" stroke="#bfc0c0" stroke-dasharray="5,4"/>
+<line x1="490" y1="76" x2="490" y2="150" stroke="#bfc0c0" stroke-dasharray="5,4"/>
+<line x1="680" y1="76" x2="680" y2="420" stroke="#bfc0c0" stroke-dasharray="5,4"/>
+<g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#4f5d75" text-anchor="middle">
+<line x1="310" y1="100" x2="490" y2="112" stroke="#4f5d75" stroke-width="1.4" marker-end="url(#d12-arr)"/><text x="400" y="96">A? AAAA?</text>
+<line x1="490" y1="124" x2="310" y2="136" stroke="#4f5d75" stroke-width="1.4" marker-end="url(#d12-arr)"/><text x="400" y="146">198.51.100.44</text>
+<line x1="310" y1="166" x2="680" y2="184" stroke="#4f5d75" stroke-width="1.4" marker-end="url(#d12-arr)"/><text x="495" y="164">SYN</text>
+<line x1="680" y1="190" x2="310" y2="208" stroke="#4f5d75" stroke-width="1.4" marker-end="url(#d12-arr)"/><text x="495" y="216">SYN-ACK</text>
+<line x1="310" y1="230" x2="680" y2="248" stroke="#4f5d75" stroke-width="1.4" marker-end="url(#d12-arr)"/><text x="495" y="228">ACK + ClientHello (key_share, SNI, ALPN)</text>
+<line x1="680" y1="254" x2="310" y2="272" stroke="#4f5d75" stroke-width="1.4" marker-end="url(#d12-arr)"/><text x="495" y="282">ServerHello · {EE, Cert, CertVerify, Finished}</text>
+<line x1="310" y1="296" x2="680" y2="314" stroke="#bf4520" stroke-width="1.8" marker-end="url(#d12-arr-acc)"/><text x="495" y="294" fill="#bf4520">{Finished} + GET /v1/orders</text>
+<rect x="674" y="316" width="12" height="34" fill="rgba(79,93,117,0.30)" stroke="#4f5d75" stroke-width="0.8"/>
+<text x="700" y="337" text-anchor="start" fill="#5a6580">server time</text>
+<line x1="680" y1="352" x2="310" y2="370" stroke="#bf4520" stroke-width="1.8" marker-end="url(#d12-arr-acc)"/><text x="495" y="378" fill="#bf4520">200 headers</text>
+<line x1="680" y1="384" x2="310" y2="402" stroke="#bf4520" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#d12-arr-acc)"/><text x="560" y="408" fill="#bf4520">body … last byte</text>
+</g>
+<g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" fill="#2d3142">
+<line x1="40" y1="138" x2="300" y2="138" stroke="#bf4520" stroke-width="1" stroke-dasharray="2,3"/><text x="40" y="134">time_namelookup</text><text x="174" y="134" fill="#5a6580">DNS</text>
+<line x1="40" y1="210" x2="300" y2="210" stroke="#bf4520" stroke-width="1" stroke-dasharray="2,3"/><text x="40" y="206">time_connect</text><text x="174" y="206" fill="#5a6580">+1 RTT TCP</text>
+<line x1="40" y1="274" x2="300" y2="274" stroke="#bf4520" stroke-width="1" stroke-dasharray="2,3"/><text x="40" y="270">time_appconnect</text><text x="174" y="270" fill="#5a6580">+1 RTT TLS</text>
+<line x1="40" y1="372" x2="300" y2="372" stroke="#bf4520" stroke-width="1" stroke-dasharray="2,3"/><text x="40" y="368">time_starttransfer</text><text x="174" y="356" fill="#5a6580">+1 RTT</text><text x="174" y="368" fill="#5a6580">+ server</text>
+<line x1="40" y1="404" x2="300" y2="404" stroke="#bf4520" stroke-width="1" stroke-dasharray="2,3"/><text x="40" y="400">time_total</text><text x="174" y="400" fill="#5a6580">+ transfer</text>
+</g>
+<rect x="24" y="432" width="752" height="56" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.12)"/>
+<text x="40" y="455" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" fill="#2d3142">Cold: 3 RTT + DNS + server time to the first byte. Pooled connection: only the last round trip, 1 RTT + server time.</text>
+<text x="40" y="475" font-family="-apple-system,'Segoe UI',Roboto,Arial,sans-serif" font-size="11" fill="#5a6580">HTTP/3 merges the TCP and TLS rows into one QUIC round trip. TLS resumption keeps the RTT but skips certificate work.</text>
+</svg>
+</div>
+<p>On a path with round-trip time R, the arithmetic is simple:</p>
+<ul>
+<li><strong>Name lookup</strong>: zero if cached in-process; one RTT to the resolver if the resolver has it; more on a cold walk (Module 11's deep dive).</li>
+<li><strong>TCP</strong>: one RTT. The SYN goes out, the SYN-ACK comes back, and the client can send right away with its ACK.</li>
+<li><strong>TLS 1.3</strong>: one RTT. ClientHello out, the server's whole flight back, and the client's Finished leaves together with the first request.</li>
+<li><strong>Request to first byte</strong>: one RTT plus whatever the server spends thinking.</li>
+</ul>
+<p>So a cold request costs roughly <strong>3 RTT + DNS + server time</strong> before the first response byte. A reused connection costs <strong>1 RTT + server time</strong>. At R = 80 ms that is about 160 ms of pure waiting saved on every request that finds a warm connection, plus the DNS time. That's why pools matter more than almost any server-side optimisation.</p>
+<h3 id="d12-connection-state">What a connection actually holds</h3>
+<p>A pooled connection is not just a file descriptor. Each side keeps:</p>
+<ul>
+<li><strong>TCP state</strong>: sequence numbers, congestion window, RTT estimate, send and receive buffers. A connection that has been busy has a large congestion window; a fresh one starts slow (Module 10). That's a second reason reuse is fast.</li>
+<li><strong>TLS state</strong>: the negotiated cipher, the client and server traffic keys, per-direction record sequence numbers used to build nonces, and any session tickets received for later resumption.</li>
+<li><strong>HTTP/2 state</strong> (when negotiated): the stream table, both HPACK dynamic tables, a flow-control window per stream plus one per connection, and the peer's SETTINGS such as <code>MAX_CONCURRENT_STREAMS</code>.</li>
+<li><strong>Pool bookkeeping</strong>: the key the connection is filed under, its idle-since timestamp, and whether a request is in flight.</li>
+</ul>
+<p>The pool key is the origin (scheme, host, port), extended by anything that changes the connection: proxy, client certificate, TLS settings. Browsers cap HTTP/1.1 at six connections per origin. For HTTP/2 they normally keep one per origin. They may also <em>coalesce</em> several origins onto it when the certificate covers both names and the names resolve to the same address (RFC 9113 §9.1.1). A server that receives a coalesced request it can't serve answers <code>421 Misdirected Request</code>, and the client retries on a fresh connection.</p>
+<h3 id="d12-keepalive">Keep-alive is two timers that must agree</h3>
+<p>Either side may close an idle connection at any time, and neither warns the other. That creates a race. The server's idle timer fires and it sends a FIN. At nearly the same instant the client takes the connection from its pool and writes a request. The request hits a closed socket, and the client sees a reset or an empty response.</p>
+<p>Two rules contain it:</p>
+<ol type="1">
+<li><strong>Order the idle timeouts.</strong> Whoever reuses a connection must give it up <em>before</em> the other side does. A client pool's idle timeout must be shorter than the server's keep-alive timeout. A load balancer's idle timeout towards its backends must be shorter than the backend's keep-alive timeout.</li>
+<li><strong>Retry only what is safe.</strong> RFC 9110 §9.2.2 allows a client to retry a request automatically after a connection failure only when the method is idempotent. Libraries do this silently for <code>GET</code>. They must not for <code>POST</code>.</li>
+</ol>
+<h3 id="d12-measure-localhost">Measuring it on localhost</h3>
+<p>The script below runs an HTTPS server on 127.0.0.1 with a real three-level PKI (root → intermediate → leaf). It times each phase, compares full and resumed TLS handshakes, and compares 50 requests on 50 connections with 50 requests on one. Finally it serves the leaf without its intermediate. First build the PKI. These commands were run with OpenSSL 3.0; they use only options LibreSSL (macOS <code>/usr/bin/openssl</code>) also documents, but if your version rejects one, use Homebrew's <code>openssl@3</code>.</p>
+<div class="sourceCode" id="d12-cb1"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="d12-cb1-1"><a href="#d12-cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/sh</span></span>
+<span id="d12-cb1-2"><a href="#d12-cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Build a three-level PKI for localhost: root CA -&gt; intermediate CA -&gt; leaf.</span></span>
+<span id="d12-cb1-3"><a href="#d12-cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Works with OpenSSL 3 (Linux, Homebrew) and LibreSSL (macOS /usr/bin/openssl).</span></span>
+<span id="d12-cb1-4"><a href="#d12-cb1-4" aria-hidden="true" tabindex="-1"></a><span class="bu">set</span> <span class="at">-e</span></span>
+<span id="d12-cb1-5"><a href="#d12-cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> pki <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> pki</span>
+<span id="d12-cb1-6"><a href="#d12-cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;</span> ext.cnf <span class="op">&lt;&lt;&#39;CNF&#39;</span></span>
+<span id="d12-cb1-7"><a href="#d12-cb1-7" aria-hidden="true" tabindex="-1"></a><span class="st">[root]</span></span>
+<span id="d12-cb1-8"><a href="#d12-cb1-8" aria-hidden="true" tabindex="-1"></a><span class="st">basicConstraints = critical, CA:TRUE</span></span>
+<span id="d12-cb1-9"><a href="#d12-cb1-9" aria-hidden="true" tabindex="-1"></a><span class="st">keyUsage = critical, keyCertSign, cRLSign</span></span>
+<span id="d12-cb1-10"><a href="#d12-cb1-10" aria-hidden="true" tabindex="-1"></a><span class="st">subjectKeyIdentifier = hash</span></span>
+<span id="d12-cb1-11"><a href="#d12-cb1-11" aria-hidden="true" tabindex="-1"></a><span class="st">[ca]</span></span>
+<span id="d12-cb1-12"><a href="#d12-cb1-12" aria-hidden="true" tabindex="-1"></a><span class="st">basicConstraints = critical, CA:TRUE, pathlen:0</span></span>
+<span id="d12-cb1-13"><a href="#d12-cb1-13" aria-hidden="true" tabindex="-1"></a><span class="st">keyUsage = critical, keyCertSign, cRLSign</span></span>
+<span id="d12-cb1-14"><a href="#d12-cb1-14" aria-hidden="true" tabindex="-1"></a><span class="st">subjectKeyIdentifier = hash</span></span>
+<span id="d12-cb1-15"><a href="#d12-cb1-15" aria-hidden="true" tabindex="-1"></a><span class="st">authorityKeyIdentifier = keyid</span></span>
+<span id="d12-cb1-16"><a href="#d12-cb1-16" aria-hidden="true" tabindex="-1"></a><span class="st">[leaf]</span></span>
+<span id="d12-cb1-17"><a href="#d12-cb1-17" aria-hidden="true" tabindex="-1"></a><span class="st">basicConstraints = critical, CA:FALSE</span></span>
+<span id="d12-cb1-18"><a href="#d12-cb1-18" aria-hidden="true" tabindex="-1"></a><span class="st">keyUsage = critical, digitalSignature</span></span>
+<span id="d12-cb1-19"><a href="#d12-cb1-19" aria-hidden="true" tabindex="-1"></a><span class="st">extendedKeyUsage = serverAuth</span></span>
+<span id="d12-cb1-20"><a href="#d12-cb1-20" aria-hidden="true" tabindex="-1"></a><span class="st">subjectKeyIdentifier = hash</span></span>
+<span id="d12-cb1-21"><a href="#d12-cb1-21" aria-hidden="true" tabindex="-1"></a><span class="st">authorityKeyIdentifier = keyid</span></span>
+<span id="d12-cb1-22"><a href="#d12-cb1-22" aria-hidden="true" tabindex="-1"></a><span class="st">subjectAltName = DNS:localhost, IP:127.0.0.1</span></span>
+<span id="d12-cb1-23"><a href="#d12-cb1-23" aria-hidden="true" tabindex="-1"></a><span class="op">CNF</span></span>
+<span id="d12-cb1-24"><a href="#d12-cb1-24" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> k <span class="kw">in</span> root inter leaf<span class="kw">;</span> <span class="cf">do</span> <span class="ex">openssl</span> ecparam <span class="at">-genkey</span> <span class="at">-name</span> prime256v1 <span class="at">-noout</span> <span class="at">-out</span> <span class="va">$k</span>.key<span class="kw">;</span> <span class="cf">done</span></span>
+<span id="d12-cb1-25"><a href="#d12-cb1-25" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> req <span class="at">-new</span> <span class="at">-key</span> root.key <span class="at">-subj</span> <span class="st">&quot;/CN=Demo Root CA&quot;</span> <span class="at">-out</span> root.csr</span>
+<span id="d12-cb1-26"><a href="#d12-cb1-26" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> x509 <span class="at">-req</span> <span class="at">-in</span> root.csr <span class="at">-signkey</span> root.key <span class="at">-days</span> 30 <span class="at">-extfile</span> ext.cnf <span class="at">-extensions</span> root <span class="at">-out</span> root.pem</span>
+<span id="d12-cb1-27"><a href="#d12-cb1-27" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> req <span class="at">-new</span> <span class="at">-key</span> inter.key <span class="at">-subj</span> <span class="st">&quot;/CN=Demo Intermediate CA&quot;</span> <span class="at">-out</span> inter.csr</span>
+<span id="d12-cb1-28"><a href="#d12-cb1-28" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> x509 <span class="at">-req</span> <span class="at">-in</span> inter.csr <span class="at">-CA</span> root.pem <span class="at">-CAkey</span> root.key <span class="at">-CAcreateserial</span> <span class="dt">\</span></span>
+<span id="d12-cb1-29"><a href="#d12-cb1-29" aria-hidden="true" tabindex="-1"></a>        <span class="at">-days</span> 30 <span class="at">-extfile</span> ext.cnf <span class="at">-extensions</span> ca <span class="at">-out</span> inter.pem</span>
+<span id="d12-cb1-30"><a href="#d12-cb1-30" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> req <span class="at">-new</span> <span class="at">-key</span> leaf.key <span class="at">-subj</span> <span class="st">&quot;/CN=localhost&quot;</span> <span class="at">-out</span> leaf.csr</span>
+<span id="d12-cb1-31"><a href="#d12-cb1-31" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> x509 <span class="at">-req</span> <span class="at">-in</span> leaf.csr <span class="at">-CA</span> inter.pem <span class="at">-CAkey</span> inter.key <span class="at">-CAcreateserial</span> <span class="dt">\</span></span>
+<span id="d12-cb1-32"><a href="#d12-cb1-32" aria-hidden="true" tabindex="-1"></a>        <span class="at">-days</span> 7 <span class="at">-extfile</span> ext.cnf <span class="at">-extensions</span> leaf <span class="at">-out</span> leaf.pem</span>
+<span id="d12-cb1-33"><a href="#d12-cb1-33" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> leaf.pem inter.pem <span class="op">&gt;</span> fullchain.pem</span>
+<span id="d12-cb1-34"><a href="#d12-cb1-34" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> verify <span class="at">-CAfile</span> root.pem <span class="at">-untrusted</span> inter.pem leaf.pem</span></code></pre></div>
+<div class="sourceCode" id="d12-cb2"><pre class="sourceCode python"><code class="sourceCode python"><span id="d12-cb2-1"><a href="#d12-cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Time each phase of an HTTPS request on localhost (name lookup, TCP, TLS 1.3, TTFB),</span></span>
+<span id="d12-cb2-2"><a href="#d12-cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co">compare full vs resumed handshakes and new vs reused connections, then show the</span></span>
+<span id="d12-cb2-3"><a href="#d12-cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co">missing-intermediate failure. Needs pki/ from d12_make_pki.sh. Stdlib only.&quot;&quot;&quot;</span></span>
+<span id="d12-cb2-4"><a href="#d12-cb2-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> socket, ssl, statistics, sys, threading, time</span>
+<span id="d12-cb2-5"><a href="#d12-cb2-5" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> http.server <span class="im">import</span> BaseHTTPRequestHandler, ThreadingHTTPServer</span>
+<span id="d12-cb2-6"><a href="#d12-cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb2-7"><a href="#d12-cb2-7" aria-hidden="true" tabindex="-1"></a>NODELAY <span class="op">=</span> <span class="st">&quot;--nodelay&quot;</span> <span class="kw">in</span> sys.argv                   <span class="co"># disable Nagle on the server side too</span></span>
+<span id="d12-cb2-8"><a href="#d12-cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb2-9"><a href="#d12-cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Handler(BaseHTTPRequestHandler):</span>
+<span id="d12-cb2-10"><a href="#d12-cb2-10" aria-hidden="true" tabindex="-1"></a>    protocol_version <span class="op">=</span> <span class="st">&quot;HTTP/1.1&quot;</span>                       <span class="co"># keep-alive on</span></span>
+<span id="d12-cb2-11"><a href="#d12-cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> do_GET(<span class="va">self</span>):</span>
+<span id="d12-cb2-12"><a href="#d12-cb2-12" aria-hidden="true" tabindex="-1"></a>        body <span class="op">=</span> <span class="st">b&#39;{&quot;ok&quot;: true}</span><span class="ch">\n</span><span class="st">&#39;</span></span>
+<span id="d12-cb2-13"><a href="#d12-cb2-13" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.send_response(<span class="dv">200</span>)</span>
+<span id="d12-cb2-14"><a href="#d12-cb2-14" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.send_header(<span class="st">&quot;Content-Type&quot;</span>, <span class="st">&quot;application/json&quot;</span>)</span>
+<span id="d12-cb2-15"><a href="#d12-cb2-15" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.send_header(<span class="st">&quot;Content-Length&quot;</span>, <span class="bu">str</span>(<span class="bu">len</span>(body)))</span>
+<span id="d12-cb2-16"><a href="#d12-cb2-16" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.end_headers()</span>
+<span id="d12-cb2-17"><a href="#d12-cb2-17" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.wfile.write(body)</span>
+<span id="d12-cb2-18"><a href="#d12-cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> log_message(<span class="va">self</span>, <span class="op">*</span>a): <span class="cf">pass</span></span>
+<span id="d12-cb2-19"><a href="#d12-cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> setup(<span class="va">self</span>):</span>
+<span id="d12-cb2-20"><a href="#d12-cb2-20" aria-hidden="true" tabindex="-1"></a>        <span class="bu">super</span>().setup()</span>
+<span id="d12-cb2-21"><a href="#d12-cb2-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> NODELAY:</span>
+<span id="d12-cb2-22"><a href="#d12-cb2-22" aria-hidden="true" tabindex="-1"></a>            <span class="va">self</span>.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, <span class="dv">1</span>)</span>
+<span id="d12-cb2-23"><a href="#d12-cb2-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb2-24"><a href="#d12-cb2-24" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Quiet(ThreadingHTTPServer):</span>
+<span id="d12-cb2-25"><a href="#d12-cb2-25" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> handle_error(<span class="va">self</span>, <span class="op">*</span>a): <span class="cf">pass</span>                    <span class="co"># clients hang up abruptly; ignore</span></span>
+<span id="d12-cb2-26"><a href="#d12-cb2-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb2-27"><a href="#d12-cb2-27" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> serve(chainfile):</span>
+<span id="d12-cb2-28"><a href="#d12-cb2-28" aria-hidden="true" tabindex="-1"></a>    ctx <span class="op">=</span> ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)</span>
+<span id="d12-cb2-29"><a href="#d12-cb2-29" aria-hidden="true" tabindex="-1"></a>    ctx.minimum_version <span class="op">=</span> ssl.TLSVersion.TLSv1_3</span>
+<span id="d12-cb2-30"><a href="#d12-cb2-30" aria-hidden="true" tabindex="-1"></a>    ctx.load_cert_chain(chainfile, <span class="st">&quot;pki/leaf.key&quot;</span>)</span>
+<span id="d12-cb2-31"><a href="#d12-cb2-31" aria-hidden="true" tabindex="-1"></a>    srv <span class="op">=</span> Quiet((<span class="st">&quot;127.0.0.1&quot;</span>, <span class="dv">0</span>), Handler)</span>
+<span id="d12-cb2-32"><a href="#d12-cb2-32" aria-hidden="true" tabindex="-1"></a>    srv.socket <span class="op">=</span> ctx.wrap_socket(srv.socket, server_side<span class="op">=</span><span class="va">True</span>)</span>
+<span id="d12-cb2-33"><a href="#d12-cb2-33" aria-hidden="true" tabindex="-1"></a>    threading.Thread(target<span class="op">=</span>srv.serve_forever, daemon<span class="op">=</span><span class="va">True</span>).start()</span>
+<span id="d12-cb2-34"><a href="#d12-cb2-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> srv.server_address[<span class="dv">1</span>]</span>
+<span id="d12-cb2-35"><a href="#d12-cb2-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb2-36"><a href="#d12-cb2-36" aria-hidden="true" tabindex="-1"></a>client <span class="op">=</span> ssl.create_default_context(cafile<span class="op">=</span><span class="st">&quot;pki/root.pem&quot;</span>)   <span class="co"># trust only the demo root</span></span>
+<span id="d12-cb2-37"><a href="#d12-cb2-37" aria-hidden="true" tabindex="-1"></a>REQ <span class="op">=</span> <span class="st">b&quot;GET / HTTP/1.1</span><span class="ch">\r\n</span><span class="st">Host: localhost</span><span class="ch">\r\n\r\n</span><span class="st">&quot;</span></span>
+<span id="d12-cb2-38"><a href="#d12-cb2-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb2-39"><a href="#d12-cb2-39" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> <span class="ex">connect</span>(port, session<span class="op">=</span><span class="va">None</span>):</span>
+<span id="d12-cb2-40"><a href="#d12-cb2-40" aria-hidden="true" tabindex="-1"></a>    t0 <span class="op">=</span> time.perf_counter()</span>
+<span id="d12-cb2-41"><a href="#d12-cb2-41" aria-hidden="true" tabindex="-1"></a>    addr <span class="op">=</span> socket.getaddrinfo(<span class="st">&quot;localhost&quot;</span>, port, socket.AF_INET, socket.SOCK_STREAM)[<span class="dv">0</span>][<span class="dv">4</span>]</span>
+<span id="d12-cb2-42"><a href="#d12-cb2-42" aria-hidden="true" tabindex="-1"></a>    t1 <span class="op">=</span> time.perf_counter()</span>
+<span id="d12-cb2-43"><a href="#d12-cb2-43" aria-hidden="true" tabindex="-1"></a>    raw <span class="op">=</span> socket.create_connection(addr)</span>
+<span id="d12-cb2-44"><a href="#d12-cb2-44" aria-hidden="true" tabindex="-1"></a>    raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, <span class="dv">1</span>)</span>
+<span id="d12-cb2-45"><a href="#d12-cb2-45" aria-hidden="true" tabindex="-1"></a>    t2 <span class="op">=</span> time.perf_counter()</span>
+<span id="d12-cb2-46"><a href="#d12-cb2-46" aria-hidden="true" tabindex="-1"></a>    tls <span class="op">=</span> client.wrap_socket(raw, server_hostname<span class="op">=</span><span class="st">&quot;localhost&quot;</span>, session<span class="op">=</span>session)</span>
+<span id="d12-cb2-47"><a href="#d12-cb2-47" aria-hidden="true" tabindex="-1"></a>    t3 <span class="op">=</span> time.perf_counter()</span>
+<span id="d12-cb2-48"><a href="#d12-cb2-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> tls, (t1 <span class="op">-</span> t0, t2 <span class="op">-</span> t1, t3 <span class="op">-</span> t2)</span>
+<span id="d12-cb2-49"><a href="#d12-cb2-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb2-50"><a href="#d12-cb2-50" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> request(tls):</span>
+<span id="d12-cb2-51"><a href="#d12-cb2-51" aria-hidden="true" tabindex="-1"></a>    t <span class="op">=</span> time.perf_counter()</span>
+<span id="d12-cb2-52"><a href="#d12-cb2-52" aria-hidden="true" tabindex="-1"></a>    tls.sendall(REQ)</span>
+<span id="d12-cb2-53"><a href="#d12-cb2-53" aria-hidden="true" tabindex="-1"></a>    tls.recv(<span class="dv">4096</span>)                                      <span class="co"># status line, headers and the tiny body</span></span>
+<span id="d12-cb2-54"><a href="#d12-cb2-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> time.perf_counter() <span class="op">-</span> t</span>
+<span id="d12-cb2-55"><a href="#d12-cb2-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb2-56"><a href="#d12-cb2-56" aria-hidden="true" tabindex="-1"></a>med <span class="op">=</span> <span class="kw">lambda</span> xs: <span class="ss">f&quot;</span><span class="sc">{</span><span class="dv">1000</span><span class="op">*</span>statistics<span class="sc">.</span>median(xs)<span class="sc">:5.2f}</span><span class="ss"> ms&quot;</span></span>
+<span id="d12-cb2-57"><a href="#d12-cb2-57" aria-hidden="true" tabindex="-1"></a>port <span class="op">=</span> serve(<span class="st">&quot;pki/fullchain.pem&quot;</span>)</span>
+<span id="d12-cb2-58"><a href="#d12-cb2-58" aria-hidden="true" tabindex="-1"></a>request(<span class="ex">connect</span>(port)[<span class="dv">0</span>])                               <span class="co"># warm-up: server thread, code paths</span></span>
+<span id="d12-cb2-59"><a href="#d12-cb2-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb2-60"><a href="#d12-cb2-60" aria-hidden="true" tabindex="-1"></a>lookup, tcp, full, resumed, ttfb <span class="op">=</span> [], [], [], [], []</span>
+<span id="d12-cb2-61"><a href="#d12-cb2-61" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">30</span>):</span>
+<span id="d12-cb2-62"><a href="#d12-cb2-62" aria-hidden="true" tabindex="-1"></a>    tls, (d, c, hs) <span class="op">=</span> <span class="ex">connect</span>(port)</span>
+<span id="d12-cb2-63"><a href="#d12-cb2-63" aria-hidden="true" tabindex="-1"></a>    lookup.append(d)<span class="op">;</span> tcp.append(c)<span class="op">;</span> full.append(hs)</span>
+<span id="d12-cb2-64"><a href="#d12-cb2-64" aria-hidden="true" tabindex="-1"></a>    ttfb.append(request(tls))                           <span class="co"># recv() also pulled in the session ticket</span></span>
+<span id="d12-cb2-65"><a href="#d12-cb2-65" aria-hidden="true" tabindex="-1"></a>    proto <span class="op">=</span> <span class="ss">f&quot;</span><span class="sc">{</span>tls<span class="sc">.</span>version()<span class="sc">}</span><span class="ss"> </span><span class="sc">{</span>tls<span class="sc">.</span>cipher()[<span class="dv">0</span>]<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="d12-cb2-66"><a href="#d12-cb2-66" aria-hidden="true" tabindex="-1"></a>    sess <span class="op">=</span> tls.session<span class="op">;</span> tls.close()</span>
+<span id="d12-cb2-67"><a href="#d12-cb2-67" aria-hidden="true" tabindex="-1"></a>    tls2, (_, _, hs2) <span class="op">=</span> <span class="ex">connect</span>(port, session<span class="op">=</span>sess)</span>
+<span id="d12-cb2-68"><a href="#d12-cb2-68" aria-hidden="true" tabindex="-1"></a>    <span class="cf">assert</span> tls2.session_reused</span>
+<span id="d12-cb2-69"><a href="#d12-cb2-69" aria-hidden="true" tabindex="-1"></a>    resumed.append(hs2)<span class="op">;</span> tls2.close()</span>
+<span id="d12-cb2-70"><a href="#d12-cb2-70" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>proto<span class="sc">}</span><span class="ss">, medians of 30 runs on loopback:&quot;</span>)</span>
+<span id="d12-cb2-71"><a href="#d12-cb2-71" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;  name lookup </span><span class="sc">{</span>med(lookup)<span class="sc">}</span><span class="ss"> | tcp connect </span><span class="sc">{</span>med(tcp)<span class="sc">}</span><span class="ss"> | ttfb </span><span class="sc">{</span>med(ttfb)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d12-cb2-72"><a href="#d12-cb2-72" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;  TLS full handshake </span><span class="sc">{</span>med(full)<span class="sc">}</span><span class="ss"> | resumed (PSK) </span><span class="sc">{</span>med(resumed)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d12-cb2-73"><a href="#d12-cb2-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb2-74"><a href="#d12-cb2-74" aria-hidden="true" tabindex="-1"></a>N <span class="op">=</span> <span class="dv">50</span></span>
+<span id="d12-cb2-75"><a href="#d12-cb2-75" aria-hidden="true" tabindex="-1"></a>t <span class="op">=</span> time.perf_counter()</span>
+<span id="d12-cb2-76"><a href="#d12-cb2-76" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(N):</span>
+<span id="d12-cb2-77"><a href="#d12-cb2-77" aria-hidden="true" tabindex="-1"></a>    tls, _ <span class="op">=</span> <span class="ex">connect</span>(port)<span class="op">;</span> request(tls)<span class="op">;</span> tls.close()</span>
+<span id="d12-cb2-78"><a href="#d12-cb2-78" aria-hidden="true" tabindex="-1"></a>cold <span class="op">=</span> time.perf_counter() <span class="op">-</span> t</span>
+<span id="d12-cb2-79"><a href="#d12-cb2-79" aria-hidden="true" tabindex="-1"></a>tls, _ <span class="op">=</span> <span class="ex">connect</span>(port)</span>
+<span id="d12-cb2-80"><a href="#d12-cb2-80" aria-hidden="true" tabindex="-1"></a>t <span class="op">=</span> time.perf_counter()</span>
+<span id="d12-cb2-81"><a href="#d12-cb2-81" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(N):</span>
+<span id="d12-cb2-82"><a href="#d12-cb2-82" aria-hidden="true" tabindex="-1"></a>    request(tls)</span>
+<span id="d12-cb2-83"><a href="#d12-cb2-83" aria-hidden="true" tabindex="-1"></a>warm <span class="op">=</span> time.perf_counter() <span class="op">-</span> t</span>
+<span id="d12-cb2-84"><a href="#d12-cb2-84" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>N<span class="sc">}</span><span class="ss"> requests, new connection each: </span><span class="sc">{</span><span class="dv">1000</span><span class="op">*</span>cold<span class="sc">:6.1f}</span><span class="ss"> ms; one kept-alive connection: </span><span class="sc">{</span><span class="dv">1000</span><span class="op">*</span>warm<span class="sc">:5.1f}</span><span class="ss"> ms&quot;</span>)</span>
+<span id="d12-cb2-85"><a href="#d12-cb2-85" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb2-86"><a href="#d12-cb2-86" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;server sends leaf only (intermediate missing):&quot;</span>)</span>
+<span id="d12-cb2-87"><a href="#d12-cb2-87" aria-hidden="true" tabindex="-1"></a><span class="cf">try</span>:</span>
+<span id="d12-cb2-88"><a href="#d12-cb2-88" aria-hidden="true" tabindex="-1"></a>    <span class="ex">connect</span>(serve(<span class="st">&quot;pki/leaf.pem&quot;</span>))</span>
+<span id="d12-cb2-89"><a href="#d12-cb2-89" aria-hidden="true" tabindex="-1"></a><span class="cf">except</span> ssl.SSLCertVerificationError <span class="im">as</span> e:</span>
+<span id="d12-cb2-90"><a href="#d12-cb2-90" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span><span class="bu">type</span>(e)<span class="sc">.</span><span class="va">__name__</span><span class="sc">}</span><span class="ss">: </span><span class="sc">{</span>e<span class="sc">.</span>verify_message<span class="sc">}</span><span class="ss"> (verify_code=</span><span class="sc">{</span>e<span class="sc">.</span>verify_code<span class="sc">}</span><span class="ss">)&quot;</span>)</span></code></pre></div>
+<p>Real output from the sandbox, run twice: first as written, then with <code>--nodelay</code>, which turns off Nagle's algorithm on the server's sockets.</p>
+<pre class="text"><code>TLSv1.3 TLS_AES_256_GCM_SHA384, medians of 30 runs on loopback:
+  name lookup  0.05 ms | tcp connect  0.30 ms | ttfb 43.50 ms
+  TLS full handshake  2.11 ms | resumed (PSK)  1.31 ms
+50 requests, new connection each: 2225.4 ms; one kept-alive connection:  46.7 ms
+server sends leaf only (intermediate missing):
+  SSLCertVerificationError: unable to get local issuer certificate (verify_code=20)</code></pre>
+<pre class="text"><code>TLSv1.3 TLS_AES_256_GCM_SHA384, medians of 30 runs on loopback:
+  name lookup  0.04 ms | tcp connect  0.15 ms | ttfb  0.62 ms
+  TLS full handshake  1.70 ms | resumed (PSK)  1.08 ms
+50 requests, new connection each:  126.3 ms; one kept-alive connection:   6.3 ms
+server sends leaf only (intermediate missing):
+  SSLCertVerificationError: unable to get local issuer certificate (verify_code=20)</code></pre>
+<p>Look at the first run's TTFB: <strong>43 ms on loopback</strong>, where the round trip is microseconds. This is a real production bug, reproduced by accident. Here is the mechanism.</p>
+<p>In TLS 1.3 the server sends session tickets right after the handshake (OpenSSL sends two by default). They are unacknowledged data in flight. The client's TCP stack delays its ACK, hoping to piggyback it on data of its own. Then the server writes its response. Nagle's algorithm holds back a small write while earlier data is still unacknowledged. So the response sits in the server's buffer until the client's delayed-ACK timer fires, and Linux's minimum delayed-ACK time is 40 ms.</p>
+<p>Turn Nagle off with <code>TCP_NODELAY</code> and TTFB drops to 0.62 ms. Setting <code>num_tickets = 0</code> on the server context removes the stall too, which confirms that the tickets are the unacknowledged data. Most production HTTP servers set <code>TCP_NODELAY</code> for exactly this reason; Python's <code>http.server</code> does not. The kept-alive figure in the first run (46.7 ms for 50 requests) is that one 43 ms stall on the first request plus well under 0.1 ms for each later one.</p>
+<p>With the stall removed, the rest reads cleanly. A full handshake costs about 1.7–2.1 ms of CPU on loopback. PSK resumption cuts that by roughly a third, because it skips the certificate and the signature check (it still does a fresh key exchange). Fifty fresh connections cost 126 ms; fifty requests on one connection cost 6.3 ms. On a real network, add two RTTs to every fresh connection and the gap grows enormously. The last line is the missing-intermediate failure, which gets its own section below.</p>
+<h2 id="d12-wire">Deep dive: what the wire actually shows</h2>
+<h3 id="d12-curl-trace"><code>curl -v --trace-time</code>, annotated</h3>
+<p><code>curl -v</code> narrates every phase; <code>--trace-time</code> stamps each line with wall-clock microseconds. Constructed illustration of a Linux <code>curl</code> built with OpenSSL, on a 40 ms path. macOS's system <code>curl</code> prints its TLS lines in a slightly different format.</p>
+<pre class="text"><code>$ curl -v --trace-time -o /dev/null https://api.example.com/v1/orders      # your output will differ
+14:02:31.100211 * Host api.example.com:443 was resolved.                    # (1)
+14:02:31.100260 * IPv6: (none)
+14:02:31.100266 * IPv4: 198.51.100.44
+14:02:31.100340 *   Trying 198.51.100.44:443...                             # (2) SYN sent
+14:02:31.141020 * Connected to api.example.com (198.51.100.44) port 443     #     SYN-ACK back: 40.7 ms
+14:02:31.141398 * ALPN: curl offers h2,http/1.1
+14:02:31.141870 * TLSv1.3 (OUT), TLS handshake, Client hello (1):           # (3)
+14:02:31.183102 * TLSv1.3 (IN), TLS handshake, Server hello (2):            #     41.2 ms later
+14:02:31.183390 * TLSv1.3 (IN), TLS handshake, Encrypted Extensions (8):
+14:02:31.183512 * TLSv1.3 (IN), TLS handshake, Certificate (11):
+14:02:31.184630 * TLSv1.3 (IN), TLS handshake, CERT verify (15):            # (4) chain check happens here
+14:02:31.184755 * TLSv1.3 (IN), TLS handshake, Finished (20):
+14:02:31.184801 * TLSv1.3 (OUT), TLS change cipher, Change cipher spec (1): # (5)
+14:02:31.184850 * TLSv1.3 (OUT), TLS handshake, Finished (20):
+14:02:31.184902 * SSL connection using TLSv1.3 / TLS_AES_128_GCM_SHA256 / X25519 / id-ecPublicKey
+14:02:31.184920 * ALPN: server accepted h2                                  # (6)
+14:02:31.184935 * Server certificate:
+14:02:31.184951 *  subject: CN=api.example.com
+14:02:31.184960 *  start date: Sep 22 08:14:03 2026 GMT
+14:02:31.184968 *  expire date: Dec 21 08:14:02 2026 GMT
+14:02:31.184990 *  subjectAltName: host &quot;api.example.com&quot; matched cert&#39;s &quot;api.example.com&quot;
+14:02:31.185001 *  issuer: C=US; O=Let&#39;s Encrypt; CN=E7
+14:02:31.185010 *  SSL certificate verify ok.
+14:02:31.185190 * [HTTP/2] [1] OPENED stream for https://api.example.com/v1/orders
+14:02:31.185260 &gt; GET /v1/orders HTTP/2                                     # (7)
+14:02:31.185260 &gt; Host: api.example.com
+14:02:31.185260 &gt; User-Agent: curl/8.9.1
+14:02:31.185260 &gt; Accept: */*
+14:02:31.185260 &gt;
+14:02:31.185301 * Request completely sent off
+14:02:31.226480 * TLSv1.3 (IN), TLS handshake, Newsession Ticket (4):       # (8)
+14:02:31.226530 * TLSv1.3 (IN), TLS handshake, Newsession Ticket (4):
+14:02:31.262874 &lt; HTTP/2 200                                                # (9)
+14:02:31.262874 &lt; content-type: application/json
+14:02:31.262874 &lt; content-length: 1834
+14:02:31.262874 &lt;
+14:02:31.263120 * Connection #0 to host api.example.com left intact         # (10)</code></pre>
+<ol type="1">
+<li>Name resolution has already finished by the first stamped line, so <code>-v</code> alone can't show DNS time. The <code>-w</code> timers below can.</li>
+<li><code>Trying</code> to <code>Connected</code> is the TCP handshake: 40.7 ms, one RTT.</li>
+<li>ClientHello out, ServerHello back 41.2 ms later: the second RTT. Everything after ServerHello is encrypted.</li>
+<li>The certificate chain and the <code>CertificateVerify</code> signature are checked in the ~1 ms around these lines. A slow gap here usually means a large chain or a slow revocation lookup.</li>
+<li>The client's "change cipher spec" is a dummy record. TLS 1.3 sends it only for middlebox compatibility; it has no cryptographic meaning.</li>
+<li>ALPN settled the HTTP version inside the handshake. No extra round trip, and no <code>Upgrade</code> dance.</li>
+<li>The request leaves 0.4 ms after the handshake. curl prints HTTP/2 headers in HTTP/1-style text for readability; on the wire they are HPACK inside a HEADERS frame.</li>
+<li>Session tickets arrive one RTT after the client's Finished. They are the material for the next connection's resumption (and for 0-RTT, if the server allows it).</li>
+<li>First response byte 77.6 ms after the request: one 41 ms RTT plus about 36 ms of server time.</li>
+<li>"Left intact" means the connection went back to curl's pool. A second URL on the same command line would reuse it.</li>
+</ol>
+<p>The same request with <code>-w</code> gives the cumulative timers from the diagram:</p>
+<pre class="text"><code>$ curl -so /dev/null -w &#39;dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} start=%{time_starttransfer} total=%{time_total} http=%{http_version}\n&#39; https://api.example.com/v1/orders
+dns=0.021374 tcp=0.062183 tls=0.106065 start=0.184037 total=0.184283 http=2</code></pre>
+<p>Subtract neighbouring timers to get phases: DNS 21.4 ms, TCP 40.8 ms, TLS 43.9 ms, request-to-first-byte 78.0 ms, transfer 0.2 ms. The diagnostic value is in which slice is fat.</p>
+<ul>
+<li>Fat DNS means resolver or <code>ndots</code> trouble.</li>
+<li>Fat TCP with a normal RTT means SYN retransmits; a jump of about 1 s is the initial retransmit timer on current Linux and macOS.</li>
+<li>Fat TLS means a ClientHello split across packets and mishandled, a slow handshake on the server, or a revocation fetch.</li>
+<li>Fat TTFB is the application (or the Nagle stall above).</li>
+</ul>
+<p>To take DNS out of the picture, pin the address with <code>--resolve api.example.com:443:198.51.100.44</code>.</p>
+<h3 id="d12-h1-hol">HTTP/1.1: head-of-line blocking by design</h3>
+<p>HTTP/1.1 has no message IDs. Responses on a connection must come back in request order, because the only way to tell them apart is their position in the byte stream. Pipelining (sending request 2 before response 1 arrives) is in the spec. Browsers never turned it on widely: a slow first response blocks every response behind it, and buggy intermediaries mixed responses up. So in practice an HTTP/1.1 connection carries <strong>one request at a time</strong>. Concurrency comes from opening more connections, which is where the six-per-origin limit comes from. Domain sharding and sprite sheets were workarounds for exactly this.</p>
+<h3 id="d12-h2">HTTP/2: streams, frames and flow control</h3>
+<p>HTTP/2 (RFC 9113) splits every message into frames with a 9-byte header and interleaves frames from many streams on one connection. The script below decodes the first bytes a client sends, then computes the throughput ceiling that flow control imposes. Real output:</p>
+<div class="sourceCode" id="d12-cb7"><pre class="sourceCode python"><code class="sourceCode python"><span id="d12-cb7-1"><a href="#d12-cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Decode the first bytes a client sends on an HTTP/2 connection (RFC 9113),</span></span>
+<span id="d12-cb7-2"><a href="#d12-cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co">then do the flow-control arithmetic that caps a single stream&#39;s throughput.&quot;&quot;&quot;</span></span>
+<span id="d12-cb7-3"><a href="#d12-cb7-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> struct</span>
+<span id="d12-cb7-4"><a href="#d12-cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb7-5"><a href="#d12-cb7-5" aria-hidden="true" tabindex="-1"></a>TYPES <span class="op">=</span> {<span class="dv">0</span>: <span class="st">&quot;DATA&quot;</span>, <span class="dv">1</span>: <span class="st">&quot;HEADERS&quot;</span>, <span class="dv">3</span>: <span class="st">&quot;RST_STREAM&quot;</span>, <span class="dv">4</span>: <span class="st">&quot;SETTINGS&quot;</span>, <span class="dv">6</span>: <span class="st">&quot;PING&quot;</span>, <span class="dv">7</span>: <span class="st">&quot;GOAWAY&quot;</span>, <span class="dv">8</span>: <span class="st">&quot;WINDOW_UPDATE&quot;</span>}</span>
+<span id="d12-cb7-6"><a href="#d12-cb7-6" aria-hidden="true" tabindex="-1"></a>SETTINGS <span class="op">=</span> {<span class="dv">1</span>: <span class="st">&quot;HEADER_TABLE_SIZE&quot;</span>, <span class="dv">2</span>: <span class="st">&quot;ENABLE_PUSH&quot;</span>, <span class="dv">3</span>: <span class="st">&quot;MAX_CONCURRENT_STREAMS&quot;</span>,</span>
+<span id="d12-cb7-7"><a href="#d12-cb7-7" aria-hidden="true" tabindex="-1"></a>            <span class="dv">4</span>: <span class="st">&quot;INITIAL_WINDOW_SIZE&quot;</span>, <span class="dv">5</span>: <span class="st">&quot;MAX_FRAME_SIZE&quot;</span>, <span class="dv">6</span>: <span class="st">&quot;MAX_HEADER_LIST_SIZE&quot;</span>}</span>
+<span id="d12-cb7-8"><a href="#d12-cb7-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb7-9"><a href="#d12-cb7-9" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> frame(ftype, flags, stream, payload):</span>
+<span id="d12-cb7-10"><a href="#d12-cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 9-byte header: Length(24) Type(8) Flags(8) R(1)+Stream Identifier(31)</span></span>
+<span id="d12-cb7-11"><a href="#d12-cb7-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> struct.pack(<span class="st">&quot;!I&quot;</span>, <span class="bu">len</span>(payload))[<span class="dv">1</span>:] <span class="op">+</span> <span class="bu">bytes</span>([ftype, flags]) <span class="op">+</span> struct.pack(<span class="st">&quot;!I&quot;</span>, stream) <span class="op">+</span> payload</span>
+<span id="d12-cb7-12"><a href="#d12-cb7-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb7-13"><a href="#d12-cb7-13" aria-hidden="true" tabindex="-1"></a>preface <span class="op">=</span> <span class="st">b&quot;PRI * HTTP/2.0</span><span class="ch">\r\n\r\n</span><span class="st">SM</span><span class="ch">\r\n\r\n</span><span class="st">&quot;</span></span>
+<span id="d12-cb7-14"><a href="#d12-cb7-14" aria-hidden="true" tabindex="-1"></a>settings <span class="op">=</span> frame(<span class="dv">4</span>, <span class="dv">0</span>, <span class="dv">0</span>, <span class="st">b&quot;&quot;</span>.join(struct.pack(<span class="st">&quot;!HI&quot;</span>, k, v) <span class="cf">for</span> k, v <span class="kw">in</span></span>
+<span id="d12-cb7-15"><a href="#d12-cb7-15" aria-hidden="true" tabindex="-1"></a>                                   [(<span class="dv">2</span>, <span class="dv">0</span>), (<span class="dv">3</span>, <span class="dv">100</span>), (<span class="dv">4</span>, <span class="dv">10</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span>)]))</span>
+<span id="d12-cb7-16"><a href="#d12-cb7-16" aria-hidden="true" tabindex="-1"></a>window <span class="op">=</span> frame(<span class="dv">8</span>, <span class="dv">0</span>, <span class="dv">0</span>, struct.pack(<span class="st">&quot;!I&quot;</span>, <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">30</span>))        <span class="co"># raise the connection window</span></span>
+<span id="d12-cb7-17"><a href="#d12-cb7-17" aria-hidden="true" tabindex="-1"></a><span class="co"># HEADERS for GET https://api.example.com/v1/orders, HPACK-encoded:</span></span>
+<span id="d12-cb7-18"><a href="#d12-cb7-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 0x82 = :method GET, 0x87 = :scheme https (static table indices 2 and 7);</span></span>
+<span id="d12-cb7-19"><a href="#d12-cb7-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 0x41/0x44 = literal :authority / :path, added to the dynamic table (plain strings)</span></span>
+<span id="d12-cb7-20"><a href="#d12-cb7-20" aria-hidden="true" tabindex="-1"></a>hpack <span class="op">=</span> (<span class="st">b&quot;</span><span class="ch">\x82\x87</span><span class="st">&quot;</span> <span class="op">+</span> <span class="st">b&quot;</span><span class="ch">\x41</span><span class="st">&quot;</span> <span class="op">+</span> <span class="bu">bytes</span>([<span class="dv">15</span>]) <span class="op">+</span> <span class="st">b&quot;api.example.com&quot;</span></span>
+<span id="d12-cb7-21"><a href="#d12-cb7-21" aria-hidden="true" tabindex="-1"></a>         <span class="op">+</span> <span class="st">b&quot;</span><span class="ch">\x44</span><span class="st">&quot;</span> <span class="op">+</span> <span class="bu">bytes</span>([<span class="dv">10</span>]) <span class="op">+</span> <span class="st">b&quot;/v1/orders&quot;</span>)</span>
+<span id="d12-cb7-22"><a href="#d12-cb7-22" aria-hidden="true" tabindex="-1"></a>headers <span class="op">=</span> frame(<span class="dv">1</span>, <span class="bn">0x05</span>, <span class="dv">1</span>, hpack)                          <span class="co"># END_STREAM | END_HEADERS, stream 1</span></span>
+<span id="d12-cb7-23"><a href="#d12-cb7-23" aria-hidden="true" tabindex="-1"></a>wire <span class="op">=</span> preface <span class="op">+</span> settings <span class="op">+</span> window <span class="op">+</span> headers</span>
+<span id="d12-cb7-24"><a href="#d12-cb7-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb7-25"><a href="#d12-cb7-25" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;preface: </span><span class="sc">{</span>preface<span class="sc">!r}</span><span class="ss"> (</span><span class="sc">{</span><span class="bu">len</span>(preface)<span class="sc">}</span><span class="ss"> bytes)&quot;</span>)</span>
+<span id="d12-cb7-26"><a href="#d12-cb7-26" aria-hidden="true" tabindex="-1"></a>pos <span class="op">=</span> <span class="bu">len</span>(preface)</span>
+<span id="d12-cb7-27"><a href="#d12-cb7-27" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> pos <span class="op">&lt;</span> <span class="bu">len</span>(wire):</span>
+<span id="d12-cb7-28"><a href="#d12-cb7-28" aria-hidden="true" tabindex="-1"></a>    length <span class="op">=</span> <span class="bu">int</span>.from_bytes(wire[pos:pos <span class="op">+</span> <span class="dv">3</span>], <span class="st">&quot;big&quot;</span>)</span>
+<span id="d12-cb7-29"><a href="#d12-cb7-29" aria-hidden="true" tabindex="-1"></a>    ftype, flags <span class="op">=</span> wire[pos <span class="op">+</span> <span class="dv">3</span>], wire[pos <span class="op">+</span> <span class="dv">4</span>]</span>
+<span id="d12-cb7-30"><a href="#d12-cb7-30" aria-hidden="true" tabindex="-1"></a>    stream <span class="op">=</span> struct.unpack(<span class="st">&quot;!I&quot;</span>, wire[pos <span class="op">+</span> <span class="dv">5</span>:pos <span class="op">+</span> <span class="dv">9</span>])[<span class="dv">0</span>] <span class="op">&amp;</span> <span class="bn">0x7FFFFFFF</span></span>
+<span id="d12-cb7-31"><a href="#d12-cb7-31" aria-hidden="true" tabindex="-1"></a>    body <span class="op">=</span> wire[pos <span class="op">+</span> <span class="dv">9</span>:pos <span class="op">+</span> <span class="dv">9</span> <span class="op">+</span> length]</span>
+<span id="d12-cb7-32"><a href="#d12-cb7-32" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>wire[pos:pos<span class="op">+</span><span class="dv">9</span>]<span class="sc">.</span><span class="bu">hex</span>(<span class="st">&#39; &#39;</span>)<span class="sc">}</span><span class="ss"> | </span><span class="sc">{</span>TYPES[ftype]<span class="sc">:13}</span><span class="ss"> len=</span><span class="sc">{</span>length<span class="sc">:&lt;3}</span><span class="ss"> flags=</span><span class="sc">{</span>flags<span class="sc">:#04x}</span><span class="ss"> stream=</span><span class="sc">{</span>stream<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d12-cb7-33"><a href="#d12-cb7-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> ftype <span class="op">==</span> <span class="dv">4</span>:</span>
+<span id="d12-cb7-34"><a href="#d12-cb7-34" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">0</span>, length, <span class="dv">6</span>):</span>
+<span id="d12-cb7-35"><a href="#d12-cb7-35" aria-hidden="true" tabindex="-1"></a>            k, v <span class="op">=</span> struct.unpack(<span class="st">&quot;!HI&quot;</span>, body[i:i <span class="op">+</span> <span class="dv">6</span>])</span>
+<span id="d12-cb7-36"><a href="#d12-cb7-36" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;    </span><span class="sc">{</span>SETTINGS[k]<span class="sc">}</span><span class="ss"> = </span><span class="sc">{</span>v<span class="sc">:,}</span><span class="ss">&quot;</span>)</span>
+<span id="d12-cb7-37"><a href="#d12-cb7-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> ftype <span class="op">==</span> <span class="dv">8</span>:</span>
+<span id="d12-cb7-38"><a href="#d12-cb7-38" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;    window increment = </span><span class="sc">{</span>struct<span class="sc">.</span>unpack(<span class="st">&#39;!I&#39;</span>, body)[<span class="dv">0</span>]<span class="sc">:,}</span><span class="ss">&quot;</span>)</span>
+<span id="d12-cb7-39"><a href="#d12-cb7-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> ftype <span class="op">==</span> <span class="dv">1</span>:</span>
+<span id="d12-cb7-40"><a href="#d12-cb7-40" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;    HPACK block: </span><span class="sc">{</span>body<span class="sc">.</span><span class="bu">hex</span>(<span class="st">&#39; &#39;</span>)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d12-cb7-41"><a href="#d12-cb7-41" aria-hidden="true" tabindex="-1"></a>        <span class="co"># same request again: both literals now sit in the dynamic table (62 = :path, 63 = :authority)</span></span>
+<span id="d12-cb7-42"><a href="#d12-cb7-42" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;    repeat request encodes as </span><span class="sc">{</span><span class="bu">bytes</span>([<span class="bn">0x82</span>, <span class="bn">0x87</span>, <span class="bn">0x80</span> <span class="op">|</span> <span class="dv">62</span>, <span class="bn">0x80</span> <span class="op">|</span> <span class="dv">63</span>])<span class="sc">.</span><span class="bu">hex</span>(<span class="st">&#39; &#39;</span>)<span class="sc">}</span><span class="ss"> (4 bytes)&quot;</span>)</span>
+<span id="d12-cb7-43"><a href="#d12-cb7-43" aria-hidden="true" tabindex="-1"></a>    pos <span class="op">+=</span> <span class="dv">9</span> <span class="op">+</span> length</span>
+<span id="d12-cb7-44"><a href="#d12-cb7-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d12-cb7-45"><a href="#d12-cb7-45" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">flow control: one stream can have at most `window` unacknowledged bytes in flight&quot;</span>)</span>
+<span id="d12-cb7-46"><a href="#d12-cb7-46" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> window <span class="kw">in</span> (<span class="dv">65_535</span>, <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span>, <span class="dv">6</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span>):</span>
+<span id="d12-cb7-47"><a href="#d12-cb7-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> rtt_ms <span class="kw">in</span> (<span class="dv">20</span>, <span class="dv">100</span>):</span>
+<span id="d12-cb7-48"><a href="#d12-cb7-48" aria-hidden="true" tabindex="-1"></a>        mbps <span class="op">=</span> window <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> (rtt_ms <span class="op">/</span> <span class="dv">1000</span>) <span class="op">/</span> <span class="fl">1e6</span></span>
+<span id="d12-cb7-49"><a href="#d12-cb7-49" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  window </span><span class="sc">{</span>window<span class="sc">:&gt;9,}</span><span class="ss"> B, RTT </span><span class="sc">{</span>rtt_ms<span class="sc">:3d}</span><span class="ss"> ms -&gt; max </span><span class="sc">{</span>mbps<span class="sc">:7.1f}</span><span class="ss"> Mbit/s per stream&quot;</span>)</span>
+<span id="d12-cb7-50"><a href="#d12-cb7-50" aria-hidden="true" tabindex="-1"></a>bdp <span class="op">=</span> <span class="fl">1e9</span> <span class="op">/</span> <span class="dv">8</span> <span class="op">*</span> <span class="fl">0.100</span></span>
+<span id="d12-cb7-51"><a href="#d12-cb7-51" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;  to fill 1 Gbit/s at 100 ms you need a window &gt;= BDP = </span><span class="sc">{</span>bdp<span class="sc">:,.0f}</span><span class="ss"> B&quot;</span>)</span></code></pre></div>
+<pre class="text"><code>preface: b&#39;PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n&#39; (24 bytes)
+00 00 12 04 00 00 00 00 00 | SETTINGS      len=18  flags=0x00 stream=0
+    ENABLE_PUSH = 0
+    MAX_CONCURRENT_STREAMS = 100
+    INITIAL_WINDOW_SIZE = 10,485,760
+00 00 04 08 00 00 00 00 00 | WINDOW_UPDATE len=4   flags=0x00 stream=0
+    window increment = 1,073,741,824
+00 00 1f 01 05 00 00 00 01 | HEADERS       len=31  flags=0x05 stream=1
+    HPACK block: 82 87 41 0f 61 70 69 2e 65 78 61 6d 70 6c 65 2e 63 6f 6d 44 0a 2f 76 31 2f 6f 72 64 65 72 73
+    repeat request encodes as 82 87 be bf (4 bytes)
+
+flow control: one stream can have at most `window` unacknowledged bytes in flight
+  window    65,535 B, RTT  20 ms -&gt; max    26.2 Mbit/s per stream
+  window    65,535 B, RTT 100 ms -&gt; max     5.2 Mbit/s per stream
+  window 1,048,576 B, RTT  20 ms -&gt; max   419.4 Mbit/s per stream
+  window 1,048,576 B, RTT 100 ms -&gt; max    83.9 Mbit/s per stream
+  window 6,291,456 B, RTT  20 ms -&gt; max  2516.6 Mbit/s per stream
+  window 6,291,456 B, RTT 100 ms -&gt; max   503.3 Mbit/s per stream
+  to fill 1 Gbit/s at 100 ms you need a window &gt;= BDP = 12,500,000 B</code></pre>
+<p>What to take from the bytes:</p>
+<ul>
+<li><strong>The preface</strong> is a fixed 24-byte string. It was chosen so an HTTP/1.1 server rejects it as garbage instead of misreading it.</li>
+<li><strong>Every frame header</strong> is length (24 bits), type, flags, and a 31-bit stream ID. Stream 0 is the connection itself; client-initiated streams are odd (1, 3, 5…).</li>
+<li><strong>SETTINGS</strong> are per-direction limits. <code>INITIAL_WINDOW_SIZE</code> defaults to 65,535 bytes for every stream until a peer raises it. <code>MAX_CONCURRENT_STREAMS</code> caps in-flight requests; servers commonly advertise somewhere between 100 and 250.</li>
+<li><strong>The connection-level window</strong> also starts at 65,535 bytes and can only grow through WINDOW_UPDATE on stream 0. That's why real clients send one immediately.</li>
+<li><strong>HPACK</strong> (RFC 7541) is stateful compression. The first request spends 31 bytes on its headers; the identical second one spends 4, because both sides added the literals to a dynamic table (4,096 bytes by default). That shared table is also why HPACK is order-dependent: HEADERS frames must be decoded in exactly the order they were sent.</li>
+</ul>
+<p>Flow control is credit-based and applies only to DATA frames. The receiver grants a window. The sender may have at most that many bytes outstanding that the receiver hasn't yet credited back. WINDOW_UPDATE frames return the credit. A stream's throughput is therefore capped at window ÷ RTT: 5.2 Mbit/s for the 65,535-byte default at 100 ms. That's the classic "HTTP/2 download is slow over long distance but fine locally" bug. It stacks with TCP's own limits. A transfer runs at the minimum of the HTTP/2 stream window, the HTTP/2 connection window, the TCP receive window and the congestion window.</p>
+<p>HTTP/2 fixes HTTP/1.1's <em>application-level</em> head-of-line blocking: a slow response no longer blocks the others. It leaves <em>transport-level</em> blocking in place, and concentrates it. All streams share one TCP byte stream. If one segment is lost, TCP holds back every byte after it, for every stream, until the retransmission arrives. With six HTTP/1.1 connections, one loss stalls one of six. With one HTTP/2 connection, it stalls all of them. On clean networks HTTP/2 wins comfortably. On lossy mobile links the gap narrows and can reverse.</p>
+<h3 id="d12-h3">HTTP/3: moving streams below the loss</h3>
+<p>HTTP/3 (RFC 9114) keeps HTTP/2's model of streams and frames, but it runs on QUIC, which implements streams itself over UDP. Loss recovery is per stream: a lost packet carrying stream 5's data stalls only stream 5. QUIC also folds the transport and TLS 1.3 handshakes into one round trip, so a cold HTTP/3 request costs about 2 RTT instead of 3. HPACK's strict ordering doesn't survive independent streams, so HTTP/3 uses QPACK (RFC 9204), which carries dynamic-table updates on dedicated encoder and decoder streams.</p>
+<p>Clients learn that a server speaks HTTP/3 in one of two ways. An <code>Alt-Svc: h3=":443"</code> response header works, but only from the second connection on, so the first visit is HTTP/2. A DNS HTTPS record (Module 11's deep dive) works before the first connection. Module 20 covers the transport itself: connection IDs, migration, packet number spaces and loss recovery.</p>
+<h3 id="d12-tls13">TLS 1.3, field by field</h3>
+<p>The module gave the message flow. Here is what is inside the first two messages, roughly as a capture tool shows it (constructed and trimmed; typical values):</p>
+<pre class="text"><code>TLSv1.3 Record: Handshake, ClientHello
+  legacy_version: 0x0303 (TLS 1.2)          # frozen for middleboxes; the real version is in an extension
+  random: 32 bytes
+  legacy_session_id: 32 bytes               # random, also for middlebox compatibility
+  cipher_suites: 0x1301 TLS_AES_128_GCM_SHA256, 0x1302 TLS_AES_256_GCM_SHA384,
+                 0x1303 TLS_CHACHA20_POLY1305_SHA256
+  extensions:
+    server_name: api.example.com            # SNI, plaintext unless ECH is used
+    supported_versions: 0x0304 (TLS 1.3), 0x0303
+    supported_groups: X25519MLKEM768 (0x11ec), x25519 (0x001d), secp256r1 (0x0017)
+    key_share: X25519MLKEM768 (1216 bytes), x25519 (32 bytes)
+    signature_algorithms: ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, ...
+    application_layer_protocol_negotiation: h2, http/1.1
+    psk_key_exchange_modes: psk_dhe_ke
+
+TLSv1.3 Record: Handshake, ServerHello
+  legacy_version: 0x0303
+  random: 32 bytes
+  cipher_suite: 0x1301 TLS_AES_128_GCM_SHA256
+  extensions:
+    supported_versions: 0x0304
+    key_share: X25519MLKEM768 (1120 bytes)  # ML-KEM ciphertext (1088) + x25519 share (32)</code></pre>
+<p>Several things here explain real behaviour:</p>
+<ul>
+<li><strong>The version disguise.</strong> Both hellos claim TLS 1.2 in the legacy field; the real negotiation happens in the <code>supported_versions</code> extension. Middleboxes that inspected the old field broke TLS 1.3 during its rollout, and this disguise was the fix.</li>
+<li><strong>The speculative key share is the 1-RTT trick.</strong> The client guesses which groups the server will accept and sends public keys for them up front. If the guess is wrong, the server answers with a HelloRetryRequest naming a group, and the handshake costs an extra RTT.</li>
+<li><strong>Post-quantum hybrids are the browser default in 2026.</strong> <code>X25519MLKEM768</code> combines classical X25519 with ML-KEM-768. Its client share alone is 1216 bytes, so the ClientHello grows past 1.5 KB and no longer fits in one TCP segment. Middleboxes that assumed the whole ClientHello arrives in one packet broke when browsers turned this on, and some still do.</li>
+<li><strong>The key schedule.</strong> After ServerHello, both sides run HKDF over the shared secret and the transcript hash to derive <em>handshake</em> traffic keys. Those encrypt everything from EncryptedExtensions through Finished. After Finished they derive <em>application</em> traffic keys. Every key depends on the transcript, so tampering with any earlier message breaks the Finished check.</li>
+<li><strong>Records.</strong> Application data travels in records of at most 2^14 (16,384) bytes of plaintext. Each record adds a 5-byte header, a 1-byte inner content type and a 16-byte AEAD tag: 22 bytes of overhead.</li>
+</ul>
+<h3 id="d12-0rtt">0-RTT, and what it gives away</h3>
+<p>On resumption, a client can send application data in its very first flight, encrypted under a key derived from the session ticket's pre-shared key. The server can act on it before any round trip completes. Three costs come with that:</p>
+<ol type="1">
+<li><strong>Replay.</strong> The early data is a self-contained, valid ciphertext. An attacker who records it can send it again, and another server instance holding the same ticket key will accept it. RFC 8446 §8 describes mitigations (single-use tickets, recording ClientHellos, freshness windows), but none of them works fully across a globally distributed fleet.</li>
+<li><strong>No forward secrecy for the early data.</strong> Only the PSK protects it. Whoever later obtains the ticket-encryption key can decrypt recorded early data.</li>
+<li><strong>Retries become the application's problem.</strong> A server may reject early data. The client must then resend it after the handshake, so the same request can arrive twice by different paths.</li>
+</ol>
+<p>RFC 8470 defines how HTTP copes. A terminator that forwards early data adds <code>Early-Data: 1</code> to the request. A backend that won't accept the replay risk for that request answers <code>425 Too Early</code>, and the client retries after the handshake. The safe policy is to allow 0-RTT only for safe methods (<code>GET</code>, <code>HEAD</code>) on endpoints without side effects. Many deployments simply leave it off.</p>
+<h3 id="d12-chain-validation">Certificate chain validation, as the client does it</h3>
+<p>"The client verifies the chain" is really a list of specific checks: RFC 5280 path validation plus RFC 9525 name matching.</p>
+<ol type="1">
+<li><strong>Build a path.</strong> Start at the leaf. Find an issuer whose subject matches the leaf's issuer name (and whose Subject Key Identifier matches the leaf's Authority Key Identifier). Look first among the certificates the server sent, then in the local trust store. Repeat until you reach a trusted root. Cross-signed intermediates can create several candidate paths, and different libraries pick differently.</li>
+<li><strong>Check each signature</strong> with the issuer's public key.</li>
+<li><strong>Check validity periods</strong> of every certificate against the local clock.</li>
+<li><strong>Check CA constraints.</strong> Each issuer needs <code>basicConstraints CA:TRUE</code>, <code>keyUsage keyCertSign</code>, and a path length the chain doesn't exceed. Name constraints, where present, must allow the leaf's names.</li>
+<li><strong>Check the leaf's purpose.</strong> Its <code>extendedKeyUsage</code> must include <code>serverAuth</code>.</li>
+<li><strong>Match the name.</strong> The hostname must match a <code>subjectAltName</code> DNS entry (or an IP entry, for an IP). Modern clients ignore the Common Name. A wildcard matches exactly one label: <code>*.example.com</code> covers <code>api.example.com</code>, but not <code>example.com</code> or <code>a.b.example.com</code>.</li>
+<li><strong>Check revocation and transparency, depending on the client.</strong> Browsers use pushed revocation data (Chrome's CRLSets, Firefox's CRLite) and require Certificate Transparency proofs. Many non-browser clients check neither.</li>
+<li><strong>Verify possession.</strong> The <code>CertificateVerify</code> signature over the handshake transcript proves the server holds the leaf's private key. Without it, a copied <em>certificate</em>, which is public, would be enough to impersonate the site.</li>
+</ol>
+<p>The demo PKI above was built to pass these checks. Python 3.13's default context enables strict X.509 checking. An earlier version of the demo root, made without an explicit <code>keyUsage</code>, failed with <code>CA cert does not include key usage extension</code>, which is why the script now sets one.</p>
+<p>To see a real server's chain:</p>
+<pre class="text"><code>$ openssl s_client -connect api.example.com:443 -servername api.example.com -showcerts &lt;/dev/null
+depth=2 C = US, O = Internet Security Research Group, CN = ISRG Root X2
+verify return:1
+depth=1 C = US, O = Let&#39;s Encrypt, CN = E7
+verify return:1
+depth=0 CN = api.example.com
+verify return:1
+---
+Certificate chain
+ 0 s:CN = api.example.com
+   i:C = US, O = Let&#39;s Encrypt, CN = E7
+ 1 s:C = US, O = Let&#39;s Encrypt, CN = E7
+   i:C = US, O = Internet Security Research Group, CN = ISRG Root X2
+---
+...
+    Verify return code: 0 (ok)</code></pre>
+<p>Constructed illustration (OpenSSL 3 format; your output will differ). The server sent two certificates, 0 and 1. The root at depth 2 came from the local trust store, which is how it should be. Sending the root wastes bytes, because the client must already have it to trust it. When the server forgets certificate 1, the same command prints <code>verify error:num=20:unable to get local issuer certificate</code> and ends with <code>Verify return code: 21 (unable to verify the first certificate)</code>. Code 20 is exactly what the localhost script printed.</p>
+<h2 id="d12-numbers">Deep dive: by the numbers</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Value</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Cold HTTPS over TCP, to first byte</td>
+<td>3 RTT + DNS + server time</td>
+<td>TCP 1 + TLS 1.3 1 + request 1</td>
+</tr>
+<tr class="even">
+<td>Warm (pooled) request</td>
+<td>1 RTT + server time</td>
+<td></td>
+</tr>
+<tr class="odd">
+<td>Cold HTTP/3</td>
+<td>~2 RTT + DNS + server time</td>
+<td>QUIC combines transport and TLS</td>
+</tr>
+<tr class="even">
+<td>TLS 1.2 full handshake</td>
+<td>2 RTT</td>
+<td>vs 1 RTT for TLS 1.3</td>
+</tr>
+<tr class="odd">
+<td>HTTP/1.1 connections per origin (browsers)</td>
+<td>6</td>
+<td></td>
+</tr>
+<tr class="even">
+<td>HTTP/2 frame header</td>
+<td>9 bytes</td>
+<td>max frame payload 16,384 bytes by default</td>
+</tr>
+<tr class="odd">
+<td>HTTP/2 initial stream and connection window</td>
+<td>65,535 bytes</td>
+<td>5.2 Mbit/s per stream at 100 ms RTT</td>
+</tr>
+<tr class="even">
+<td>HPACK default dynamic table</td>
+<td>4,096 bytes</td>
+<td>the static table has 61 entries</td>
+</tr>
+<tr class="odd">
+<td>TLS record plaintext max</td>
+<td>16,384 bytes</td>
+<td>+22 bytes overhead per TLS 1.3 record</td>
+</tr>
+<tr class="even">
+<td>ClientHello size</td>
+<td>a few hundred bytes classical; &gt;1.5 KB with X25519MLKEM768</td>
+<td>ML-KEM-768 share is 1184 bytes, plus 32 for X25519</td>
+</tr>
+<tr class="odd">
+<td>Linux delayed-ACK minimum</td>
+<td>40 ms</td>
+<td>the Nagle stall in the localhost demo; other OSes differ</td>
+</tr>
+<tr class="even">
+<td>Linux ephemeral ports</td>
+<td>32768–60999 (28,232)</td>
+<td><code>net.ipv4.ip_local_port_range</code></td>
+</tr>
+<tr class="odd">
+<td>macOS ephemeral ports</td>
+<td>49152–65535 (16,384)</td>
+<td><code>net.inet.ip.portrange.first</code> / <code>.last</code></td>
+</tr>
+<tr class="even">
+<td>Linux TIME_WAIT</td>
+<td>60 s</td>
+<td>fixed in the kernel</td>
+</tr>
+<tr class="odd">
+<td>New connections/s to one server ip:port without reuse (Linux)</td>
+<td>≈ 28,232 ÷ 60 ≈ 470</td>
+<td>per source IP; <code>tcp_tw_reuse</code> relaxes it for outbound</td>
+</tr>
+<tr class="even">
+<td>nginx <code>keepalive_timeout</code> default</td>
+<td>75 s</td>
+<td></td>
+</tr>
+<tr class="odd">
+<td>Node.js <code>server.keepAliveTimeout</code> default</td>
+<td>5 s</td>
+<td></td>
+</tr>
+<tr class="even">
+<td>AWS ALB idle timeout default</td>
+<td>60 s</td>
+<td></td>
+</tr>
+<tr class="odd">
+<td>Public TLS certificate max lifetime</td>
+<td>200 days for certificates issued since 15 March 2026</td>
+<td>CA/Browser Forum schedule: 100 days from March 2027, 47 days from March 2029</td>
+</tr>
+</tbody>
+</table>
+<h2 id="d12-failures">Deep dive: production failure modes</h2>
+<p><strong>Intermittent 502s from the load balancer, a few per thousand requests, nothing in the app logs.</strong> Mechanism: the backend's keep-alive timeout is shorter than the load balancer's idle timeout. The classic pairing is Node.js (5 s) behind an AWS ALB (60 s). The backend closes an idle connection; the ALB still considers it reusable, sends the next request into it and gets a reset. Prove it: the 502s land on connections that sat idle for more than 5 s. A capture on the backend, <code>tcpdump -nn 'tcp[tcpflags] &amp; (tcp-fin|tcp-rst) != 0'</code>, shows the backend's FIN just before the ALB's request. Fix: make the backend's keep-alive timeout longer than the LB's idle timeout. For Node, raise <code>headersTimeout</code> above it as well.</p>
+<p><strong><code>ConnectionResetError</code> or "Remote end closed connection without response" on the first request after a quiet period.</strong> Mechanism: the same race on the client side. The pool kept a connection longer than the server allows. Prove it: the failures cluster after idle gaps longer than the server's keep-alive timeout. Fix: set the client pool's idle timeout below the server's; enable the library's retry for idempotent requests; never auto-retry <code>POST</code>.</p>
+<p><strong>Works in the browser, fails in <code>curl</code>, Python, Java and mobile apps with "unable to get local issuer certificate".</strong> Mechanism: the server sends only its leaf. Browsers often paper over this. They fetch the intermediate from the certificate's AIA URL, or already have it cached from another site. Most other clients do neither. Prove it: <code>openssl s_client -showcerts</code> lists only certificate 0, with verify errors 20 and 21. Fix: configure the server with the full chain (<code>fullchain.pem</code>, not <code>cert.pem</code>).</p>
+<p><strong>Mass TLS failures on old clients, with a perfectly valid certificate.</strong> Mechanism: path building chose an expired root or cross-sign. The well-known case was September 2021, when an old cross-signing root expired. OpenSSL 1.0.2 clients failed even though a valid path existed, because they built the expired one. Prove it: run <code>openssl s_client</code> with the failing client's library version and read the path it reports. Fix: update the client's trust store or library; serve a chain that doesn't steer old clients onto the expired path.</p>
+<p><strong>Certificate errors on a few machines only.</strong> Mechanism: the local clock is wrong, so every certificate looks "not yet valid" or "expired". Common on VMs restored from snapshots and on devices without a clock battery. Prove it: compare <code>date -u</code> with a trusted source; the error names validity, not trust. Fix: NTP.</p>
+<p><strong>A flat ~40 ms added to some responses.</strong> Mechanism: Nagle's algorithm plus delayed ACK, as in the localhost demo. Any pattern of "small write, then another small write" with data still unacknowledged can trigger it. Prove it: a packet capture shows the response leaving exactly when the peer's delayed ACK arrives. Fix: <code>TCP_NODELAY</code> on the server socket; coalesce headers and body into one write.</p>
+<p><strong>Large HTTP/2 downloads are slow from far away and fast nearby.</strong> Mechanism: the flow-control window is smaller than the bandwidth-delay product, so throughput = window ÷ RTT. Prove it: in a capture, the sender pauses until each WINDOW_UPDATE arrives, and throughput scales inversely with RTT. Fix: raise the initial stream window and send a large connection-level WINDOW_UPDATE. Most proxies and servers have a setting for both.</p>
+<p><strong>Requests queue in the client although the server is idle.</strong> Mechanism: every request shares one HTTP/2 connection and the server's <code>MAX_CONCURRENT_STREAMS</code> (say 100) is reached, so request 101 waits for a stream to finish. Common with gRPC clients that hold a single channel. Prove it: client metrics show pending streams while the server shows exactly 100 concurrent. Fix: a small pool of connections, or a higher server limit.</p>
+<p><strong>One backend pod at 90% CPU, the rest idle, behind a Kubernetes Service.</strong> Mechanism: an L4 load balancer (kube-proxy, a cloud network LB) balances <em>connections</em>, and gRPC or HTTP/2 clients each hold one long-lived connection. Whichever pod got the busy client's connection gets all its requests. Prove it: compare per-pod request rates with per-pod connection counts. Fix: L7 balancing (a mesh or an HTTP/2-aware proxy), client-side balancing, or a server-side maximum connection age that forces periodic reconnects.</p>
+<p><strong><code>EADDRNOTAVAIL</code> ("Cannot assign requested address") under load.</strong> Mechanism: no connection reuse. Every request opens a new connection to the same ip:port, and each closed connection sits in TIME_WAIT on the side that closed first. At around 470 new connections per second, Linux runs out of ephemeral ports for that destination. Prove it: <code>ss -tan state time-wait | wc -l</code> is close to 28,000 on Linux; on macOS, <code>netstat -an -p tcp | grep -c TIME_WAIT</code>. Fix: pooling first; more source IPs or destination ports second; <code>net.ipv4.tcp_tw_reuse</code> for outbound connections.</p>
+<p><strong>Some users behind one corporate network can't connect after a browser update.</strong> Mechanism: a post-quantum hybrid key share made the ClientHello span two TCP segments, and a middlebox that expects the whole ClientHello in one packet drops or resets the connection. Prove it: a capture shows the reset right after the second ClientHello segment, and the failure disappears when the hybrid group is disabled. Fix: update the middlebox. Disabling post-quantum key exchange is a stopgap, not a fix.</p>
+<h2 id="d12-2026">Deep dive: 2026 context</h2>
+<p><strong>HTTP/3 is mainstream at the edge.</strong> Major browsers and CDNs speak it, and discovery increasingly comes from DNS HTTPS records rather than <code>Alt-Svc</code>. Inside data centres HTTP/2 over TCP still dominates, because loss is rare and TCP tooling is mature. Networks that block UDP/443 push clients back to HTTP/2, so every HTTP/3 deployment needs a working TCP fallback.</p>
+<p><strong>Browser TLS is post-quantum by default.</strong> Hybrid X25519MLKEM768 key exchange protects today's traffic against "record now, decrypt later". Certificates and signatures are still classical; post-quantum authentication isn't deployed at scale yet. The visible cost is the bigger ClientHello.</p>
+<p><strong>Encrypted ClientHello hides the last plaintext name.</strong> With ECH, the real SNI travels encrypted inside an outer ClientHello addressed to a shared front-end name, using a key published in the DNS HTTPS record. Major browsers and some CDNs support it. It moves name visibility from the network path to the resolver and the CDN, which matters for networks that filter by SNI. (Module 12 cites RFC 9258 for ECH; that RFC number belongs to an unrelated TLS document about importing external PSKs, so treat ECH by name rather than by that number.)</p>
+<p><strong>Certificates are getting short-lived, and revocation is changing.</strong> The CA/Browser Forum cut the maximum lifetime of public certificates to 200 days from March 2026, on a path to 47 days by 2029. Let's Encrypt issues 90-day certificates and moved from OCSP to CRLs in 2025. Manual renewal is no longer a workable process. Monitor expiry for <em>every</em> certificate in a chain, including internal CAs and mTLS client certificates, which have their own lifetimes.</p>
+<p><strong>HTTP/2 has an abuse history worth knowing.</strong> "Rapid Reset" (CVE-2023-44487, 2023) opened streams and cancelled them immediately with RST_STREAM. Cancelled streams don't count against <code>MAX_CONCURRENT_STREAMS</code>, so a single connection could make a server start unbounded work. Servers now limit reset rates. When you expose HTTP/2 directly rather than behind a CDN, those limits become your configuration to get right.</p>
+<p><strong>Zero trust makes TLS the identity layer inside the network.</strong> Service meshes terminate mutual TLS in sidecars or node proxies, using short-lived workload certificates (SPIFFE IDs in the SAN) rotated within hours. The chain-validation rules above apply in both directions, and an expired mesh CA fails <em>every</em> service at once. In-cluster latency budgets now include mTLS handshakes, so connection reuse between services matters as much as it does at the edge.</p>
+<h2 id="d12-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: Count the round trips for a first HTTPS request over HTTP/2, then for a second request to the same host.</strong> First: DNS (zero to several RTTs), TCP 1, TLS 1.3 1, request 1, so 3 RTT plus DNS and server time. Second, on the pooled connection: 1 RTT plus server time. Over HTTP/3 the first drops to about 2 RTT, because QUIC merges the transport and crypto handshakes.</p>
+<p><strong>Q2: HTTP/2 multiplexes. Why can it be slower than HTTP/1.1 on a lossy network?</strong> All its streams share one TCP byte stream, and TCP delivers in order. One lost segment stalls every stream until the retransmission arrives. Six HTTP/1.1 connections lose packets independently, so a loss stalls only one of them. HTTP/3 fixes this by doing loss recovery per stream inside QUIC.</p>
+<p><strong>Q3: A single large HTTP/2 download tops out around 5 Mbit/s across an ocean but is fast in-region. Why?</strong> Flow control. With the default 65,535-byte window, at most 64 KB can be outstanding per stream, so throughput ≤ window ÷ RTT, about 5.2 Mbit/s at 100 ms. Raise the stream and connection windows to at least the bandwidth-delay product.</p>
+<p><strong>Q4: Your service shows intermittent 502s behind a load balancer, never under steady load. Diagnose.</strong> A keep-alive timeout mismatch. When the backend's idle timeout is shorter than the LB's, the backend closes connections the LB still thinks are reusable, and requests sent into them fail. The fix is ordering: the side that reuses connections must time out first, so the backend's keep-alive must exceed the LB's idle timeout.</p>
+<p><strong>Q5: What exactly does TLS 1.3 0-RTT risk, and how would you allow it safely?</strong> Replay: an attacker can resend early data, and another server instance will accept it. It also lacks forward secrecy, since only the resumption PSK protects it. Allow it only for safe, idempotent requests; have the terminator mark it with <code>Early-Data: 1</code>; have backends answer <code>425 Too Early</code> for anything else.</p>
+<p><strong>Q6: Where does TLS 1.3 save its round trip compared with TLS 1.2?</strong> The client sends key shares speculatively in the ClientHello, so the server can finish the key exchange in its first reply and encrypt everything after ServerHello. TLS 1.2 spent a full round trip agreeing on parameters before the key exchange. If the client guesses the wrong group, a HelloRetryRequest costs the round trip back.</p>
+<p><strong>Q7: A site works in Chrome but <code>curl</code> says "unable to get local issuer certificate". What's wrong, and who's right?</strong> The server sends only its leaf. Chrome fetched or remembered the intermediate; <code>curl</code> won't. <code>curl</code> is right: the server must send the chain. <code>openssl s_client -showcerts</code> proves it, and serving <code>fullchain.pem</code> fixes it.</p>
+<p><strong>Q8: Beyond "signed by a trusted CA", what does a client check on a certificate chain?</strong> Every link's signature; validity dates against the local clock; <code>CA:TRUE</code>, <code>keyCertSign</code> and path-length constraints on each issuer; name constraints; the <code>serverAuth</code> EKU on the leaf; the hostname against the SAN (not the CN, and wildcards cover one label); revocation and Certificate Transparency in browsers; and <code>CertificateVerify</code>, which proves the server holds the private key.</p>
+<p><strong>Q9: Why does a gRPC service behind a Kubernetes Service show one hot pod?</strong> kube-proxy balances connections, not requests. gRPC multiplexes all calls over one long-lived HTTP/2 connection per client, so each client's whole load lands on one pod. Fix it with L7 balancing, client-side balancing, or a maximum connection age.</p>
+<p><strong>Q10: What does <code>curl -w '%{time_appconnect}'</code> measure, and how do you turn the timers into phases?</strong> The time from the start of the transfer until the TLS handshake completed; all the timers are cumulative. Subtract neighbours: <code>time_connect − time_namelookup</code> is TCP, <code>time_appconnect − time_connect</code> is TLS, <code>time_starttransfer − time_appconnect</code> is request-to-first-byte, and <code>time_total − time_starttransfer</code> is the transfer.</p>
+<p><em>Standards cited in this deep dive: RFC 9110 (HTTP semantics, retry rules), RFC 9112 (HTTP/1.1), RFC 9113 (HTTP/2), RFC 7541 (HPACK), RFC 9114 (HTTP/3), RFC 9204 (QPACK), RFC 8446 (TLS 1.3), RFC 8470 (early data in HTTP), RFC 5280 (certificate path validation), RFC 9525 (service identity). Timeout defaults (nginx, Node.js, AWS ALB), browser behaviour and CA/Browser Forum dates are vendor or industry policy and can change.</em></p>

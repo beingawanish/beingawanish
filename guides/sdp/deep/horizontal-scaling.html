@@ -1,0 +1,305 @@
+<h2 id=dd-horizontal-scaling-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's checklist says where each kind of state goes. A design review goes one level down. How exactly does a session live in Redis? What makes a job run once and only once? What breaks while two versions of the code run side by side? Those details decide whether the fleet behaves like one service or like fifty slightly different ones.</p>
+
+<h3 id=dd-horizontal-scaling-contract level=3>The real contract: any request, any server, any time, any version</h3>
+<p>"Stateless" is shorthand for a contract with four parts. Each part rules out a different class of bug.</p>
+<ul>
+<li><strong>Any request.</strong> Nothing about a user lives only on one machine. This is the part the lesson covers: sessions, files, caches, counters.</li>
+<li><strong>Any server.</strong> Servers are configured identically. No server is "the one with the cron", "the one with the admin console" or "the one with the bigger disk". Config comes from the same source for all of them.</li>
+<li><strong>Any time.</strong> A server can be killed at any moment and replaced. So it must start from nothing: no hand-applied setup, no data that only exists after a warm-up script someone ran once. And it must stop cleanly when told to.</li>
+<li><strong>Any version.</strong> During a rolling deploy, old and new code serve traffic together for minutes. A session written by version 2 may be read by version 1 a second later. Shared state formats, cache entries and queue messages must be readable by both.</li>
+</ul>
+<p>Teams usually get the first part right and discover the fourth in production. It is the subtlest, and it never shows up on a single machine.</p>
+
+<h3 id=dd-horizontal-scaling-sessions level=3>Sessions: two ways out of the server</h3>
+<p><strong>A server-side store.</strong> The browser keeps only a random session ID in a cookie. The data lives in a shared store, typically Redis, under a key like <code>sess:&lt;id&gt;</code>:</p>
+<ul>
+<li>Create the session with a TTL: <code>SET sess:9f2c... &lt;data&gt; EX 1800</code>.</li>
+<li>Read it on every request with <code>GET</code>. That is the lesson's ~1 ms hop.</li>
+<li>Sliding expiry means extending the TTL as the user stays active. Doing an <code>EXPIRE</code> on every request doubles the store's write load. Most systems refresh only when the remaining TTL drops below half.</li>
+<li>Logout or "sign out everywhere" is a <code>DEL</code>. Revocation is instant, which is this design's big advantage.</li>
+</ul>
+<p>The store's settings now matter as much as the code. Redis's <code>maxmemory-policy</code> defaults to <code>noeviction</code>, which rejects writes when memory is full. A shared cache instance is usually set to an LRU policy. Put sessions on that same instance and memory pressure from cache entries will quietly evict logged-in users. Sessions want their own instance, sized to hold them all, with replication.</p>
+<p><strong>A signed token.</strong> The session data travels with the request, signed so the client cannot change it. A JWT or an HMAC-signed cookie are the usual forms. No server needs to look anything up. The costs are real, though:</p>
+<ul>
+<li><strong>Revocation is hard.</strong> A token is valid until it expires. The common answer is a short-lived access token (minutes) plus a refresh token checked against a store. That reintroduces a store, but only on refresh, not on every request.</li>
+<li><strong>Size.</strong> Every claim rides on every request. Browsers limit a cookie to about 4 KB, and proxies cap total header size. A token that grows with the user's roles will eventually break something.</li>
+<li><strong>Key rotation.</strong> Every server must verify with the same keys. Use a key ID (<code>kid</code>) in the token header, publish several keys at once, and retire old ones only after the last token signed with them has expired.</li>
+</ul>
+<p>Neither is "the stateless one". Both move state out of the server. The store keeps it in one shared place. The token spreads it across every client.</p>
+
+<h3 id=dd-horizontal-scaling-files level=3>Files: get the app servers out of the byte path</h3>
+<p>Moving uploads from local disk to object storage fixes the 404s. Routing every upload <em>through</em> the app servers still ties up a worker for the whole transfer, and a 200 MB video on a slow connection holds it for minutes.</p>
+<p>The better shape is a <strong>presigned URL</strong>. The app server checks permissions and returns a short-lived URL that allows one PUT to one object key. The browser uploads straight to object storage, then tells the app the upload is done. Downloads work the same way, often through a CDN. The app server touches metadata only. Note also that S3 now gives strong read-after-write consistency for new objects and overwrites, so the old "upload then 404 on read" race is no longer a design concern there. Check the consistency model of whatever store you actually use.</p>
+
+<h3 id=dd-horizontal-scaling-jobs level=3>Scheduled jobs: once, and only once</h3>
+<p>A cron on every server runs N times. The fix is mutual exclusion: one runner holds the right to run, and everyone else skips. Three common ways to get it:</p>
+<ul>
+<li><strong>A lease in Redis.</strong> <code>SET lock:nightly-report &lt;random-token&gt; NX PX 600000</code> succeeds for exactly one caller and expires after 10 minutes. Release with a compare-and-delete, so a server never deletes a lock someone else now holds.</li>
+<li><strong>A Postgres advisory lock.</strong> <code>SELECT pg_try_advisory_lock(42)</code> returns true for one session only. A session-level advisory lock is released automatically when that connection drops, so a crashed runner frees it.</li>
+<li><strong>An external scheduler.</strong> A Kubernetes CronJob with <code>concurrencyPolicy: Forbid</code>, or a queue-based scheduler that enqueues one job per tick for one consumer. The app servers stop scheduling anything.</li>
+</ul>
+<p>Every lease has the same hole. The holder can pause (a GC pause, a VM freeze, a network partition) past the lease time. A second server then takes the lock while the first still believes it holds it. For a report that only sends email, idempotency keyed by customer and date makes the double run harmless. For anything that writes, pass a <strong>fencing token</strong>: a number that increases with every grant, which the database checks and rejects if it is older than the last one it saw.</p>
+<pre><code># Lease-based "run once" with stdlib only, using a Redis-like client passed in.
+import uuid
+
+RELEASE = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+def run_once(r, name, ttl_ms, job):
+    token = str(uuid.uuid4())
+    if not r.set(f"lock:{name}", token, nx=True, px=ttl_ms):
+        return False          # another server holds it this tick
+    try:
+        job()                 # must finish well inside ttl_ms, and be idempotent
+    finally:
+        r.eval(RELEASE, 1, f"lock:{name}", token)
+    return True</code></pre>
+
+<h3 id=dd-horizontal-scaling-counters level=3>Counters, rate limits and IDs</h3>
+<p>A counter in process memory counts 1/N of reality. The shared version is an atomic increment with a window: <code>INCR rl:user:42:202611211405</code> with an <code>EXPIRE</code> set in the same transaction or Lua script, so a crash between the two cannot leave a key that never expires.</p>
+<p>Two refinements come up in reviews. A <strong>hybrid limiter</strong> keeps a local allowance of limit/N per server and syncs with the store periodically. It saves a network hop per request and tolerates a small overshoot. And an <strong>atomic script</strong> (a token bucket in Lua) avoids the race where two servers read the same count and both allow the last request.</p>
+<p>ID generation is the other hidden counter. An in-memory sequence or "timestamp plus a random suffix" can collide once N servers generate IDs in the same millisecond. Use database sequences, UUIDv7 (time-ordered and random), or a Snowflake-style scheme with a worker ID. If you choose worker IDs, assigning them is itself a coordination problem: two servers with the same worker ID will mint identical IDs.</p>
+
+<h3 id=dd-horizontal-scaling-lifecycle level=3>The server lifecycle: start, serve, stop</h3>
+<p>A replaceable server needs a clean birth and a clean death. In Kubernetes terms, these settings carry the contract:</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: store-web
+spec:
+  replicas: 6
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%        # extra pods allowed during the rollout
+      maxUnavailable: 0    # never drop below 6 ready pods
+  template:
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+      - name: web
+        image: store-web:2.14.0
+        readinessProbe:            # "send me traffic?" Gates admission.
+          httpGet: {path: /healthz/ready, port: 8080}
+          periodSeconds: 2
+          failureThreshold: 3
+        lifecycle:
+          preStop:                 # give endpoint removal time to propagate
+            exec: {command: ["sleep", "10"]}</code></pre>
+<ul>
+<li><code>maxSurge</code> and <code>maxUnavailable</code> trade rollout speed against spare capacity. <code>maxUnavailable: 0</code> keeps full capacity but needs room for extra pods.</li>
+<li>The <strong>readiness probe</strong> keeps a new pod out of rotation until it has loaded config, opened its pools and warmed what it needs.</li>
+<li>On shutdown the pod gets SIGTERM. The app must stop accepting new work, finish in-flight requests and exit within the grace period. The <code>preStop</code> sleep covers a race the <a href="#load-balancing">load balancing</a> deep dive explains: the pod can receive SIGTERM before every balancer has stopped sending it traffic. Newer Kubernetes versions also offer a built-in sleep action for <code>preStop</code>, so the image does not need a <code>sleep</code> binary.</li>
+<li>A <strong>PodDisruptionBudget</strong> stops node maintenance from evicting too many replicas at once. It is the N+1 policy written as config.</li>
+</ul>
+
+<h3 id=dd-horizontal-scaling-versions level=3>Two versions at once: expand, then contract</h3>
+<p>Any change to a shared format needs two deploys, not one. The pattern is called <strong>expand and contract</strong>:</p>
+<ol>
+<li><strong>Expand.</strong> Deploy code that can <em>read</em> both the old and new formats, but still writes the old one. Add new database columns as nullable.</li>
+<li><strong>Switch.</strong> Once every server runs that version, deploy code that writes the new format.</li>
+<li><strong>Contract.</strong> After old-format data has expired or been migrated, remove the old read path and old columns.</li>
+</ol>
+<p>This applies to session payloads, cache entries, queue messages and database schemas alike. Skip it and the rollout itself causes the incident: version 2 writes a session that version 1 cannot parse, and users bounce between working and broken pages until the deploy finishes. Versioned serialisation (a <code>v</code> field in every stored blob) makes the expand step easy.</p>
+
+<h2 id=dd-horizontal-scaling-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+
+<h3 id=dd-horizontal-scaling-littles-law level=3>From requests per second to workers per server</h3>
+<p>"800 requests per second per server" hides a second number: concurrency. <strong>Little's law</strong> says in-flight requests = arrival rate &times; time in the system.</p>
+<ul>
+<li>Fleet: 4,000 rps &times; 50 ms average latency = 200 requests in flight at peak.</li>
+<li>Per server at 800 rps: 800 &times; 0.05 = 40 in flight.</li>
+</ul>
+<p>So each server needs at least 40 concurrent workers (threads, processes or event-loop slots) just for the average. Latency has a tail. If p99 is 400 ms and a dependency slows down, in-flight work climbs toward 800 &times; 0.4 = 320. A thread-per-request server with a pool of 64 will queue long before its CPU is busy. Size the pool from Little's law with a slow-dependency case, not from the CPU count.</p>
+
+<h3 id=dd-horizontal-scaling-zones level=3>N+1 is per failure domain, not per server</h3>
+<p>The lesson's six servers (five for peak, plus one) survive one server failure. Clouds also lose whole zones. Spread across three zones, the question becomes "can two zones carry the peak?"</p>
+<ul>
+<li>Peak 4,000 rps at 800 per server means 5 servers must survive.</li>
+<li>Those 5 must fit in 2 zones: 2.5 per zone, so 3 per zone.</li>
+<li>3 zones &times; 3 servers = <strong>9 servers</strong>, not 6.</li>
+</ul>
+<p>Normal peak utilisation is then 4,000 / (9 &times; 800) &asymp; 56%. That 56% is the price of surviving a zone. With two zones the price is higher: each zone must carry everything, so you need 10 servers at 50%. Three zones is the usual sweet spot for this reason.</p>
+<p>Check one more thing: that the balancer actually spreads load evenly across zones. If one zone has 4 servers and another has 2 and the balancer splits traffic by zone, the small zone runs at twice the load.</p>
+
+<h3 id=dd-horizontal-scaling-shared-store level=3>Sizing the shared stores</h3>
+<p>The session store, for 2 million active sessions at about 1 KB each:</p>
+<ul>
+<li>Memory: 2 million &times; 1 KB &asymp; 2 GB of data, plus Redis per-key overhead. Plan on 3 to 4 GB, and size a replica the same.</li>
+<li>Load: 4,000 reads per second, plus TTL refreshes. With refresh-at-half-TTL on a 30-minute session, a user active every minute triggers about one refresh per 15 minutes. Writes stay a small fraction of reads.</li>
+<li>That load is far below what one Redis instance handles. Throughput is not the risk. Availability is: every request now depends on this store.</li>
+</ul>
+<p>The database, for the lesson's 50 servers:</p>
+<ul>
+<li>Opened: 50 servers &times; 20 pooled connections = 1,000 connections. In Postgres each one is a process using several MB, before any query runs.</li>
+<li>Actually needed: 4,000 rps &times; 3 queries per request &times; 2 ms per query = 24 connections busy on average, by Little's law again.</li>
+</ul>
+<p>That gap, 1,000 opened against about 24 used, is what <a href="#database-connection-pooling">connection pooling</a> recovers. Scaling the app tier multiplies <em>opened</em> connections linearly while <em>needed</em> connections stay roughly the same.</p>
+
+<h3 id=dd-horizontal-scaling-cache-dilution level=3>Local caches get worse as you add servers</h3>
+<p>A local cache with a 60-second TTL works well on one server. Spread the same traffic across 50 servers and each server sees only 1/50 of it.</p>
+<p>Take a product page requested 60 times a minute:</p>
+<ul>
+<li><strong>One server:</strong> about one miss a minute and 59 hits. A 98% hit ratio, and the database sees about 1 query a minute.</li>
+<li><strong>50 servers:</strong> each sees about 1.2 requests a minute. Often the entry has expired before the next request arrives. With random arrivals, the hit ratio is &lambda;T / (1 + &lambda;T), where &lambda;T is the requests per server during one TTL. That is 1.2 / 2.2, or about 55%. Each server misses about 0.55 times a minute, so the database sees about 27 queries a minute for the same page.</li>
+</ul>
+<p>Same traffic, same TTL, 27x the database load for that key. The same formula gives 98.4% for the single server (60 / 61), so you can redo it for any key's rate.</p>
+<p>Popular keys survive this. The long tail does not. This is why a horizontally scaled tier usually puts a shared cache behind a small local one (two levels), or routes requests by key with <a href="#consistent-hashing">consistent hashing</a> so each server caches a distinct slice.</p>
+
+<h3 id=dd-horizontal-scaling-rollout level=3>How long a rolling deploy takes</h3>
+<p>Assume 48 servers, and per replacement: 20 s to start, 10 s until readiness passes, 30 s to drain the old server. About a minute per wave.</p>
+<ul>
+<li><code>maxSurge: 25%</code> (12 at a time): 4 waves, about 4 minutes.</li>
+<li><code>maxSurge: 1</code>: 48 waves, about 48 minutes.</li>
+</ul>
+<p>The slow rollout is safer per step, but it means two versions coexist for most of an hour, and rolling back takes just as long. Canary releases separate these concerns: a small slice first, a pause to compare metrics, then a fast rollout.</p>
+
+<h3 id=dd-horizontal-scaling-overhead level=3>Fixed overhead per instance</h3>
+<p>Every instance pays a fixed tax: runtime memory, a logging and metrics agent, maybe a mesh sidecar, its own database pool. Suppose that is 1.5 GB and 0.5 vCPU per instance.</p>
+<ul>
+<li>48 small instances with 2 vCPU / 4 GB: overhead is 24 vCPU and 72 GB, a quarter of the CPU and over a third of the memory.</li>
+<li>12 large instances with 8 vCPU / 16 GB, same total: overhead is 6 vCPU and 18 GB.</li>
+</ul>
+<p>The small-instance fleet has a smaller blast radius per failure. It also wastes a lot more on overhead and opens four times as many database connections. That is the "24 small or 6 large" tuning decision from the lesson, with numbers attached.</p>
+
+<h2 id=dd-horizontal-scaling-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-horizontal-scaling-fm-two-leaders level=3>1. The job that ran twice anyway</h3>
+<p><strong>Symptom.</strong> The nightly billing job is behind a distributed lock, yet some customers are charged twice. It happens rarely, always on nights the job ran long.</p>
+<p><strong>Mechanism.</strong> The lease was 10 minutes. One night the job took 14 minutes, because of a slow database and a long GC pause. At minute 10 the lease expired, a second server acquired it and started from the beginning. Both ran for four minutes. The lock gave mutual exclusion only while the holder stayed fast.</p>
+<p><strong>Detect.</strong> Log the lock token and the start and end time on every run. Two overlapping runs with different tokens are proof. Alert on job duration approaching the lease TTL.</p>
+<p><strong>Fix.</strong> Make the work idempotent per item (charge keyed by customer and billing period). Renew the lease periodically while working, and abort if renewal fails. For writes that must not overlap, use fencing tokens checked by the database. A lock is a performance optimisation. Correctness comes from idempotency.</p>
+
+<h3 id=dd-horizontal-scaling-fm-rate-limit level=3>2. The rate limit that grew with the fleet</h3>
+<p><strong>Symptom.</strong> An API advertises 100 requests per minute per key. A scraper sustains 4,800 a minute without a single 429. When the fleet scales to 60 servers, it gets 6,000.</p>
+<p><strong>Mechanism.</strong> The limiter is an in-process counter. With round-robin across 48 servers, each server sees about 1/48 of the key's traffic and allows up to 100 of it. The effective limit is 100 &times; N. Nothing errors, so nothing looks wrong.</p>
+<p><strong>Detect.</strong> Compare per-key request counts from access logs (fleet-wide) against the limit. Any key consistently above it means the limiter is local.</p>
+<p><strong>Fix.</strong> A shared counter (atomic Redis increment or a Lua token bucket), or a hybrid with local allowances of limit/N and periodic sync. Or move rate limiting to the edge, where one component sees every request. See <a href="#rate-limiting">rate limiting</a>.</p>
+
+<h3 id=dd-horizontal-scaling-fm-mixed-version level=3>3. The deploy that broke sessions halfway through</h3>
+<p><strong>Symptom.</strong> During a rolling deploy, errors climb steadily as the rollout progresses, then vanish when it completes. Rolling back causes the same spike again.</p>
+<p><strong>Mechanism.</strong> Version 2 added a field to the session object and changed its serialisation. Users who hit a version 2 server got a session that version 1 servers could not parse. Rolling back did the same thing in reverse, because version 1 cannot read sessions now written by version 2.</p>
+<p><strong>Detect.</strong> Error rate correlated with the share of new pods, not with traffic. Deserialisation exceptions in logs, only from old-version pods. Tag every log line and metric with the build version so this correlation is one query.</p>
+<p><strong>Fix.</strong> Expand and contract: ship a version that reads both formats first. Version every stored blob. Add a test that runs the previous release's reader against the new release's writer.</p>
+
+<h3 id=dd-horizontal-scaling-fm-session-store level=3>4. The mass logout</h3>
+<p><strong>Symptom.</strong> Thousands of users are logged out at once, mid-afternoon. No deploy happened. Support tickets arrive before any alert fires.</p>
+<p><strong>Mechanism.</strong> Two common causes. Either the session store shares an instance with the cache and evicts sessions under an LRU policy when memory fills. Or the session primary failed and a replica was promoted. With asynchronous replication, the newest writes, including just-created sessions, never reached the replica.</p>
+<p><strong>Detect.</strong> Redis <code>evicted_keys</code> rising in <code>INFO stats</code>. A replication failover event in the store's logs. A spike in login requests right after either.</p>
+<p><strong>Fix.</strong> A dedicated session instance with <code>noeviction</code> and memory alerts well before full. Replication with automatic failover, and acceptance that a few seconds of new sessions may be lost. Or signed tokens for the common path, so a store outage does not log anyone out. The shared stores inherit the criticality, as the lesson warns. Monitor them like the database.</p>
+
+<h3 id=dd-horizontal-scaling-fm-connection-storm level=3>5. The scale-out that took down the database</h3>
+<p><strong>Symptom.</strong> Traffic spikes, auto-scaling doubles the fleet, and a minute later the database starts refusing connections with "too many clients already". The new servers fail readiness, so they get replaced, and the new replacements also connect.</p>
+<p><strong>Mechanism.</strong> Each new server opens its full pool at startup. Doubling 30 servers with 20 connections each adds 600 connections in about a minute. The database was already busy, so each new connection's setup cost (in Postgres, forking a process) makes it slower. Failed readiness triggers restarts, which reconnect again. The scaling action multiplied the downstream load, exactly when the database had the least room for it.</p>
+<p><strong>Detect.</strong> Database connection count tracks the instance count step for step. Connection errors in app logs start right after a scaling event.</p>
+<p><strong>Fix.</strong> Put a pooler between the fleet and the database (PgBouncer in transaction mode, RDS Proxy and similar), so app scaling does not change database connections. Open pools lazily with a small minimum. Cap total connections in the fleet's config: per-server pool = budget / max instances. Cap how fast auto-scaling can add instances.</p>
+
+<h3 id=dd-horizontal-scaling-fm-cold-start level=3>6. New servers are slow servers</h3>
+<p><strong>Symptom.</strong> Each scale-out briefly makes latency worse. p99 jumps for a minute or two after new instances join, then settles.</p>
+<p><strong>Mechanism.</strong> A new server has an empty local cache, a JIT that has not compiled the hot paths, and pools that are not open yet. It passes a readiness check that only tests "is the port open", then receives a full share of traffic at once. Least-connections makes this worse if the new server looks idle: it gets a burst.</p>
+<p><strong>Detect.</strong> Latency broken down by instance age. New instances show higher latency and lower cache hit ratios for their first minutes.</p>
+<p><strong>Fix.</strong> Readiness checks that test real readiness (pools open, config loaded). A warm-up step before readiness, such as replaying a few hundred representative requests. Balancer slow start, which ramps a new server's weight over 30 to 60 seconds. Scale out a little earlier, so warm-up happens before the peak, not during it.</p>
+
+<h3 id=dd-horizontal-scaling-fm-hidden-affinity level=3>7. Scaling out that adds no capacity</h3>
+<p><strong>Symptom.</strong> The fleet grows from 10 to 20 servers. The old 10 stay hot. The new 10 sit at 5% CPU. Latency barely improves.</p>
+<p><strong>Mechanism.</strong> Some hidden affinity pins existing traffic to existing servers. Sticky sessions left on after the migration. Long-lived HTTP/2 or gRPC connections from other services, balanced once at connect time and never again. Mobile clients that hold keep-alive connections for minutes. New servers only receive <em>new</em> connections, and there are not many.</p>
+<p><strong>Detect.</strong> Per-instance request rate, not just per-instance CPU. A wide spread between instances with the same configuration means affinity. Check the balancer's stickiness settings and connection age distribution.</p>
+<p><strong>Fix.</strong> Remove stickiness once sessions are shared. Balance per request (L7) rather than per connection for multiplexed protocols. Set a maximum connection age on servers, so clients reconnect and redistribute; for gRPC, servers can set <code>MaxConnectionAge</code> on their keepalive parameters.</p>
+
+<h2 id=dd-horizontal-scaling-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-horizontal-scaling-choose-sessions level=3>Where sessions live</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach<th>Per-request cost<th>Revocation<th>Server failure<th>New dependency<th>Fits<tbody>
+<tr><td>Sticky sessions, local memory<td>None<td>Instant on that server<td>Its users lose sessions<td>None, but uneven load<td>Migration step only
+<tr><td>Replicated sessions between servers<td>Replication traffic grows with N<td>Must propagate<td>Survives, if replication kept up<td>None, but complex<td>Legacy app servers; rarely chosen now
+<tr><td>Central store (Redis)<td>~1 ms lookup<td>Instant (<code>DEL</code>)<td>No effect<td>The store, which needs replication<td>The default for most web apps
+<tr><td>Database-backed<td>A query per request<td>Instant<td>No effect<td>Load on the main database<td>Low traffic; when Redis is not in the stack
+<tr><td>Signed token (JWT, signed cookie)<td>Signature check, no network<td>Hard: wait for expiry, or keep a deny-list<td>No effect<td>Key management<td>APIs, mobile, multi-region; short-lived tokens
+<tr><td>Short token + refresh in a store<td>None, except at refresh<td>At next refresh (minutes)<td>No effect<td>The store, on the refresh path only<td>Large scale where per-request lookups cost too much
+</table></div></div>
+<p>The central store is the right default. Move to tokens when per-request lookups become a measurable cost or when sessions must work across regions without a shared store. Treat sticky sessions as scaffolding you remove.</p>
+
+<h3 id=dd-horizontal-scaling-choose-jobs level=3>Running a job exactly once per tick</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Approach<th>Failure of the runner<th>Double-run risk<th>Operational cost<tbody>
+<tr><td>One designated "cron server"<td>Job silently stops running<td>Low, until someone adds a second<td>Low, but breaks "any server"
+<tr><td>Lease in Redis<td>Lease expires, another server takes over<td>On long pauses past the TTL<td>Low
+<tr><td>Postgres advisory lock<td>Released when the connection drops<td>Low; tied to connection lifetime<td>Low; uses a DB connection for the duration
+<tr><td>Orchestrator CronJob (e.g. <code>concurrencyPolicy: Forbid</code>)<td>Orchestrator retries per its policy<td>Low, but runs can be missed or delayed<td>Uses existing platform
+<tr><td>Scheduler enqueues; workers consume from a queue<td>Message redelivered to another worker<td>At-least-once: needs idempotency<td>A queue, which you may already run
+</table></div></div>
+<p>Whichever you pick, the job must be idempotent. Every option above either can double-run or can redeliver after a crash.</p>
+
+<h3 id=dd-horizontal-scaling-choose-unit level=3>What you scale: a tier, or a whole cell</h3>
+<p>The lesson scales one tier: more app servers in front of shared stores. At large scale, the shared stores become the limit and the blast radius. A <strong>cell-based architecture</strong> scales the whole stack instead. Each cell is a complete, independent copy (app servers, cache, database) serving a fixed slice of customers. A thin routing layer maps each customer to a cell.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th><th>Scale one tier<th>Scale cells<tbody>
+<tr><td>Unit of growth<td>One server<td>One whole stack
+<tr><td>Blast radius of a bad deploy or store failure<td>Everyone<td>One cell's customers
+<tr><td>Shared-store limit<td>Eventually hit; needs sharding<td>Each cell's store stays small
+<tr><td>Cost of the first step<td>The statelessness checklist<td>The checklist, plus a router and cross-cell operations
+<tr><td>Cross-customer features<td>Easy: one database<td>Hard: data is split by cell
+<tr><td>Fits<td>Almost everyone, for a long time<td>Large multi-tenant SaaS, very high availability targets
+</table></div></div>
+<p>Cells are sharding applied to the entire stack. They are worth it when a single shared store's failure is unacceptable or when deploys need a small first target. For the store in this course, a tier fleet with replicated stores is right for years.</p>
+
+<h2 id=dd-horizontal-scaling-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>Has every item of server-local state been found: sessions, files, caches, scheduled jobs, counters, rate limits, locks, ID generators, temp files? How was the search done?</li>
+<li>Where do sessions live, how are they revoked, and what happens to logged-in users if that store fails over?</li>
+<li>Is the session store separate from any cache with an eviction policy?</li>
+<li>For each scheduled job: what guarantees one run per tick, what happens if the runner pauses past its lease, and is the job idempotent?</li>
+<li>Are rate limits and counters enforced fleet-wide? What is the effective limit at the maximum instance count?</li>
+<li>Can version N and N+1 read each other's sessions, cache entries, messages and schema? Where is that tested?</li>
+<li>What is the per-server concurrency (Little's law at p99), and is the worker pool sized for it?</li>
+<li>Does N+1 hold per zone? How many servers survive a zone loss, and can they carry peak?</li>
+<li>What is the total database connection count at maximum fleet size, and what caps it?</li>
+<li>How does a new server warm up, and when does it start taking full traffic?</li>
+<li>Does shutdown stop accepting work, finish in-flight requests and exit within the grace period?</li>
+<li>Is any affinity left (stickiness, long-lived connections) that would stop new servers from taking load?</li>
+</ol>
+
+<h2 id=dd-horizontal-scaling-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"JWTs make the service stateless, so why not use them everywhere?"</summary>
+<p>They move the state to the client rather than removing it, and they give up instant revocation. A stolen or stale token stays valid until it expires. The usual compromise is short-lived access tokens with a refresh token checked against a store, so revocation takes effect within minutes. Tokens also grow with every claim, ride on every request, and require key rotation across all servers. They are a good fit for APIs and multi-region setups. A plain Redis session store is simpler when you need "log out everywhere" to be instant.</p>
+</details>
+
+<details>
+<summary>"You put a distributed lock around the cron. Is it now guaranteed to run once?"</summary>
+<p>No. A lease-based lock guarantees exclusion only while the holder is fast. A GC pause, VM freeze or partition longer than the lease lets a second holder in while the first still thinks it owns the lock. You make it safe with idempotent work, lease renewal that aborts on failure, and for writes, fencing tokens that the storage layer checks. "Exactly once" comes from idempotency plus at-least-once execution, not from the lock.</p>
+</details>
+
+<details>
+<summary>"Rolling deploys are zero-downtime. What can still go wrong?"</summary>
+<p>Mixed versions. For several minutes old and new code share sessions, caches, queues and the schema. If the new version writes a format the old one cannot read, the rollout causes errors that scale with its progress, and rollback repeats them. The fix is expand and contract: first ship a version that reads both formats, then switch writes, then remove the old path. The other risks are capacity during the surge and draining that is shorter than the longest request.</p>
+</details>
+
+<details>
+<summary>"You need 5 servers at peak. How many do you run?"</summary>
+<p>It depends on the failure domain. N+1 in one zone is 6. Across three zones, two zones must carry peak, so 3 per zone and 9 total, which runs at about 56% at peak. Then check what the per-zone balancing does with uneven counts, how many extra pods a rolling deploy surges, and whether auto-scaling can replace a lost zone's capacity fast enough to justify running fewer.</p>
+</details>
+
+<details>
+<summary>"We doubled the fleet and the database fell over. Why didn't the database scale too?"</summary>
+<p>Because opened connections scale with servers, not with work. 50 servers &times; 20 connections is 1,000 opened, while Little's law says perhaps 24 are actually busy. In Postgres each connection is a process, so 1,000 idle ones cost memory and scheduling. And they all arrive at once on scale-out. Put a transaction-mode pooler in front, budget connections per server from the fleet maximum, and rate-limit scale-out.</p>
+</details>
+
+<details>
+<summary>"Why might adding servers lower your cache hit ratio?"</summary>
+<p>Local caches see 1/N of the traffic each. A key requested 60 times a minute with a 60-second TTL is a 98% hit on one server and about a 55% hit on 50 servers, by &lambda;T / (1 + &lambda;T). The database then sees about 27x the queries for that key. The fixes: a shared second-level cache, routing by key with consistent hashing so each server owns a slice, or longer TTLs with explicit invalidation where staleness allows.</p>
+</details>
+
+<details>
+<summary>"The fleet scaled out but the old servers stay hot. What's going on?"</summary>
+<p>Affinity. Sticky sessions left on, or long-lived connections. HTTP/2 and gRPC clients hold a few connections and multiplex everything over them, and an L4 balancer places each connection once. New servers only receive new connections. Balance per request at L7, set a maximum connection age on the server side so clients reconnect, and look at request rate per instance rather than CPU to confirm.</p>
+</details>
+
+<details>
+<summary>"When is horizontal scaling the wrong unit and you'd use cells instead?"</summary>
+<p>When the shared stores become the limit or the blast radius. A fleet of stateless servers still shares one session store, one cache and one database. A bad deploy or a store failure hits every customer. Cells copy the whole stack and assign each customer to one cell, so a failure or a bad canary hits only that cell's share. The cost is a routing layer, harder cross-customer features and N copies to operate. That trade usually pays off for large multi-tenant SaaS, not for one store.</p>
+</details>

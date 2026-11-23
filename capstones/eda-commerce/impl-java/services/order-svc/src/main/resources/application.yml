@@ -1,0 +1,18 @@
+eda:
+  service-name: order-svc
+  db-context: order
+  consumer:
+    topics: [checkout.events.v1, inventory.events.v1, payment.events.v1, fulfilment.events.v1, shipping.events.v1]
+server:
+  port: 8103
+order:
+  saga:
+    stock-timeout: ${SAGA_STOCK_TIMEOUT:30s}
+    payment-timeout: ${SAGA_PAYMENT_TIMEOUT:180s}
+    commit-timeout: ${SAGA_COMMIT_TIMEOUT:30s}
+    fulfilment-ack-timeout: ${SAGA_FULFILMENT_ACK_TIMEOUT:600s}
+    fulfilment-max-resends: ${SAGA_FULFILMENT_MAX_RESENDS:3}
+    dispatch-timeout: ${SAGA_DISPATCH_TIMEOUT:24h}
+    capture-timeout: ${SAGA_CAPTURE_TIMEOUT:300s}
+    compensation-timeout: ${SAGA_COMPENSATION_TIMEOUT:60s}
+    sweep-interval: 5s

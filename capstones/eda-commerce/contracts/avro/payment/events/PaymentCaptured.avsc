@@ -1,0 +1,36 @@
+{
+  "type": "record",
+  "name": "PaymentCaptured",
+  "namespace": "com.edacommerce.payment",
+  "doc": "Reply to CapturePayment.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "paymentId",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": "com.edacommerce.common.Money"
+    },
+    {
+      "name": "pspReference",
+      "type": "string"
+    },
+    {
+      "name": "capturedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "envelope": {
+    "eventId": "113d9e06-048a-5847-9ee0-ea8a469f4c02",
+    "type": "com.edacommerce.shipping.ShipmentException",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "c42e4558-2ce7-5a6e-97a2-fae9053c6b35",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "shipping-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Shipment",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "shipmentId": "a909cff4-4af5-5e76-935d-45dd634389e1",
+  "direction": "OUTBOUND",
+  "code": "ADDRESS_ISSUE",
+  "detail": "example-detail",
+  "carrierEventId": "575e57f3-519c-5973-858a-13804c3f399c",
+  "raisedAt": 1795000000000
+}

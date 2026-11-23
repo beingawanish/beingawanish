@@ -1,0 +1,32 @@
+{
+  "type": "record",
+  "name": "OrderRequiresAttention",
+  "namespace": "com.edacommerce.order",
+  "doc": "The saga reached a state it cannot resolve on its own (for example capture failed after the parcel left). A human must act.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "sagaState",
+      "type": "string"
+    },
+    {
+      "name": "issue",
+      "type": "string"
+    },
+    {
+      "name": "raisedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

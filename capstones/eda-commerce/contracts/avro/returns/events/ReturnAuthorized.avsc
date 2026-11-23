@@ -1,0 +1,39 @@
+{
+  "type": "record",
+  "name": "ReturnAuthorized",
+  "namespace": "com.edacommerce.returns",
+  "doc": "The return passed policy checks. An RMA number exists.",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "returnId",
+      "type": "string"
+    },
+    {
+      "name": "rmaNumber",
+      "type": "string"
+    },
+    {
+      "name": "authorizedAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    },
+    {
+      "name": "parcelDueBy",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

@@ -1,0 +1,191 @@
+# uv workspace for the Python build of eda-commerce (docs/implementation-guide.md §2, §9).
+#
+#   uv sync                     install every member (editable) plus the dev tools
+#   uv run pytest               run the whole test suite
+#   uv run ruff check . && uv run mypy && uv run lint-imports
+#
+# Versions are pinned exactly (==). Bump them deliberately, run the full suite, and commit uv.lock.
+[project]
+name = "eda-commerce-python"
+version = "0.1.0"
+description = "Python build of the eda-commerce capstone (workspace root, not a package)"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "edacommon",
+    "contracts-py",
+    "catalog-svc",
+    "checkout-svc",
+    "order-svc",
+    "inventory-svc",
+    "payment-svc",
+    "fulfilment-svc",
+    "shipping-svc",
+    "notification-svc",
+    "returns-svc",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.2.0",
+    "hypothesis==6.170.17",
+    "respx==0.23.1",
+    "testcontainers[postgres,kafka,minio]==4.15.0",
+    "moto[s3]==5.2.5",
+    "jsonschema==4.26.0",
+    "referencing==0.37.0",
+    "pyyaml==6.0.4",
+    "ruff==0.17.6",
+    "mypy==2.4.1",
+    "import-linter==2.17",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["libs/*", "services/*"]
+
+[tool.uv.sources]
+edacommon = { workspace = true }
+contracts-py = { workspace = true }
+catalog-svc = { workspace = true }
+checkout-svc = { workspace = true }
+order-svc = { workspace = true }
+inventory-svc = { workspace = true }
+payment-svc = { workspace = true }
+fulfilment-svc = { workspace = true }
+shipping-svc = { workspace = true }
+notification-svc = { workspace = true }
+returns-svc = { workspace = true }
+
+# ------------------------------------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --import-mode=importlib"
+testpaths = ["libs", "services"]
+markers = [
+    "integration: needs Postgres/Kafka (Testcontainers, or EDA_TEST_* env vars); skipped cleanly when neither is available",
+    "kafka: needs a Kafka broker",
+    "slow: takes more than a few seconds",
+]
+filterwarnings = ["ignore::DeprecationWarning:testcontainers.*"]
+
+# --------------------------------------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 130
+target-version = "py313"
+extend-exclude = ["libs/contracts_py/src/contracts_py/_generated"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "S", "C4", "SIM", "RUF", "PL", "PT", "DTZ", "TID"]
+ignore = [
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004",  # state machines are long by nature
+    "S101",                                                 # asserts are fine in tests and invariants
+    "S608",                                                 # SQL is built from constants, never user input
+    "RUF012",
+    "PLC0415",                                              # lazy imports keep optional deps (boto3, uvicorn) off hot paths
+    "PLR0917",
+    "N818",                                                 # DomainError subclasses read better as NotFound, IdempotencyConflict
+    "N812",                                                 # `from contracts_py import records as R`
+    "PLW0603",                                              # uuid7 monotonic state; test container singletons
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S", "PLR", "N802", "DTZ", "PT018", "E501", "PT012", "RUF059"]
+"**/config.py" = ["S105"]
+"**/psp/fake/*.py" = ["S105"]                                # magic test tokens, not secrets
+
+# --------------------------------------------------------------------------------------------- mypy
+[tool.mypy]
+strict = true
+python_version = "3.13"
+mypy_path = [
+    "libs/edacommon/src", "libs/contracts_py/src",
+    "services/catalog_svc/src", "services/checkout_svc/src", "services/order_svc/src",
+    "services/inventory_svc/src", "services/payment_svc/src",
+    "services/fulfilment_svc/src", "services/shipping_svc/src", "services/notification_svc/src", "services/returns_svc/src",
+]
+files = [
+    "libs/edacommon/src", "libs/contracts_py/src",
+    "services/catalog_svc/src", "services/checkout_svc/src", "services/order_svc/src",
+    "services/inventory_svc/src", "services/payment_svc/src",
+    "services/fulfilment_svc/src", "services/shipping_svc/src", "services/notification_svc/src", "services/returns_svc/src",
+]
+explicit_package_bases = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["confluent_kafka.*", "fastavro.*", "boto3.*", "botocore.*", "fpdf.*", "testcontainers.*", "moto.*", "yaml", "jsonschema",
+          "docker", "opentelemetry.exporter.otlp.proto.http.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------------- import-linter
+# The dependency rule of guide §3: adapters > application > domain, and the domain imports nothing
+# but the standard library. One contract set per service; wave 2 services add their own block.
+[tool.importlinter]
+root_packages = [
+    "catalog_svc", "checkout_svc", "order_svc", "inventory_svc", "payment_svc",
+    "fulfilment_svc", "shipping_svc", "notification_svc", "returns_svc",
+    "edacommon", "contracts_py",
+]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Hexagonal layers (every service)"
+type = "layers"
+containers = [
+    "catalog_svc", "checkout_svc", "order_svc", "inventory_svc", "payment_svc",
+    "fulfilment_svc", "shipping_svc", "notification_svc", "returns_svc",
+]
+layers = ["adapters", "application", "domain"]
+exhaustive = false
+
+[[tool.importlinter.contracts]]
+name = "Domain is pure: no frameworks, no Avro, no SQL, no Kafka, no HTTP, no shared runtime"
+type = "forbidden"
+source_modules = [
+    "catalog_svc.domain", "checkout_svc.domain", "order_svc.domain", "inventory_svc.domain", "payment_svc.domain",
+    "fulfilment_svc.domain", "shipping_svc.domain", "notification_svc.domain", "returns_svc.domain",
+]
+forbidden_modules = [
+    "edacommon", "contracts_py", "sqlalchemy", "fastapi", "starlette", "pydantic", "confluent_kafka",
+    "fastavro", "httpx", "boto3", "opentelemetry", "structlog", "psycopg",
+]
+
+[[tool.importlinter.contracts]]
+name = "Application layer does not know frameworks or drivers"
+type = "forbidden"
+source_modules = [
+    "catalog_svc.application", "checkout_svc.application", "order_svc.application",
+    "inventory_svc.application", "payment_svc.application",
+    "fulfilment_svc.application", "shipping_svc.application", "notification_svc.application", "returns_svc.application",
+]
+forbidden_modules = ["fastapi", "starlette", "confluent_kafka", "httpx", "boto3", "psycopg"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Fakes are never imported by domain or application"
+type = "forbidden"
+source_modules = [
+    "payment_svc.domain", "payment_svc.application",
+]
+forbidden_modules = ["payment_svc.adapters"]
+
+[[tool.importlinter.contracts]]
+name = "Fakes are never imported by domain or application (wave 2)"
+type = "forbidden"
+source_modules = [
+    "fulfilment_svc.domain", "fulfilment_svc.application",
+    "shipping_svc.domain", "shipping_svc.application",
+    "notification_svc.domain", "notification_svc.application",
+    "returns_svc.domain", "returns_svc.application",
+]
+forbidden_modules = ["fulfilment_svc.adapters", "shipping_svc.adapters", "notification_svc.adapters", "returns_svc.adapters"]
+
+[[tool.importlinter.contracts]]
+name = "Shared library depends on no service"
+type = "forbidden"
+source_modules = ["edacommon", "contracts_py"]
+forbidden_modules = [
+    "catalog_svc", "checkout_svc", "order_svc", "inventory_svc", "payment_svc",
+    "fulfilment_svc", "shipping_svc", "notification_svc", "returns_svc",
+]

@@ -1,0 +1,53 @@
+{
+  "type": "record",
+  "name": "Address",
+  "namespace": "com.edacommerce.common",
+  "doc": "A postal address. Personal data: every field that uses this type is tagged pii=true.",
+  "fields": [
+    {
+      "name": "recipientName",
+      "type": "string"
+    },
+    {
+      "name": "line1",
+      "type": "string"
+    },
+    {
+      "name": "line2",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "city",
+      "type": "string"
+    },
+    {
+      "name": "region",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "postalCode",
+      "type": "string"
+    },
+    {
+      "name": "countryCode",
+      "type": "string",
+      "doc": "ISO 3166-1 alpha-2."
+    },
+    {
+      "name": "phone",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    }
+  ]
+}

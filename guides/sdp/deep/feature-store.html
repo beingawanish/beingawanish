@@ -1,0 +1,281 @@
+<h2 id=dd-feature-store-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's promise is "one definition, two execution paths, identical results." That sentence hides four pieces of machinery: a data model that names what a feature is keyed on, a point-in-time join that builds training sets, a streaming aggregator that keeps the online store current, and a write protocol that keeps the two from corrupting each other. Each one has a few knobs, and each knob is a place where skew can sneak back in.</p>
+
+<h3 id=dd-feature-store-data-model level=3>The data model: entities, feature views and timestamps</h3>
+<p>Every feature store, whatever it calls things, has the same three objects.</p>
+<ul>
+<li><strong>Entity.</strong> The thing a feature describes, with a join key: <code>card_id</code>, <code>user_id</code>, <code>merchant_id</code>. The entity is what both paths agree on. If serving normalizes <code>card_id</code> one way and training another way, nothing else matters.</li>
+<li><strong>Feature view</strong> (Feast's term; others say feature group or feature set). A group of features computed from one source, keyed on one or more entities, with a <strong>TTL</strong>: how old a value may be before it counts as missing. <code>card_velocity_1h</code>, <code>card_amount_sum_24h</code> and <code>card_distinct_merchants_24h</code> might share one view.</li>
+<li><strong>Feature row.</strong> One computed value set for one entity at one moment: <code>(card_id, event_timestamp, created_timestamp, values…)</code>. The two timestamps are different and both matter. <code>event_timestamp</code> is the moment the value describes. <code>created_timestamp</code> is when the pipeline wrote it.</li>
+</ul>
+<p>The offline store keeps <em>every</em> feature row: a long, append-only history, usually Parquet or warehouse tables partitioned by date. The online store keeps only the <em>latest</em> row per entity and view. That asymmetry is the whole design. Training needs history; serving needs the present, fast.</p>
+<p>In Feast, those objects are Python code that <code>feast apply</code> registers. Training calls <code>get_historical_features(entity_df=…, features=[…])</code>, serving calls <code>get_online_features(features=[…], entity_rows=[…])</code>, and <code>feast materialize</code> copies the latest offline rows into the online store. Tecton and the cloud feature stores have their own names for the same three calls. Learn the three calls and you can read any of them.</p>
+
+<h3 id=dd-feature-store-pit-join level=3>The point-in-time join, step by step</h3>
+<p>The training input is a <strong>label table</strong>, sometimes called the entity dataframe or spine: one row per example, with an entity key, a timestamp and a label. "Card 4411, 2026-03-14 10:05, fraud = 1." For each row and each feature view, the join must find the latest feature row stamped at or before 10:05. That row must also be younger than the view's TTL.</p>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-feature-store-svg-title dd-feature-store-svg-desc" viewBox="0 0 720 250" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-feature-store-svg-title">A point-in-time join for one training row</title>
+<desc id="dd-feature-store-svg-desc">A timeline for card 4411 from 09:00 to 10:30. Feature rows for card_velocity_1h land at 09:10 with value 2, 09:40 with value 5, and 10:20 with value 9. The label is at 10:05. The join looks backward from 10:05 within the TTL window and picks the 09:40 row with value 5. The 10:20 row is in the future and must not be used; joining it is leakage.</desc>
+<defs><marker id="dd-feature-store-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker></defs>
+<rect x="0" y="0" width="720" height="250" fill="#ffffff"/>
+<rect x="100" y="70" width="410" height="60" fill="#e4eef8" stroke="none"/>
+<text x="305" y="62" font-size="12" fill="#1f5f99" text-anchor="middle">TTL window: values older than this count as missing</text>
+<line x1="40" y1="130" x2="690" y2="130" stroke="#1c2430"/>
+<text x="40" y="152" font-size="12" fill="#5c6b7c">09:00</text>
+<text x="250" y="152" font-size="12" fill="#5c6b7c" text-anchor="middle">09:30</text>
+<text x="470" y="152" font-size="12" fill="#5c6b7c" text-anchor="middle">10:00</text>
+<text x="680" y="152" font-size="12" fill="#5c6b7c" text-anchor="end">10:30</text>
+<circle cx="113" cy="110" r="9" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="113" y="95" font-size="12" fill="#1c2430" text-anchor="middle">v=2</text>
+<circle cx="323" cy="110" r="9" fill="#e5f3ec" stroke="#7eae96" stroke-width="2"/>
+<text x="323" y="95" font-size="12" fill="#1c2430" text-anchor="middle">v=5</text>
+<circle cx="617" cy="110" r="9" fill="#f8ebee" stroke="#c898a4"/>
+<text x="617" y="95" font-size="12" fill="#1c2430" text-anchor="middle">v=9</text>
+<line x1="510" y1="60" x2="510" y2="200" stroke="#1f5f99" stroke-width="2" stroke-dasharray="5,4"/>
+<text x="510" y="218" font-size="13" fill="#1c2430" text-anchor="middle">label at 10:05 (fraud = 1)</text>
+<path d="M505,180 C450,190 360,190 328,124" fill="none" stroke="#1c2430" marker-end="url(#dd-feature-store-arrow)"/>
+<text x="420" y="200" font-size="12" fill="#1c2430" text-anchor="middle">as-of: latest row at or before 10:05</text>
+<text x="617" y="180" font-size="12" fill="#1c2430" text-anchor="middle">future row:</text>
+<text x="617" y="196" font-size="12" fill="#1c2430" text-anchor="middle">joining it = leakage</text>
+</svg>
+<figcaption>The training row gets v=5, the value a live request at 10:05 would have seen. A "latest value" join would hand it v=9, which already includes the fraud it is trying to predict.</figcaption>
+</figure>
+
+<p>In SQL, the classic form ranks candidate feature rows per label row and keeps the first:</p>
+<pre><code>SELECT * FROM (
+  SELECT l.card_id, l.ts, l.label, f.velocity_1h,
+         ROW_NUMBER() OVER (
+           PARTITION BY l.card_id, l.ts
+           ORDER BY f.event_ts DESC, f.created_ts DESC) AS rn
+  FROM labels l
+  LEFT JOIN card_features f
+    ON  f.card_id  = l.card_id
+    AND f.event_ts &lt;= l.ts
+    AND f.event_ts &gt;  l.ts - INTERVAL '2' HOUR      -- the view's TTL
+) WHERE rn = 1;</code></pre>
+<p>Warehouses with a native <code>ASOF JOIN</code> do the same thing with a sort-merge, which is much cheaper. The ranking version builds every candidate pair first. Two details in that query carry real weight.</p>
+<ul>
+<li><strong>The TTL bound.</strong> Without it, a card unused for a year would join a year-old velocity. Online, that value would have expired and the model would have seen the default. The TTL must be the same number in both paths, or you have built a new skew.</li>
+<li><strong>The <code>LEFT JOIN</code>.</strong> When no feature row qualifies, the row stays, with a NULL. What happens next must match serving exactly: the same default, the same "missing" indicator. Using an inner join instead silently drops the cards with no history. Those are often new cards, which are where fraud concentrates.</li>
+</ul>
+
+<h3 id=dd-feature-store-availability-time level=3>Event time versus availability time</h3>
+<p>Here is the subtle one. <code>event_ts &lt;= label_ts</code> is not quite the right condition. The right condition is "this value was <em>available to serving</em> at <code>label_ts</code>." Usually those agree. They come apart in two cases.</p>
+<ul>
+<li><strong>Late events.</strong> An order from 09:55 arrives at 10:30, after the network partition heals. The offline history now holds a feature row with <code>event_ts = 09:55</code>. A pure event-time join hands it to the 10:05 label. But the live system at 10:05 had not seen that order. The training set is a little more informed than production ever was.</li>
+<li><strong>Batch features.</strong> A nightly job computes <code>card_amount_sum_90d</code> as of midnight and lands it at 03:00. A label at 01:00 should see <em>yesterday's</em> value, because today's had not been written yet. Event time says otherwise.</li>
+</ul>
+<p>The fix is to join on availability: <code>created_ts &lt;= label_ts</code>, or to make <code>event_ts</code> itself mean "when serving could have had it" for batch features. This is a <strong>bitemporal</strong> view, the one <a href="#event-sourcing">Event Sourcing</a> gives you for free: what was true at time T, and what we <em>knew</em> at time T. Most leakage that survives a feature store lives in this gap.</p>
+
+<h3 id=dd-feature-store-windows level=3>Sliding windows in the online path</h3>
+<p><code>card_velocity_1h</code> is a sliding window: orders in the last 60 minutes, at any instant. Computing that exactly means keeping every event timestamp per card for an hour, and expiring each one precisely. Streaming engines (Flink, Spark Structured Streaming, Kafka Streams) offer sliding windows, but an exact per-event slide is expensive in state. So real systems approximate it with <strong>tiles</strong>: fixed sub-windows, such as sixty one-minute buckets per card. A read sums the buckets in range. The answer is exact to the bucket boundary, which here means it may include up to one minute of extra history.</p>
+<p>That approximation is fine. It becomes skew only if the offline path computes the exact window while the online path uses tiles. Define-once means the <em>tile size is part of the definition</em>, and both paths compute the same bucketed answer. A shared function makes that concrete:</p>
+<pre><code>BUCKET_S = 60          # part of the definition, shared by both paths
+WINDOW_BUCKETS = 60    # 60 x 1 min = 1 hour
+
+def bucket_of(ts: float) -&gt; int:
+    return int(ts // BUCKET_S)
+
+def velocity_1h(bucket_counts: dict[int, int], as_of: float) -&gt; int:
+    """Orders in the 60 one-minute buckets ending at as_of's bucket.
+    Online: bucket_counts is the card's live state.
+    Offline: bucket_counts is rebuilt from event history up to as_of."""
+    end = bucket_of(as_of)
+    return sum(bucket_counts.get(b, 0) for b in range(end - WINDOW_BUCKETS + 1, end + 1))</code></pre>
+<p>The online job updates <code>bucket_counts</code> per card as events arrive and evicts buckets older than the window. The offline job builds the same dictionary from history. The arithmetic is now one function. The lesson's platform does this through a definition language that compiles to SQL and a streaming topology. The principle is identical.</p>
+<p>The window's other knob is the <strong>watermark</strong>: how long the streaming job waits for late events before it treats a bucket as final. A 30-second watermark adds 30 seconds of potential delay to correctness, though not to freshness, because most engines emit early results and update them. Events later than the watermark are dropped online but present offline. That is precisely the late-event gap above. Join on availability, and the offline path drops them too.</p>
+
+<h3 id=dd-feature-store-write-protocol level=3>The online write protocol</h3>
+<p>Three writers touch the online store: the streaming job, the batch materializer and the occasional backfill. They must not overwrite each other blindly. The rule is a <strong>conditional upsert keyed on event time</strong>: write only if the incoming row is newer than the stored one.</p>
+<ul>
+<li>Store <code>event_ts</code> beside the values, per entity and view.</li>
+<li>Compare and write atomically. On Redis, a short Lua script does both in one step. On DynamoDB, a condition expression on the timestamp attribute does it. On Cassandra, a write timestamp set to the event time gives last-write-wins by event time.</li>
+<li>Make it idempotent. A replayed event from a stream restart re-applies the same bucket increment unless the job uses exactly-once state (Flink checkpoints with a transactional or idempotent sink). The lesson mentions <a href="#exactlyonce-semantics">exactly-once processing</a>; this is where it is spent.</li>
+</ul>
+<p>A typical layout on a Redis-class store is one hash per entity per view: key <code>fv:card_txn:4411</code>, fields for each feature plus <code>_ts</code>, and a key expiry equal to the view's TTL. The read for one inference is one pipelined round trip that fetches every view for every entity in the request.</p>
+
+<h3 id=dd-feature-store-logging level=3>Feature logging, the verification loop</h3>
+<p>Log-and-verify needs a specific record. At inference, the model server writes <code>(request_id, entity keys, as_of timestamp, feature name, version, value served)</code> to a topic, then to the offline store. A daily job takes a sample of those rows, recomputes each feature offline at the same <code>as_of</code>, and compares. The report is a mismatch rate per feature, with the worst examples attached. Two rules make it trustworthy.</p>
+<ul>
+<li><strong>Log what the model actually received</strong>, after defaults and type coercion, not what the store returned. The coercion step is a classic hiding place for skew.</li>
+<li><strong>Allow a tolerance per feature</strong>, set from its semantics. A tiled window may legitimately differ near bucket edges for a few seconds. "Zero drift" means zero <em>unexplained</em> drift.</li>
+</ul>
+<p>The same logs pay off a second time. They become the training set for the next model version. Training on served values is the one way to guarantee zero skew for the past, which is why the lesson kept log-and-wait as the verification layer.</p>
+
+<h2 id=dd-feature-store-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions for this section: 10M cards, 2M users, 400K merchants. 40 features in total, spread across card, user, merchant and device views. Order traffic averages 500 per second and peaks at 2,000. The model's feature budget is 10 ms at p99.</p>
+
+<h3 id=dd-feature-store-online-memory level=3>Online store memory</h3>
+<p>Raw values are small: 40 features at 8 bytes is 320 bytes. The store's overhead is not small. A hash per entity in Redis carries per-key and per-field costs. Small hashes use a compact encoding and large ones do not, and the exact bytes depend on version and configuration. A working estimate of 500 bytes to 1 KB per entity per view, all-in, is honest. Measure your own with a sample load.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>View</th><th>Entities</th><th>Est. bytes each</th><th>Total</th></tr></thead><tbody>
+<tr><td>Card transaction features</td><td>10M</td><td>~800 B</td><td>~8 GB</td></tr>
+<tr><td>User profile features</td><td>2M</td><td>~600 B</td><td>~1.2 GB</td></tr>
+<tr><td>Merchant features</td><td>400K</td><td>~600 B</td><td>~0.24 GB</td></tr>
+<tr><td>Window tiles (active cards only)</td><td>~1M active per hour</td><td>60 buckets x ~4 B + overhead ≈ 400 B</td><td>~0.4 GB</td></tr>
+<tr><td colspan=3><strong>Primary copy</strong></td><td><strong>~10 GB</strong></td></tr>
+<tr><td colspan=3>With one replica and 30% headroom</td><td>~26 GB</td></tr>
+</tbody></table></div></div>
+<p>That is a few modest shards. The lesson's "gigabytes of RAM, and that is fine" holds. What breaks the estimate is cardinality you forgot: a feature keyed on <code>(card, merchant)</code> pairs can have a hundred times more entities than either key alone. Always multiply out composite keys before approving a view.</p>
+
+<h3 id=dd-feature-store-write-rate level=3>Write rate</h3>
+<p>Each order updates the card view, the user view, the merchant view and the device view: four upserts. At the 2,000 orders per second peak, that is 8,000 writes per second, plus tile updates. A single Redis-class shard handles tens of thousands of simple operations per second or more, so this is comfortable on two or three shards. The trap is the batch materializer. A nightly job that pushes 10M rows in 20 minutes adds about 8,300 writes per second on top. Run it through a rate limiter, or it will crowd out the stream at the worst moment.</p>
+
+<h3 id=dd-feature-store-fanout-tail level=3>Read fan-out and the tail</h3>
+<p>One fraud score needs four entities: card, user, merchant, device. If the store keeps them on different shards, a request is four parallel reads, and its latency is the slowest of the four. Suppose each read has a p99 of 2 ms. The chance that all four come in under 2 ms is 0.99<sup>4</sup> ≈ 0.96. So 2 ms is now the request's p96, not its p99. The request's p99 lands near each read's p99.75, which on a busy shard can be 4–5 ms.</p>
+<p>Two consequences follow. First, budget the feature fetch against the per-read tail, not the median: 10 ms is plenty for four reads at a 2 ms p99, but tight for twelve. Second, every new entity you add to a model widens the fan-out. Ask for it in review. Co-locating a request's entities on one shard isn't possible in general, but pipelining and a single client-side deadline help.</p>
+
+<h3 id=dd-feature-store-freshness level=3>Freshness budget</h3>
+<p>The lesson quotes fresh within about 200 ms. Here is where those milliseconds go, as a plausible budget rather than a guarantee:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Step</th><th>Typical</th><th>What sets it</th></tr></thead><tbody>
+<tr><td>Commit to CDC event on the topic</td><td>20–100 ms</td><td>CDC connector poll interval and producer batching (<code>linger.ms</code>)</td></tr>
+<tr><td>Stream job consumes and updates state</td><td>10–50 ms</td><td>Consumer fetch settings and job parallelism</td></tr>
+<tr><td>Emit and upsert to the online store</td><td>5–50 ms</td><td>Sink batching; exactly-once sinks may wait for checkpoints</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>~50–200 ms</strong></td><td></td></tr>
+</tbody></table></div></div>
+<p>One line in that table can blow the budget: a transactional sink that only publishes on checkpoint. With a 10-second checkpoint interval, freshness becomes about 10 seconds. That is a direct trade between exactly-once and freshness. For a velocity feature, idempotent upserts with at-least-once delivery are usually the better choice, since a replayed bucket write with the same value is harmless.</p>
+
+<h3 id=dd-feature-store-backfill-math level=3>Backfill time</h3>
+<p>A new feature needs six months of history before anyone can train on it. Six months is about 15.6M seconds. At the 500 events per second average, that is roughly 7.8B events. A replay job that processes 200K events per second finishes in about 39,000 seconds, near 11 hours. At 50K events per second, it takes nearly two days.</p>
+<p>That number decides how teams work. An 11-hour backfill means "ship a feature, train tomorrow." A two-day backfill means people start skipping it and training on a shorter window, which quietly weakens the model. Two levers help: precompute daily tiles once and reuse them for every new aggregation over the same events, and backfill only the label timestamps you will actually train on rather than every moment in history.</p>
+
+<h3 id=dd-feature-store-cost level=3>Streaming versus batch, per feature</h3>
+<p>Streaming features cost a running job, state and on-call. A rough comparison for one feature view:</p>
+<ul>
+<li><strong>Streaming:</strong> a job running around the clock, sized for peak. Say four workers continuously.</li>
+<li><strong>Nightly batch:</strong> a warehouse job of perhaps 20 minutes, plus a materialization push.</li>
+</ul>
+<p>The lesson's "one tenth the cost" for batch is the right order of magnitude. The decision rule is the staleness budget: how much does a value's age move the model's score? Measure it. Take a trained model and replay validation data with features deliberately aged by 1 minute, 1 hour and 1 day. If AUC barely moves at 1 day, that feature belongs in batch.</p>
+
+<h2 id=dd-feature-store-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-feature-store-fm-availability-leak level=3>1. The leak that survived the feature store</h3>
+<p><strong>Symptom.</strong> A model trained through the platform's point-in-time join still beats production by a clear margin. Log-and-verify, run on live traffic, reports no drift.</p>
+<p><strong>Mechanism.</strong> The join uses event time. A batch view lands at 03:00 but is stamped midnight, and late events are stamped with their original time. Training rows between midnight and 03:00 see values serving could not have had. Log-and-verify did not catch it, because it compares served values against offline recomputation for <em>live</em> requests. It never examines how training sets were built.</p>
+<p><strong>Detect.</strong> Compare a training set built from feature logs against one built by the point-in-time join, for the same label rows. Any systematic difference is leakage or skew. Also check <code>created_ts - event_ts</code> per view; a large lag means event time is lying about availability.</p>
+<p><strong>Fix.</strong> Join on availability time, as in the mechanism section. Stamp batch outputs with the time they become servable.</p>
+
+<h3 id=dd-feature-store-fm-backfill-clobber level=3>2. The backfill that rewound production</h3>
+<p><strong>Symptom.</strong> Right after a backfill job finishes, the fraud model's block rate drops. Velocity values in the online store look low for active cards.</p>
+<p><strong>Mechanism.</strong> The backfill computed history and then "helpfully" materialized its final state into the online store with plain <code>SET</code>s. Its view of the world ended when the job started, hours ago. It overwrote fresher values from the streaming job. Every active card now looks hours quieter than it is, until the stream overwrites each key again.</p>
+<p><strong>Detect.</strong> The online-store age metric (now minus the stored <code>event_ts</code>) jumps for many keys at once. Feature distribution monitoring shows velocity's mean falling in a step.</p>
+<p><strong>Fix.</strong> Conditional upserts that refuse older rows, on every writer. And by policy, backfills write to the offline store only. The online store is filled by the stream and by a materializer that respects timestamps.</p>
+
+<h3 id=dd-feature-store-fm-stale level=3>3. Stale features, served as fresh</h3>
+<p><strong>Symptom.</strong> Fraud gets through during a 40-minute window. Nothing errored.</p>
+<p><strong>Mechanism.</strong> The streaming job fell behind after a rebalance, and its consumer lag grew to 35 minutes. The online store kept serving the last values it had, and the key TTL was 2 hours, so nothing expired. A card on a spree looked like it had placed two orders in the past hour, because the store had not heard about the rest.</p>
+<p><strong>Detect.</strong> Two metrics, both cheap. Consumer lag on the feature job's topic. And feature age at read time, sampled in the model server: <code>now - event_ts</code> per view, as a histogram. Alert when p50 age exceeds the view's freshness SLO.</p>
+<p><strong>Fix.</strong> Make staleness visible to the decision. The model server can check age, and above a threshold it treats the feature as missing or falls back to stricter rules. This is <a href="#graceful-degradation">graceful degradation</a> for features. Some teams also add "seconds since last update" as an input during training, so the model learns how much to trust a value.</p>
+
+<h3 id=dd-feature-store-fm-defaults level=3>4. Missing means different things in each path</h3>
+<p><strong>Symptom.</strong> New customers are declined far more often than in offline tests.</p>
+<p><strong>Mechanism.</strong> For a card with no history, the online store returns nothing, and the client fills <code>0.0</code>. In training, the warehouse join left a NULL, and the training framework's preprocessing replaced NULLs with the column mean. The model learned "mean velocity" for unknown cards. It now gets zero, which in its world means something specific and unusual.</p>
+<p><strong>Detect.</strong> Compare null and default rates per feature at serving against the training-set profile. Feature logging shows the value the model actually received.</p>
+<p><strong>Fix.</strong> The default belongs to the feature definition, not to either client. Emit an explicit "is missing" indicator as its own feature if missingness carries signal, which for new cards it usually does.</p>
+
+<h3 id=dd-feature-store-fm-key-mismatch level=3>5. The join key that does not join</h3>
+<p><strong>Symptom.</strong> After a payments-service migration, one model's online hit rate (fraction of reads that find a row) drops from 99% to 3%. The model keeps scoring, on defaults.</p>
+<p><strong>Mechanism.</strong> The new service sends card tokens in a different format: a new prefix, or a hash with a different salt. The stream job still writes under the old format, because it reads from CDC on the old table. The keys no longer meet.</p>
+<p><strong>Detect.</strong> Online hit rate per view, as a first-class metric with an alert. A sudden drop is almost always a key problem, not a data problem.</p>
+<p><strong>Fix.</strong> Normalize entity keys in one place, owned by the platform, and treat the key format as part of the entity's contract. A canary check that fetches features for a few known entities after every deploy catches it in minutes.</p>
+
+<h3 id=dd-feature-store-fm-hot-key level=3>6. The hot merchant</h3>
+<p><strong>Symptom.</strong> p99 feature latency climbs during a flash sale. One shard's CPU sits at 100% while the rest idle.</p>
+<p><strong>Mechanism.</strong> One merchant receives 30% of all orders. Every order reads its merchant features and writes its tile updates to the same key, so one shard serves all of it. This is the hot-key problem from <a href="#sharding">Sharding</a>, inside your feature store.</p>
+<p><strong>Detect.</strong> Per-shard operation rate and the store's hot-key tooling (Redis has one, with suitable eviction settings). Latency by entity type: merchant reads slow while card reads stay fine.</p>
+<p><strong>Fix.</strong> For reads, a tiny in-process cache in the model server with a one-second TTL. A merchant's 24-hour aggregates do not change meaningfully in a second. For writes, pre-aggregate in the stream job and flush the merchant's tiles once a second, instead of on every order.</p>
+
+<h3 id=dd-feature-store-fm-tile-edge level=3>7. Skew at the window's edge</h3>
+<p><strong>Symptom.</strong> Log-and-verify reports a 4% mismatch on <code>card_velocity_1h</code>, all small, clustered near bucket boundaries.</p>
+<p><strong>Mechanism.</strong> The online path uses one-minute tiles; the offline compiler computes an exact sliding hour. Or the two use the same tiles, but the online path assigns events by arrival time while the offline path uses event time. Both are "the same definition" in name only.</p>
+<p><strong>Detect.</strong> Exactly the report you have. Group mismatches by the seconds past the bucket boundary, and the pattern shows itself.</p>
+<p><strong>Fix.</strong> Put the tile size and the time semantics in the definition, and compile both paths from it. If the platform cannot express that, write the window function once in a shared library, as in the snippet above.</p>
+
+<h2 id=dd-feature-store-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-feature-store-choose-compute level=3>Where each feature is computed</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th></th><th>Batch, materialized</th><th>Streaming</th><th>On-demand (request time)</th><th>Logged at serving</th></tr></thead><tbody>
+<tr><td>Freshness</td><td>Hours to a day</td><td>Sub-second to seconds</td><td>Exact, current request</td><td>Whatever serving computed</td></tr>
+<tr><td>Serving latency</td><td>One store read</td><td>One store read</td><td>Compute cost in the request</td><td>Not a source; a record</td></tr>
+<tr><td>Running cost</td><td>Low</td><td>High: a job around the clock</td><td>Model-server CPU</td><td>Log storage</td></tr>
+<tr><td>Training data</td><td>Point-in-time join</td><td>Point-in-time join over stream output</td><td>Same function over logged request payloads</td><td>The logs themselves</td></tr>
+<tr><td>New feature needs</td><td>Backfill query</td><td>Replay history</td><td>Logged request history, or nothing to train on</td><td>Months of waiting</td></tr>
+<tr><td>Best for</td><td>90-day aggregates, profiles</td><td>Velocity, session counts</td><td>Text length, hour of day, distance from home</td><td>Verification, and training the next version</td></tr>
+</tbody></table></div></div>
+<p>On-demand features deserve a word. "Distance between the shipping address and the card's home" combines a request field with a stored feature. Compute it in the model server from one function, and for training, run the same function over logged requests joined to point-in-time features. Feast calls these on-demand feature views. The trap is the training side: if the raw request fields were not logged, you cannot reconstruct the feature for history.</p>
+
+<h3 id=dd-feature-store-choose-store level=3>The online store</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th></th><th>Redis-class, in memory</th><th>DynamoDB / Cassandra / Bigtable-class</th><th>Embedded in the model server</th></tr></thead><tbody>
+<tr><td>Read latency</td><td>Sub-millisecond to low ms</td><td>Single-digit ms</td><td>Microseconds</td></tr>
+<tr><td>Cost at 100s of GB</td><td>High: RAM</td><td>Moderate: disk-backed</td><td>RAM on every server</td></tr>
+<tr><td>Conditional writes</td><td>Lua script or transaction</td><td>Condition expressions / write timestamps</td><td>Your code</td></tr>
+<tr><td>Fits</td><td>Tight budgets, moderate data</td><td>Large entity counts, multi-region</td><td>Small, slow-changing tables (merchant categories)</td></tr>
+</tbody></table></div></div>
+<p>Start with whichever store your team already runs well. The difference between 1 ms and 4 ms matters only if your feature budget is tight and your fan-out is wide. A disk-backed store is usually right once the data passes the size where RAM gets expensive, or once you need writes in more than one region.</p>
+
+<h3 id=dd-feature-store-choose-build level=3>Build, buy or library</h3>
+<ul>
+<li><strong>Shared library plus logging.</strong> One team, a dozen features, one model. Write the feature functions once in a module that both the training pipeline and the server import. Add feature logging and a verification job. This covers what most teams actually need, as the lesson says.</li>
+<li><strong>Open-source framework</strong> (Feast and similar). Gives you the registry, the point-in-time join and materialization. You still run the streaming jobs and the stores. Good when you have several teams and a platform owner.</li>
+<li><strong>Managed platform</strong> (Tecton or a cloud provider's feature store). Adds the compiler from one definition to both paths, managed streaming, monitoring. You pay in money and lock-in, and the definition language sets limits.</li>
+</ul>
+<p>The real decision is who owns the definition-to-execution compiler. If no product compiles your definitions to both paths, then your team does, by hand, through a shared library. That's fine. Just do not leave it to each model team.</p>
+
+<h2 id=dd-feature-store-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>For each feature, is there exactly one definition, and can you show the code path from it to both the training set and the online value?</li>
+<li>Does the training join use availability time (when serving could have had the value), not just event time? How are batch features stamped?</li>
+<li>Is the TTL the same in the offline join and the online store, per view?</li>
+<li>Where is the default for a missing value defined, and do both paths apply it identically? Is missingness itself a feature?</li>
+<li>Do all online writers use conditional, event-time-ordered upserts? Can a backfill ever write to the online store?</li>
+<li>What is the freshness SLO per view, and which metric (feature age at read, consumer lag) alerts when it is broken?</li>
+<li>What is the feature fetch's fan-out per request, and is the latency budget set against the per-read p99, not the median?</li>
+<li>Have composite-key views been sized by multiplying out their real cardinality?</li>
+<li>Is there feature logging of the values the model actually received, and a verification job with per-feature tolerances?</li>
+<li>Is there distribution monitoring (mean, percentiles, null rate) against the training profile, to catch upstream meaning changes?</li>
+<li>How long does a backfill take for a new feature, and what stops teams from skipping it?</li>
+<li>Are feature versions immutable, and do models pin them?</li>
+</ol>
+
+<h2 id=dd-feature-store-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"Your point-in-time join is correct on event time. Can it still leak?"</summary>
+<p>Yes, through the gap between event time and availability time. A late event stamped 09:55 that arrived at 10:30 is visible to a 10:05 training row, though serving never saw it. A nightly aggregate stamped midnight but written at 03:00 is visible to labels at 01:00. Join on when the value became servable (a created or ingestion timestamp), or stamp batch outputs with their landing time. Then check: training sets built from feature logs and from the join should match for the same rows.</p>
+</details>
+
+<details>
+<summary>"Why not just train on logged serving features and skip the offline path?"</summary>
+<p>Because a new feature has no logs, and a fixed serving bug leaves bad values in the logs forever. Logged features give perfect consistency for the past and nothing for the future. The offline path is what lets you try a feature today against six months of history. Keep logs as the verification layer and as training data for retrains of an existing feature set.</p>
+</details>
+
+<details>
+<summary>"The streaming job is down for 30 minutes. What does the model see, and what should it see?"</summary>
+<p>By default it sees the last value written, which ages silently. Velocity features say a card has been quiet when it has not. It should see a value it can judge: the server checks feature age and, past the view's freshness bound, marks the feature missing so the model or a rules fallback handles it. Then the job restarts from its checkpoint, replays the gap, and conditional upserts make sure the replay never overwrites anything newer.</p>
+</details>
+
+<details>
+<summary>"How do you compute a 1-hour sliding window cheaply for 10 million cards?"</summary>
+<p>Tiles. Keep sixty one-minute counters per active card, sum them at read time or keep a running sum, and evict counters older than the window. State is a few hundred bytes per active card, not one entry per event. The answer is exact to the minute boundary. That approximation must be in the definition, so the offline path computes the same bucketed count. Otherwise you have built skew at the window edge.</p>
+</details>
+
+<details>
+<summary>"A model needs features for card, user, merchant and device. The read p99 per entity is 2 ms. What is the request's p99?"</summary>
+<p>Higher than 2 ms. With four independent parallel reads, all four finish under their p99 only 0.99<sup>4</sup>, about 96%, of the time. The request's p99 is roughly each read's p99.75. Budget for that, pipeline the reads, set one deadline across them, and push back on every entity a new model adds.</p>
+</details>
+
+<details>
+<summary>"Feature distribution monitoring alerts: the mean of order_total dropped 8% overnight. Is that skew?"</summary>
+<p>Not necessarily. Skew is the two paths disagreeing; this could be a real-world shift (a sale), an upstream meaning change (shipping now excluded), or a pipeline bug. Check in order. Does log-and-verify still agree? If not, it is skew in your platform. Did any upstream schema or service change ship? Then it is a meaning change, which calls for a new feature version. Does the shift appear in raw events too? Then it is probably the world, and you consider retraining. The alert is the start of a diagnosis, not the answer.</p>
+</details>
+
+<details>
+<summary>"When would you not put a feature in the online store at all?"</summary>
+<p>When it can be computed from the request itself (text length, hour of day), compute it in the model server from one shared function. When it changes rarely and the table is small (merchant category), embed it in the server and refresh it periodically. When the model only scores in batch, skip the online path entirely. The online store is for values that need history and must be fresh at request time.</p>
+</details>
+
+<details>
+<summary>"A team wants to change how card_velocity_1h handles refunds. How do you ship that?"</summary>
+<p>As a new version, not an edit. <code>card_velocity_1h_v2</code> gets its own definition, a backfill, and its own online rows. Models trained on v1 keep reading v1 until they are retrained and validated on v2. Then v1 is retired once nothing pins it. Editing in place changes the input under a model trained on the old meaning. That is the lesson's Q3 incident, self-inflicted.</p>
+</details>

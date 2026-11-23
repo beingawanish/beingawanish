@@ -1,0 +1,12 @@
+{
+  "type": "enum",
+  "name": "ShipmentDirection",
+  "namespace": "com.edacommerce.common",
+  "doc": "Whether a shipment goes to the customer or back to the warehouse. UNKNOWN is the reader default so that new symbols added by a producer do not break old consumers.",
+  "symbols": [
+    "OUTBOUND",
+    "RETURN",
+    "UNKNOWN"
+  ],
+  "default": "UNKNOWN"
+}

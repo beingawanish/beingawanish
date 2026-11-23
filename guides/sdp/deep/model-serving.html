@@ -1,0 +1,252 @@
+<h2 id=dd-model-serving-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson explains why batching works: weights stream once per step, so more requests per step means more tokens per byte moved. This section opens the engine. It covers the arithmetic that says where "memory-bound" turns into "compute-bound," the memory layout that decides how many requests fit, and the scheduler loop that decides which ones run. It also names the configuration knobs that control each.</p>
+
+<h3 id=dd-model-serving-two-phases level=3>Two phases, two bottlenecks</h3>
+<p>Every LLM request runs in two phases with opposite characters.</p>
+<ul>
+<li><strong>Prefill</strong> processes the whole prompt in one pass. A 1,200-token prompt is 1,200 tokens of matrix multiplication against the same weights, all at once. That is a lot of arithmetic per byte of weights loaded, so prefill is <strong>compute-bound</strong>. Its output is the KV cache for the prompt and the first generated token. Prefill time is most of TTFT.</li>
+<li><strong>Decode</strong> generates one token per step per request. Each step multiplies one token's activations by every weight. That is very little arithmetic per byte loaded, so decode is <strong>bandwidth-bound</strong>. Decode time per token is called TPOT (time per output token) or inter-token latency.</li>
+</ul>
+<p>A useful way to see the boundary is <strong>arithmetic intensity</strong>: FLOPs done per byte moved from memory. A forward pass for one token costs about 2 FLOPs per parameter. With 16-bit weights, each parameter is 2 bytes. So one token per step does about 1 FLOP per byte of weights. A batch of <em>B</em> decode tokens does about <em>B</em> FLOPs per byte, because the weights are shared.</p>
+<p>An A100-class GPU offers on the order of 300 TFLOPS of dense 16-bit compute and about 2 TB/s of memory bandwidth. Divide one by the other and the chip balances at roughly 150 FLOPs per byte. Below that, memory is the limit. Above it, compute is. So for the weight-multiplication part of decode, batches up to around 100–150 ride almost free. That is the precise version of "batch-32 is barely slower than batch-1." The real crossover comes earlier, for a reason the next section explains: the KV cache.</p>
+
+<h3 id=dd-model-serving-kv-cache level=3>The KV cache: what it is and how big</h3>
+<p>Attention needs every earlier token's key and value vectors, at every layer. Recomputing them each step would make generation quadratic, so the engine stores them. That store is the KV cache. Its size per token is:</p>
+<pre><code>bytes per token = 2 (K and V) x layers x kv_heads x head_dim x bytes_per_value</code></pre>
+<p>For a 7B model in the Llama-2 shape (32 layers, 32 KV heads, head dimension 128, 16-bit values), that is 2 x 32 x 32 x 128 x 2 = 524,288 bytes. Half a megabyte <em>per token</em>. A 1,600-token conversation holds 800 MB of KV cache. Models with <strong>grouped-query attention</strong> (GQA) share each KV head across several query heads. An 8B model with 8 KV heads instead of 32 needs a quarter of that: 128 KB per token. Architecture choices like this move serving cost as much as any engine setting.</p>
+<p>KV cache also costs bandwidth. Every decode step reads each active request's whole cache. At large batches, those reads outgrow the weight reads, and decode stays bandwidth-bound well past the batch size the weight arithmetic alone predicts. The sizing section works through the numbers.</p>
+
+<h3 id=dd-model-serving-paged level=3>Paged KV memory</h3>
+<p>Before paging, engines reserved one contiguous slab per request, sized for the maximum possible length. A request allowed 4,096 tokens that stopped at 300 wasted over 90% of its slab. PagedAttention, introduced by vLLM, borrows the operating system's answer.</p>
+<ul>
+<li>The KV pool is cut into fixed <strong>blocks</strong>, each holding a small number of tokens (16 by default in vLLM, set by <code>block_size</code>).</li>
+<li>Each sequence has a <strong>block table</strong> mapping its logical token positions to physical blocks, which can be anywhere in the pool.</li>
+<li>Blocks are allocated as tokens are generated. Waste is limited to the partly filled last block of each sequence.</li>
+<li>Blocks can be <strong>shared</strong>. Two sequences with the same prefix (the same system prompt, or parallel samples of one prompt) point at the same physical blocks, with copy-on-write when they diverge. <strong>Prefix caching</strong> extends this across requests: the engine hashes full blocks of prompt tokens, so a later request with the same system prompt reuses them and skips that part of prefill.</li>
+</ul>
+
+<figure class="diagram">
+<svg role="img" aria-labelledby="dd-model-serving-svg-title dd-model-serving-svg-desc" viewBox="0 0 720 260" width="100%" style="max-width:720px;font-family:'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="dd-model-serving-svg-title">How an 80 GB GPU's memory is spent when serving a 7B model</title>
+<desc id="dd-model-serving-svg-desc">A bar representing 80 GB. The engine claims 90 percent, 72 GB. Of that, about 14 GB holds the 16-bit weights, about 4 GB holds activations and runtime overhead, and about 54 GB is the KV block pool. The remaining 8 GB is left unclaimed. Below, the KV pool is shown as blocks of 16 tokens. Request A holds three blocks, request B holds two, and requests C and D share one prefix block for a common system prompt.</desc>
+<rect x="0" y="0" width="720" height="260" fill="#ffffff"/>
+<rect x="20" y="40" width="126" height="50" fill="#e4eef8" stroke="#7ea4c8"/>
+<text x="83" y="62" font-size="13" fill="#1c2430" text-anchor="middle">Weights</text>
+<text x="83" y="80" font-size="12" fill="#5c6b7c" text-anchor="middle">~14 GB</text>
+<rect x="146" y="40" width="36" height="50" fill="#f8ebee" stroke="#c898a4"/>
+<text x="164" y="106" font-size="11" fill="#5c6b7c" text-anchor="middle">~4 GB</text>
+<text x="164" y="120" font-size="11" fill="#5c6b7c" text-anchor="middle">overhead</text>
+<rect x="182" y="40" width="486" height="50" fill="#e5f3ec" stroke="#7eae96" stroke-width="2"/>
+<text x="425" y="62" font-size="13" fill="#1c2430" text-anchor="middle">KV block pool</text>
+<text x="425" y="80" font-size="12" fill="#5c6b7c" text-anchor="middle">~54 GB: everything left inside the 90% claim</text>
+<rect x="668" y="40" width="32" height="50" fill="#ffffff" stroke="#5c6b7c" stroke-dasharray="4,3"/>
+<text x="684" y="106" font-size="11" fill="#5c6b7c" text-anchor="middle">10%</text>
+<text x="20" y="28" font-size="12" fill="#1c2430">80 GB GPU, gpu_memory_utilization = 0.9</text>
+<g font-size="11" fill="#1c2430" text-anchor="middle">
+<rect x="182" y="160" width="54" height="34" fill="#e4eef8" stroke="#1f5f99"/><text x="209" y="181">A0</text>
+<rect x="240" y="160" width="54" height="34" fill="#e5f3ec" stroke="#7eae96"/><text x="267" y="181">B0</text>
+<rect x="298" y="160" width="54" height="34" fill="#e4eef8" stroke="#1f5f99"/><text x="325" y="181">A1</text>
+<rect x="356" y="160" width="54" height="34" fill="#f8ebee" stroke="#c898a4" stroke-width="2"/><text x="383" y="181">C+D prefix</text>
+<rect x="414" y="160" width="54" height="34" fill="#e5f3ec" stroke="#7eae96"/><text x="441" y="181">B1</text>
+<rect x="472" y="160" width="54" height="34" fill="#e4eef8" stroke="#1f5f99"/><text x="499" y="181">A2</text>
+<rect x="530" y="160" width="54" height="34" fill="#ffffff" stroke="#5c6b7c"/><text x="557" y="181">free</text>
+<rect x="588" y="160" width="54" height="34" fill="#ffffff" stroke="#5c6b7c"/><text x="615" y="181">free</text>
+</g>
+<text x="20" y="182" font-size="12" fill="#1c2430">Blocks of 16 tokens:</text>
+<text x="182" y="220" font-size="12" fill="#5c6b7c">Each request's block table points at blocks anywhere in the pool. Shared prefixes are stored once.</text>
+</svg>
+<figcaption>Whatever the weights and overhead leave behind becomes KV blocks. The pool's size, divided by KV bytes per token, is how many tokens of context the GPU can hold at once.</figcaption>
+</figure>
+
+<h3 id=dd-model-serving-scheduler level=3>The continuous-batching scheduler loop</h3>
+<p>An engine like vLLM runs a loop. Each iteration is one forward pass, and before each one the scheduler decides what goes in:</p>
+<ol>
+<li><strong>Keep the running set.</strong> Every running sequence needs one more token. If any of them needs a new KV block and none is free, the scheduler <strong>preempts</strong> the most recently admitted sequence. It either frees the sequence's blocks and recomputes them later, or swaps them to CPU memory. Recompute is the common default.</li>
+<li><strong>Admit from the waiting queue</strong>, first come first served, while three limits hold: free KV blocks for the new prompt, the cap on concurrent sequences (<code>max_num_seqs</code>), and the per-step token budget (<code>max_num_batched_tokens</code>).</li>
+<li><strong>Run the step.</strong> Decode tokens for running sequences and prompt tokens for newly admitted ones go into one batch.</li>
+<li><strong>Retire finished sequences</strong> (stop token, stop string, or <code>max_tokens</code> reached) and free their blocks at once. Streamed tokens go back to clients as they are produced.</li>
+</ol>
+<p>With <strong>chunked prefill</strong>, step 2 can admit part of a long prompt. A 30,000-token prompt is fed in pieces that fit the remaining token budget, interleaved with everyone else's decodes. That is the lesson's Q3 fix. Whether it is on by default has varied across vLLM versions and settings, so check yours.</p>
+
+<h3 id=dd-model-serving-knobs level=3>The knobs that matter</h3>
+<p>These are vLLM's names. TGI, TensorRT-LLM and SGLang have equivalents. Defaults change between releases, so treat any number here as a starting point and read your version's documentation.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Knob</th><th>What it controls</th><th>Raise it and you get</th><th>And you pay</th></tr></thead><tbody>
+<tr><td><code>gpu_memory_utilization</code></td><td>Fraction of GPU memory the engine claims (0.9 is a common default)</td><td>A bigger KV pool, more concurrency</td><td>Out-of-memory risk if anything else shares the GPU</td></tr>
+<tr><td><code>max_model_len</code></td><td>Longest prompt plus output allowed</td><td>Long documents accepted</td><td>One request can occupy a large share of the pool</td></tr>
+<tr><td><code>max_num_seqs</code></td><td>Most sequences running at once</td><td>Throughput</td><td>Slower TPOT for everyone; more preemption when memory is tight</td></tr>
+<tr><td><code>max_num_batched_tokens</code></td><td>Tokens processed in one step</td><td>Faster prefill, better TTFT under load</td><td>Longer steps, so decode stutters while big prefills run</td></tr>
+<tr><td><code>enable_chunked_prefill</code></td><td>Splitting long prompts across steps</td><td>Steady TPOT despite long prompts</td><td>Slightly slower TTFT for the long prompt itself</td></tr>
+<tr><td><code>enable_prefix_caching</code></td><td>Reusing KV blocks for repeated prefixes</td><td>Much faster TTFT for shared system prompts</td><td>Little, unless prefixes never repeat; makes routing matter</td></tr>
+<tr><td><code>tensor_parallel_size</code></td><td>GPUs one model copy is split across</td><td>Fits bigger models; lower latency per token</td><td>Cross-GPU communication every layer; needs fast interconnect</td></tr>
+</tbody></table></div></div>
+
+<h3 id=dd-model-serving-dynamic level=3>Dynamic batching for fixed-shape models</h3>
+<p>For the embeddings endpoint, the mechanism is much simpler. A request queue, a timer and a size cap. Triton's model configuration states it directly:</p>
+<pre><code>max_batch_size: 64
+dynamic_batching {
+  preferred_batch_size: [ 16, 32 ]
+  max_queue_delay_microseconds: 5000
+}
+instance_group [ { count: 2, kind: KIND_GPU } ]</code></pre>
+<p>The server launches a batch as soon as it can form a preferred size, or when the oldest request has waited 5 ms. Two model instances on the GPU let one batch run while the next forms. The one subtlety is padding. If inputs vary in length (texts of 20 and 500 tokens), a batch pads everything to its longest member. Sorting or bucketing by length before batching can recover a large share of wasted compute, and the cost is a little added queueing delay.</p>
+
+<h2 id=dd-model-serving-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>Assumptions: a 7B model in 16-bit (about 14 GB of weights), the Llama-2 shape (0.5 MB of KV per token), one 80 GB A100-class GPU with about 2 TB/s of bandwidth and about 300 TFLOPS of dense 16-bit compute. Real kernels reach perhaps 60–80% of peak bandwidth, so real numbers land below these ceilings. The point is the shape of the curve, which holds.</p>
+
+<h3 id=dd-model-serving-kv-capacity level=3>How many conversations fit</h3>
+<p>With <code>gpu_memory_utilization = 0.9</code>, the engine claims 72 GB. Weights take 14 GB. Activations, CUDA graphs and runtime overhead take a few more; call it 4 GB. That leaves about 54 GB for the KV pool.</p>
+<ul>
+<li>54 GB / 0.5 MB per token ≈ 108,000 tokens of context, across all running requests.</li>
+<li>An average support conversation at generation time holds 1,200 prompt tokens plus up to 400 output tokens, so about 1,600 tokens.</li>
+<li>108,000 / 1,600 ≈ 67 concurrent conversations.</li>
+</ul>
+<p>That is where the lesson's "batch around 64" comes from. The ceiling is memory, not compute. With a GQA model at 128 KB per token, the same pool holds about 430,000 tokens, around 270 conversations. Then the limit moves to latency.</p>
+
+<h3 id=dd-model-serving-step-time level=3>Step time, throughput and per-user pace</h3>
+<p>Decode step time is roughly the bytes read divided by bandwidth: the weights once, plus every running sequence's KV cache. Assume 1,000 tokens of context per sequence on average during decode.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Batch</th><th>Bytes per step</th><th>Step time at 2 TB/s</th><th>Total tokens/s</th><th>Tokens/s per user</th></tr></thead><tbody>
+<tr><td>1</td><td>14 + 0.5 GB</td><td>~7 ms</td><td>~140</td><td>~140</td></tr>
+<tr><td>16</td><td>14 + 8 GB</td><td>~11 ms</td><td>~1,450</td><td>~90</td></tr>
+<tr><td>64</td><td>14 + 32 GB</td><td>~23 ms</td><td>~2,780</td><td>~43</td></tr>
+<tr><td>128</td><td>14 + 64 GB</td><td colspan=3>Does not fit: needs ~128,000 tokens of KV, pool holds ~108,000</td></tr>
+<tr><td>128, GQA (128 KB/token)</td><td>14 + 16 GB</td><td>~15 ms</td><td>~8,500</td><td>~67</td></tr>
+</tbody></table></div></div>
+<p>Three things come out of this table.</p>
+<p>First, batch 64 lands at about 2,800 tokens per second, which matches the lesson's 2,500–3,000. Second, per-user pace falls from 140 to 43 tokens per second. People read at perhaps 5–10 tokens per second, so 43 is still comfortably faster than reading. That is why the lesson can say pace is "roughly unchanged" from the user's point of view. Third, at batch 64 the KV reads (32 GB) already outweigh the weights (14 GB). The cache, not the weights, now sets the cost of each extra request.</p>
+<p>A note on the incident's 50 tokens per second at batch 1: the bandwidth ceiling is about 140. Plain framework serving loses the difference to kernel launches, Python overhead and unoptimized attention. Engines close much of that gap even at batch 1, which is part of why "use vLLM-class engines" is the advice.</p>
+<p>Compute check at GQA batch 128: 128 tokens x 14 GFLOPs each ≈ 1.8 TFLOPs per step, about 6 ms at 300 TFLOPS. The step is 15 ms. Still bandwidth-bound, as the arithmetic-intensity argument predicted.</p>
+
+<h3 id=dd-model-serving-tpot-slo level=3>Picking the batch cap from a latency target</h3>
+<p>Don't set <code>max_num_seqs</code> from throughput alone. Set it from a TPOT target. If product wants at least 25 tokens per second per user, TPOT must stay under 40 ms. From the table, that allows a batch of about 100 on the non-GQA model, if memory allowed it. Memory caps it at about 67. So memory binds first here, and the GPU will run near its memory limit. That is exactly where preemption lives (failure mode 1). Leave margin: a cap around 48–56 with real traffic's length distribution is safer than 67.</p>
+
+<h3 id=dd-model-serving-littles-law level=3>Fleet size by Little's law</h3>
+<p>Concurrency equals arrival rate times time in system. At 20 requests per second, with TTFT around 0.3 s and 400 output tokens at 23 ms each (9.2 s), each request lives about 9.5 s. So the fleet holds 20 x 9.5 = 190 conversations at once. At 64 per GPU, that is three GPUs at the limit. The lesson's "4 plus one for headroom" is the same answer from the throughput side (2,800 tokens per second / 400 tokens ≈ 7 requests per second per GPU). Two methods, one answer: a good sign the model is right.</p>
+
+<h3 id=dd-model-serving-prefill-math level=3>The pasted contract, in numbers</h3>
+<p>Prefill costs about 2 x parameters FLOPs per prompt token, plus attention, which grows with the square of length. A 30,000-token contract on a 7B model is at least 2 x 7B x 30,000 ≈ 4.2 x 10<sup>14</sup> FLOPs. At an effective 150 TFLOPS (half of peak), that is around 3 seconds. Without chunking, that is one 3-second step for everyone in the batch: every running user's stream freezes for 3 seconds. That is the lesson's Q3 spike.</p>
+<p>Chunked prefill with a 2,048-token budget per step splits it into about 15 chunks. Each chunk adds roughly 2 x 7B x 2,048 ≈ 29 TFLOPs, about 0.2 s at 150 TFLOPS, to its step. So everyone's TPOT rises to about 200 ms for those 15 steps, instead of one 3-second freeze. A 512-token budget means about 60 chunks of ~50 ms each: smoother for everyone else, slower TTFT for the contract. The chunk size is a fairness dial between the big request and the rest. Prefill/decode disaggregation exists to stop trading one against the other.</p>
+
+<h3 id=dd-model-serving-prefix-math level=3>What prefix caching saves</h3>
+<p>The support assistant sends the same 800-token system prompt on every request. Without prefix caching, every request prefills it: 800 x 14 GFLOPs ≈ 11 TFLOPs, about 75 ms at 150 TFLOPS, and 400 MB of KV per request. With prefix caching, that prefix lives once per replica. TTFT drops by most of that 75 ms, and running conversations share 400 MB instead of each holding a copy. That is only true if requests reach a replica that has the prefix cached, which is why routing becomes part of serving.</p>
+
+<h2 id=dd-model-serving-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-model-serving-fm-preemption level=3>1. The preemption storm</h3>
+<p><strong>Symptom.</strong> Throughput drops by half during peak, and TPOT becomes jagged. GPU utilization still looks high.</p>
+<p><strong>Mechanism.</strong> The batch cap was tuned on short test prompts. Real conversations are longer, and the KV pool fills. Each time a running sequence needs a block, the scheduler preempts another and later recomputes its whole prefix. The GPU spends its time recomputing work it already did. Long conversations get preempted repeatedly, so they are the ones that suffer most.</p>
+<p><strong>Detect.</strong> The engine's preemption counter, and KV cache usage pinned near 100%. vLLM logs a warning when it preempts and exposes both as metrics. Watch the ratio of prompt tokens computed to prompt tokens received; above 1 means recompute.</p>
+<p><strong>Fix.</strong> Lower <code>max_num_seqs</code> until preemption is rare. Cap <code>max_model_len</code> and <code>max_tokens</code> to what the product needs. Use a GQA model or a quantized KV cache if quality allows. Admission control at the router should queue requests rather than let the engine overcommit.</p>
+
+<h3 id=dd-model-serving-fm-runaway level=3>2. The generation that never stops</h3>
+<p><strong>Symptom.</strong> A handful of requests take two minutes. Their responses end in the same phrase repeated hundreds of times.</p>
+<p><strong>Mechanism.</strong> The model fell into a repetition loop and nothing stopped it. The request had no <code>max_tokens</code>, so the engine's limit was the model's full context length. Each looping request held a batch slot and a growing pile of KV blocks for thousands of steps.</p>
+<p><strong>Detect.</strong> The distribution of output tokens per request. A long tail out at the context limit is the signature. Also count finish reasons: "length" versus "stop."</p>
+<p><strong>Fix.</strong> Always set <code>max_tokens</code> from the product's real need. The support assistant needs perhaps 800. Set stop sequences that fit the chat template. Add a wall-clock deadline at the router. Repetition penalties help some models, at some cost to quality, so test them.</p>
+
+<h3 id=dd-model-serving-fm-cancel level=3>3. Abandoned generations still running</h3>
+<p><strong>Symptom.</strong> The fleet runs hot but delivered tokens per second are well below generated tokens per second.</p>
+<p><strong>Mechanism.</strong> A user closes the tab. The browser drops the SSE stream. But the proxy in front of the engine does not propagate the disconnect, or the gateway buffers, so the engine keeps generating 400 tokens to nobody. On a support assistant where users often leave mid-answer, this can waste a large share of capacity.</p>
+<p><strong>Detect.</strong> Compare tokens generated by the engine with tokens written to clients, per route. Count engine-side aborts. Zero aborts on a chat product means disconnects are not arriving.</p>
+<p><strong>Fix.</strong> End-to-end cancellation. Every hop (load balancer, gateway, engine API server) must close its upstream request when its downstream closes, and the engine must abort the sequence and free its blocks. Test it: start a stream, kill the client and watch the engine's running count drop.</p>
+
+<h3 id=dd-model-serving-fm-routing level=3>4. The replica that gets all the long ones</h3>
+<p><strong>Symptom.</strong> One replica has a deep queue and preempts constantly. Its neighbours sit half empty. Average TTFT looks fine; p99 does not.</p>
+<p><strong>Mechanism.</strong> Least-connections routing sees equal connection counts. It cannot see that one replica's connections are 20,000-token document sessions and another's are short chats. The variance the lesson calls Constant 1 defeats connection-count balancing.</p>
+<p><strong>Detect.</strong> Per-replica KV cache usage, waiting-queue length and running-sequence count, side by side. Healthy fleets show them close together.</p>
+<p><strong>Fix.</strong> Route on the engine's own load signals: waiting requests, KV usage, or outstanding tokens. Prefix-aware routing adds a second goal, sending requests that share a system prompt or a conversation to the replica that holds its blocks. The two goals conflict at the margin, so routers score both, for example by preferring the warm replica unless its queue is much deeper than average.</p>
+
+<h3 id=dd-model-serving-fm-template level=3>5. The silent template mismatch</h3>
+<p><strong>Symptom.</strong> After a routine upgrade to a newer model version, answer quality drops. Responses sometimes continue the user's message, or include stray role markers. No errors.</p>
+<p><strong>Mechanism.</strong> Chat models are trained on a specific <strong>chat template</strong>: special tokens and markers around system, user and assistant turns. The serving code formatted prompts with the old model's template, hard-coded. The new model reads the conversation slightly wrong and has no way to say so.</p>
+<p><strong>Detect.</strong> An evaluation set run against every model version through the real serving path, not a notebook. Watch for responses that end with "length" when they should end with "stop."</p>
+<p><strong>Fix.</strong> Take the template and stop tokens from the model's own tokenizer configuration, not from serving code. Pin tokenizer and model together as one artifact. Treat a model swap as a release with an evaluation gate, as in <a href="#canary-deployment">Canary Deployment</a>.</p>
+
+<h3 id=dd-model-serving-fm-nondeterminism level=3>6. Temperature zero, different answers</h3>
+<p><strong>Symptom.</strong> The evaluation suite flickers. The same prompt at temperature 0 gives different outputs from run to run, and a regression test fails one day in ten.</p>
+<p><strong>Mechanism.</strong> Batched GPU kernels can change the order of floating-point additions depending on batch size and composition. Addition in floating point is not associative, so logits differ in the last bits. When two candidate tokens are nearly tied, the argmax flips, and from that token on the whole continuation differs. Under continuous batching, the batch around your request is never the same twice.</p>
+<p><strong>Detect.</strong> Run one prompt a hundred times under load and count distinct outputs.</p>
+<p><strong>Fix.</strong> Don't build tests or caches that assume exact determinism. Evaluate with tolerance: graded quality scores, not string equality. Some engines and kernel libraries now offer batch-invariant modes, at a throughput cost. Use them only where reproducibility is a hard requirement, such as audits.</p>
+
+<h3 id=dd-model-serving-fm-oom level=3>7. Two engines, one GPU, one crash loop</h3>
+<p><strong>Symptom.</strong> After a deploy that added an embedding model to the chat GPUs to save money, pods crash on start with out-of-memory errors, intermittently.</p>
+<p><strong>Mechanism.</strong> Each engine claims a fraction of total GPU memory at start. Two engines each set to 0.9 cannot both get it. Which one wins depends on start order, so the failure looks random.</p>
+<p><strong>Detect.</strong> Startup logs show the memory each process claimed. Track GPU memory per process.</p>
+<p><strong>Fix.</strong> Give each engine an explicit share that sums under 1.0, or better, keep separate pools, or use hardware partitioning where the GPU supports it. Co-location saves money only when the claims are deliberate.</p>
+
+<h2 id=dd-model-serving-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-model-serving-choose-batching level=3>Batching strategy</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th></th><th>No batching</th><th>Dynamic (request-level)</th><th>Continuous (token-level)</th><th>Disaggregated prefill/decode</th></tr></thead><tbody>
+<tr><td>Throughput</td><td>Lowest</td><td>High for uniform work</td><td>High despite variance</td><td>Highest at large scale</td></tr>
+<tr><td>Latency control</td><td>Best for one request</td><td>Window adds a few ms</td><td>Good; long prefills need chunking</td><td>TTFT and TPOT tuned separately</td></tr>
+<tr><td>Complexity</td><td>None</td><td>A timer and a cap</td><td>A full engine (use one)</td><td>Two pools plus KV transfer between them</td></tr>
+<tr><td>Fits</td><td>Dev, tiny traffic, hard real time</td><td>Embeddings, vision, rankers</td><td>LLM chat and generation</td><td>Very large fleets with strict TTFT and TPOT targets</td></tr>
+</tbody></table></div></div>
+
+<h3 id=dd-model-serving-choose-levers level=3>Other levers, and what each trades</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Lever</th><th>What it buys</th><th>What it costs</th><th>Use when</th></tr></thead><tbody>
+<tr><td>Weight quantization (8-bit, 4-bit)</td><td>Fewer bytes per step, so faster decode; more room for KV</td><td>Some quality loss, varying by method and model; measure it</td><td>After batching is fixed, if evaluations hold</td></tr>
+<tr><td>KV cache quantization</td><td>Up to 2x more context per GPU</td><td>Possible quality loss on long contexts</td><td>Memory-bound fleets with long conversations</td></tr>
+<tr><td>Prefix caching</td><td>Faster TTFT, less KV memory for shared prompts</td><td>Routing must keep prefixes warm</td><td>Long, repeated system prompts; multi-turn chat</td></tr>
+<tr><td>Speculative decoding</td><td>Fewer target-model steps per token at low batch sizes</td><td>A draft model or extra heads; gains shrink as batches grow</td><td>Latency-sensitive, lightly loaded serving</td></tr>
+<tr><td>Tensor parallelism</td><td>Larger models; lower TPOT per request</td><td>Interconnect traffic per layer; whole-node fate sharing</td><td>The model does not fit one GPU, or TPOT targets demand it</td></tr>
+<tr><td>More replicas</td><td>Linear throughput, independent failures</td><td>One full copy of the weights each</td><td>The default way to scale once one replica is tuned</td></tr>
+</tbody></table></div></div>
+<p>A sensible order: get a real engine with continuous batching and paged KV. Turn on prefix caching if prompts share prefixes. Size the batch cap from a TPOT target. Then reach for quantization, judged by evaluations. Speculative decoding and disaggregation come last, when the fleet is big enough that their gains pay for their complexity.</p>
+
+<h2 id=dd-model-serving-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>What are the TTFT and TPOT targets, at which percentile, and was the batch cap derived from them?</li>
+<li>What is KV bytes per token for this model, and how many tokens of context does one GPU hold after weights and overhead?</li>
+<li>What are the real prompt and output length distributions, and was the configuration load-tested with them rather than with fixed-size prompts?</li>
+<li>Is <code>max_tokens</code> always set, and is <code>max_model_len</code> no larger than the product needs?</li>
+<li>Is chunked prefill on, and what caps or tiering keep very long inputs from dominating a shared pool?</li>
+<li>Does cancellation propagate end to end, from the client's closed stream to the engine aborting the sequence?</li>
+<li>What does the router balance on: engine queue depth and KV usage, or just connections? Is it prefix-aware?</li>
+<li>Which engine metrics are dashboarded and alerted: preemptions, KV usage, waiting queue, finish reasons, generated versus delivered tokens?</li>
+<li>Do the chat template and stop tokens come from the model's own configuration, versioned with the weights?</li>
+<li>Is every model or engine upgrade gated by an evaluation run through the real serving path?</li>
+<li>Is bulk work kept off the interactive fleet, by a rule rather than by convention?</li>
+</ol>
+
+<h2 id=dd-model-serving-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"At what batch size does decode stop being memory-bound?"</summary>
+<p>For the weight multiplications alone, around the GPU's compute-to-bandwidth ratio: roughly 150 FLOPs per byte on an A100-class part, and each batched token adds about 1 FLOP per weight byte in 16-bit. So somewhere past 100. In practice you usually never get there. Each sequence's KV cache must also be read every step, and those reads grow with batch size and context length. Memory capacity or KV bandwidth binds first, so decode stays bandwidth-bound across the batch sizes you can actually fit.</p>
+</details>
+
+<details>
+<summary>"How much KV cache does one token cost, and why does grouped-query attention matter for serving?"</summary>
+<p>Two (K and V) times layers times KV heads times head dimension times bytes. For a Llama-2-shaped 7B in 16-bit, that is about 0.5 MB per token, so 1,600 tokens is 800 MB. GQA cuts the KV heads, often by 4x or more, which cuts both the memory per conversation and the bytes read per step. On the same GPU that means several times more concurrent conversations at similar per-user speed. It is an architecture choice with a serving price tag.</p>
+</details>
+
+<details>
+<summary>"KV usage is at 100% and throughput just halved. What is happening?"</summary>
+<p>Preemption. Running sequences need new blocks, none are free, so the scheduler evicts some and later recomputes their prefixes. The GPU redoes work. Confirm with the preemption counter and recomputed prompt tokens. Lower the concurrent-sequence cap, cap output and context lengths, and queue at admission instead of overcommitting the engine.</p>
+</details>
+
+<details>
+<summary>"Why is least-connections routing bad for LLM serving, and what replaces it?"</summary>
+<p>Connections hide a hundredfold variance in work per request: one connection can be a 20,000-token document, another a ten-token reply. Balance on what the engine reports: waiting queue, KV usage, outstanding tokens. Then add affinity: a conversation or shared prefix should return to the replica holding its blocks, unless that replica is much busier than the rest. The router trades cache warmth against load.</p>
+</details>
+
+<details>
+<summary>"A user closes the tab halfway through. What should happen, and what usually happens?"</summary>
+<p>The stream closes, each proxy closes its upstream, the engine aborts the sequence and frees its blocks within a step. What usually happens is that some hop does not propagate the disconnect, and the GPU keeps generating to nobody. Measure generated versus delivered tokens to find it.</p>
+</details>
+
+<details>
+<summary>"Your temperature-zero regression test is flaky. Is the engine broken?"</summary>
+<p>Probably not. Batched kernels can sum in different orders depending on what else is in the batch. Floating-point addition is not associative, so near-tied tokens can flip, and the continuation diverges from there. Under continuous batching the batch is never the same twice. Test with graded evaluations and tolerances, not string equality. Use batch-invariant modes only where exact reproducibility is required and the throughput cost is accepted.</p>
+</details>
+
+<details>
+<summary>"When would you use tensor parallelism instead of more replicas?"</summary>
+<p>When the model does not fit on one GPU with room for a useful KV pool, or when the per-token latency target is below what one GPU can do. Otherwise replicas win. They scale linearly, fail independently and need no fast interconnect. Tensor parallelism splits each layer across GPUs and pays communication on every layer of every step.</p>
+</details>
+
+<details>
+<summary>"Would quantizing to 4-bit fix the incident's cost problem?"</summary>
+<p>It would help a little and miss the cause. At batch 1, 4-bit weights stream about a quarter of the bytes, so one GPU might go from 50 to well over 100 tokens per second. That's maybe a 2–3x saving. Batching gave 30x without touching quality. Fix batching first; then quantize if evaluations show the quality loss is acceptable, and spend the freed memory on KV cache.</p>
+</details>

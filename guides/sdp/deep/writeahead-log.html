@@ -1,0 +1,219 @@
+<h2 id=dd-writeahead-log-inside-the-mechanism level=2>Deep Dive: Inside the Mechanism</h2>
+<p>The lesson's rule is short: append the record, fsync it, then acknowledge. A real database needs a few more rules to make that safe. It has to stop a data page from reaching disk before its log record does. It has to survive a torn data page, not only a torn log record. It needs to know where replay starts, and it has to decide what "fsync" means on hardware that sometimes lies. PostgreSQL shows all of this clearly, so we start there, then compare InnoDB, SQLite, LSM engines and the systems that skip fsync on purpose.</p>
+
+<h3 id=dd-writeahead-log-postgres-records level=3>PostgreSQL: records, LSNs and the page rule</h3>
+<p>Postgres writes its log as a sequence of 16 MB <strong>segment files</strong> in <code>pg_wal/</code> (the size is set at <code>initdb</code>). Every record has a <strong>log sequence number</strong> (LSN), its byte position in the endless logical log. A record's header carries its total length, the transaction ID, the LSN of the previous record, which subsystem it belongs to (heap, B-tree index, transaction commit and so on) and a CRC-32C checksum over the whole record. The previous-record pointer and the checksum together let recovery tell a valid next record from leftover bytes.</p>
+<p>Every 8 KB data page also stores an LSN in its header: the LSN of the last record that changed it. That enables the rule that makes the whole design work, usually called the <strong>WAL rule</strong>. Before the buffer manager writes a dirty page to disk, it makes sure the WAL is flushed at least up to that page's LSN. So a data page can never be on disk with changes whose log record is not. Pages can be written lazily, in any order, at any time, and recovery can always redo them.</p>
+<p>In database theory this is the "steal, no-force" policy from the ARIES family of algorithms. <em>Steal</em>: dirty pages may be written before their transaction commits. <em>No-force</em>: committed pages need not be written at commit. The log makes both safe. ARIES also uses an undo log to roll back stolen pages of transactions that aborted. Postgres does not need undo for that, because MVCC never overwrites a row in place. An aborted transaction's new row versions simply stay invisible until vacuum removes them.</p>
+
+<h3 id=dd-writeahead-log-torn-pages level=3>Torn data pages: full-page writes and doublewrite</h3>
+<p>The lesson's checksum protects log records. But the WAL rule lets data pages be written at any time, and an 8 KB database page is several 4 KB disk sectors. A power cut mid-write can leave a page half old and half new. Redo cannot fix that by replaying a small "change byte 312" record, because the rest of the page is garbage.</p>
+<p>Postgres solves it with <strong>full-page writes</strong> (<code>full_page_writes = on</code>, the default). The first time a page is modified after each checkpoint, the WAL record carries a full image of the page. Recovery restores that image and replays later changes on top, so a torn page is simply overwritten. The cost is WAL volume, and the sizing section shows how large it can get. <code>wal_compression</code> (with <code>lz4</code> or <code>zstd</code> in PostgreSQL 15 and later) shrinks these images.</p>
+<p>InnoDB takes a different route, the <strong>doublewrite buffer</strong>. Before writing pages into their real places, it writes them sequentially to a doublewrite area and syncs that. If a real write tears, recovery takes the intact copy from the doublewrite area. Both designs pay to make torn pages repairable. Postgres pays in log volume, InnoDB in a second data write.</p>
+
+<h3 id=dd-writeahead-log-checkpoints level=3>Checkpoints and where replay starts</h3>
+<p>A Postgres checkpoint does not stop the world. It records a <strong>redo point</strong> (the current WAL position), then writes out every page that was dirty at that moment, spreading the writes over time. When done, it writes a checkpoint record and updates <code>pg_control</code>, a small file that tells recovery where the latest checkpoint is. On restart, recovery reads <code>pg_control</code>, jumps to that checkpoint's redo point, and replays forward until the next record fails to validate. That is the end of the log.</p>
+<p>The knobs:</p>
+<ul>
+<li><code>checkpoint_timeout</code> (5 minutes by default): the longest time between checkpoints.</li>
+<li><code>max_wal_size</code> (1 GB by default): a soft limit on WAL between checkpoints. Reaching it triggers a checkpoint early. If that happens more often than <code>checkpoint_warning</code> (30 seconds), the log says "checkpoints are occurring too frequently."</li>
+<li><code>checkpoint_completion_target</code> (0.9 by default since PostgreSQL 14): spread the page writes over 90% of the interval to avoid I/O bursts.</li>
+</ul>
+<p>These three settings trade four things: recovery time, full-page-write volume, I/O smoothness and disk used by <code>pg_wal</code>. The sizing section works through them.</p>
+
+<h3 id=dd-writeahead-log-commit-path level=3>The commit path and group commit</h3>
+<p>Backends do not each write their own WAL file. Each one inserts its records into shared <strong>WAL buffers</strong> in memory. At commit, the backend asks for WAL to be flushed up to its commit record. If another backend's flush already covered that position, it is done without any disk work. Group commit therefore happens on its own: one <code>fdatasync</code> covers every commit record written before it. (<code>wal_sync_method</code> defaults to <code>fdatasync</code> on Linux.) <code>commit_delay</code> can make a backend wait a few microseconds to gather more company, but on modern hardware the natural batching is usually enough.</p>
+<p><code>synchronous_commit = off</code> lets a commit return before its flush. A background <strong>WAL writer</strong> flushes every <code>wal_writer_delay</code> (200 ms by default), and the documentation puts the worst-case loss at three times that, about 600 ms. The database stays consistent after a crash; only the most recent commits may be missing. This is a session-level setting, so you can use it for the click log and keep full durability for orders.</p>
+
+<h3 id=dd-writeahead-log-other-engines level=3>Other engines, other defaults</h3>
+<ul>
+<li><strong>MySQL/InnoDB</strong> keeps a redo log (sized by <code>innodb_redo_log_capacity</code> since 8.0.30) and separate undo logs for rollback and MVCC. <code>innodb_flush_log_at_trx_commit</code> decides durability: <code>1</code> (the default) writes and flushes at every commit; <code>2</code> writes to the OS at commit and flushes about once a second, so it survives a MySQL crash but not a power cut; <code>0</code> writes and flushes about once a second. MySQL also has the binlog, a second log for replication. <code>sync_binlog = 1</code> is needed for the binlog to be durable too, and an internal two-phase commit keeps the two logs in agreement.</li>
+<li><strong>SQLite</strong> in WAL mode appends to a <code>-wal</code> file and copies pages back into the database at checkpoints (by default once the WAL reaches 1,000 pages). With <code>synchronous=FULL</code> each commit is fsynced. With <code>synchronous=NORMAL</code> in WAL mode, the database stays consistent after a power loss, but the most recent commits may roll back.</li>
+<li><strong>LSM engines</strong> such as RocksDB write to a WAL, then a sorted in-memory table (memtable). When the memtable is flushed to an on-disk sorted file, the WAL it covers can be deleted. RocksDB's <code>WriteOptions.sync</code> defaults to <code>false</code>. A write then survives a process crash, because it is in the OS page cache, but not a machine crash. Applications that need power-loss durability must ask for it.</li>
+<li><strong>Cassandra</strong> appends to a commit log, but by default (<code>commitlog_sync: periodic</code>, every 10 seconds) it acknowledges before fsync. Durability comes from replication: a write acknowledged at <code>QUORUM</code> sits in the memory of several machines. <code>batch</code> and <code>group</code> modes fsync before acknowledging.</li>
+<li><strong>Kafka</strong> does not fsync each message by default either. It relies on replication (<code>acks=all</code> with <code>min.insync.replicas</code>) and the OS page cache. A message is safe once several brokers have it, even if none has flushed it.</li>
+<li><strong>etcd</strong> fsyncs its WAL for every batch, because Raft's safety depends on it. Its documentation treats disk fsync latency as a primary health signal and suggests p99 <code>wal_fsync_duration</code> under about 10 ms.</li>
+<li><strong>Redis</strong> AOF offers <code>appendfsync always</code>, <code>everysec</code> (the default) and <code>no</code>. With <code>everysec</code>, Redis documents a typical loss of up to one second of writes, and up to about two seconds if fsync is slow.</li>
+</ul>
+<p>The pattern across that list: "durable" can mean on one disk, or in the memory of several machines. Both are legitimate. What fails is assuming one when the system does the other.</p>
+
+<h3 id=dd-writeahead-log-fsync-truth level=3>What fsync actually promises</h3>
+<p><code>fsync(fd)</code> asks the kernel to push a file's dirty data and metadata to the device and wait for the device to confirm. Four details catch people who write their own logs:</p>
+<ul>
+<li><strong>New files need a directory fsync.</strong> Creating or renaming a file changes the directory. If you fsync the file but not its parent directory, a crash can leave a perfectly synced file with no name pointing at it. Log rotation must fsync the directory.</li>
+<li><strong>Device write caches.</strong> Many drives have a volatile cache. The kernel sends a cache-flush command on fsync, and correct drives honour it. Some consumer devices, some RAID controllers without batteries, and virtual disks configured with an unsafe cache mode do not. They make fsync fast by not doing it. Enterprise SSDs with <strong>power-loss protection</strong> (capacitors that let the drive finish cached writes) are both fast and honest.</li>
+<li><strong>fsync errors are not retryable.</strong> In 2018 PostgreSQL developers found that on Linux, after a failed write-back, the kernel could mark the pages clean and clear the error. A retried fsync then "succeeded" even though data was lost. Since PostgreSQL 12 (and matching minor releases of older versions) Postgres treats an fsync failure as fatal (<code>PANIC</code>) and recovers from the WAL instead of retrying. The episode is often called "fsyncgate."</li>
+<li><strong><code>O_DIRECT</code> is not durability.</strong> Bypassing the page cache does not bypass the device cache. You still need <code>O_DSYNC</code> or an explicit flush.</li>
+</ul>
+<p>Here is the lesson's write path as runnable Python, with group commit and torn-tail handling. It is a teaching sketch, not a storage engine; a real one also needs the directory fsync above, segment rotation and checkpoints.</p>
+<pre><code>import os, struct, zlib
+
+HEADER = struct.Struct(">II")   # payload length, CRC-32 of payload
+
+def append(fd, records: list[bytes]) -> None:
+    """Group commit: write every record in the batch, then one fsync."""
+    buf = b"".join(HEADER.pack(len(r), zlib.crc32(r)) + r for r in records)
+    os.write(fd, buf)
+    os.fsync(fd)            # only now may the callers hear "saved"
+
+def recover(path: str) -> list[bytes]:
+    """Replay complete records; stop at the first torn or corrupt one."""
+    out, data, pos = [], open(path, "rb").read(), 0
+    while pos + HEADER.size &lt;= len(data):
+        length, crc = HEADER.unpack_from(data, pos)
+        body = data[pos + HEADER.size : pos + HEADER.size + length]
+        if len(body) &lt; length or zlib.crc32(body) != crc:
+            break           # torn tail: never acknowledged, safe to drop
+        out.append(body)
+        pos += HEADER.size + length
+    return out
+
+path = "orders.wal"
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+append(fd, [b'{"order":"7f3a","status":"paid"}', b'{"order":"7f3b","status":"paid"}'])
+os.write(fd, HEADER.pack(40, 12345) + b'{"order":"7f3c"')   # crash mid-write
+os.close(fd)
+print(recover(path))   # the two acknowledged records, nothing else</code></pre>
+<p>Note the one judgement call in <code>recover</code>: it stops at the first bad record. That is right for a torn <em>tail</em>. A bad record in the <em>middle</em> of the log, followed by valid ones, means real corruption, and silently stopping there would discard acknowledged writes. Production engines tell the two apart (Postgres checks the previous-record pointer and page headers) and refuse to start rather than guess.</p>
+
+<h2 id=dd-writeahead-log-sizing level=2>Deep Dive: Sizing and the Numbers</h2>
+<p>We use shard 2 from the lesson: 625 order writes per second, each transaction touching one table row and two indexes.</p>
+
+<h3 id=dd-writeahead-log-fsync-latency level=3>fsync latency sets the commit budget</h3>
+<p>Rough orders of magnitude for one small fsync; measure yours with <code>pg_test_fsync</code> or <code>fio</code>, because they vary widely:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Device<th>Typical fsync latency<th>Serial commits per second, one stream<tbody><tr><td>7,200 rpm hard disk<td>several ms (rotation-bound)<td>100 to 200<tr><td>Consumer SSD without power-loss protection<td>roughly 0.5 to a few ms (must reach flash)<td>hundreds to 2,000<tr><td>Cloud network block volume<td>roughly 0.5 to 2 ms, with occasional spikes<td>500 to 2,000<tr><td>Enterprise SSD with power-loss protection<td>tens of microseconds<td>tens of thousands</table></div></div>
+<p>A consumer SSD reporting 50,000 fsyncs per second is a warning sign. It probably is not flushing its cache.</p>
+<p>Group commit is what makes a slow device usable. With a 1 ms fsync, one connection committing serially gets at most 1,000 commits per second. With 64 connections committing at once, each fsync covers many commit records, and the same disk can sustain tens of thousands of commits per second, until CPU or WAL bandwidth limits it. Shard 2's 625 commits per second is easy either way. The latency floor still applies to every single commit: a client never hears "saved" in less than one fsync.</p>
+
+<h3 id=dd-writeahead-log-fpw-math level=3>WAL volume: where full-page writes dominate</h3>
+<p>The raw change records for one order transaction (row, two index entries, commit record) come to roughly 500 bytes. At 625 per second, that is about 0.3 MB per second.</p>
+<p>Now add full-page images. Assume the hot set touched within any few minutes is 250,000 pages (2 GB of table and index pages). After every checkpoint, the first change to each of those pages logs the whole 8 KB page.</p>
+<ul>
+<li>Checkpoint every 5 minutes: up to 250,000 × 8 KB = 2 GB of page images per 300 seconds, about 6.7 MB per second.</li>
+<li>Checkpoint every 30 minutes: the same 2 GB per 1,800 seconds, about 1.1 MB per second.</li>
+</ul>
+<p>At 5-minute checkpoints, page images are about 20 times the size of the actual changes. That surprises most teams the first time they look. You can see it in <code>pg_stat_wal</code> (<code>wal_fpi</code> against <code>wal_records</code>), or per record type with <code>pg_waldump --stats</code>. Longer checkpoint intervals and <code>wal_compression</code> are the two big levers. Both also shrink what replicas must receive and what archives must store.</p>
+
+<h3 id=dd-writeahead-log-recovery-math level=3>Recovery time from checkpoint settings</h3>
+<p>Recovery replays all WAL from the last checkpoint's redo point. In the worst case that is about one full checkpoint interval of WAL, more if the crash hits while a spread checkpoint is still writing. Replay speed depends heavily on whether pages it touches are in memory. Postgres replays in one process, and reading cold pages is the slow part. Assume 100 MB per second as a planning figure and measure your own.</p>
+<ul>
+<li>Defaults (5 minutes, <code>max_wal_size</code> 1 GB) at about 7 MB per second of WAL: around 2 GB of WAL per cycle. Since <code>max_wal_size</code> caps it near 1 GB, checkpoints trigger early, every couple of minutes. Replay: about 10 seconds.</li>
+<li>Tuned for less WAL (30 minutes, <code>max_wal_size</code> 8 GB) at 1.4 MB per second: about 2.5 GB per cycle. Replay: about 25 seconds.</li>
+<li>Over-tuned (2 hours, <code>max_wal_size</code> 64 GB) during a bulk load producing 20 MB per second: up to 64 GB to replay. At 100 MB per second that is 11 minutes, and much longer if replay is reading cold pages from disk.</li>
+</ul>
+<p>The middle row is usually the sweet spot: far less WAL than the defaults, and recovery still under a minute. Set the target from the recovery-time objective, then confirm it by killing a test instance under load and timing the restart.</p>
+
+<h3 id=dd-writeahead-log-pitr-math level=3>Point-in-time recovery storage</h3>
+<p>Archived WAL plus base backups let you restore to any second. Assume shard 2 produces about 1.4 MB per second of WAL after tuning, around 120 GB per day.</p>
+<ul>
+<li>14 days of WAL archive: about 1.7 TB before compression. WAL often compresses well; how well depends on the data, so measure.</li>
+<li>Base backups of the 1 TB shard: weekly, keeping two, is 2 TB. Daily, keeping 14, is 14 TB, though incremental backups (native in PostgreSQL 17, and in tools like pgBackRest) cut that sharply.</li>
+<li>Restore time is base restore plus replay to the target time. With weekly base backups, restoring to day 6 replays about 720 GB of WAL: roughly 2 hours at 100 MB per second. With daily backups, under 20 minutes.</li>
+</ul>
+<p>So backup frequency is really a restore-time decision, not a storage decision. Storage is cheap; hours of replay during an incident are not.</p>
+
+<h2 id=dd-writeahead-log-failure-modes level=2>Deep Dive: Failure Modes in Production</h2>
+
+<h3 id=dd-writeahead-log-fm-lying-disk level=3>1. The disk that says yes too quickly</h3>
+<p><strong>Symptom.</strong> After a power cut in a small office deployment, Postgres starts, but orders acknowledged in the last few seconds are missing. A week later, another power cut leaves an index that returns wrong rows.</p>
+<p><strong>Mechanism.</strong> The SSD has a volatile write cache and no power-loss protection, and it acknowledges cache flushes before data reaches flash. Or a virtual machine's disk is set to a cache mode that ignores guest flushes. fsync returns in microseconds, so the database believes the WAL rule holds. The power cut erases the cache, and with it log records the database already promised, sometimes along with data pages written in the wrong order.</p>
+<p><strong>Detect.</strong> Before production, run <code>pg_test_fsync</code>: tens of thousands of flushes per second on a device without power-loss protection is not believable. For a real check, run a pull-the-plug test with a tool such as <code>diskchecker.pl</code>, which records acknowledged writes on a second machine and verifies them after power returns.</p>
+<p><strong>Fix.</strong> Use drives with power-loss protection, or turn off the volatile write cache. Use a safe hypervisor cache mode. In the cloud, trust the provider's block storage semantics, but never a local ephemeral disk as the only copy.</p>
+
+<h3 id=dd-writeahead-log-fm-fsyncgate level=3>2. A write error that a retry "fixed"</h3>
+<p><strong>Symptom.</strong> Weeks after a storage hiccup, a query returns a row with old data. Checksums flag a page. Nobody remembers any database error.</p>
+<p><strong>Mechanism.</strong> A transient storage error made a write-back fail during a checkpoint. On older kernels and database versions, the first fsync reported the error, and the database retried the checkpoint. The second fsync succeeded, because the kernel had already dropped the failed dirty pages and cleared the error flag. The checkpoint completed, the WAL before it was recycled, and the lost page write could no longer be redone.</p>
+<p><strong>Detect.</strong> Kernel logs with I/O errors (<code>dmesg</code>, "Buffer I/O error", "lost async page write") should page someone even when the database looks fine. Enable data checksums (<code>initdb --data-checksums</code>) so damaged pages are detected on read.</p>
+<p><strong>Fix.</strong> Run a PostgreSQL version that panics on fsync failure, and leave <code>data_sync_retry</code> off. A panic forces crash recovery from WAL, which redoes the lost writes. For anything homegrown, the lesson is the same: never treat a failed fsync as retryable. Crash, and recover from the log.</p>
+
+<h3 id=dd-writeahead-log-fm-archive-full level=3>3. A broken archive fills the WAL disk</h3>
+<p><strong>Symptom.</strong> Writes start failing with "could not write to file pg_wal/…: No space left on device", and the database shuts down. The data volume has plenty of room.</p>
+<p><strong>Mechanism.</strong> <code>archive_command</code> copies each finished WAL segment to object storage. A rotated credential made it fail on every segment. Postgres must keep every segment until it is archived, so <code>pg_wal</code> grew at the full WAL rate for two days. An abandoned replication slot does the same thing (see <a href="#primaryreplica">Primary-Replica</a>).</p>
+<p><strong>Detect.</strong> <code>pg_stat_archiver</code>: alert when <code>failed_count</code> rises or <code>last_archived_time</code> is more than a few minutes old. Alert on <code>pg_wal</code> volume use at 50 to 60%, with an estimate of hours left at the current WAL rate.</p>
+<p><strong>Fix.</strong> Monitor the archive like a production dependency, because it is one. Put WAL on its own volume, sized for a day or more of archive outage at peak WAL rate. Test the archive with real restores, not just successful uploads.</p>
+
+<h3 id=dd-writeahead-log-fm-checkpoint-spikes level=3>4. Latency spikes every few minutes</h3>
+<p><strong>Symptom.</strong> p99 query latency jumps on a steady rhythm, every 2 to 5 minutes. The log contains "checkpoints are occurring too frequently."</p>
+<p><strong>Mechanism.</strong> A write-heavy period fills <code>max_wal_size</code> quickly, so checkpoints trigger early and close together. Each one must write out dirty pages fast to finish in time, competing with queries for I/O. Each also restarts full-page writes, so WAL volume jumps right after it, which fills <code>max_wal_size</code> again even sooner. That feedback loop is why the spikes repeat.</p>
+<p><strong>Detect.</strong> <code>log_checkpoints = on</code> (default in recent versions) shows each checkpoint's trigger, duration and pages written. In <code>pg_stat_bgwriter</code> (or <code>pg_stat_checkpointer</code> in PostgreSQL 17), checkpoints requested by WAL size should be rare next to timed ones.</p>
+<p><strong>Fix.</strong> Raise <code>max_wal_size</code> so checkpoints are time-driven, keep <code>checkpoint_completion_target</code> at 0.9, and re-check the recovery-time math. Enable <code>wal_compression</code> if CPU allows.</p>
+
+<h3 id=dd-writeahead-log-fm-fsync-latency level=3>5. Slow fsync, and the cluster starts electing leaders</h3>
+<p><strong>Symptom.</strong> Commit latency p99 goes from 2 ms to 300 ms in the afternoon, with no change in traffic. In the Kubernetes control plane on the same storage class, etcd logs leader elections and "slow fdatasync" warnings.</p>
+<p><strong>Mechanism.</strong> The cloud volume ran out of burst credits, or a noisy neighbour saturated the shared storage. Every commit waits for one fsync, so commit latency is fsync latency. etcd is stricter: a leader that cannot persist its log in time misses heartbeats, followers call an election, and the cluster churns.</p>
+<p><strong>Detect.</strong> fsync latency as a first-class metric: etcd's <code>etcd_disk_wal_fsync_duration_seconds</code>, and in Postgres <code>pg_stat_wal</code> sync time with <code>track_wal_io_timing</code> on (moved to <code>pg_stat_io</code> in newer versions). Also watch the volume's burst balance and queue depth.</p>
+<p><strong>Fix.</strong> Provisioned-IOPS volumes, or local disks with power-loss protection for the log. Put WAL on its own volume so data-file I/O cannot delay commits. For etcd, follow its hardware guidance and keep it off shared, burstable storage.</p>
+
+<h3 id=dd-writeahead-log-fm-long-recovery level=3>6. The restart that took 40 minutes</h3>
+<p><strong>Symptom.</strong> After a kernel panic, the machine is back in 2 minutes, but Postgres takes 40 minutes before it accepts connections. Failover did not trigger because this was a single-node analytics database "that doesn't need it."</p>
+<p><strong>Mechanism.</strong> Someone set <code>checkpoint_timeout</code> to 1 hour and <code>max_wal_size</code> to 100 GB to cut WAL volume during nightly loads. The crash came near the end of a load. Recovery had 80 GB to replay in one process, reading data pages that were no longer in memory after the reboot.</p>
+<p><strong>Detect.</strong> Measure, before production: crash a staging instance at peak write rate and time the restart. In production, watch the WAL distance since the last checkpoint's redo point; that is the replay you would face right now.</p>
+<p><strong>Fix.</strong> Choose checkpoint settings from the recovery-time objective. Enable <code>recovery_prefetch</code> (PostgreSQL 15 and later) to overlap page reads during replay. Where minutes matter, run a replica and fail over, so recovery time stops being user-facing.</p>
+
+<h3 id=dd-writeahead-log-fm-default-durability level=3>7. The store that was durable "per process," not per power cut</h3>
+<p><strong>Symptom.</strong> After a host reboot in a power event, a service built on an embedded key-value engine has lost the last several seconds of acknowledged writes. The engine "has a WAL."</p>
+<p><strong>Mechanism.</strong> The engine wrote every record to its WAL, but with its default <code>sync = false</code>, so records went to the OS page cache and fsync happened later. That survives the process crashing, since the kernel still has the data. It does not survive the kernel or the power going away. The same gap exists with Redis <code>appendfsync everysec</code>, Cassandra's periodic commit log sync, and Kafka's default flush policy. Those last two are designed around replication; a single-node deployment of them has no such backstop.</p>
+<p><strong>Detect.</strong> Read the durability settings of every store in the request path, and write down what each acknowledgement means: in memory, in the page cache, on one disk, or on a quorum. Kill-and-power-cut tests in staging confirm it.</p>
+<p><strong>Fix.</strong> Turn on per-write sync where the data matters (<code>WriteOptions.sync = true</code>, <code>appendfsync always</code>, <code>commitlog_sync: batch</code> or <code>group</code>), or make replication the durability mechanism and acknowledge only after a quorum has the write. Either is fine. Not knowing which one you have is the bug.</p>
+
+<h2 id=dd-writeahead-log-design-variations level=2>Deep Dive: Design Variations and How to Choose</h2>
+
+<h3 id=dd-writeahead-log-choose-durability level=3>What an acknowledgement waits for</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Policy<th>Examples<th>Survives process crash<th>Survives power loss<th>Survives losing the machine<th>Commit latency<tbody><tr><td>fsync per commit, with group commit<td>Postgres default, InnoDB <code>=1</code>, SQLite <code>FULL</code>, etcd<td>Yes<td>Yes<td>No, unless replicated<td>One fsync<tr><td>Write to OS per commit, fsync periodically<td>InnoDB <code>=2</code>, RocksDB default, Redis <code>everysec</code><td>Yes<td>Loses up to the period (about 1 s)<td>No<td>Memory speed<tr><td>Asynchronous commit<td>Postgres <code>synchronous_commit=off</code>, InnoDB <code>=0</code><td>Loses up to about a second<td>Loses up to about a second<td>No<td>Memory speed<tr><td>Replicate to a quorum, fsync lazily<td>Kafka defaults, Cassandra periodic at <code>QUORUM</code><td>Yes<td>Yes, unless all replicas lose power together<td>Yes<td>One network round trip<tr><td>fsync locally and synchronously replicate<td>Postgres with a sync standby, Raft systems<td>Yes<td>Yes<td>Yes<td>fsync plus a round trip</table></div></div>
+<p>Two points shape the choice. First, lazy fsync plus replication is a real durability design, but it assumes replicas fail independently. Replicas in one rack on one power feed share a failure. Second, durability is a per-write decision in most databases. Orders and payments take the top or bottom row. Click logs and metrics can take the middle rows and save a lot of I/O, as long as someone wrote that decision down.</p>
+
+<h3 id=dd-writeahead-log-choose-structure level=3>How engines structure the log</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Design<th>Examples<th>What the log holds<th>Torn-page defence<th>Trade<tbody><tr><td>Physical/physiological redo log<td>Postgres WAL, InnoDB redo<td>Page-level changes<td>Full-page images (Postgres) or doublewrite (InnoDB)<td>Fast, exact replay; log is tied to the storage format and version<tr><td>Logical log<td>MySQL row-based binlog, Postgres logical decoding output, Redis AOF<td>Row or command changes<td>Not its job; the engine's own log handles it<td>Portable, readable by other systems; slower to replay<tr><td>WAL + LSM<td>RocksDB, Cassandra, LevelDB<td>Recent writes not yet in sorted files<td>Immutable files are never overwritten<td>WAL stays short; write amplification moves to compaction<tr><td>No WAL: copy-on-write tree<td>LMDB, Btrfs-style designs<td>No log; new pages, then an atomic root-pointer switch<td>Old pages are never overwritten<td>Very fast reads and simple recovery; random writes and one writer at a time</table></div></div>
+<p>Copy-on-write is the honest alternative to a WAL: it gets atomicity by never overwriting and flipping one root pointer at the end. It is excellent for read-heavy embedded stores. For write-heavy servers, the WAL's sequential appends and lazy page writes still win, which is why nearly every server database uses one.</p>
+
+<h2 id=dd-writeahead-log-checklist level=2>Deep Dive: Design-Review Checklist</h2>
+<ol>
+<li>For each store in the write path, what does an acknowledgement mean: in memory, in the page cache, on one disk, or on a quorum? Is it written down?</li>
+<li>Which data is allowed relaxed durability (async commit, periodic fsync), and who signed off on the loss window?</li>
+<li>Has the storage been checked for honest flushes: power-loss protection, write-cache settings, hypervisor cache mode? Has anyone pulled the plug in staging?</li>
+<li>What is the measured fsync latency, p50 and p99, on the production volume, and is it alerted on?</li>
+<li>Is the WAL on its own volume, sized for the worst write burst plus a day of archive or replica outage?</li>
+<li>What are the checkpoint settings, and what recovery time do they imply at peak write rate? Has a crash-restart been timed?</li>
+<li>How much of WAL volume is full-page images, and is <code>wal_compression</code> or a longer checkpoint interval worth it?</li>
+<li>Is WAL archived continuously, monitored for failure, and proven by a recent restore to a chosen timestamp?</li>
+<li>What is the restore-time objective, and does the base-backup frequency meet it given replay speed?</li>
+<li>Are data checksums on, and do kernel I/O errors page someone?</li>
+<li>Does anything in the system write its own append-only log? If so, does it fsync directories, distinguish a torn tail from mid-log corruption, and crash on fsync failure?</li>
+</ol>
+
+<h2 id=dd-writeahead-log-interview level=2>Deep Dive: Senior Interview Follow-ups</h2>
+
+<details>
+<summary>"The WAL is fsynced at commit, but data pages are written later in any order. What stops a page from reaching disk with changes the log doesn't have?"</summary>
+<p>The WAL rule in the buffer manager. Each page stores the LSN of the last record that changed it. Before writing a dirty page, the database flushes the WAL up to that LSN. So the log is always at least as new as any page on disk, and recovery can redo every change it finds on a page. Without that rule, a page could hold changes from a transaction whose commit record never made it, and redo-only recovery would have nothing to undo them with.</p>
+</details>
+
+<details>
+<summary>"The log record has a checksum. Why does Postgres also need full-page writes?"</summary>
+<p>The checksum protects log records. Full-page writes protect data pages. A data page write can tear halfway, leaving a page mixed from old and new versions. A small redo record like "insert this tuple at offset 312" cannot repair a page whose other half is garbage. So after each checkpoint, the first change to a page logs its full image; recovery restores that image and replays from there. InnoDB solves the same problem with its doublewrite buffer instead.</p>
+</details>
+
+<details>
+<summary>"Kafka doesn't fsync every message by default. Is it less durable than Postgres?"</summary>
+<p>It uses a different durability mechanism. With <code>acks=all</code> and <code>min.insync.replicas=2</code>, a message is acknowledged once several brokers have it in memory or page cache, so losing one machine loses nothing. It would lose data if all in-sync replicas lost power at once before flushing, which is why they should sit in different zones. Postgres defaults to "on this disk," so a single machine survives power loss, but losing the disk itself needs replication. Each is durable against a different failure; neither is durable against everything without the other.</p>
+</details>
+
+<details>
+<summary>"How does group commit raise throughput without breaking the 'fsync before ack' rule?"</summary>
+<p>One fsync makes every byte written to the log before it durable. If 50 commit records are in the WAL buffer when one backend flushes, all 50 are durable after that single fsync, and all 50 clients can be acknowledged. Nobody is told "saved" before their record is on disk; they just share the flush. The cost is that a commit may wait a little for the flush already in progress, so per-commit latency rises slightly while throughput rises a lot.</p>
+</details>
+
+<details>
+<summary>"Recovery hits a record with a bad checksum in the middle of the log, with valid records after it. What should happen?"</summary>
+<p>Stop and refuse to start, rather than treat it as the end of the log. A bad record at the tail is expected after a crash: it was being written, so it was never acknowledged. A bad record followed by valid ones means the log itself was damaged after it was written. Truncating there would discard acknowledged commits; skipping it would replay later changes without an earlier one. Either silently corrupts data. The correct move is to fail loudly and restore from a replica or backup plus archived WAL.</p>
+</details>
+
+<details>
+<summary>"Why can't you just retry a failed fsync?"</summary>
+<p>Because on Linux the failed pages may already be gone. After a write-back error, the kernel could mark the dirty pages clean and clear the error, so the next fsync reports success with nothing written. A database that retries then believes data is on disk that never got there, and may recycle the WAL that could have redone it. Since 2018 Postgres panics on fsync failure, and recovery replays from the WAL, which still holds the changes. Any system with its own log should do the same.</p>
+</details>
+
+<details>
+<summary>"An LSM engine also has a WAL. How is its job different from Postgres's?"</summary>
+<p>In an LSM engine, writes go to the WAL and an in-memory table, then the memtable is written out as an immutable sorted file. Files are never modified in place, so torn data pages are not a problem, and the WAL only needs to cover the current memtable; once flushed, that part of the WAL is deleted. Recovery means replaying a short WAL into a new memtable. The write amplification that Postgres pays in full-page writes and checkpoints, an LSM pays later in compaction, rewriting sorted files as they merge.</p>
+</details>

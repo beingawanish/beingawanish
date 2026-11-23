@@ -1,0 +1,120 @@
+openapi: 3.1.0
+info:
+  title: eda-commerce inbound webhooks (PSP and carrier)
+  version: 1.0.0
+  description: |
+    HTTP callbacks that third parties send to us. In this system the third parties are the fake PSP
+    (inside payment-svc) and the fake carrier (inside shipping-svc), but the contract is written as if
+    they were real, so a real adapter can replace the fake without touching the domain.
+
+    Rules for every webhook endpoint (ADR-006, ADR-013):
+    1. Verify the HMAC-SHA256 signature over "<timestamp>.<raw body>" and reject if the timestamp is
+       older than 5 minutes (replay protection). Answer 401 on failure.
+    2. Insert the provider event id into the inbox table. If it is already there, answer 200 and stop:
+       providers retry until they see a 2xx, and duplicates are normal.
+    3. Store the raw payload and answer 200 quickly (under 1 second). Domain processing happens after
+       the response, from the stored row, so a slow database never causes provider retries.
+    4. Never trust ordering. Carriers send "delivered" before "in transit" more often than you think.
+servers:
+  - url: http://localhost:8104
+    description: payment-svc (PSP webhooks)
+  - url: http://localhost:8107
+    description: shipping-svc (carrier webhooks)
+paths:
+  /webhooks/psp:
+    post:
+      operationId: receivePspWebhook
+      summary: Payment service provider notification
+      servers:
+        - url: http://localhost:8104
+      security:
+        - pspSignature: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookTimestamp'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PspNotification'}
+      responses:
+        '200': {description: Accepted or already seen.}
+        '400': {description: Unparseable body. The provider will not retry a 4xx.}
+        '401': {description: Bad signature or stale timestamp.}
+        '503': {description: Temporarily unavailable. The provider retries with backoff.}
+  /webhooks/carrier:
+    post:
+      operationId: receiveCarrierWebhook
+      summary: Carrier tracking update
+      servers:
+        - url: http://localhost:8107
+      security:
+        - carrierSignature: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookTimestamp'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CarrierTrackingEvent'}
+      responses:
+        '200': {description: Accepted or already seen.}
+        '400': {description: Unparseable body.}
+        '401': {description: Bad signature or stale timestamp.}
+        '503': {description: Temporarily unavailable.}
+components:
+  parameters:
+    WebhookTimestamp:
+      name: X-Webhook-Timestamp
+      in: header
+      required: true
+      description: Unix seconds when the provider signed the request.
+      schema: {type: integer}
+  securitySchemes:
+    pspSignature:
+      type: apiKey
+      in: header
+      name: X-Psp-Signature
+      description: hex(HMAC-SHA256(PSP_WEBHOOK_SECRET, "<X-Webhook-Timestamp>.<raw body>"))
+    carrierSignature:
+      type: apiKey
+      in: header
+      name: X-Carrier-Signature
+      description: hex(HMAC-SHA256(CARRIER_WEBHOOK_SECRET, "<X-Webhook-Timestamp>.<raw body>"))
+  schemas:
+    PspNotification:
+      type: object
+      required: [pspEventId, eventType, pspPaymentId, merchantReference, occurredAt]
+      properties:
+        pspEventId:
+          type: string
+          description: Unique per notification. The fake PSP re-sends the same id when it duplicates.
+        eventType:
+          type: string
+          enum: [authorization.succeeded, authorization.failed, capture.succeeded, capture.failed, void.succeeded, refund.succeeded, refund.failed]
+        pspPaymentId: {type: string}
+        merchantReference:
+          type: string
+          description: Our paymentId or refundId (the idempotency key we sent).
+        amount: {$ref: './common.yaml#/components/schemas/Money'}
+        failureCode:
+          type: [string, 'null']
+          enum: [insufficient_funds, card_declined, fraud_suspected, authorization_expired, processing_error, null]
+        occurredAt: {type: string, format: date-time}
+    CarrierTrackingEvent:
+      type: object
+      required: [carrierEventId, trackingNumber, status, occurredAt]
+      properties:
+        carrierEventId: {type: string}
+        trackingNumber: {type: string}
+        status:
+          type: string
+          description: |
+            Carrier vocabulary. shipping-svc maps it to a rank (LABEL_CREATED=0, PICKED_UP=1, IN_TRANSIT=2,
+            OUT_FOR_DELIVERY=3, DELIVERED=4) and only emits forward moves. EXCEPTION is emitted whenever seen.
+          enum: [LABEL_CREATED, PICKED_UP, IN_TRANSIT, OUT_FOR_DELIVERY, DELIVERED, EXCEPTION]
+        exceptionCode: {type: [string, 'null'], enum: [ADDRESS_ISSUE, DAMAGED, LOST, DELAYED, null]}
+        location: {type: [string, 'null']}
+        occurredAt:
+          type: string
+          format: date-time
+          description: Carrier's own timestamp. Used to order events, not arrival time.

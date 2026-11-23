@@ -1,0 +1,29 @@
+{
+  "envelope": {
+    "eventId": "df169484-1a01-53b1-9a67-cdf5c8c198aa",
+    "type": "com.edacommerce.payment.RefundSucceeded",
+    "version": 1,
+    "occurredAt": 1795000000000,
+    "correlationId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "causationId": "7d81ef21-5ef3-5566-b7ea-fc3564f4b63e",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tracestate": null,
+    "producer": "payment-svc",
+    "partitionKey": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateType": "Payment",
+    "aggregateId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+    "aggregateVersion": 1,
+    "tenantId": null,
+    "expiresAt": null
+  },
+  "orderId": "6ed9d0ed-127a-524b-b079-a06e34f3ec73",
+  "paymentId": "720ddbaf-1312-58dd-b197-fdbcfd1b0bd9",
+  "refundId": "d0baba18-648d-511a-b448-431ba90601d7",
+  "returnId": "8684773d-d7a5-5f9b-a7f1-8f69b8cce635",
+  "amount": {
+    "amountMinor": 1999,
+    "currency": "EUR"
+  },
+  "pspReference": "example-pspReference",
+  "refundedAt": 1795000000000
+}

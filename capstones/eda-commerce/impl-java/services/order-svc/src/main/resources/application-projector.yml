@@ -1,0 +1,6 @@
+# order-history-projector: same codebase, own process and consumer group (ADR-0010).
+eda:
+  service-name: order-history-projector
+  consumer-group: ${CONSUMER_GROUP:order-history-projector}
+  consumer:
+    topics: [order.events.v1, payment.events.v1, fulfilment.events.v1, shipping.events.v1, returns.events.v1, notification.events.v1]

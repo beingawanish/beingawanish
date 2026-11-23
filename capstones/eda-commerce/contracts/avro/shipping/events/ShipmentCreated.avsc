@@ -1,0 +1,60 @@
+{
+  "type": "record",
+  "name": "ShipmentCreated",
+  "namespace": "com.edacommerce.shipping",
+  "doc": "A carrier booking exists and a label PDF is stored (claim check).",
+  "fields": [
+    {
+      "name": "envelope",
+      "type": "com.edacommerce.common.Envelope",
+      "doc": "Shared metadata. Always the first field."
+    },
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "shipmentId",
+      "type": "string"
+    },
+    {
+      "name": "direction",
+      "type": "com.edacommerce.common.ShipmentDirection"
+    },
+    {
+      "name": "fulfilmentId",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "returnId",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "carrier",
+      "type": "string"
+    },
+    {
+      "name": "trackingNumber",
+      "type": "string"
+    },
+    {
+      "name": "label",
+      "type": "com.edacommerce.common.ClaimCheck"
+    },
+    {
+      "name": "createdAt",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    }
+  ]
+}

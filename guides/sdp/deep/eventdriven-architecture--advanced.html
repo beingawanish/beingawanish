@@ -1,0 +1,794 @@
+<h2 id=dd-eventdriven-architecture-adv-orchestration level=2>Deep Dive: Orchestrating Order → Payment → Inventory → Fulfilment → Shipping</h2>
+<p>The first deep dive gave the rule: orchestrate the steps that depend on each other, and choreograph the reactions that don't. This part builds the order workflow that rule points at. One order, five services, every message named and keyed, and every failure branch walked through. The aim is a design you could hand to five teams on Monday.</p>
+<p>The running example is the bookstore again. Customer <code>c_91</code> places order <code>ord_7f3a</code>: three books, $142.00, shipping to Austin.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-commands-events level=3>Commands and events: two kinds of message, two naming rules</h3>
+<p>A workflow needs both kinds of message, and mixing them up is the most common design error in event-driven systems. They differ in who decides.</p>
+<p>A <strong>command</strong> asks one specific service to do something. It is named in the imperative: <code>AuthorizePayment</code>, <code>ReserveStock</code>, <code>CreateShipment</code>. It has exactly one intended handler, the service that owns that capability. And it can be refused. Payment may answer "declined", and that is a normal outcome, not an error.</p>
+<p>An <strong>event</strong> records something that already happened. It is named in the past tense: <code>PaymentAuthorized</code>, <code>StockReserved</code>, <code>ShipmentDispatched</code>. The publisher does not know or care who listens. Nobody can refuse it, because it is already true.</p>
+<p>The naming is not cosmetic. A past-tense name on a message that is really an instruction (<code>SendReceiptRequested</code>, say) hides a dependency. The publisher expects a specific consumer to act, so it is a command dressed as an event. When that consumer is down, the publisher's workflow silently stalls, and nobody owns the timeout.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Property<th>Command<th>Event<tbody>
+<tr><td>Grammar<td>Imperative: <code>ReserveStock</code><td>Past tense: <code>StockReserved</code>
+<tr><td>Handlers<td>Exactly one owner<td>Zero or more subscribers
+<tr><td>Can be refused?<td>Yes, and the refusal is itself an event<td>No, it is a fact
+<tr><td>Who owns the schema<td>The receiver (it defines what it accepts)<td>The publisher (it defines what it states)
+<tr><td>Typical channel<td>A per-service command topic or queue<td>A per-entity event topic
+<tr><td>Coupling<td>Sender knows the receiver<td>Publisher knows nobody
+<tr><td>Retention need<td>Short: until handled<td>Long: replay builds new views
+</table></div></div>
+<p>Notice the schema-ownership row. It decides where a command's schema lives. <code>ReserveStock</code> belongs to inventory, which publishes it in its own contract: "send me this and I will reserve". The orchestrator is a client of that contract, in the same way an HTTP client is a client of an API.</p>
+<p>A good test in review: read each message name aloud and ask "who decided?" If the sender decided what must happen, it's a command. If the sender is reporting what did happen, it's an event.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-who-holds level=3>Who holds the workflow: orchestrator, choreography, and the hybrid</h3>
+<p>The order workflow has every property that pushes toward orchestration. Inventory should not reserve stock for an order whose payment failed. A late failure must undo earlier steps in reverse order. And customer support needs to answer "where is order <code>ord_7f3a</code>?" right now, not by reading five services.</p>
+<p>So something owns the workflow's state. That something is called a <strong>process manager</strong> (the enterprise-integration term) or an <strong>orchestrator</strong>. It holds one record per order: the current step, what has been done, what must be undone if things go wrong, and when the current step is overdue. It reacts to events and sends commands. It contains no business rules about payments or stock. Those stay in the services that own them.</p>
+<p>Pure choreography would wire the same steps as a chain of subscriptions: payment listens for <code>OrderPlaced</code>, inventory listens for <code>PaymentAuthorized</code>, and so on. It works on the happy path and gets awkward fast. Inventory now needs to know that a payment authorization is the trigger for reservation, which is order-workflow knowledge leaking into the stock service. Compensation needs every service to listen for every later failure. And the "where is it?" question needs a separate process monitor, which is an orchestrator that is not allowed to act.</p>
+<p>The shape most companies land on is a hybrid, and it is worth stating precisely:</p>
+<ul>
+<li><strong>The spine is orchestrated.</strong> Payment, inventory, fulfilment and shipping are steps of one saga. The orchestrator sends them commands and listens for their outcome events.</li>
+<li><strong>Every step still publishes domain events.</strong> <code>PaymentAuthorized</code> goes to <code>payment.events</code>, where the orchestrator is just one subscriber.</li>
+<li><strong>Everything else is choreographed.</strong> Email, analytics, loyalty, the fraud model and the search index subscribe to those event topics. The orchestrator never hears of them, and adding a sixth reaction needs no change to the workflow.</li>
+<li><strong>The orchestrator publishes its own events too.</strong> <code>OrderConfirmed</code>, <code>OrderCancelled</code> and <code>OrderShipped</code> are facts about the order as a whole. Most downstream consumers want these, not the step events.</li>
+</ul>
+<p>The line between the two halves is one question: if this consumer did nothing, would the order be wrong? If yes, it is a step and belongs to the orchestrator. If the order would be fine but someone would miss a receipt, it is a reaction and should be choreographed.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-engines level=3>Three ways to build the orchestrator</h3>
+<p>"Use an orchestrator" still leaves the build choice. There are three common answers, and they differ mostly in where the workflow state lives and who writes the timer code.</p>
+<p><strong>A durable workflow engine</strong> such as Temporal (or Cadence, the Uber project it grew out of). You write the workflow as ordinary code: call <code>authorize_payment</code>, then <code>reserve_stock</code>, wrap them in try/except for compensation, and <code>sleep</code> for a deadline. The engine records every step's result in an event history. If the worker crashes, another worker replays that history through the same code and continues from the same point. This is why workflow code must be deterministic: no wall-clock reads, random numbers or direct I/O outside the engine's APIs. Activities (the steps that touch the outside world) are retried by the engine with policies you configure. The engine owns timers, so a seven-day deadline is one line of code.</p>
+<p><strong>A database-backed state machine.</strong> The orchestrator is a normal service with a <code>saga</code> table, an outbox and an inbox. Each incoming event loads the saga row, checks the transition is legal, updates the row, and writes the next command to the outbox, all in one transaction. Timers are a <code>deadline_at</code> column scanned by a small poller. Nothing is magic, so everything is visible in SQL. You also write everything yourself, including the bugs in the timer scanner.</p>
+<p><strong>A managed state-machine service</strong> such as AWS Step Functions or a BPMN engine like Camunda. The workflow is a declared graph (JSON or a diagram) rather than code. These fit well when the steps are mostly calls to other managed services and the team wants the console view for free. Long-running waits on external events need a callback-token style integration, which is more ceremony than a Temporal signal.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Concern<th>Durable workflow engine<th>DB-backed state machine<th>Managed state machine<tbody>
+<tr><td>Where state lives<td>Engine's event history<td>Your <code>saga</code> table<td>The provider's execution record
+<tr><td>Timers and deadlines<td>Built in, durable<td>Your poller over <code>deadline_at</code><td>Built in (wait states)
+<tr><td>Compensation<td>Ordinary code (try/finally)<td>Explicit states and transitions<td>Catch/fallback states in the graph
+<tr><td>Changing a running workflow<td>Versioning APIs; old histories must still replay<td>Migrate rows; easy to reason about<td>New version applies to new executions
+<tr><td>Querying "all orders stuck at payment"<td>Visibility queries, with limits<td>Plain SQL<td>Console and API filters
+<tr><td>New infrastructure<td>Engine cluster plus its database, or a hosted service<td>None beyond what you run<td>None, but vendor lock-in
+<tr><td>Main trap<td>Non-deterministic code breaks replay<td>Hand-written concurrency and timer bugs<td>Payload size and per-transition pricing at volume
+</table></div></div>
+<p>A sensible default: if the company already runs a workflow engine, use it. If not, and there are only one or two sagas, a DB-backed state machine is less to operate and easier for new engineers to read. Move to an engine when the third or fourth long-running workflow arrives, or the first one that needs waits measured in days. The rest of this section uses the DB-backed version, because it shows every moving part. A Temporal workflow does the same things with less code you can see.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-topics-keys level=3>Topic design, keys and ordering</h3>
+<p>The message plan below uses Kafka terms. The same shape works on most log-based brokers.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Topic<th>Kind<th>Written by<th>Read by<th>Key<th>Retention<tbody>
+<tr><td><code>order.events</code><td>Events<td>Checkout, orchestrator<td>Orchestrator, email, analytics, search<td><code>order_id</code><td>Long (30 days or compacted)
+<tr><td><code>payment.commands</code><td>Commands<td>Orchestrator<td>Payment<td><code>order_id</code><td>Short (days)
+<tr><td><code>payment.events</code><td>Events<td>Payment<td>Orchestrator, finance, fraud<td><code>order_id</code><td>Long
+<tr><td><code>inventory.commands</code><td>Commands<td>Orchestrator<td>Inventory<td><code>order_id</code><td>Short
+<tr><td><code>inventory.events</code><td>Events<td>Inventory<td>Orchestrator, replenishment<td><code>order_id</code> (see below)<td>Long
+<tr><td><code>fulfilment.commands</code> / <code>.events</code><td>Both<td>Orchestrator / warehouse adapter<td>Warehouse adapter / orchestrator<td><code>order_id</code><td>Short / long
+<tr><td><code>shipping.commands</code> / <code>.events</code><td>Both<td>Orchestrator / shipping<td>Shipping / orchestrator, email<td><code>order_id</code><td>Short / long
+</table></div></div>
+<p>Four decisions sit inside that table.</p>
+<p><strong>Separate command and event topics per service.</strong> Commands are private traffic between the orchestrator and one service. Events are public. Mixing them on one topic forces every event subscriber to skip commands, and it tempts other teams to send commands they have no business sending. Separate topics also let you give them different retention and access control: only the orchestrator may write <code>payment.commands</code>.</p>
+<p><strong>Key everything in the workflow by <code>order_id</code>.</strong> Kafka orders records only within a partition, and the key picks the partition. Keying every command and event about one order by its ID puts them in one partition per topic. So payment will see <code>AuthorizePayment</code> before <code>VoidAuthorization</code> for the same order, and the orchestrator will see <code>PaymentAuthorized</code> before <code>PaymentCaptured</code>.</p>
+<p>That guarantee is narrower than it sounds. It holds within one topic. Across topics there is no order at all. The orchestrator might read <code>StockReserved</code> (from <code>inventory.events</code>) before an earlier <code>PaymentAuthorized</code> (from <code>payment.events</code>), if the two topics' consumers run at different speeds. A correct orchestrator never relies on cross-topic arrival order. It checks each incoming event against the saga's state, and an event that arrives "early" is either handled or held, never assumed impossible. In the design here the orchestrator sends one command at a time, so a step's reply cannot really overtake the previous step's reply. Parallel steps are where this bites.</p>
+<p><strong>Watch for services whose natural key is something else.</strong> Inventory thinks in SKUs and warehouses. Its own stock-level events (<code>StockLevelChanged</code>) should be keyed by SKU, so that every change to one SKU's count is ordered. Its replies to the order workflow should be keyed by <code>order_id</code>. Those are different facts about different entities, so they go on different topics or at least carry different keys. Forcing one key onto both breaks one of the two orderings.</p>
+<p><strong>Size the partitions for the slowest step.</strong> Ordering per key is bought with parallelism limited by partition count, and per-key serial processing. If the warehouse adapter takes 200 ms per command (it calls an external warehouse system), one consumer thread handles 5 commands per second per partition. At 300 orders per second you need at least 60-way parallelism on <code>fulfilment.commands</code>: more partitions, or a consumer that processes different keys within a partition concurrently while keeping each key serial. The <a href="#partitioned-consumption">Partitioned Consumption</a> lesson covers the second technique.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-ids-saga-table level=3>Correlation, causation, and the saga state table</h3>
+<p>Every message in the workflow carries three identifiers in its envelope, plus its own ID:</p>
+<ul>
+<li><code>message_id</code>: unique per message, assigned once when the message is written to the outbox. This is the dedup key.</li>
+<li><code>correlation_id</code>: the same for every message in this order's workflow. Use the saga ID (here, the order ID with a prefix) so a single search returns the whole story.</li>
+<li><code>causation_id</code>: the <code>message_id</code> of the message that directly caused this one. <code>ReserveStock</code>'s causation ID is the <code>PaymentAuthorized</code> event that triggered it. Following causation links rebuilds the workflow as a tree, including retries and compensations.</li>
+<li><code>traceparent</code>: the W3C trace context, so the hops appear in distributed tracing.</li>
+</ul>
+<p>The correlation ID answers "everything about this order". The causation ID answers "why did this message exist?" You need both. When a refund goes out twice, correlation finds the 40 messages for that order. Causation shows that both <code>RefundPayment</code> commands trace back to the same <code>ShipmentFailed</code> event, which points straight at a non-idempotent compensation handler.</p>
+<p>The orchestrator's state lives in one table:</p>
+<pre><code>CREATE TABLE order_saga (
+  saga_id          text PRIMARY KEY,          -- 'saga_ord_7f3a'
+  order_id         text NOT NULL UNIQUE,
+  state            text NOT NULL,             -- AWAITING_PAYMENT, AWAITING_STOCK, ...
+  version          bigint NOT NULL,           -- optimistic concurrency
+  payment_auth_id  text,                      -- filled as steps complete
+  reservation_id   text,
+  fulfilment_id    text,
+  shipment_id      text,
+  compensations    jsonb NOT NULL DEFAULT '[]',  -- stack of undo actions owed
+  attempt          int NOT NULL DEFAULT 0,    -- retries of the current step
+  step_deadline_at timestamptz,               -- when the current step is overdue
+  saga_deadline_at timestamptz NOT NULL,      -- when the whole order must be resolved
+  last_message_id  text,                      -- causation for the next command
+  created_at       timestamptz NOT NULL,
+  updated_at       timestamptz NOT NULL
+);
+CREATE INDEX order_saga_due ON order_saga (step_deadline_at)
+  WHERE state NOT IN ('COMPLETED', 'CANCELLED', 'FAILED');
+
+CREATE TABLE inbox (                          -- one row per handled message
+  consumer    text NOT NULL,
+  message_id  text NOT NULL,
+  handled_at  timestamptz NOT NULL,
+  PRIMARY KEY (consumer, message_id)
+);</code></pre>
+<p>Handling one event is one database transaction with four parts:</p>
+<ol>
+<li>Insert the message ID into <code>inbox</code>. A primary-key conflict means it was already handled: commit nothing and acknowledge.</li>
+<li>Load the saga row <code>FOR UPDATE</code> (or compare <code>version</code> on update). Check that the event is legal in the current state. <code>StockReserved</code> while in <code>AWAITING_PAYMENT</code> is not, so it is logged and parked for investigation.</li>
+<li>Update the saga row: the new state, the new step deadline, and a push onto the compensation stack if the step created something that must be undone later.</li>
+<li>Insert the next command into the outbox, with <code>causation_id</code> set to the incoming event's ID.</li>
+</ol>
+<p>Commit, then acknowledge the broker offset. A crash anywhere before the commit means the event is redelivered and the whole thing runs again. A crash after the commit but before the ack means it is redelivered and step 1 stops it. That is exactly-once <em>effect</em> on the orchestrator's state, built from at-least-once delivery, without any broker transaction.</p>
+<p>The compensation stack deserves a word. Undo actions are recorded as the steps succeed, not derived at failure time. When payment is authorized, the orchestrator pushes <code>VoidAuthorization(auth_id)</code>. When capture succeeds, it replaces that with <code>RefundPayment(capture_id)</code>. When stock is reserved, it pushes <code>ReleaseStock(reservation_id)</code>. On failure, the orchestrator pops and sends them in reverse order. Recording them up front means the failure path cannot forget a step that the happy path added last month.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-timeouts level=3>Timeouts, deadlines and compensations</h3>
+<p>Every step needs a timeout, and the whole saga needs a deadline. They protect against different things.</p>
+<p>A <strong>step timeout</strong> covers a lost or slow reply: the command went out and nothing came back. For a step that should take milliseconds, like a stock reservation, a timeout of 30 seconds to a few minutes is generous. On expiry the orchestrator does not assume failure. It retries the command (with the <em>same</em> <code>message_id</code> semantics underneath, so the handler's idempotency absorbs it) a bounded number of times with backoff. Only then does it escalate.</p>
+<p>A <strong>saga deadline</strong> covers a workflow that keeps making slow progress, or keeps waiting on something external. "Every order is either shipped or cancelled within 72 hours" is a business rule. It belongs in the saga row as a timestamp, so a scanner can find orders that are about to break it.</p>
+<p>Some deadlines are imposed from outside, and they should drive the design. A card authorization is a hold, and holds expire. Card networks and issuers set how long an authorization stays valid, and it varies by network, card type and merchant category, from a few days to a few weeks. If fulfilment can take longer than that, the workflow needs a branch that re-authorizes before capture, or it must capture earlier. Treat the authorization's expiry as a deadline field, filled from the payment provider's response rather than hard-coded.</p>
+<p>When a step does fail, the decision is between three moves:</p>
+<ul>
+<li><strong>Retry</strong>, when the failure is transient (a timeout, a 503, a broker hiccup) and the step is idempotent.</li>
+<li><strong>Compensate</strong>, when the failure is a business answer (declined, out of stock) or retries are exhausted. Pop the compensation stack and run it backwards.</li>
+<li><strong>Escalate to a human</strong>, when compensation itself fails or the outcome is ambiguous. A refund that the provider keeps rejecting is not something to retry forever. The saga moves to <code>NEEDS_ATTENTION</code>, and a ticket opens with the correlation ID.</li>
+</ul>
+<p>Compensations are commands like any other. They need idempotency, timeouts and retries too. And they are semantic undos, not rollbacks. A refund is a new movement of money that the customer sees on their statement. A void before capture is invisible to most customers. That difference is the reason step order matters, which the next part shows.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-step-order level=3>Choosing the step order: where to put the point of no return</h3>
+<p>The saga literature calls the step after which you can no longer undo cleanly the <strong>pivot</strong>. Steps before it are compensatable. Steps after it must be retried until they succeed. A good order pushes cheap, reversible steps early and the expensive, irreversible ones late.</p>
+<p>In this workflow, the irreversible-ish actions are capturing money (undo means a visible refund) and handing a parcel to a carrier (undo means an interception or a return). So the order below <em>authorizes</em> payment first, which is cheap to void. It reserves stock, which is cheap to release. It lets the warehouse pick and pack. Only then does it capture, and finally it books the shipment.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Order of steps<th>"Out of stock" costs<th>"Payment declined" costs<th>Comment<tbody>
+<tr><td>Capture payment → reserve stock<td>A refund the customer sees<td>Nothing<td>Simple, but every stock-out becomes a refund and a support ticket
+<tr><td>Authorize → reserve → pick → capture → ship<td>A void (usually invisible)<td>Nothing<td>The order used here; needs auth expiry handling for slow fulfilment
+<tr><td>Reserve stock → authorize → pick → capture → ship<td>Nothing<td>Releasing a reservation<td>Fraudulent or failing cards briefly hold scarce stock; reservations need a TTL
+<tr><td>Reserve and authorize in parallel<td>Void or release, whichever succeeded<td>Same<td>Lower latency; the orchestrator must handle replies in either order
+</table></div></div>
+<p>The reader's original sequence put payment before inventory, and that is fine with authorization instead of capture. If your payment provider or market does not support separate authorization and capture, the first row is what you get. Then the out-of-stock branch below becomes a refund, and you should reserve stock first.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-sequence level=3>The worked sequence, end to end</h3>
+<p>Here is the happy path for <code>ord_7f3a</code>. Solid arrows are commands. Dashed arrows are events. Every arrow is a record written through an outbox and read through an inbox.</p>
+<svg role="img" aria-labelledby="dd-eventdriven-architecture-adv-seq-title dd-eventdriven-architecture-adv-seq-desc" viewBox="0 0 720 470" width="100%" style="max-width:720px;font-family:inherit;font-size:12px">
+<title id="dd-eventdriven-architecture-adv-seq-title">Orchestrated order saga, happy path</title>
+<desc id="dd-eventdriven-architecture-adv-seq-desc">A sequence diagram with six lanes: checkout, orchestrator, payment, inventory, fulfilment and shipping. Checkout publishes order.placed. The orchestrator sends AuthorizePayment and receives PaymentAuthorized, sends ReserveStock and receives StockReserved, sends RequestFulfilment and receives FulfilmentPacked, sends CapturePayment and receives PaymentCaptured, then sends CreateShipment and receives ShipmentDispatched, and finally publishes OrderShipped. Commands are solid arrows and events are dashed.</desc>
+<rect x="0" y="0" width="720" height="470" fill="var(--paper, #ffffff)"/>
+<g stroke="var(--accent, #1f5f99)" fill="var(--bg, #f4f7fa)">
+<rect x="10" y="14" width="100" height="30" rx="5"/><rect x="125" y="14" width="110" height="30" rx="5"/><rect x="250" y="14" width="100" height="30" rx="5"/>
+<rect x="365" y="14" width="100" height="30" rx="5"/><rect x="480" y="14" width="100" height="30" rx="5"/><rect x="600" y="14" width="110" height="30" rx="5"/>
+</g>
+<g fill="var(--ink, #1c2430)" font-weight="bold" text-anchor="middle">
+<text x="60" y="34">Checkout</text><text x="180" y="34">Orchestrator</text><text x="300" y="34">Payment</text>
+<text x="415" y="34">Inventory</text><text x="530" y="34">Fulfilment</text><text x="655" y="34">Shipping</text>
+</g>
+<g stroke="var(--line, #d5dee8)" stroke-width="2">
+<line x1="60" y1="44" x2="60" y2="420"/><line x1="180" y1="44" x2="180" y2="420"/><line x1="300" y1="44" x2="300" y2="420"/>
+<line x1="415" y1="44" x2="415" y2="420"/><line x1="530" y1="44" x2="530" y2="420"/><line x1="655" y1="44" x2="655" y2="420"/>
+</g>
+<g stroke="var(--muted, #5c6b7c)" stroke-width="1.5" stroke-dasharray="5 4" fill="none">
+<line x1="60" y1="75" x2="174" y2="75"/>
+<line x1="300" y1="135" x2="186" y2="135"/>
+<line x1="415" y1="195" x2="186" y2="195"/>
+<line x1="530" y1="255" x2="186" y2="255"/>
+<line x1="300" y1="315" x2="186" y2="315"/>
+<line x1="655" y1="375" x2="186" y2="375"/>
+</g>
+<g stroke="var(--accent, #1f5f99)" stroke-width="2" fill="none">
+<line x1="180" y1="105" x2="294" y2="105"/>
+<line x1="180" y1="165" x2="409" y2="165"/>
+<line x1="180" y1="225" x2="524" y2="225"/>
+<line x1="180" y1="285" x2="294" y2="285"/>
+<line x1="180" y1="345" x2="649" y2="345"/>
+</g>
+<g fill="var(--accent, #1f5f99)">
+<polygon points="294,101 300,105 294,109"/><polygon points="409,161 415,165 409,169"/><polygon points="524,221 530,225 524,229"/>
+<polygon points="294,281 300,285 294,289"/><polygon points="649,341 655,345 649,349"/>
+</g>
+<g fill="var(--muted, #5c6b7c)">
+<polygon points="174,71 180,75 174,79"/><polygon points="186,131 180,135 186,139"/><polygon points="186,191 180,195 186,199"/>
+<polygon points="186,251 180,255 186,259"/><polygon points="186,311 180,315 186,319"/><polygon points="186,371 180,375 186,379"/>
+</g>
+<g fill="var(--ink, #1c2430)">
+<text x="66" y="69">order.placed</text>
+<text x="190" y="99">AuthorizePayment</text>
+<text x="190" y="129">PaymentAuthorized</text>
+<text x="190" y="159">ReserveStock</text>
+<text x="190" y="189">StockReserved</text>
+<text x="190" y="219">RequestFulfilment</text>
+<text x="190" y="249">FulfilmentPacked</text>
+<text x="190" y="279">CapturePayment</text>
+<text x="190" y="309">PaymentCaptured</text>
+<text x="190" y="339">CreateShipment</text>
+<text x="190" y="369">ShipmentDispatched</text>
+<text x="190" y="405">publishes OrderShipped to order.events</text>
+</g>
+<line x1="20" y1="445" x2="60" y2="445" stroke="var(--accent, #1f5f99)" stroke-width="2"/>
+<text x="68" y="449" fill="var(--ink, #1c2430)">command (to one owner, can be refused)</text>
+<line x1="340" y1="445" x2="380" y2="445" stroke="var(--muted, #5c6b7c)" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="388" y="449" fill="var(--ink, #1c2430)">event (a fact; any number of subscribers)</text>
+</svg>
+<p>Checkout publishes the order fact. The saga starts from it rather than from a synchronous call, so checkout's response time never includes payment or inventory.</p>
+<pre><code>// topic: order.events   key: ord_7f3a
+{
+  "message_id": "evt_01J8QF2A",
+  "type": "order.placed.v1",
+  "correlation_id": "saga_ord_7f3a",
+  "causation_id": "req_88c1",            // the HTTP request that created it
+  "occurred_at": "2026-11-20T14:03:11.204Z",
+  "order_version": 1,
+  "data": {
+    "order_id": "ord_7f3a", "customer_id": "c_91",
+    "lines": [ {"sku": "bk_ddia", "qty": 1, "unit_cents": 4800},
+               {"sku": "bk_sre",  "qty": 2, "unit_cents": 4700} ],
+    "total_cents": 14200, "currency": "USD",
+    "payment_method_ref": "pm_tok_3c9",   // a token, never card data
+    "ship_to_ref": "addr_77",             // a reference, see the large-payload section
+    "promise_by": "2026-11-23T23:59:00Z"
+  }
+}</code></pre>
+<p>The orchestrator creates the saga row in state <code>AWAITING_PAYMENT</code>, with a step deadline 2 minutes out and a saga deadline at the delivery promise. In the same transaction it writes the first command:</p>
+<pre><code>// topic: payment.commands   key: ord_7f3a
+{
+  "message_id": "cmd_01J8QF2C",
+  "type": "payment.authorize.v1",
+  "correlation_id": "saga_ord_7f3a",
+  "causation_id": "evt_01J8QF2A",
+  "deadline": "2026-11-20T14:05:11Z",     // after this, don't bother: the saga has moved on
+  "data": {
+    "order_id": "ord_7f3a", "amount_cents": 14200, "currency": "USD",
+    "payment_method_ref": "pm_tok_3c9",
+    "idempotency_key": "saga_ord_7f3a:authorize:1"
+  }
+}</code></pre>
+<p>Two fields carry real weight. The <code>deadline</code> tells payment not to start work that the orchestrator has already given up on. A command that sat in a backlog for 10 minutes should be dropped with a <code>payment.authorize_expired</code> reply, not executed. The <code>idempotency_key</code> is built from the saga, the step and the attempt <em>generation</em>, not from the message ID. A retry of the same step reuses the same key, so the payment provider collapses duplicates. A deliberate re-authorization later (after expiry, say) bumps the generation to <code>:2</code> and gets a new key.</p>
+<p>Payment authorizes with the provider and replies:</p>
+<pre><code>// topic: payment.events   key: ord_7f3a
+{
+  "message_id": "evt_01J8QF3K",
+  "type": "payment.authorized.v1",
+  "correlation_id": "saga_ord_7f3a",
+  "causation_id": "cmd_01J8QF2C",
+  "data": {
+    "order_id": "ord_7f3a", "auth_id": "auth_5521", "amount_cents": 14200,
+    "expires_at": "2026-11-27T14:03:40Z"   // provider-supplied; drives a saga deadline
+  }
+}</code></pre>
+<p>The orchestrator moves to <code>AWAITING_STOCK</code>, pushes <code>VoidAuthorization(auth_5521)</code> onto the compensation stack, and sends <code>ReserveStock</code> with the order lines. Inventory reserves (decrementing available stock, recording a reservation with its own TTL as a safety net) and replies <code>StockReserved</code> with a <code>reservation_id</code>. The orchestrator pushes <code>ReleaseStock</code> and sends <code>RequestFulfilment</code>.</p>
+<p>Fulfilment is the slow step. A warehouse management system works in minutes or hours, not milliseconds. The adapter acknowledges quickly with <code>FulfilmentAccepted</code>, and the orchestrator resets its step deadline to the warehouse's service level, say 8 hours. Later the warehouse reports <code>FulfilmentPacked</code> with parcel weight and dimensions. Now the orchestrator sends <code>CapturePayment</code>. On <code>PaymentCaptured</code> it swaps the stack entry <code>VoidAuthorization</code> for <code>RefundPayment(capture_id)</code>, sends <code>CreateShipment</code>, and on <code>ShipmentDispatched</code> marks the saga <code>COMPLETED</code> and publishes <code>order.shipped.v1</code> to <code>order.events</code>.</p>
+<p>The orchestrator also publishes an <code>order.status_changed</code> event at every state change. That one event feeds the "where is my order?" page, the support console and the stuck-order dashboard. None of them needs to know the saga's internals.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-branches level=3>Failure branches</h3>
+<p>The happy path is the easy 95%. The design is judged on four branches.</p>
+<p><strong>Branch 1: payment declined.</strong> Payment replies with an event, not an error:</p>
+<pre><code>{ "type": "payment.declined.v1", "causation_id": "cmd_01J8QF2C",
+  "data": { "order_id": "ord_7f3a", "reason": "insufficient_funds", "retryable": false } }</code></pre>
+<p>The compensation stack is empty, because nothing succeeded yet. The orchestrator moves to <code>CANCELLED</code> and publishes <code>order.cancelled.v1</code> with <code>reason: payment_declined</code>. Email sends the "please update your card" message by choreography. Two details matter. First, the provider's decline code decides <code>retryable</code>. A soft decline (a provider outage, a "try again" code) should go through bounded retries. A hard decline must not be retried, and repeated attempts on a declined card can attract scheme penalties. Second, some businesses give the customer a window to fix the card. That is a <code>AWAITING_CUSTOMER</code> state with its own deadline, not a retry loop.</p>
+<p><strong>Branch 2: out of stock after payment.</strong> Payment is authorized. Inventory replies <code>StockUnavailable</code> for <code>bk_sre</code>. Perhaps the last two copies sold in the same second, or the stock count was simply wrong. The orchestrator now has a business choice, and it belongs in a product decision, not an engineer's default:</p>
+<ul>
+<li><strong>Cancel the order.</strong> Pop the stack: send <code>VoidAuthorization(auth_5521)</code>, wait for <code>AuthorizationVoided</code>, publish <code>order.cancelled.v1</code> with <code>reason: out_of_stock</code>.</li>
+<li><strong>Partially fulfil.</strong> Reserve what is available, then send <code>AdjustAuthorization</code> (or capture only the smaller amount later). This needs a payment provider that supports partial capture, and a customer-facing policy.</li>
+<li><strong>Backorder.</strong> Move to <code>AWAITING_RESTOCK</code> with a deadline before the authorization expires. Listen for <code>StockReplenished</code> for that SKU. On the deadline, cancel or re-authorize.</li>
+</ul>
+<p>Whatever the choice, the void is idempotent at the provider (keyed by <code>auth_5521</code>), and a void that fails after retries sends the saga to <code>NEEDS_ATTENTION</code>. Money held on a customer's card with no order behind it is a support call waiting to happen, so it gets a page, not a log line. If the payment had been captured already, the same branch would send <code>RefundPayment</code>, which is why the step order put capture late.</p>
+<p><strong>Branch 3: the warehouse times out.</strong> <code>RequestFulfilment</code> went out, <code>FulfilmentAccepted</code> came back, and then nothing for 8 hours. This is the dangerous branch, because the outcome is <em>ambiguous</em>. The warehouse may have lost the request. It may have packed the parcel and failed to tell anyone. Or the event may be sitting in a backlog behind a broken consumer.</p>
+<p>The wrong move is to compensate straight away. Releasing the stock and voiding the payment for a parcel that is already on a truck turns a delay into a loss. The right sequence is:</p>
+<ol>
+<li><strong>Ask before acting.</strong> Send <code>QueryFulfilmentStatus</code>, or call the warehouse adapter's status API directly. Timeouts are where synchronous reads to the owner earn their place.</li>
+<li><strong>If the warehouse says "never heard of it"</strong>, resend <code>RequestFulfilment</code> with the same fulfilment idempotency key. The warehouse adapter must dedupe on that key, so a late original and the resend cannot create two pick lists.</li>
+<li><strong>If it says "in progress"</strong>, extend the step deadline once, record why, and alert if it slips again.</li>
+<li><strong>If it cannot answer at all</strong>, retry the query with backoff until the saga deadline approaches. Then escalate to <code>NEEDS_ATTENTION</code>. A human checking the warehouse floor is cheaper than an automated compensation that might be wrong.</li>
+</ol>
+<p>One more trap: the late reply. Suppose the orchestrator gave up and cancelled, and then <code>FulfilmentPacked</code> arrives. The saga is in <code>CANCELLED</code>, where that event is not a legal transition. The handler must not drop it silently. A packed parcel for a cancelled order needs action: return it to stock and record the reason. So "event in an unexpected state" is a first-class path with its own handling and an alert, never a <code>pass</code>.</p>
+<p><strong>Branch 4: duplicate delivery.</strong> The orchestrator's consumer crashed after committing the saga update for <code>PaymentAuthorized</code> but before committing its Kafka offset. On restart it reads <code>PaymentAuthorized</code> again. Three layers stop the duplicate from doing damage:</p>
+<ol>
+<li>The inbox insert of <code>evt_01J8QF3K</code> conflicts. The handler acknowledges and does nothing.</li>
+<li>Even without the inbox, the saga is now in <code>AWAITING_STOCK</code>, where <code>PaymentAuthorized</code> is not a legal transition. The state check rejects it.</li>
+<li>Even if the orchestrator somehow sent <code>ReserveStock</code> twice, inventory dedupes on its own inbox, and its reservation is keyed by <code>(order_id, line)</code>, so a second reserve for the same order is a no-op returning the same <code>reservation_id</code>.</li>
+</ol>
+<p>Defence in depth is not paranoia here. Each layer catches a different bug. The inbox catches redelivery. The state check catches redelivery after inbox rows were cleaned up, and replays. Downstream idempotency catches bugs in the orchestrator itself. The <a href="#idempotency">Idempotency</a> lesson covers the handler side in general, and the <a href="#saga">Saga</a> lesson covers compensation semantics.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Branch<th>Trigger<th>Orchestrator action<th>Compensations run<th>Customer sees<tbody>
+<tr><td>Payment declined<td><code>payment.declined</code>, non-retryable<td>Cancel<td>None<td>"Update your card" email
+<tr><td>Soft decline / provider down<td>Retryable failure or step timeout<td>Retry with backoff, then cancel<td>None<td>Nothing, or a delay
+<tr><td>Out of stock<td><code>stock.unavailable</code><td>Cancel, partial, or backorder (product decision)<td>Void authorization<td>Cancellation or backorder notice
+<tr><td>Warehouse silent<td>Step deadline expires<td>Query status, resend with same key, escalate<td>Only once outcome is known<td>A delay, ideally with an honest status
+<tr><td>Late reply after cancel<td>Event illegal in current state<td>Handle explicitly, alert<td>Return parcel to stock<td>Nothing
+<tr><td>Duplicate message<td>Redelivery after crash<td>Inbox and state check drop it<td>None<td>Nothing
+</table></div></div>
+<p>For completeness, here is the orchestrator's handler in the DB-backed style, using Python's standard-library <code>sqlite3</code> to keep it self-contained. A production version would use Postgres and <code>SELECT ... FOR UPDATE</code>, but the shape is identical.</p>
+<pre><code>import json, sqlite3, uuid
+
+TRANSITIONS = {   # (state, event type) -&gt; (next state, command to send, undo to push)
+    ("AWAITING_PAYMENT", "payment.authorized.v1"): ("AWAITING_STOCK", "inventory.reserve.v1", "payment.void.v1"),
+    ("AWAITING_STOCK",   "stock.reserved.v1"):     ("AWAITING_PACK",  "fulfilment.request.v1", "inventory.release.v1"),
+    # ... the rest of the happy path, plus the failure transitions
+}
+
+def handle(db: sqlite3.Connection, msg: dict) -&gt; None:
+    with db:  # one transaction: inbox, saga, outbox
+        try:
+            db.execute("INSERT INTO inbox VALUES ('orchestrator', ?, datetime('now'))", (msg["message_id"],))
+        except sqlite3.IntegrityError:
+            return                                    # duplicate: already handled
+        row = db.execute("SELECT state, version, compensations FROM order_saga WHERE order_id = ?",
+                         (msg["data"]["order_id"],)).fetchone()
+        state, version, comps = row
+        step = TRANSITIONS.get((state, msg["type"]))
+        if step is None:
+            park_unexpected(db, msg, state)           # illegal in this state: record and alert
+            return
+        nxt, command, undo = step
+        stack = json.loads(comps) + [{"type": undo, "ref": msg["data"]}]
+        updated = db.execute(
+            "UPDATE order_saga SET state=?, version=version+1, compensations=?, attempt=0, "
+            "step_deadline_at=datetime('now', '+2 minutes'), last_message_id=? "
+            "WHERE order_id=? AND version=?",
+            (nxt, json.dumps(stack), msg["message_id"], msg["data"]["order_id"], version)).rowcount
+        if updated != 1:
+            raise RuntimeError("concurrent update; let the broker redeliver")
+        db.execute("INSERT INTO outbox (message_id, topic, key, type, causation_id, payload) "
+                   "VALUES (?, ?, ?, ?, ?, ?)",
+                   ("cmd_" + uuid.uuid4().hex, command.split(".")[0] + ".commands",
+                    msg["data"]["order_id"], command, msg["message_id"], json.dumps(msg["data"])))
+    # only after commit: acknowledge the broker offset</code></pre>
+<p>The transition table is the workflow. Reviewers can read it, tests can enumerate it, and a missing row (an event with no legal transition in some state) shows up as a parked message rather than a silent drop.</p>
+
+<h2 id=dd-eventdriven-architecture-adv-large-payloads level=2>Deep Dive: Large Payloads</h2>
+<p>Sooner or later someone asks to put a 4 MB thing in an event. A scanned invoice, a product's full image set, a model's feature vector, a 3,000-line order from a wholesale customer. The broker refuses, or worse, accepts it and gets slower for everyone. This section covers why the limits exist, what to do instead, and how the alternatives fail.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-limits level=3>Broker limits, and why they exist</h3>
+<p>Every broker caps message size. The exact numbers change between versions and providers, so check current documentation before you design around them. The order of magnitude is stable, though:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Broker<th>Default or hard cap (approximate)<th>Notes<tbody>
+<tr><td>Apache Kafka<td>About 1 MB by default<td>Configurable. Several settings must agree: broker <code>message.max.bytes</code> (or topic <code>max.message.bytes</code>), producer <code>max.request.size</code>, consumer <code>max.partition.fetch.bytes</code> and <code>fetch.max.bytes</code>, and replica fetch sizes
+<tr><td>Amazon SQS / SNS / EventBridge<td>Historically 256 KB; AWS has raised some of these limits<td>Check the current quota for your service; billing is per 64 KB chunk on SQS
+<tr><td>Amazon Kinesis Data Streams<td>About 1 MB per record historically<td>Per-shard write throughput limits make large records expensive anyway
+<tr><td>Google Cloud Pub/Sub<td>About 10 MB per message<td>Large messages still count against throughput quotas
+<tr><td>Azure Service Bus<td>256 KB on Standard; much larger on Premium<td>Event Hubs is around 1 MB
+<tr><td>RabbitMQ<td>Large configurable cap (tens to hundreds of MB depending on version)<td>The cap is not the practical limit; memory alarms and flow control are
+</table></div></div>
+<p>The limits are not arbitrary. A broker is built around the assumption that messages are small and many, and large ones break that assumption in five places.</p>
+<ul>
+<li><strong>Memory per request.</strong> Producers batch records in memory, and brokers and consumers allocate fetch buffers sized by configuration. A 50 MB record forces every one of those buffers up, on every client, for one outlier.</li>
+<li><strong>Replication.</strong> Followers copy the leader's log in fetch requests. A huge record makes those fetches slow, which can push followers out of the in-sync set and, with <code>acks=all</code>, slow every producer on the partition.</li>
+<li><strong>Head-of-line blocking.</strong> A partition is consumed in order. One 40 MB record that takes 2 seconds to download and parse delays every small record queued behind it, including ones for other keys.</li>
+<li><strong>Timeouts.</strong> Request and session timeouts are tuned for kilobyte-scale messages. A large message plus a slow network can exceed them, causing retries that resend the same large message, and sometimes consumer-group rebalances.</li>
+<li><strong>Page cache and retention cost.</strong> Brokers serve recent data from the OS page cache. A topic full of multi-megabyte records pushes hot small data out of cache. And every byte is stored times the replication factor for the whole retention period.</li>
+</ul>
+<p>So raising the limit is a real option, but it is a trade. A topic that carries 2–5 MB records with its own tuned clients can work fine. Raising the cluster-wide default so one team can send blobs puts the cost on everyone else.</p>
+<p>A quick sanity check before deciding: size the topic. At 200 events per second and 3 MB each, the topic ingests 600 MB/s. With replication factor 3, that is 1.8 GB/s of disk writes and replication traffic, and about 155 TB per day before retention. The same events at 3 KB with a claim check cost 1,000 times less on the broker, plus 600 MB/s into object storage. That is still large, but object storage is built for it.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-claim-check level=3>The claim check, done properly</h3>
+<p>The <strong>claim-check pattern</strong> stores the large payload in object storage and sends an event that carries a reference to it, like a coat-check ticket. The first deep dive introduced the idea. Here are the details that decide whether it works.</p>
+<svg role="img" aria-labelledby="dd-eventdriven-architecture-adv-cc-title dd-eventdriven-architecture-adv-cc-desc" viewBox="0 0 720 250" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-eventdriven-architecture-adv-cc-title">Claim-check flow with integrity and lifecycle</title>
+<desc id="dd-eventdriven-architecture-adv-cc-desc">The producer first uploads the payload to object storage under a content-addressed key, then writes a small event through its outbox containing the key, size, SHA-256 hash and content type. Consumers read the event from the topic, fetch the object with their own read permission, and verify the hash. A lifecycle rule deletes objects after the topic retention plus a safety margin.</desc>
+<rect x="0" y="0" width="720" height="250" fill="var(--paper, #ffffff)"/>
+<g stroke="var(--accent, #1f5f99)" fill="var(--paper, #ffffff)">
+<rect x="16" y="40" width="150" height="80" rx="6"/>
+<rect x="270" y="20" width="190" height="60" rx="6"/>
+<rect x="270" y="140" width="190" height="60" rx="6"/>
+<rect x="560" y="70" width="146" height="90" rx="6"/>
+</g>
+<g fill="var(--ink, #1c2430)">
+<text x="28" y="62" font-weight="bold">Producer</text>
+<text x="28" y="82">1. PUT object</text>
+<text x="28" y="100">2. outbox: event</text>
+<text x="282" y="42" font-weight="bold">Object storage</text>
+<text x="282" y="62">key = sha256 of bytes</text>
+<text x="282" y="162" font-weight="bold">Topic (small event)</text>
+<text x="282" y="182">key, size, sha256, type</text>
+<text x="572" y="92" font-weight="bold">Consumer</text>
+<text x="572" y="112">3. read event</text>
+<text x="572" y="130">4. GET object</text>
+<text x="572" y="148">5. verify hash</text>
+</g>
+<g stroke="var(--muted, #5c6b7c)" stroke-width="1.5" fill="none">
+<line x1="166" y1="66" x2="266" y2="50"/><line x1="166" y1="100" x2="266" y2="168"/>
+<line x1="460" y1="170" x2="556" y2="130"/><line x1="556" y1="100" x2="464" y2="50"/>
+</g>
+<g fill="var(--muted, #5c6b7c)">
+<polygon points="265,46 270,49 266,54"/><polygon points="264,163 270,169 263,171"/>
+<polygon points="552,127 560,128 555,135"/><polygon points="467,46 460,49 465,54"/>
+</g>
+<text x="16" y="224" fill="var(--muted, #5c6b7c)">Lifecycle rule: delete objects after topic retention + longest replay window + margin.</text>
+<text x="16" y="242" fill="var(--muted, #5c6b7c)">Write the object before the event, never after.</text>
+</svg>
+<p><strong>Write order.</strong> Upload the object first. Only after the upload succeeds, write the event (through the outbox, as usual). The other order publishes a reference to something that does not exist yet. If the upload fails after the event commits, every consumer hits a missing object. An upload that succeeds with no event behind it is an orphan, which the lifecycle rule cleans up. Orphans cost a little storage. Dangling references cost incidents.</p>
+<p><strong>Keys.</strong> Two schemes work well.</p>
+<ul>
+<li><strong>Content-addressed</strong>: the key is the SHA-256 of the bytes, for example <code>blobs/sha256/9f/86d0…</code>. Identical payloads dedupe for free, retries of the upload are naturally idempotent, and the key itself proves integrity. The cost is that you cannot tell from a key what owns it, so deletion for privacy needs an index.</li>
+<li><strong>Entity-addressed</strong>: <code>orders/ord_7f3a/invoice/evt_01J8QF2A.pdf</code>. Easy to reason about, easy to delete everything for one customer or order, and easy to scope access by prefix. Include the event ID or a version so a newer payload never overwrites one a slow consumer has yet to read.</li>
+</ul>
+<p>Never reuse a key for different bytes. A consumer that fetches "the invoice for this order" and gets a newer one than the event describes has a correctness bug that only shows up under lag.</p>
+<p><strong>What the event carries.</strong> The reference alone is not enough. Carry what a consumer needs to decide whether to fetch, and to check what it got:</p>
+<pre><code>"data": {
+  "order_id": "ord_7f3a",
+  "invoice": {
+    "uri": "s3://bookstore-events-blobs/orders/ord_7f3a/invoice/evt_01J8QF2A.pdf",
+    "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "size_bytes": 4194304,
+    "content_type": "application/pdf",
+    "encryption": "kms:alias/orders-blobs",
+    "expires_at": "2027-02-18T00:00:00Z"
+  },
+  "total_cents": 14200, "currency": "USD", "line_count": 3    // the facts most consumers need, inline
+}</code></pre>
+<p>The hash catches truncated uploads, the wrong object, and tampering. The size lets a consumer refuse something absurd before downloading it. <code>expires_at</code> tells a replaying consumer up front that the object may be gone, so it can choose a different recovery path.</p>
+<p><strong>Encryption and access control.</strong> Encrypt at rest with a managed key (on AWS, SSE-KMS with a key dedicated to this data set). Then access needs both bucket permission and key permission, which gives you two independent controls and an audit trail of decrypt calls. Grant each consuming service read access to the prefixes it needs, using its own identity. Avoid putting pre-signed URLs in events: they are bearer tokens that live as long as the topic retains the event, and anyone who can read the topic can use them. If you must pass a pre-signed URL, keep its expiry short and accept that replay will need a fresh one.</p>
+<p><strong>Lifecycle and TTL.</strong> Set an object lifecycle rule that deletes objects after a period. That period must be longer than three things added together: the topic's retention, the longest replay you might run, and a margin. If <code>order.events</code> keeps 30 days and you replay at most 7 days behind real time, a 45-day lifecycle is reasonable. If the topic is compacted and keeps the latest event per key forever, the object it points to must live as long as that event does. Then a time-based lifecycle is wrong, and deletion has to follow the event (see the GC race below).</p>
+<p><strong>Consistency.</strong> Amazon S3 has provided strong read-after-write consistency for new objects since late 2020, and Google Cloud Storage and Azure Blob Storage offer strong consistency for object reads too. So a consumer that reads the event after the upload completes will find the object. Older advice about "retry the GET a few times because S3 is eventually consistent" is out of date for these services. Other object stores and caching layers in front of them may behave differently, so check yours.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-chunking level=3>Chunking, and why it is usually wrong</h3>
+<p>The other obvious approach is to split a large payload into chunks, send them as separate messages, and reassemble at the consumer. Some systems have done this. LinkedIn's engineers, for example, have spoken publicly about weighing chunking against reference-based approaches for large Kafka messages. It works only under narrow conditions, and the costs are easy to underestimate:</p>
+<ul>
+<li><strong>Every chunk must land in the same partition</strong>, so they share a key. A partition carrying a 200-chunk message is blocked for every other key in it until the last chunk arrives.</li>
+<li><strong>The consumer must hold reassembly state</strong>: which chunks it has, in memory or on disk. A rebalance moves the partition to another instance that has none of that state, so it must either re-read from the first chunk or keep state externally.</li>
+<li><strong>Offset commits get subtle.</strong> You cannot commit past the first chunk until the last one is processed, or a crash loses the half-assembled message.</li>
+<li><strong>Partial failure is a new state.</strong> A producer crash after chunk 37 of 80 leaves a message that will never complete. The consumer needs timeouts and cleanup for it.</li>
+<li><strong>Compaction and retention break it.</strong> Log compaction keeps the latest record per key, which destroys chunk sequences. Time-based retention can delete the first chunks of a message whose last chunks are still retained.</li>
+<li><strong>Every consumer needs the reassembly logic</strong>, in every language the company uses. A claim check needs only an object-store client, which every language already has.</li>
+</ul>
+<p>Chunking is defensible when object storage is unavailable or forbidden and the payloads are only a few times the limit. Otherwise, use a claim check.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-compression level=3>Compression: the cheap first step</h3>
+<p>Before any of this, turn on compression. Kafka producers compress whole batches with <code>compression.type</code> set to <code>gzip</code>, <code>snappy</code>, <code>lz4</code> or <code>zstd</code>. JSON events with repeated field names compress well, often by several times; zstd tends to give the best ratio for reasonable CPU and lz4 the lowest latency. Measure on your own data, because ratios vary a lot.</p>
+<p>Two caveats. First, the size checks are applied at different points. In Kafka the broker's limit applies to the record batch as written, which is compressed. The producer's <code>max.request.size</code> check applies to the serialized record before batching, and that check is on the uncompressed size in common client versions. So a record that compresses under the broker limit can still be rejected by the producer. Second, compression helps throughput and storage, not head-of-line blocking or consumer memory: the consumer still decompresses the full record. Compression turns a 1.5 MB problem into a 300 KB non-problem. It does not make a 50 MB payload a good idea.</p>
+<p>Encrypted or already-compressed payloads (images, PDFs, ciphertext) do not compress further. If a team encrypts payloads at the field level, compression of those fields does nothing, which is one more reason to keep large blobs out of the event.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-state-vs-thin level=3>Event-carried state, thin events, and fetch-on-read</h3>
+<p>The lesson framed this as notification versus full state. With large payloads, the decision becomes per field, and there are four options rather than two:</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Option<th>Event carries<th>Consumer gets the rest by<th>Good for<th>Failure it invites<tbody>
+<tr><td>Full state inline<td>Everything<td>Nothing to fetch<td>Small entities, many consumers<td>Size creep; personal data spread
+<tr><td>Key facts + claim check<td>Common fields, plus a blob reference<td>Object storage GET<td>Large, immutable attachments<td>Dangling references; access sprawl
+<tr><td>Key facts + reference by ID<td>Common fields, plus an entity ID<td>Calling the owner's API<td>Sensitive or rarely needed detail<td>Callback storm if many consumers fetch
+<tr><td>Thin notification<td>ID and type only<td>Calling the owner's API<td>Cache invalidation, low volume<td>Callback storm; reads newer state than the event
+</table></div></div>
+<p>The last row hides a correctness trap worth naming. A thin event says "order 7f3a changed". By the time the consumer calls the API, the order may have changed again. The consumer reads version 5 while processing the event for version 3. For a cache invalidation that is fine, even desirable. For an audit trail it is wrong: you have recorded the wrong facts against the event. So fetch-on-read needs a way to ask for a specific version (<code>GET /orders/ord_7f3a?version=3</code>), or the consumer must accept that it sees the latest state, not the state at the event.</p>
+<p><strong>Reference by ID versus snapshot.</strong> When an order event mentions the customer, should it carry <code>customer_id</code> or a copy of the customer's name and tier? A reference keeps the event small and avoids copying personal data. It also means the consumer sees the customer as they are <em>now</em>. A snapshot records the customer as they were <em>when the order was placed</em>. For many business facts that is what you want: the shipping address at the time of the order, the price at the time of the order, the loyalty tier that determined the discount. A useful rule: snapshot the values that the fact depends on, and reference everything else.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-small-schemas level=3>Designing schemas that stay small</h3>
+<p>Most oversized events were not designed big. They grew, one "just add it" field at a time. A few habits keep them in check.</p>
+<ul>
+<li><strong>Set a size budget per event type</strong>, and enforce it in CI: serialize a realistic worst-case example and fail the build above, say, 64 KB. Track the p99 size in production as a metric per type.</li>
+<li><strong>Bound every collection.</strong> An order with 3 lines is 2 KB. A wholesale order with 4,000 lines is 2 MB. Decide the maximum in the schema. Above it, switch to a summary event plus a claim check for the line list, or emit per-line events.</li>
+<li><strong>Don't embed related entities.</strong> An order event should not contain the full product records for each line. Carry the SKU and the price that applied. Product details live on the product topic.</li>
+<li><strong>Use a binary format at volume.</strong> Avro and Protobuf drop field names from every record and encode numbers compactly. The registry keeps the schema, so the record does not have to.</li>
+<li><strong>Prefer IDs and enums over free text.</strong> <code>"reason": "out_of_stock"</code>, not a paragraph.</li>
+<li><strong>Keep derivable data out.</strong> If <code>total_cents</code> is in the event, the consumer does not need <code>total_dollars_formatted</code> as well.</li>
+</ul>
+
+<h3 id=dd-eventdriven-architecture-adv-payload-failures level=3>Costs and failure modes</h3>
+<p><strong>Dangling references.</strong> The event says the invoice is at a key, and the object is not there. Causes: the producer wrote the event before the upload finished; a lifecycle rule shorter than a replay; a manual cleanup; a cross-region consumer reading a bucket that has not replicated yet. Detect with a counter of 404s on claim-check fetches, per producer and per event type. A healthy system has zero. Fix by enforcing upload-before-event in the producer library, lifecycle periods derived from retention, and replication-aware reads in other regions (wait for replication, or read from the source region).</p>
+<p><strong>The GC race.</strong> A garbage-collection job deletes objects that "nobody needs any more", decided by checking whether the latest event still references them. Meanwhile a consumer is 3 days behind and about to read an older event that points at the deleted object. The fix is to make the deletion condition about consumers, not events: an object can go once its event is older than the slowest consumer group's committed position on every topic that references it, plus margin. Most teams settle for the simpler rule: time-based lifecycle well beyond retention, and accept the storage cost.</p>
+<p><strong>Privacy deletion.</strong> A deletion request for customer <code>c_91</code> now covers object storage too. Entity-addressed keys make this a prefix delete. Content-addressed keys need an index from customer to hashes. One technique worth knowing is <em>crypto-shredding</em>: encrypt each customer's blobs with a per-customer key, and delete the key to make every copy unreadable at once, including copies in backups. It is more machinery, but it is often the only practical way to cover retained topics and backups.</p>
+<p><strong>Cost shape.</strong> Claim checks move cost from broker storage to object storage requests. Object storage is cheap per byte but charges per request, and a fan-out to 10 consumer groups means 10 GETs per event. At 1,000 events per second with 10 consumers, that is 10,000 GETs per second, around 26 billion a month. At typical published request prices that is a five-figure monthly bill, often more than the storage. Check your provider's pricing. If many consumers need the same blob, a shared cache or a consumer that fetches once and republishes the needed fields can be cheaper.</p>
+<p><strong>Latency and availability.</strong> Every claim-check consumer now depends on object storage being available and fast. Its p99 latency (tens to hundreds of milliseconds) enters the consumer's processing time. And an object-storage outage stops consumers even while the broker is healthy. Consumers should keep processing events that do not need the blob, and retry the ones that do through a retry topic, rather than blocking the partition.</p>
+
+<h2 id=dd-eventdriven-architecture-adv-predictable level=2>Deep Dive: Patterns That Make EDA Predictable, Traceable and Fault Tolerant</h2>
+<p>An event-driven system that works in a demo becomes unpredictable in production for a small number of reasons. Messages get lost or invented at the producer. They get processed twice at the consumer. Formats drift. A bad message blocks a partition. Nobody can say where an order is or why it took six minutes. Each pattern below closes one of those holes. None is exotic. The skill is in knowing which hole each one closes, and which ones it leaves open.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Pattern<th>Hole it closes<th>What it does not fix<tbody>
+<tr><td>Transactional outbox + CDC<td>Lost or ghost events at the producer<td>Duplicates (the relay is at-least-once)
+<tr><td>Inbox / dedupe<td>Duplicate processing at the consumer<td>Side effects outside the consumer's database
+<tr><td>Idempotency keys<td>Duplicate side effects at external systems<td>Keys built from the wrong inputs
+<tr><td>Schema registry + compatibility<td>Structural breaks between producer and consumer<td>Changes in meaning
+<tr><td>Consumer contract tests<td>Semantic breaks for known consumers<td>Consumers nobody registered
+<tr><td>Retry topics + DLQ<td>Transient failures blocking a partition<td>Per-key ordering, unless designed for
+<tr><td>Poison-message quarantine<td>One bad record stopping a consumer<td>The bug that produced the record
+<tr><td>Replay and backfill strategy<td>Rebuilding views, onboarding consumers<td>Side effects re-firing, unless suppressed
+<tr><td>Tracing + correlation<td>"Where did the time go?"<td>Sampled-away traces (logs cover these)
+<tr><td>Catalog, AsyncAPI, lineage<td>"Who consumes this? Who owns it?"<td>Anything, if it is not kept current
+<tr><td>Lag and age SLOs<td>Silent slowdowns<td>Correctness bugs
+<tr><td>Game days<td>Untested recovery paths<td>Nothing on its own; it finds the gaps
+</table></div></div>
+
+<h3 id=dd-eventdriven-architecture-adv-outbox-cdc level=3>Transactional outbox and CDC, the operational layer</h3>
+<p>Part one covered why the outbox exists and how the two relay styles work. What remains is the operational detail that decides whether it is predictable.</p>
+<p><strong>Give the outbox row everything the relay needs to route without parsing.</strong> A Debezium-style outbox router expects columns like <code>aggregatetype</code> (used to pick the topic), <code>aggregateid</code> (used as the record key) and <code>payload</code>, and can map extra columns to headers. Add columns for <code>traceparent</code>, <code>correlation_id</code> and <code>causation_id</code>, mapped to Kafka headers. Then the relay never needs to understand the payload, and tracing works from the first hop.</p>
+<p><strong>Order is per aggregate, and only because of the key.</strong> CDC emits changes in commit order for the whole database, but the topic partitions by key. So two events for the same order stay in order (same key, same partition), while events for different orders may interleave. That is the guarantee you want. Don't promise more.</p>
+<p><strong>Measure outbox age, not just relay health.</strong> The one number that tells you the relay is healthy is the age of the oldest unpublished event. For a polling relay that is a SQL query. For CDC it is the connector's lag (in Debezium, the time since the last event it processed, or the gap between the source position and the slot's confirmed position). Alert when outbox age exceeds the consistency budget, for example 5 seconds.</p>
+<p><strong>Plan the snapshot.</strong> A new CDC connector, or one recovering from an invalidated replication slot, may take a snapshot of existing rows. For an outbox table that is usually small (rows are deleted quickly), which is one more reason to keep it trimmed. For CDC on business tables, the snapshot can emit millions of synthetic "read" events. Consumers must tolerate them, and you should know how long one takes before you need it.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-inbox level=3>The inbox and dedupe: three ways to absorb duplicates</h3>
+<p>Every consumer of an at-least-once stream sees duplicates. Redelivery after a crash, a relay retry, a producer retry, a rebalance mid-batch, a deliberate replay. There are three ways to make that harmless, and they are not interchangeable.</p>
+<p><strong>Natural idempotency.</strong> Make the operation produce the same result however many times it runs. "Set the order's status to shipped, if the stored version is below 7" is naturally idempotent. "Add 50 loyalty points" is not. Upserts guarded by a per-entity version are the cheapest dedupe there is, because they need no extra table. They also handle replays and reordering. Prefer this wherever the operation can be phrased as "set" rather than "add".</p>
+<p><strong>An inbox table in the consumer's own database.</strong> Insert the message ID in the same transaction as the business change, as the orchestrator above does. If the insert conflicts, skip. This is exact, because the dedupe record and the effect commit together. Its costs are a write per message and a table that grows. Retention is the real design decision. Keep inbox rows at least as long as a duplicate could plausibly arrive. If you might replay from the start, that means the topic's retention. A shorter window (7 days, say) works if replays always start from a known later offset and the version guard covers anything older.</p>
+<p><strong>A dedupe cache</strong> such as Redis <code>SET key NX EX 86400</code>. It is fast and keeps the database clean. It is also not transactional with the effect. Set the key and crash before the effect, and the retry is wrongly skipped: a lost message. Do the effect and crash before setting the key, and the retry runs twice. A cache is a good <em>first</em> filter in front of a natural-idempotency or inbox check. On its own it gives "mostly once", and the failures cluster at exactly the moments (crashes, failovers) when you most need correctness.</p>
+<p>Which ID to dedupe on also matters. Use the <code>message_id</code> assigned at the source, carried through every hop, never a broker offset. Offsets change when a message is copied to a retry topic, mirrored to another cluster, or replayed into a new topic. An ID that changes on retry defeats the whole point.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-idempotency-keys level=3>Idempotency keys for side effects you don't own</h3>
+<p>The inbox protects your database. It cannot protect a payment provider, an email service or a carrier's booking API. For those you pass an idempotency key the external system understands. Stripe's API is the well-known example: a client sends an <code>Idempotency-Key</code> header, and the provider returns the stored result of the first request for any retry with the same key within a retention window.</p>
+<p>The design question is what the key is made of. Three rules cover most cases.</p>
+<ol>
+<li><strong>Derive it from the business intent, not the message.</strong> <code>saga_ord_7f3a:capture:1</code> is the same for every retry of that capture, whichever message carried it. A random UUID generated in the handler is different on every retry, which makes it useless.</li>
+<li><strong>Include a generation for deliberate repeats.</strong> If the business genuinely wants a second capture (a re-authorization after expiry, a split shipment), it is a new intent with a new key. Bump the generation in the saga state, in the same transaction that decides to repeat.</li>
+<li><strong>Keep the key's lifetime inside the provider's window.</strong> Providers keep idempotency records for a limited time; check yours. A retry after that window is a new request. For long-delayed retries, query the provider's state first ("does a capture for this auth already exist?") instead of trusting the key.</li>
+</ol>
+<p>When the external system offers no idempotency key, you need a <strong>check-then-act with a recorded intent</strong>. Write "about to book shipment for <code>ord_7f3a</code>" to your database. Call the carrier with your own reference (most carrier APIs take a customer reference field). On retry, search the carrier for that reference before booking again. That narrows the duplicate window to the carrier's own consistency, which is usually the best you can do.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-registry-versioning level=3>Schema registry: subjects, multiple types per topic, and versioning</h3>
+<p>Part one covered compatibility modes. Two practical questions come up as soon as a real system uses a registry.</p>
+<p><strong>How are schemas grouped?</strong> In Confluent's registry the unit of compatibility is a <em>subject</em>, and a subject name strategy maps each record to one. The default, <code>TopicNameStrategy</code>, uses one subject per topic (<code>order.events-value</code>). That allows only one evolving schema per topic. The order topic above carries <code>order.placed</code>, <code>order.cancelled</code> and <code>order.shipped</code>, which are different shapes. You have two options:</p>
+<ul>
+<li><code>RecordNameStrategy</code> or <code>TopicRecordNameStrategy</code>: one subject per record type (optionally per topic). Each type evolves on its own, and many types share a topic. This is the natural fit for an entity topic carrying its whole lifecycle.</li>
+<li>One schema that is a union (Avro) or a <code>oneof</code> (Protobuf) of every event type, under the default strategy. Adding a new type is a compatible change to the union. This keeps one subject per topic, at the cost of one big schema.</li>
+</ul>
+<p>Keeping a whole entity's lifecycle on one topic matters more than the registry's convenience, because it keeps per-key ordering across event types. Choose the strategy to fit the topic design, not the other way round.</p>
+<p><strong>Where does the version live?</strong> The registry versions schemas automatically, on every compatible change. Those versions are for machines. The version in the event type name (<code>order.placed.v1</code>) is for people, and should change only on a breaking change. When it does, the new type gets a new subject and the dual-publish migration from part one applies. Treat the registry's numbers as an implementation detail, and the name's major version as the contract.</p>
+<p>Gate the registry from CI, not by hand. The producer's build should run the compatibility check against the target environment's registry and fail before merge. Most registries expose a "test compatibility" endpoint for exactly this. Turn off automatic schema registration in production producers, so a schema reaches the registry only through the pipeline.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-contract-tests level=3>Consumer contract tests</h3>
+<p>A registry checks the shape. A contract test checks what a specific consumer actually relies on. With consumer-driven contracts (Pact is the common tool, and it supports message contracts, not just HTTP), each consumer team writes down the messages it expects: "an <code>order.placed</code> with <code>total_cents</code> as an integer and <code>currency</code> as a three-letter code". The tool turns that into a contract file. The producer's build verifies its real serializer against every consumer's contract. If checkout's change would break loyalty's expectations, checkout's build fails, before anyone deploys.</p>
+<p>Three things make them worth the effort:</p>
+<ul>
+<li><strong>Test the important consumers, not all of them.</strong> Contracts for payment, finance and the orchestrator; registry checks for the long tail.</li>
+<li><strong>Encode meaning where you can.</strong> Contracts can assert value ranges and formats (an amount in cents is an integer below a sane maximum). That catches some of the semantic breaks a registry cannot, like the dollars-to-cents change from part one.</li>
+<li><strong>Make "can I deploy?" a pipeline step.</strong> A contract broker records which versions verified against which. The deploy step asks whether this producer version is compatible with the consumer versions currently in production.</li>
+</ul>
+
+<h3 id=dd-eventdriven-architecture-adv-retry-dlq level=3>Retry topics and dead-letter queues, with backoff</h3>
+<p>A consumer that fails on one message has three bad options if it has only one topic. Retry forever, and the partition stops. Skip it, and the message is lost. Crash, and the whole consumer group rebalances around it. Retry topics give it a fourth option: move the message aside, keep going, and come back to it later.</p>
+<svg role="img" aria-labelledby="dd-eventdriven-architecture-adv-retry-title dd-eventdriven-architecture-adv-retry-desc" viewBox="0 0 720 230" width="100%" style="max-width:720px;font-family:inherit;font-size:13px">
+<title id="dd-eventdriven-architecture-adv-retry-title">Tiered retry topics and a dead-letter topic</title>
+<desc id="dd-eventdriven-architecture-adv-retry-desc">A message that fails on the main topic is republished to retry-1 with a 1 minute delay, then retry-2 with a 10 minute delay, then retry-3 with a 1 hour delay. After the last attempt it goes to the dead-letter topic for inspection and redrive. Permanent errors such as deserialization failures skip the retry tiers and go straight to the dead-letter topic.</desc>
+<rect x="0" y="0" width="720" height="230" fill="var(--paper, #ffffff)"/>
+<g stroke="var(--accent, #1f5f99)" fill="var(--paper, #ffffff)">
+<rect x="16" y="50" width="120" height="56" rx="6"/>
+<rect x="170" y="50" width="120" height="56" rx="6"/>
+<rect x="324" y="50" width="120" height="56" rx="6"/>
+<rect x="478" y="50" width="120" height="56" rx="6"/>
+<rect x="600" y="150" width="108" height="56" rx="6"/>
+</g>
+<g fill="var(--ink, #1c2430)">
+<text x="28" y="74" font-weight="bold">order.events</text><text x="28" y="94">main consumer</text>
+<text x="182" y="74" font-weight="bold">retry-1</text><text x="182" y="94">due after 1 min</text>
+<text x="336" y="74" font-weight="bold">retry-2</text><text x="336" y="94">due after 10 min</text>
+<text x="490" y="74" font-weight="bold">retry-3</text><text x="490" y="94">due after 1 h</text>
+<text x="612" y="174" font-weight="bold">DLQ</text><text x="612" y="194">inspect, redrive</text>
+</g>
+<g stroke="var(--muted, #5c6b7c)" stroke-width="1.5" fill="none">
+<line x1="136" y1="78" x2="166" y2="78"/><line x1="290" y1="78" x2="320" y2="78"/><line x1="444" y1="78" x2="474" y2="78"/>
+<path d="M598 78 L654 78 L654 146"/>
+<path d="M76 106 L76 178 L596 178" stroke-dasharray="5 4"/>
+</g>
+<g fill="var(--muted, #5c6b7c)">
+<polygon points="166,74 170,78 166,82"/><polygon points="320,74 324,78 320,82"/><polygon points="474,74 478,78 474,82"/>
+<polygon points="650,146 654,150 658,146"/><polygon points="596,174 600,178 596,182"/>
+</g>
+<text x="90" y="170" fill="var(--muted, #5c6b7c)">permanent error (bad schema, failed validation): straight to DLQ</text>
+<text x="16" y="24" fill="var(--ink, #1c2430)">Each hop copies the original headers (message_id, traceparent, correlation_id)</text>
+<text x="16" y="40" fill="var(--ink, #1c2430)">and adds the attempt count, original offset and last error.</text>
+</svg>
+<p>Uber's engineering blog described this design for Kafka in a widely read 2018 post on reliable reprocessing: a chain of retry topics with increasing delays, ending in a dead-letter topic. Many frameworks now ship it, including Spring Kafka's non-blocking retries. The mechanics:</p>
+<ul>
+<li><strong>Classify the error first.</strong> A deserialization failure, a schema violation or a business-rule rejection will fail every time. Send it straight to the DLQ. A timeout, a 503 or a lock conflict may succeed later. Send it to the first retry tier.</li>
+<li><strong>Implement the delay by pausing, not sleeping.</strong> Each retry message records when it becomes due. The retry consumer reads one, sees it is not due yet, and pauses that partition until it is (Kafka consumers have <code>pause</code> and <code>resume</code>). Messages in one retry topic all have the same delay, so they become due in the order they arrived. That is why tiers have fixed delays rather than one topic with variable ones.</li>
+<li><strong>Copy everything forward.</strong> The retry record keeps the original key, payload and headers (<code>message_id</code>, <code>traceparent</code>, correlation and causation), and adds the attempt count, original topic, partition and offset, and the last error. A DLQ entry without the original offset and error is a mystery to whoever opens it.</li>
+<li><strong>Add jitter at the source of the failure.</strong> If a downstream dependency was down for 10 minutes, thousands of messages land in <code>retry-1</code> together and all become due in the same second. Spread them, or rate-limit the retry consumer, so recovery does not knock the dependency over again. The <a href="#retry-with-exponential-backoff">Retry with Exponential Backoff</a> lesson covers the arithmetic.</li>
+<li><strong>Build the redrive tool before you need it.</strong> A DLQ is only useful if someone can inspect messages, fix the cause, and republish them, one at a time or by filter, with the original IDs so consumers still dedupe. Track DLQ depth and age as alerts. A DLQ that only grows is a slow data-loss incident.</li>
+</ul>
+<p><strong>The catch: non-blocking retries break per-key order.</strong> When <code>order.placed</code> for <code>ord_7f3a</code> goes to <code>retry-1</code>, the main consumer moves on. If <code>order.cancelled</code> for the same order arrives a second later, it is processed first. When the placed event comes back from retry, it can resurrect the order, which is failure mode 5 from part one, now caused by your own retry design. There are three answers:</p>
+<ol>
+<li><strong>Make the consumer order-insensitive.</strong> Version guards (ignore anything older than the stored version) make a late <code>order.placed</code> harmless. This is the best answer where it applies.</li>
+<li><strong>Retry in place for ordering-critical consumers.</strong> Retry inside the partition with backoff, blocking it, and accept the stall. The orchestrator and ledger consumers often choose this, with a short bound before escalating to quarantine.</li>
+<li><strong>Quarantine the key, not just the message.</strong> See the next section.</li>
+</ol>
+
+<h3 id=dd-eventdriven-architecture-adv-poison level=3>Poison-message quarantine</h3>
+<p>A <strong>poison message</strong> fails every time it is processed. Without handling, it is redelivered forever and the partition stops. With a naive DLQ, it is moved aside, and later messages for the same key are processed as if nothing happened. For an entity stream, that second behaviour can be worse than stopping.</p>
+<p>Sequence-preserving quarantine fixes this. When a message for key <code>K</code> is sent to the DLQ, the consumer records <code>K</code> in a "parked keys" table. Every later message for <code>K</code> is parked too, behind it, until someone resolves the first one. Other keys continue normally. On redrive, the parked messages for <code>K</code> are replayed in their original order. You lose availability for one order instead of correctness for one order, or availability for a whole partition.</p>
+<p>Quarantine also needs a breaker. If 5% of messages are suddenly going to the DLQ, the problem is not the messages, it is a bad deploy or a broken dependency. Shovelling half a partition into the DLQ makes recovery harder. Stop the consumer when the DLQ rate crosses a threshold, page someone, and roll back.</p>
+<p>The <a href="#dead-letter-queue">Dead-Letter Queue</a> lesson covers DLQ basics. The parts that are specific to event-driven architecture are the per-key parking and the rule that a DLQ'd fact is still a fact that some view has not applied.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-replay level=3>Replay and backfill strategy</h3>
+<p>Replay is the lesson's headline benefit: rebuild a view, or onboard a new consumer, by reading history. It is also how many teams cause their worst incidents. A replay is safe when four questions have good answers.</p>
+<p><strong>Which consumer group?</strong> Never rewind a live group's offsets to rebuild a view. Start a new group (<code>fraud-view-rebuild-2026-11-21</code>) that writes to a new table. When it has caught up, switch reads to the new table and retire the old group. The live consumer keeps working throughout, and rollback is switching reads back.</p>
+<p><strong>From where?</strong> From the earliest offset for a full rebuild. From a timestamp (Kafka's <code>offsetsForTimes</code> maps a time to offsets per partition) to repair a known bad window. From a snapshot plus the tail if the topic does not retain enough history. That last one is common: a compacted "latest state per key" topic or a database snapshot gives the starting state, and the live topic supplies the rest. Version guards make the overlap between the two harmless.</p>
+<p><strong>What must not happen again?</strong> A consumer that sends emails, charges cards or books shipments must not repeat them during replay. The lesson already said to separate state-building consumers from side-effecting ones. Back that up with a mechanism: a replay flag in the consumer's config that disables side effects, and idempotency keys that would catch them anyway. Do not rely on side-effecting consumers "knowing" they are in a replay.</p>
+<p><strong>How fast?</strong> A replay can read far faster than the view store can write, and faster than a downstream API can absorb if the consumer calls one. Rate-limit it. Part one estimated a 500-million-event rebuild at about 35 minutes with 12 parallel consumers, if the store takes 240,000 writes per second. If it shares that store with production traffic, cap the replay at a fraction of headroom and accept the longer run.</p>
+<p><strong>Backfill is different from replay.</strong> Replay reads events that exist. Backfill creates events that never existed: publishing history for data that predates the topic, or adding a field to old events. Publish backfills to a separate topic, or mark them with a header, so consumers can treat them differently (no emails for 2019 orders). And make sure a backfilled "old" event cannot overwrite newer live state. The per-entity version guard is again the tool.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-ordering-eos level=3>Ordering and exactly-once: what you actually get</h3>
+<p>Claims about ordering and exactly-once are where design documents most often overstate. Here is what the mechanisms really provide in Kafka. Other brokers differ in detail, not in spirit. The <a href="#exactlyonce-semantics">Exactly-Once Semantics</a> lesson goes deeper.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Mechanism<th>Guarantees<th>Does not guarantee<tbody>
+<tr><td>Partitioning by key<td>Order per key within one topic<td>Order across topics, or across keys
+<tr><td>Idempotent producer (on by default in recent clients)<td>No duplicates or reordering from the producer's own retries, per partition, per producer session<td>Dedupe across producer restarts with new IDs, or across application-level resends
+<tr><td>Transactions (read-process-write)<td>Consumed offsets and produced records commit atomically, for consumers using <code>read_committed</code><td>Anything outside Kafka: database writes, HTTP calls, emails
+<tr><td>Outbox + inbox<td>Exactly-once effect on the producer's and consumer's databases<td>External side effects
+<tr><td>Idempotency keys at external systems<td>Exactly-once effect at that system, within its key window<td>Systems that ignore or expire the key
+</table></div></div>
+<p>The honest phrase is <strong>effectively once</strong>: at-least-once delivery, plus idempotent effects, gives exactly-once results. Every link in the chain needs its own idempotency. When someone says "we use Kafka exactly-once, so the consumer doesn't need to dedupe", ask what the consumer writes to. If it is anything other than Kafka, the claim does not cover it.</p>
+<p>Ordering has a similar trap. Kafka's ordering per partition holds for records as written. Producer retries can reorder records unless the producer is idempotent (or limits in-flight requests to one), and consumers that process a partition with a thread pool reorder records unless they keep each key on one thread. Repartitioning a topic (adding partitions) changes which partition most keys map to, so for a while old and new records for one key sit in different partitions. Add partitions with care on ordered topics, or create a new topic and migrate.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-tracing-deeper level=3>End-to-end tracing that survives the broker</h3>
+<p>Part one explained trace context in headers and span links. Four further details decide whether traces are actually usable.</p>
+<ul>
+<li><strong>Propagate <code>traceparent</code> and <code>tracestate</code> as message headers, not payload fields.</strong> OpenTelemetry's messaging instrumentation for Kafka, RabbitMQ and the cloud brokers reads and writes headers. A trace ID buried in the JSON payload is invisible to it.</li>
+<li><strong>Use the messaging semantic conventions</strong> so every service names spans and attributes the same way: the messaging system, the destination name, the operation (publish, receive, process), the message ID and the consumer group. Then "show me every process span on <code>payment.commands</code> slower than 1 s" works across teams.</li>
+<li><strong>Decide sampling at the start and honour it downstream.</strong> Head sampling records the decision in the <code>traceparent</code> flags. Consumers that respect it keep whole workflows. Consumers that re-sample independently keep random fragments. Tail sampling across asynchronous hops is hard, because the "trace" can take hours to finish. A common compromise is to keep 100% of traces for the orchestrator's workflow messages (low volume, high value), and sample the high-volume analytics paths.</li>
+<li><strong>Link the saga, not just the hops.</strong> The saga takes hours. No tracing backend shows that well as one trace. Give each step its own trace, linked to the previous one, and let the correlation ID tie the whole saga together in logs and in the saga table's history.</li>
+</ul>
+<p>The <a href="#distributed-tracing">Distributed Tracing</a> lesson covers propagation in general.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-catalog level=3>Event catalog, AsyncAPI and lineage</h3>
+<p>Every pattern above assumes you know who produces and consumes each event. In a company with 200 topics, that knowledge has to live somewhere other than people's heads.</p>
+<p><strong>AsyncAPI</strong> is a specification for describing event-driven interfaces, playing the role for channels and messages that OpenAPI plays for HTTP. A producer's AsyncAPI document lists its channels (topics), the messages on each, their schemas (inline or by reference to the registry), and bindings such as the Kafka key. It can be generated from code or written by hand and checked in CI. A trimmed example:</p>
+<pre><code>asyncapi: 3.0.0
+info:
+  title: Order events
+  version: 1.4.0
+  description: Facts about orders, owned by the checkout team.
+channels:
+  orderEvents:
+    address: order.events
+    messages:
+      orderPlaced:
+        $ref: '#/components/messages/OrderPlaced'
+operations:
+  publishOrderPlaced:
+    action: send
+    channel:
+      $ref: '#/channels/orderEvents'
+components:
+  messages:
+    OrderPlaced:
+      name: order.placed.v1
+      contentType: application/avro
+      headers:
+        type: object
+        properties:
+          traceparent: { type: string }
+          correlation_id: { type: string }
+      payload:
+        schemaFormat: application/vnd.apache.avro;version=1.9.0
+        schema:
+          $ref: 'registry://order.placed/latest'   # illustrative: point at your registry or a schema file
+      bindings:
+        kafka:
+          key: { type: string, description: order_id }</code></pre>
+<p>A <strong>catalog</strong> sits on top: one page per event type with its owner, schema, AsyncAPI document, data classification (does it contain personal data?), freshness SLO, retention, and its consumers. The consumer list is the part teams forget to keep current. Generate it from reality instead: the broker knows which consumer groups read which topics, and ACLs (access-control lists) know which service identities may. A catalog that merges declared consumers with observed consumer groups, and flags differences, stays honest.</p>
+<p><strong>Lineage</strong> answers "where did this value come from, and where does it go?" At the topic level, lineage is the graph of services and topics: checkout writes <code>order.events</code>, the orchestrator reads it and writes <code>payment.commands</code>, and so on. It can be drawn from the same producer and consumer metadata. At the record level, lineage is the causation chain: this refund was caused by that event, which was caused by that command. The envelope's causation IDs, logged consistently, give you record-level lineage for free. For data pipelines that land events in a warehouse, OpenLineage is an emerging standard for recording job-level lineage.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-slos level=3>SLOs on consumer lag and event age</h3>
+<p>Consumer lag is the most-watched number in event-driven systems, and on its own it is a poor one. "Lag 120,000" means nothing without the drain rate. At 2,000 records per second it is one minute behind. At 50 per second it is 40 minutes. And a consumer that is completely stuck has constant lag on a quiet topic, which looks healthy.</p>
+<p>Measure in time. Two time-based signals cover most needs:</p>
+<ul>
+<li><strong>Time lag</strong>: for each partition, how long ago the oldest unconsumed record was written. Tools such as Burrow, and many managed-Kafka dashboards, estimate it from offsets and timestamps.</li>
+<li><strong>Event age at processing</strong>: in the consumer, record <code>now − occurred_at</code> as a histogram when each event is handled. This is the user-visible delay, end to end, including the outbox and relay. It is the number that belongs in an SLO.</li>
+</ul>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>SLI<th>Example SLO<th>Why this consumer<tbody>
+<tr><td>Orchestrator event age, p99<td>&lt; 5 s, 99.9% of 5-minute windows per month<td>Every second here delays the customer's order
+<tr><td>Fraud view event age, p99<td>&lt; 2 s during business hours<td>Scoring on stale data lets fraud through
+<tr><td>Email consumer event age, p99<td>&lt; 60 s<td>A receipt a minute late is fine
+<tr><td>Analytics loader time lag<td>&lt; 15 min<td>Dashboards refresh every 15 minutes anyway
+<tr><td>Outbox age (oldest unpublished)<td>&lt; 2 s<td>Upstream of everything above
+<tr><td>DLQ age (oldest unresolved)<td>&lt; 1 business day<td>Each entry is a fact some view has not applied
+<tr><td>Saga steps past deadline<td>0 for more than 15 min<td>The stuck-order signal choreography lacks
+</table></div></div>
+<p>Two practical notes. Alert on burn rate (how fast the error budget is being spent), not on single spikes; a 30-second lag spike during a deploy rebalance is normal. And alert per partition, not just per group. One hot or stuck partition hides easily inside a group average: 47 healthy partitions and one stuck for an hour average out to "fine".</p>
+
+<h3 id=dd-eventdriven-architecture-adv-gamedays level=3>Chaos and game-day drills</h3>
+<p>Every pattern in this section has a recovery path that only runs during an incident. Paths that never run in practice don't work when you need them. A game day runs them on purpose, in staging first and then carefully in production, with someone watching the dashboards and a written expectation for each drill.</p>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Drill<th>Expected behaviour<th>What to measure<tbody>
+<tr><td>Kill one broker under load<td>Leaders move; producers retry; no lost acknowledged writes<td>Produce error rate, under-replicated partitions, recovery time
+<tr><td>Stop the CDC connector for 30 minutes<td>Outbox age alert fires; WAL growth stays within limits; catch-up after restart<td>Time to alert, retained WAL, catch-up time
+<tr><td>Pause the orchestrator for 10 minutes<td>Backlog builds; no saga lost; deadlines scanned on resume<td>Event age, sagas past deadline, time to drain
+<tr><td>Inject a poison message<td>Routed to DLQ; key parked; other keys flow; DLQ alert fires<td>Partition throughput, DLQ age, parked keys
+<tr><td>Make the payment provider return 503s<td>Retries with backoff; no duplicate charges; sagas wait then recover<td>Retry tier depth, idempotency-key collisions, duplicate captures (must be 0)
+<tr><td>Deliver every message twice<td>No duplicate effects anywhere<td>Inbox conflicts (should equal injected duplicates), business reconciliation
+<tr><td>Rebuild the largest view from scratch<td>New group catches up within the recovery objective<td>Rebuild time, view-store load, production latency during replay
+<tr><td>Fail over to the second region<td>Consumers resume from translated offsets; duplicates absorbed<td>Data loss window, duplicate count, time to resume
+</table></div></div>
+<p>The "deliver every message twice" drill is the cheapest and most revealing. A small wrapper around the consumer framework that duplicates a configurable fraction of messages, run in staging continuously, will find every non-idempotent handler you have. Reconciliation queries afterwards (charges per order, emails per order, reservations per order) should all show exactly one.</p>
+
+<h2 id=dd-eventdriven-architecture-adv-industry level=2>Deep Dive: Industry Use-Case Analysis</h2>
+<p>The lesson named LinkedIn, Uber, banks and Netflix in a sentence each. This section looks at five organisations that have written publicly, in engineering blogs, conference talks and open-source projects, about how they run event-driven systems. The descriptions summarise those public write-ups. Systems change after a post is published, and companies rarely publish everything, so treat these as accounts of published designs at a point in time, not as current architecture diagrams. Where the details are uncertain, the text says so.</p>
+<p>The value is not in copying any of them. It is in noticing that companies with very different products kept arriving at the same few decisions.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-case-uber level=3>Uber: retry topics as a platform, and workflows as code</h3>
+<p><strong>What they built.</strong> Uber has described Kafka as a central piece of its infrastructure, carrying trip, pricing, payment and logging traffic between many services. Two published pieces are directly relevant to this deep dive. The first is the 2018 engineering-blog post on reliable reprocessing and dead-letter queues with Kafka, which described the tiered retry-topic design shown earlier, using a payments-related processing flow as the example. The second is Cadence, a workflow orchestration engine built at Uber and open-sourced. Cadence's original authors later founded Temporal, whose engine started as a fork of Cadence. Uber has also written about a consumer proxy that sits between Kafka and services, pushing messages to them over RPC and handling retries and dead-lettering centrally.</p>
+<p><strong>Why.</strong> The reprocessing post's argument was the one this deep dive made: a consumer that retries in place blocks its partition, and one that drops failures loses money-relevant events. Tiered retry topics let healthy messages flow while failed ones wait. Cadence came from a different need: long-running business processes, with timers and compensation, that were painful to express as chains of queue consumers.</p>
+<p><strong>Trade-offs.</strong> Non-blocking retries give up strict per-key order, which is acceptable for some flows and not others. Centralising consumption in a proxy makes retry policy consistent across hundreds of services, and adds a component that every consumer now depends on. A workflow engine makes long processes readable and durable, and imposes determinism rules on workflow code that teams must learn.</p>
+<p><strong>Lessons.</strong> At scale, retry and dead-letter handling become platform features, not something each team writes. And the company that ran one of the largest Kafka deployments still built an orchestrator for its multi-step processes. Events and workflows are complements.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-case-netflix level=3>Netflix: orchestration for media pipelines, CDC to avoid dual writes</h3>
+<p><strong>What they built.</strong> Netflix open-sourced Conductor in 2016, an orchestration engine in which workflows are declared as JSON definitions of tasks, executed by workers that poll for work. Their posts described it coordinating content-processing workflows, such as the steps involved in ingesting and encoding media. Netflix has since stepped back from maintaining the open-source project, and community and commercial forks continue it. Separately, Netflix's engineering blog described Keystone, a Kafka- and Flink-based pipeline that routes event data to many sinks. A later post described Delta, a data-synchronisation platform built on change data capture (using their DBLog CDC framework). Delta keeps stores such as search indexes in step with a source database.</p>
+<p><strong>Why.</strong> Media workflows are long, branching and expensive to redo. A failed step deep into a multi-hour encode should be retried, not restarted from the top, and operators need a view of where every title is. That is the orchestration case exactly. Delta's write-up, as summarised publicly, was motivated by the dual-write problem: applications writing to a database and to a search index or cache separately, and those copies drifting.</p>
+<p><strong>Trade-offs.</strong> A central orchestrator becomes critical infrastructure with its own scaling work. JSON workflow definitions are easy to visualise and harder to test than code. CDC removes dual writes from application code, and couples the downstream stream to the database's change log, which needs its own care (the replication-slot failure in part one).</p>
+<p><strong>Lessons.</strong> The same company used orchestration for its dependent, long-running steps and log-based streaming for data distribution. And "read the database's log instead of writing twice" was a conclusion reached by a team with no shortage of engineering capacity. It is not a workaround for small teams.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-case-zalando level=3>Zalando: governance through a platform and published guidelines</h3>
+<p><strong>What they built.</strong> Zalando, a large European online fashion retailer, open-sourced Nakadi, an event bus that put an HTTP API in front of Kafka. Producers register an <em>event type</em> with a schema and a category, and Nakadi validates each published event against its schema before accepting it. Zalando also published its RESTful API and Event Guidelines, a public style guide that includes rules for events. One is to distinguish business events (a process step happened) from data change events (an entity was created, updated or deleted). Others: include standard metadata such as an event ID and occurrence time, evolve schemas compatibly, use partition keys for ordering where it matters, and design consumers to tolerate duplicates and out-of-order delivery.</p>
+<p><strong>Why.</strong> Zalando's public material describes a large number of autonomous teams. In that setting, governance by review meetings does not scale. A platform that refuses invalid events, plus a written standard every team can point to, does.</p>
+<p><strong>Trade-offs.</strong> An HTTP front door is easy for any language to use, and adds a hop and some loss of Kafka's client-side features. Schema validation at publish time catches errors early, and makes the platform's validation path part of every producer's critical path. Guidelines are only as good as their enforcement, which is why the platform checks what it can.</p>
+<p><strong>Lessons.</strong> The business-event versus data-change-event split is the same distinction part one drew between domain events and event-carried state. Zalando made it a required property of every event type. If you adopt one thing, adopt the habit of writing your event rules down and having the platform enforce the mechanical ones.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-case-stripe level=3>Stripe: idempotency keys and ledgers for money movement</h3>
+<p><strong>What they built.</strong> Stripe's public API is designed around idempotency. Clients send an <code>Idempotency-Key</code> header on mutating requests, and retries with the same key return the original result. Stripe's engineering blog explained the reasoning in a 2017 post on designing robust and predictable APIs with idempotency. A related, widely cited write-up by the same author showed how to implement Stripe-like idempotency keys in Postgres, splitting a request into atomic phases with recovery points so a retry resumes rather than repeats. That is the saga-state-table idea applied to a single API call. Stripe also exposes an events API and webhooks, retrying webhook delivery over an extended period when the receiver fails. More recently Stripe's blog described an internal ledger system that records money movement as immutable double-entry records and runs automated checks to detect discrepancies. The details of that system are less public than the API design, so take this summary as approximate.</p>
+<p><strong>Why.</strong> In payments, "retry and hope" is not acceptable. A network timeout on a charge request leaves the client unsure whether money moved. Idempotency keys turn that ambiguity into a safe retry. Immutable ledgers make every balance a derived view of facts, which is the lesson's bank-ledger point, and make discrepancies detectable rather than silent.</p>
+<p><strong>Trade-offs.</strong> Idempotency keys push work to clients: generating keys correctly, and understanding that keys expire. Immutable ledgers mean corrections are new entries, never edits, which complicates reporting and requires tooling to explain a balance.</p>
+<p><strong>Lessons.</strong> Two of the patterns in this deep dive, idempotency keys and append-only facts with derived balances, are standard practice where money is involved. The order saga above passes Stripe-style keys to its payment provider for exactly this reason. Reconciliation (independently checking that the facts add up) is a first-class feature, not an afterthought.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-case-doordash level=3>DoorDash: from task queues to Kafka, with a workflow engine as a safety net</h3>
+<p><strong>What they built.</strong> DoorDash's engineering blog has described several steps in its asynchronous architecture. One post covered replacing a Celery-on-RabbitMQ task-processing setup with Kafka after a series of outages, and doing the migration without downtime. Another described using Cadence as a fallback for event-driven processing in a delivery-related flow: when the primary event-driven path failed or stalled, a durable workflow ensured the work still completed. DoorDash has also written about Iguazu, its real-time event processing system for moving large volumes of events to analytics and other consumers.</p>
+<p><strong>Why.</strong> Food delivery has hard real-time constraints. An order that silently stalls means a customer waiting and food going cold. The task-queue migration was framed around reliability and operability at growing volume. The Cadence post, as summarised publicly, addressed exactly the stuck-choreography problem from part one: event chains have no built-in owner for "this should have happened by now".</p>
+<p><strong>Trade-offs.</strong> Moving from a task queue to a log changes semantics: per-message acknowledgement becomes offset commits, and a slow message can hold up its partition. Running a workflow engine beside an event pipeline adds a second system, in return for guaranteed completion and timeouts.</p>
+<p><strong>Lessons.</strong> The hybrid shape again: events for throughput and fan-out, a workflow engine for "this must finish". DoorDash's framing of the engine as a fallback is a useful middle path for teams that already have a working choreographed flow and need durability without a rewrite.</p>
+
+<h3 id=dd-eventdriven-architecture-adv-case-synthesis level=3>What the five have in common</h3>
+<div class="MuiBox-root css-1h3kb9f"><div class="table-scroll"><table class="MuiTable-root css-104jnbp"><thead><tr><th>Decision<th>Uber<th>Netflix<th>Zalando<th>Stripe<th>DoorDash<tbody>
+<tr><td>Orchestrator for multi-step work<td>Cadence<td>Conductor<td>Not the focus of public material<td>Phased idempotent requests<td>Cadence as fallback
+<tr><td>Log-based event backbone<td>Kafka<td>Kafka (Keystone)<td>Kafka behind Nakadi<td>Events API, webhooks to customers<td>Kafka
+<tr><td>Avoiding dual writes<td>—<td>CDC (Delta, DBLog)<td>—<td>Atomic phases in one database<td>—
+<tr><td>Retries and DLQ as platform<td>Retry topics, consumer proxy<td>—<td>—<td>Webhook retries<td>—
+<tr><td>Schema governance<td>—<td>—<td>Validation at publish, guidelines<td>Versioned public API<td>—
+<tr><td>Idempotency as a contract<td>Implied by retries<td>—<td>Consumers must tolerate duplicates<td>Idempotency-Key header<td>—
+</table></div></div>
+<p>A dash means the public material reviewed here did not emphasise it, not that the company lacks it. Three conclusions hold across the set:</p>
+<ol>
+<li><strong>Nobody runs pure choreography for critical multi-step processes.</strong> Each of them added an orchestrator, a durable workflow, or phased state for the steps that must complete.</li>
+<li><strong>Reliability features moved into platforms.</strong> Retry tiers, schema validation, CDC and workflow durability ended up as shared infrastructure, because every team writing its own produced every possible bug.</li>
+<li><strong>Idempotency is assumed everywhere.</strong> At-least-once delivery is the baseline in all five, and the published designs put the burden of safe duplicates on handlers and keys, not on the broker.</li>
+</ol>
+
+<h2 id=dd-eventdriven-architecture-adv-capstone level=2>Deep Dive: The Hands-On Capstone</h2>
+<p>Reading about sagas and outboxes only goes so far. The repository includes a hands-on capstone template under <code>capstones/eda-commerce/</code>. It builds a small version of the order workflow from this deep dive, with implementations in Python and Java and a set of architecture decision records (ADRs) that write down the trade-offs.</p>
+<p>It contains nine services (catalog, checkout, order, payment, inventory, fulfilment, shipping, notification, returns) and two sagas: the order saga (authorize at checkout, capture at dispatch) and a returns-and-refunds saga. The contracts are shared by both languages: Avro schemas, AsyncAPI 3.0, OpenAPI 3.1 and the outbox, inbox and saga tables. Sixteen ADRs cover orchestration versus choreography, the Debezium outbox, partition keys, inbox idempotency, retry topics and the DLQ, claim checks and observability. One Docker Compose file runs Kafka (KRaft), Schema Registry, Debezium, Postgres, MinIO, the OpenTelemetry Collector, Jaeger, Prometheus and Grafana, and twelve chaos drills come as <code>make</code> targets. The README lays the build out as a ten-day plan with acceptance criteria for each day.</p>
+<p>The capstone is meant to be worked through alongside the lesson, not instead of it. A reasonable way to use it:</p>
+<ol>
+<li><strong>Read the lesson and both deep dives first.</strong> The capstone assumes the vocabulary: commands and events, outbox and inbox, saga state, retry tiers.</li>
+<li><strong>Read the ADRs before the code.</strong> Each one records a decision of the kind covered here, such as orchestration versus choreography, step order or partition keys, with its alternatives and consequences. Decide whether you agree before you see how it was built.</li>
+<li><strong>Pick one language and run the happy path</strong>, then follow one order from start to finish using its identifiers.</li>
+<li><strong>Break it on purpose.</strong> Use the failure branches above as exercises: a declined payment, a stock-out after authorization, a silent warehouse, duplicated delivery. Check that each ends in the state the branch table predicts.</li>
+<li><strong>Change a decision and write the ADR for it.</strong> Swap the step order, or move a step from orchestration to choreography, and record what got better and what got worse.</li>
+</ol>
+<p>Treat the template as a starting point. The ADRs are the part worth keeping, because the habit of writing down a trade-off before building it is what a design review is checking for.</p>
+
+<h2 id=dd-eventdriven-architecture-adv-checklist level=2>Deep Dive: Design-Review Checklist (Workflows, Payloads and Operations)</h2>
+<p>These questions extend the checklist in part one. They are aimed at a design that coordinates several services through events.</p>
+<ol>
+<li>For every message, is it a command or an event, and does its name say so? Who owns each command's schema?</li>
+<li>Which steps are orchestrated and which reactions are choreographed? For each choreographed reaction, would the order be wrong if it did nothing? If yes, why is it not a step?</li>
+<li>Where does the workflow's state live, and can support answer "where is order X?" from it in one query?</li>
+<li>What is the partition key on every topic in the workflow? Does any step rely on order <em>across</em> topics?</li>
+<li>Where is the pivot step? Which earlier steps are compensated, which later steps are retried until they succeed, and why is the step order the cheapest one?</li>
+<li>Is the compensation stack recorded as steps succeed, or worked out at failure time?</li>
+<li>Every step has a timeout and the saga has a deadline. What happens on expiry when the outcome is ambiguous? Who gets paged?</li>
+<li>What does each handler do with an event that is illegal in the current state, such as a late reply after cancellation?</li>
+<li>What are the idempotency keys for external side effects, what are they derived from, and how long does each provider honour them?</li>
+<li>What is the largest event each type can produce, and what enforces the budget? For claim checks: write order, key scheme, hash, encryption, access, and lifecycle relative to retention and replay?</li>
+<li>Which consumers retry in place and which use retry topics? For the latter, how is per-key order protected?</li>
+<li>When a message is dead-lettered, are later messages for the same key parked? Who owns the DLQ, what is its age alert, and does the redrive tool exist yet?</li>
+<li>How is a view rebuilt: which consumer group, which starting point, how are side effects suppressed, and what rate limit protects production?</li>
+<li>What are the event-age SLOs per consumer, measured from <code>occurred_at</code>, and are they alerted per partition?</li>
+<li>Which game-day drills have been run against this design, and what did they find?</li>
+</ol>
+
+<h2 id=dd-eventdriven-architecture-adv-interview level=2>Deep Dive: Senior Follow-ups on Workflows and Operations</h2>
+<details>
+<summary>"Why authorize first and capture later, instead of just charging the card?"</summary>
+<p>Because it moves the expensive, customer-visible undo out of the common failure paths. Before capture, cancelling is a void, which usually never appears as a completed charge on the customer's statement. After capture, cancelling is a refund, a new money movement with fees, delay and a support conversation. Authorizing first, reserving stock, and capturing after pick and pack puts the pivot late. The cost is handling authorization expiry for slow fulfilment, and needing a provider and market that support separate authorization and capture.</p>
+</details>
+<details>
+<summary>"Your orchestrator crashes between updating the saga row and publishing the next command. What happens?"</summary>
+<p>Nothing is lost, because there is no separate publish. The saga update and the command's outbox row commit in one transaction, and the relay publishes the outbox later. If the crash is before commit, neither exists, and the incoming event is redelivered because its offset was not committed. If the crash is after commit but before the offset commit, the redelivered event hits the inbox's primary key and is skipped. The relay may publish the command twice, so the receiving service dedupes on the command's message ID.</p>
+</details>
+<details>
+<summary>"The warehouse has not answered for eight hours. Do you cancel the order?"</summary>
+<p>Not yet. A timeout means the outcome is unknown, not that the step failed. Compensating could release stock and void payment for a parcel that has already shipped. First ask the warehouse for the status directly. If it never received the request, resend with the same fulfilment key so a late original cannot create a duplicate. If it is in progress, extend the deadline once and record why. If it cannot answer, escalate to a person before the saga deadline. And handle the late reply that arrives after any decision explicitly, never by dropping it.</p>
+</details>
+<details>
+<summary>"Retry topics keep the partition moving. Why wouldn't you use them everywhere?"</summary>
+<p>Because they break per-key order. While <code>order.placed</code> waits in a retry topic, <code>order.cancelled</code> for the same order can be processed first, and the late retry can resurrect the order. They are safe where handlers are order-insensitive, typically because every write is guarded by a per-entity version. For order-critical consumers such as the orchestrator or a ledger, retry in place with a short bound, then quarantine the whole key so later messages for it wait behind the failed one.</p>
+</details>
+<details>
+<summary>"Someone wants to put 8 MB product media in the product.updated event. What do you say?"</summary>
+<p>Put the media in object storage and send a claim check: key, SHA-256, size, content type, and the facts most consumers need inline. Upload before publishing, so the event never points at nothing. Use a key per version so a slow consumer never reads newer bytes than its event describes. Encrypt with a dedicated key and grant each consumer read access by identity rather than putting pre-signed URLs in events. Set the lifecycle beyond retention plus the longest replay. Don't chunk it, and don't raise the cluster's message limit for one producer.</p>
+</details>
+<details>
+<summary>"We use Kafka transactions, so we have exactly-once. Do consumers still need idempotency?"</summary>
+<p>If they write anywhere other than Kafka, yes. Kafka transactions make consumed offsets and produced records commit together, for readers using <code>read_committed</code>. A database write, an email or a payment call sits outside that transaction, and a crash between the side effect and the offset commit repeats it. The real guarantee is effectively-once: at-least-once delivery plus an idempotent effect at every system that is touched, through an inbox, a version guard or an idempotency key.</p>
+</details>
+<details>
+<summary>"How would you rebuild the fraud view without touching production?"</summary>
+<p>Start a new consumer group writing to a new table, from the earliest offset or from a snapshot plus the topic tail. Version guards make the overlap harmless. Rate-limit it so the view store keeps headroom for live traffic, and run it with side effects disabled by configuration. When it has caught up and its event age matches the live consumer's, switch reads to the new table. Keep the old group and table for a while so rollback is just switching back. Measure the rebuild time, because that is your recovery time objective for this view.</p>
+</details>
+<details>
+<summary>"Consumer lag is 120,000. Is that bad?"</summary>
+<p>It depends on the drain rate, which is why lag in records is the wrong unit. At 2,000 records per second it is a minute. At 50 per second it is 40 minutes. A stuck consumer on a quiet topic can even show steady, small lag. Measure time instead: time lag per partition, and event age at processing (now minus <code>occurred_at</code>) as a histogram. Set SLOs per consumer according to what staleness costs it, alert on burn rate, and check per partition so one stuck partition cannot hide inside a group average.</p>
+</details>
+<details>
+<summary>"Inventory keys its events by SKU. The orchestrator needs them by order. Who wins?"</summary>
+<p>Neither, because they are different facts. Stock-level changes are facts about a SKU and need per-SKU order, so they are keyed by SKU on inventory's own topic. Replies to the order workflow (<code>StockReserved</code>, <code>StockUnavailable</code>) are facts about an order's reservation and should be keyed by order ID on the topic the orchestrator reads. Forcing one key onto both breaks one of the two orderings. Inventory publishes both, from the same transaction, through its outbox.</p>
+</details>
+<details>
+<summary>"What would you drill first on a game day for this design?"</summary>
+<p>Deliver every message twice. It is cheap to build (a wrapper that duplicates a fraction of consumed messages), safe in staging, and it exercises the property everything depends on. Then reconcile: one charge, one reservation, one shipment, one email per order. Next, stop the CDC connector to prove the outbox-age alert fires before the database's disk is at risk, and inject a poison message to check that only its key parks while the partition flows. Each drill should have a written expected outcome, and the finding goes into the backlog with an owner.</p>
+</details>
