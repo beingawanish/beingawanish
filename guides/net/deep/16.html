@@ -1,0 +1,425 @@
+<h2 id="d16-deep-dive">Deep dive: a tunnel is a routing decision plus a byte budget</h2>
+<p>The envelope-inside-an-envelope picture is accurate, and it hides two things that cause nearly every real tunnel incident. The first is that a tunnel is not a pipe. It is a virtual interface the routing table can choose, plus a lookup that decides which remote endpoint gets each packet. That means routing happens twice per packet, and the second lookup can go wrong in ways the first cannot. The second is that the outer envelope costs bytes, and it costs them out of a fixed budget, usually 1500. Every byte of header is a byte the inner packet loses. When nobody tells the inner hosts, large packets disappear while small ones work.</p>
+<p>This deep dive covers both. It works out the exact overhead of ESP, WireGuard, GRE and VXLAN, then shows WireGuard's cryptokey routing as the data structure it really is. It covers what split tunnelling does to the routing table, and why path MTU discovery breaks across a tunnel, shown with real captures. It ends with overlay versus underlay, the vocabulary of every cloud and Kubernetes network.</p>
+<p>The captures in the "what the wire shows" section come from a Linux 6.18 lab built from network namespaces, running a real VXLAN overlay across an underlay with a 1400-byte hop. That kernel had no ESP, GRE or WireGuard modules, so the overhead figures for those come from the calculator script below, not from captures. The text says which is which.</p>
+<h2 id="d16-mental-model">Deep dive: the real mental model</h2>
+<h3 id="d16-two-lookups-per-packet">Two lookups per packet</h3>
+<p>Follow one packet from an application to an office database at <code>10.1.7.20</code>, through a WireGuard interface.</p>
+<ol type="1">
+<li><strong>Route lookup #1, on the inner packet.</strong> The kernel looks up <code>10.1.7.20</code> in the routing table. A route for <code>10.1.0.0/16</code> points at <code>wg0</code>. To the application, <code>wg0</code> is just another interface with an MTU, here 1420.</li>
+<li><strong>The tunnel's own lookup.</strong> WireGuard looks up the inner destination in its cryptokey table. That finds the peer, and with it the session key, the next counter value and the peer's current UDP endpoint.</li>
+<li><strong>Encapsulation.</strong> The inner packet is padded, encrypted and authenticated, and a 16-byte header is prepended. The result is handed to WireGuard's UDP socket as an ordinary datagram addressed to the peer's endpoint, say <code>203.0.113.50:51820</code>.</li>
+<li><strong>Route lookup #2, on the outer packet.</strong> The kernel now routes a UDP datagram to <code>203.0.113.50</code>. This lookup must <em>not</em> choose <code>wg0</code>. If it did, the tunnel would be trying to carry itself.</li>
+</ol>
+<p>Every tunnel technology has the same skeleton: an inner route, a selector that picks the remote end, an encapsulation function, and an outer route. IPsec's selector is the Security Policy Database. Each policy matches traffic selectors (source and destination subnets, sometimes ports and protocol) and points at a Security Association: SPI, keys, sequence number. A route-based IPsec setup puts a virtual interface (<code>xfrm</code> or VTI on Linux, a <code>utun</code>/<code>ipsec</code> interface on macOS) in front of that, so ordinary routes can steer traffic. GRE and VXLAN have the simplest selector of all: a configured remote address, or for VXLAN a forwarding table that maps inner MAC addresses to remote endpoints.</p>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 540" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="d16-wg-title d16-wg-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
+<title id="d16-wg-title">One packet through a WireGuard interface: two route lookups and a cryptokey table</title>
+<desc id="d16-wg-desc">An application's packet to 10.1.7.20 is routed to the wg0 interface. WireGuard looks up the destination in its cryptokey table of allowed IPs, finds the peer office-gw, encrypts the packet with that peer's session key and hands it to its UDP socket. The resulting outer packet to 203.0.113.50 is routed a second time, and a policy rule keeps it out of the tunnel so it leaves through the physical interface. A byte budget shows 40 bytes of outer IPv6 header, 8 of UDP, 16 of WireGuard header, up to 1420 of inner packet and a 16-byte tag, totalling 1500.</desc>
+<defs>
+<marker id="d16-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M 0 1 L 9 5 L 0 9 z" fill="#6b7280"/>
+</marker>
+<marker id="d16-arr-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M 0 1 L 9 5 L 0 9 z" fill="#bf4520"/>
+</marker>
+</defs>
+<text x="24" y="28" font-size="12" fill="#6b7280" letter-spacing="2">INNER PACKET: APP TO 10.1.7.20</text>
+<rect x="24" y="44" width="120" height="92" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="84" y="80" font-size="14" fill="#2d3142" text-anchor="middle" font-weight="600">app socket</text>
+<text x="84" y="102" font-size="11" fill="#6b7280" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">→ 10.1.7.20:5432</text>
+<rect x="166" y="44" width="150" height="92" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="241" y="70" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">route lookup #1</text>
+<text x="241" y="94" font-size="11" fill="#6b7280" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">10.1.0.0/16</text>
+<text x="241" y="112" font-size="11" fill="#6b7280" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">dev wg0 mtu 1420</text>
+<rect x="338" y="44" width="236" height="92" rx="6" fill="none" stroke="#bf4520" stroke-width="2"/>
+<text x="456" y="64" font-size="11" fill="#6b7280" text-anchor="middle" letter-spacing="1.5">CRYPTOKEY TABLE (LONGEST MATCH)</text>
+<text xml:space="preserve" style="white-space:pre" x="350" y="86" font-size="11" fill="#bf4520" font-family="ui-monospace, Menlo, monospace">10.1.0.0/16   → office-gw  ✓</text>
+<text xml:space="preserve" style="white-space:pre" x="350" y="104" font-size="11" fill="#2d3142" font-family="ui-monospace, Menlo, monospace">10.1.42.0/24  → db-replica</text>
+<text xml:space="preserve" style="white-space:pre" x="350" y="122" font-size="11" fill="#2d3142" font-family="ui-monospace, Menlo, monospace">10.8.0.5/32   → laptop-ana</text>
+<rect x="596" y="44" width="140" height="92" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="666" y="70" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">encrypt</text>
+<text x="666" y="92" font-size="11" fill="#6b7280" text-anchor="middle">peer's session key,</text>
+<text x="666" y="108" font-size="11" fill="#6b7280" text-anchor="middle">counter + 1,</text>
+<text x="666" y="124" font-size="11" fill="#6b7280" text-anchor="middle">pad to 16</text>
+<line x1="144" y1="90" x2="160" y2="90" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d16-arr)"/>
+<line x1="316" y1="90" x2="332" y2="90" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d16-arr)"/>
+<line x1="574" y1="90" x2="590" y2="90" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d16-arr)"/>
+<line x1="666" y1="136" x2="666" y2="196" stroke="#bf4520" stroke-width="2" marker-end="url(#d16-arr-acc)"/>
+<text x="24" y="186" font-size="12" fill="#6b7280" letter-spacing="2">OUTER PACKET: UDP TO THE PEER'S ENDPOINT</text>
+<rect x="596" y="202" width="140" height="92" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="666" y="228" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">UDP socket</text>
+<text x="666" y="250" font-size="11" fill="#6b7280" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">:51820 →</text>
+<text x="666" y="266" font-size="11" fill="#6b7280" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">203.0.113.50:51820</text>
+<text x="666" y="284" font-size="11" fill="#6b7280" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">fwmark 0xca6c</text>
+<rect x="338" y="202" width="236" height="92" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="456" y="228" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">route lookup #2</text>
+<text x="456" y="250" font-size="11" fill="#6b7280" text-anchor="middle">marked packets skip table 51820,</text>
+<text x="456" y="266" font-size="11" fill="#6b7280" text-anchor="middle">so the default route is the real one:</text>
+<text x="456" y="284" font-size="11" fill="#6b7280" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">via 192.168.1.1 dev eth0</text>
+<rect x="166" y="202" width="150" height="92" rx="6" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="241" y="240" font-size="13" fill="#2d3142" text-anchor="middle" font-weight="600">eth0 / en0</text>
+<text x="241" y="262" font-size="11" fill="#6b7280" text-anchor="middle" font-family="ui-monospace, Menlo, monospace">mtu 1500</text>
+<line x1="596" y1="248" x2="580" y2="248" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d16-arr)"/>
+<line x1="338" y1="248" x2="322" y2="248" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d16-arr)"/>
+<line x1="166" y1="248" x2="150" y2="248" stroke="#6b7280" stroke-width="1.5" marker-end="url(#d16-arr)"/>
+<text x="84" y="244" font-size="12" fill="#6b7280" text-anchor="middle">to the</text>
+<text x="84" y="260" font-size="12" fill="#6b7280" text-anchor="middle">underlay</text>
+<text x="24" y="346" font-size="12" fill="#6b7280" letter-spacing="2">BYTE BUDGET ON A 1500-BYTE IPv6 UNDERLAY (NOT TO SCALE)</text>
+<rect x="24" y="362" width="64" height="40" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<rect x="88" y="362" width="48" height="40" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<rect x="136" y="362" width="72" height="40" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<rect x="208" y="362" width="456" height="40" fill="none" stroke="#bf4520" stroke-width="2"/>
+<rect x="664" y="362" width="72" height="40" fill="none" stroke="#2d3142" stroke-width="1.5"/>
+<text x="56" y="387" font-size="11" fill="#2d3142" text-anchor="middle">IPv6 40</text>
+<text x="112" y="387" font-size="11" fill="#2d3142" text-anchor="middle">UDP 8</text>
+<text x="172" y="387" font-size="11" fill="#2d3142" text-anchor="middle">WG hdr 16</text>
+<text x="436" y="387" font-size="12" fill="#bf4520" text-anchor="middle" font-weight="600">inner IP packet, at most 1420 (the wg0 MTU)</text>
+<text x="700" y="387" font-size="11" fill="#2d3142" text-anchor="middle">tag 16</text>
+<text x="24" y="424" font-size="11" fill="#6b7280">40 + 8 + 16 + 1420 + 16 = 1500. On an IPv4 underlay the outer header is 20, which is why 1440 would also fit.</text>
+<text x="24" y="460" font-size="13" fill="#6b7280">The packet is routed twice: once as the inner packet (into wg0), once as the outer UDP datagram.</text>
+<text x="24" y="482" font-size="13" fill="#6b7280">If lookup #2 also chose wg0, the tunnel would try to carry itself. wg-quick prevents that with a fwmark</text>
+<text x="24" y="504" font-size="13" fill="#6b7280">rule on Linux and with two /1 routes plus a host route to the endpoint on macOS.</text>
+</svg>
+
+<h3 id="d16-wireguards-cryptokey-routing-as-a-data-structure">WireGuard's cryptokey routing, as a data structure</h3>
+<p>Each WireGuard peer is a record: a public key, a list of AllowedIPs, an optional endpoint, and session state (keys, counters, timers). Internally the AllowedIPs of every peer go into one prefix trie. That gives two operations, and they are the whole design.</p>
+<p><strong>Sending.</strong> Do a longest-prefix match of the inner <em>destination</em> across all peers' AllowedIPs. The matching peer is who you encrypt for. With no match, the packet is dropped, and the Linux driver answers the sender with an ICMP "host unreachable". A peer whose endpoint is still unknown cannot be sent to.</p>
+<p><strong>Receiving.</strong> The 32-bit receiver index in the data message header picks the session. Then the packet must decrypt and authenticate under that session's key, and its counter must pass the replay window. Only after that does WireGuard read the inner packet. Then comes the check that makes the design safe: the inner <em>source</em> address is looked up in the same trie, and it must map to the same peer that sent it. A peer allowed <code>10.8.0.5/32</code> cannot inject packets claiming to come from <code>10.1.7.20</code>. Finally, the peer's endpoint is updated to the outer source address of this authenticated packet. That is how roaming works: a laptop that moves from Wi-Fi to LTE sends one packet from its new address, and the server starts replying there.</p>
+<p>So AllowedIPs is a routing table on the way out and an access-control list on the way in. In IPsec those are separate artefacts (routes, policies, selectors), negotiated and checked separately. That difference explains most of the configuration-size gap people notice.</p>
+<p>The module described WireGuard's rekeying as a continuous key chain with "no handshake involved". In fact WireGuard runs a fresh 1-RTT handshake for every new session. The whitepaper's timers say an initiator starts a new handshake once a session is 120 seconds old (REKEY_AFTER_TIME). It refuses to use a session at all after 180 seconds (REJECT_AFTER_TIME), or after 2^60 messages. Those handshakes are cheap and happen in the background on live tunnels, so nobody notices them. What the module had right is the outcome: keys turn over every couple of minutes, which bounds what any one key protects.</p>
+<h3 id="d16-split-tunnelling-is-just-route-specificity">Split tunnelling is just route specificity</h3>
+<p>There is no "split tunnel" switch in the kernel. There are routes, and the most specific one wins.</p>
+<ul>
+<li><strong>Full tunnel</strong> means a route for everything points at the tunnel. Replacing the default route would break route lookup #2: the outer packet to the VPN server would follow the new default into the tunnel. So clients don't replace it. wg-quick on macOS adds <code>0.0.0.0/1</code> and <code>128.0.0.0/1</code> via the tunnel, which beat <code>0.0.0.0/0</code> on prefix length and together cover everything. It also adds a host route for the server's address via the original gateway. On Linux, wg-quick instead marks WireGuard's own packets with fwmark <code>0xca6c</code> (51820) and adds policy rules. Unmarked traffic consults a separate table, 51820, whose default route points at <code>wg0</code>; marked traffic skips that table and uses the normal default route.</li>
+<li><strong>Split tunnel</strong> means only some prefixes point at the tunnel, such as <code>10.0.0.0/8</code>, and the original default route stays in charge of everything else.</li>
+</ul>
+<p>Two things leak around those routes. DNS is the first. Name resolution is a separate configuration, and on macOS it can be scoped: a VPN can install a resolver used only for <code>corp.example</code> while public names go to the local resolver. <code>scutil --dns</code> shows those scoped resolvers. IPv6 is the second. A VPN that routes only IPv4 leaves IPv6 on the local network, and a dual-stack site will happily take the IPv6 path. A full tunnel has to claim <code>::/0</code> too, or block it.</p>
+<h3 id="d16-overlay-and-underlay">Overlay and underlay</h3>
+<p>The <strong>underlay</strong> is the network that actually carries packets: physical links, routers, cloud fabric, the internet. The <strong>overlay</strong> is the network the tunnel endpoints pretend exists, with its own addresses, sometimes its own Ethernet segment. VXLAN makes the split explicit. Each VXLAN Tunnel Endpoint (VTEP) has an underlay IP. The overlay is identified by a 24-bit VXLAN Network Identifier (VNI), so up to about 16.7 million segments, against 4094 for 802.1Q VLANs. Each VTEP keeps a forwarding table that maps inner MAC addresses to remote VTEP IPs.</p>
+<p>Three properties follow, and each is a failure mode waiting to happen.</p>
+<ol type="1">
+<li><strong>The overlay's MTU is the underlay's minus the overhead.</strong> Nothing adjusts it automatically across a whole path.</li>
+<li><strong>The overlay can't see the underlay.</strong> A ping inside the overlay tests the whole stack at once. When it fails, it tells you nothing about which underlay hop broke.</li>
+<li><strong>Underlay load-balancing works on outer headers.</strong> VTEPs put a hash of the inner flow into the outer UDP <em>source</em> port (RFC 7348 recommends the range 49152–65535; Linux uses its local port range by default). The underlay's ECMP spreads overlay flows across paths by that port. A single bad link therefore breaks <em>some</em> overlay flows between two hosts and not others.</li>
+</ol>
+<h2 id="d16-on-the-wire">Deep dive: what the wire shows</h2>
+<h3 id="d16-the-lab">The lab</h3>
+<p>Two VTEPs, <code>x</code> (<code>192.0.2.1</code>) and <code>y</code> (<code>192.0.2.6</code>), are routed through a middle router <code>m</code>. Each VTEP bridges a host onto VNI 42. Host <code>h1</code> is <code>10.10.0.1</code> and host <code>h2</code> is <code>10.10.0.2</code>, on one overlay subnet. The underlay links are 1500 bytes, except in the runs where the <code>m</code>–<code>y</code> hop is set to 1400. This is Linux-only (<code>ip netns</code>, <code>ip link add ... type vxlan</code>).</p>
+<p>When a VXLAN device is created on top of a 1500-byte underlay device, Linux sets its MTU for you:</p>
+<pre class="text"><code>$ ip -d link show vxlan42
+2: vxlan42: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1450 qdisc noqueue master br0 state UNKNOWN mode DEFAULT group default qlen 1000
+    vxlan id 42 remote 192.0.2.6 local 192.0.2.1 dev wan srcport 0 0 dstport 4789 ttl auto ageing 300 udpcsum noudp6zerocsumtx noudp6zerocsumrx</code></pre>
+<p>That 1450 is 1500 minus 50: outer IPv4 20, UDP 8, VXLAN 8, and the inner Ethernet header 14 that rides inside. Ask for more and the kernel refuses. Setting the VXLAN MTU to 1500 on that device returned <code>RTNETLINK answers: Invalid argument</code>. The local VTEP protects itself; it knows nothing about the rest of the path.</p>
+<h3 id="d16-the-boundary-byte-exact">The boundary, byte-exact</h3>
+<p>With all links at 1500 and the hosts set to MTU 1450, a 1422-byte ICMP payload fits and 1423 does not. 1422 + 8 (ICMP) + 20 (IP) = 1450:</p>
+<pre class="text"><code>$ ping -M do -c1 -s 1422 10.10.0.2
+1430 bytes from 10.10.0.2: icmp_seq=1 ttl=64 time=0.121 ms
+$ ping -M do -c1 -s 1423 10.10.0.2
+ping: local error: message too long, mtu=1450</code></pre>
+<p>On the underlay, that maximum-size packet is exactly 1500 bytes:</p>
+<pre class="text"><code>01:13:25.869154 IP (tos 0x0, ttl 64, id 15684, offset 0, flags [none], proto UDP (17), length 1500)
+    192.0.2.1.53382 &gt; 192.0.2.6.4789: VXLAN, flags [I] (0x08), vni 42
+IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto ICMP (1), length 1450)</code></pre>
+<p>Read the layers from the top. The outer IPv4 header has DF clear (<code>flags [none]</code>), which is the Linux VXLAN default (<code>df unset</code>). UDP goes to port 4789, the IANA VXLAN port. The <code>I</code> flag (0x08) says the VNI is valid, and the VNI is 42. Then comes the inner packet, which <em>does</em> carry DF: the host asked for path MTU discovery, but its DF bit lives inside the envelope, where underlay routers never look. The outer source port, 53382, is the hash of the inner flow. A different inner flow (an IGMP report in the same capture) left from port 59443.</p>
+<p>The VTEP's forwarding table shows the overlay's own state: one learned MAC entry for <code>h2</code> behind VTEP <code>192.0.2.6</code>, plus the all-zeros default entry that sends unknown and broadcast frames to the configured remote.</p>
+<pre class="text"><code>$ bridge fdb show dev vxlan42
+0a:70:fe:3e:1c:b6 dst 192.0.2.6 self
+00:00:00:00:00:00 dst 192.0.2.6 via wan self permanent</code></pre>
+<h3 id="d16-a-1400-byte-hop-in-the-middle-outer-df-clear">A 1400-byte hop in the middle, outer DF clear</h3>
+<p>Now the <code>m</code>–<code>y</code> link drops to 1400 while everything else stays as it was. The hosts still believe in 1450. With DF clear on the outer header, a 1331-byte inner packet (1323-byte payload) becomes a 1401-byte outer packet. Router <code>m</code> fragments the outer packet, and the ping works:</p>
+<pre class="text"><code>$ ping -M do -c2 -s 1323 10.10.0.2
+1331 bytes from 10.10.0.2: icmp_seq=1 ttl=64 time=0.074 ms
+1331 bytes from 10.10.0.2: icmp_seq=2 ttl=64 time=0.134 ms</code></pre>
+<p>It "works" at a price. Every large packet is now two underlay fragments, reassembled by the far VTEP. If either fragment is lost, the whole packet is lost. Some underlays (cloud fabrics, many firewalls) drop fragments outright. The reply direction shows a second mechanism. VTEP <code>y</code> sends straight onto the 1400 link, so it <em>knows</em> the limit, and Linux VXLAN signalled that back to <code>h2</code>. <code>h2</code>'s echo reply carries no DF, so <code>h2</code> fragmented the <em>inner</em> packet itself, to fit 1350:</p>
+<pre class="text"><code>    192.0.2.6.53382 &gt; 192.0.2.1.4789: VXLAN, flags [I] (0x08), vni 42
+IP (tos 0x0, ttl 64, id 39704, offset 0, flags [+], proto ICMP (1), length 1348)
+    10.10.0.2 &gt; 10.10.0.1: ICMP echo reply, id 1340, seq 1, length 1328
+    192.0.2.6.53382 &gt; 192.0.2.1.4789: VXLAN, flags [I] (0x08), vni 42
+IP (tos 0x0, ttl 64, id 39704, offset 1328, flags [none], proto ICMP (1), length 23)</code></pre>
+<h3 id="d16-the-same-hop-outer-df-set-watch-pmtud-across-the-tunnel">The same hop, outer DF set: watch PMTUD across the tunnel</h3>
+<p>Set <code>df set</code> on both VTEPs and repeat. Now the outer packet may not be fragmented, so the underlay has to signal. Here is the whole sequence for two pings of 1331 bytes:</p>
+<pre class="text"><code>$ ping -M do -c2 -s 1323 10.10.0.2
+From 10.10.0.2 icmp_seq=2 Frag needed and DF set (mtu = 1350)
+2 packets transmitted, 0 received, +1 errors, 100% packet loss, time 316ms</code></pre>
+<p>And on the underlay link between <code>x</code> and <code>m</code>:</p>
+<pre class="text"><code>01:13:51.051444 IP (tos 0x0, ttl 64, id 17807, offset 0, flags [DF], proto UDP (17), length 1401)
+    192.0.2.1.53382 &gt; 192.0.2.6.4789: VXLAN, flags [I] (0x08), vni 42
+IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto ICMP (1), length 1351)
+    10.10.0.1 &gt; 10.10.0.2: ICMP echo request, id 1447, seq 1, length 1331
+01:13:51.051588 IP (tos 0xc0, ttl 64, id 21198, offset 0, flags [none], proto ICMP (1), length 576)
+    192.0.2.2 &gt; 192.0.2.1: ICMP 192.0.2.6 unreachable - need to frag (mtu 1400), length 556
+    IP (tos 0x0, ttl 64, id 17807, offset 0, flags [DF], proto UDP (17), length 1401)
+    192.0.2.1.53382 &gt; 192.0.2.6.4789: VXLAN, flags [I] (0x08), vni 42</code></pre>
+<p>This is the whole problem in four lines. Router <code>m</code> did its job: "fragmentation needed, MTU 1400", quoting the packet it dropped. It sent that to the packet's source, which is the <em>outer</em> source, VTEP <code>x</code>. Host <code>h1</code> never sees this ICMP. Note what the quote contains: the outer headers. To map it back to an inner flow, the VTEP must read past them. That is possible for VXLAN, because the inner packet is in clear text and <code>m</code> quoted 548 bytes of it (RFC 1812 routers quote as much as fits in 576 bytes). It is impossible for ESP or WireGuard, where everything after the outer headers is ciphertext.</p>
+<p>What Linux does with it is the best case. VTEP <code>x</code> caches the lower MTU for its underlay route:</p>
+<pre class="text"><code>$ ip route get 192.0.2.6
+192.0.2.6 via 192.0.2.2 dev wan src 192.0.2.1 uid 0
+    cache expires 597sec mtu 1400</code></pre>
+<p>Then, when the <em>next</em> oversized inner packet arrives (seq 2), the VXLAN driver compares it with 1400 − 50 = 1350. It sends <code>h1</code> an ICMP "fragmentation needed, mtu 1350" whose source address is the inner destination, <code>10.10.0.2</code>. The host caches that, and from then on refuses locally:</p>
+<pre class="text"><code>$ ping -M do -c2 -s 1422 10.10.0.2
+ping: local error: message too long, mtu=1350
+ping: local error: message too long, mtu=1350</code></pre>
+<p>So, even when every piece works, the first oversized packet of a flow is lost. The tunnel endpoint learns on that packet, and the inner host learns on the next one. The cached value expires after about ten minutes (<code>expires 597sec</code>), and then the process repeats.</p>
+<h3 id="d16-break-one-link-in-that-chain-the-black-hole">Break one link in that chain: the black hole</h3>
+<p>Now add one rule on VTEP <code>x</code>, the kind of thing a hardened host config or an over-eager cloud firewall does: drop ICMP "destination unreachable" on input. Then upload 200 kB over TCP from <code>h1</code> to <code>h2</code>:</p>
+<pre class="text"><code>h1 upload FAILED after 8.0s: TimeoutError
+
+$ ss -tin dst 10.10.0.2
+ESTAB 0      78288      10.10.0.1:53996    10.10.0.2:8080
+     bbr wscale:10,10 rto:1632 backoff:3 rtt:0.262/0.131 mss:1398 pmtu:1450 rcvmss:536 advmss:1398 cwnd:1 bytes_sent:19572 bytes_retrans:4194 bytes_acked:1 segs_out:16 segs_in:1 data_segs_out:14 ... unacked:11 retrans:1/3 lost:11 ...
+
+$ nft list table ip blackhole
+        icmp type destination-unreachable counter packets 8 bytes 4608 drop</code></pre>
+<p>The handshake succeeded, because SYNs are small. <code>bytes_acked:1</code> means only the SYN was ever acknowledged. The host still believes <code>pmtu:1450</code>, so it sends 1398-byte segments: 1450 minus 40 bytes of headers minus 12 bytes of timestamp option. Every one of them dies at <code>m</code>. The router's eight ICMP messages were each thrown away at <code>x</code>, so nobody lowered anything. The retransmission timer backs off (<code>backoff:3</code>, <code>rto:1632</code>), the window collapses to one segment, and the application times out. Under the same conditions, an SSH login works and <code>git push</code> hangs. That is the classic shape.</p>
+<h3 id="d16-the-fix-that-doesnt-need-icmp-mss-clamping">The fix that doesn't need ICMP: MSS clamping</h3>
+<p>Keep the ICMP-dropping rule and add one rule on each VTEP's bridge. It rewrites the MSS option in passing SYNs to 1310 (a 1350-byte path minus 40):</p>
+<pre class="text"><code>table bridge clamp {
+  chain forward_clamp {
+    type filter hook forward priority filter; policy accept;
+    tcp flags syn tcp option maxseg size set 1310 counter
+  }
+}</code></pre>
+<pre class="text"><code>h2 received 200000
+h1 upload done in 0.01s
+        icmp type destination-unreachable counter packets 0 bytes 0 drop
+        tcp flags syn tcp option maxseg size set 1310 counter packets 2 bytes 120</code></pre>
+<p>Two SYNs rewritten, zero ICMP needed, and the upload completed. MSS clamping works because TCP agrees on segment size during the handshake, so a middlebox can lower it in passing. Its limits follow from the same fact. It only helps TCP. It does nothing for UDP, QUIC, ICMP or anything already inside another encrypted tunnel, where the SYN is not visible. On a routed (not bridged) tunnel the usual forms are <code>iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu</code> or the nftables <code>tcp option maxseg size set rt mtu</code>.</p>
+<h3 id="d16-try-it-on-your-mac">Try it on your Mac</h3>
+<div class="sourceCode" id="d16-cb14"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d16-cb14-1"><a href="#d16-cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># run on your Mac — your output will differ</span></span>
+<span id="d16-cb14-2"><a href="#d16-cb14-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Tunnel interfaces and their MTUs (WireGuard and most VPN clients show as utunN)</span></span>
+<span id="d16-cb14-3"><a href="#d16-cb14-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ifconfig</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^utun|mtu&#39;</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-A1</span> <span class="st">&#39;^utun&#39;</span></span>
+<span id="d16-cb14-4"><a href="#d16-cb14-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d16-cb14-5"><a href="#d16-cb14-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Find the largest DF packet that crosses your VPN: -D sets Don&#39;t Fragment on macOS.</span></span>
+<span id="d16-cb14-6"><a href="#d16-cb14-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 1392 + 28 = 1420, WireGuard&#39;s default MTU. Raise or lower -s until it fails.</span></span>
+<span id="d16-cb14-7"><a href="#d16-cb14-7" aria-hidden="true" tabindex="-1"></a><span class="fu">ping</span> <span class="at">-D</span> <span class="at">-c</span> 2 <span class="at">-s</span> 1392 10.8.0.1</span>
+<span id="d16-cb14-8"><a href="#d16-cb14-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d16-cb14-9"><a href="#d16-cb14-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Full tunnel or split? Look for 0/1 and 128.0/1 via utun (full) or only specific prefixes (split)</span></span>
+<span id="d16-cb14-10"><a href="#d16-cb14-10" aria-hidden="true" tabindex="-1"></a><span class="fu">netstat</span> <span class="at">-rn</span> <span class="at">-f</span> inet <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;utun|^default|^0/1|^128.0/1&#39;</span></span>
+<span id="d16-cb14-11"><a href="#d16-cb14-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d16-cb14-12"><a href="#d16-cb14-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Scoped resolvers a VPN installed (look for &quot;domain&quot; entries pointing at office DNS)</span></span>
+<span id="d16-cb14-13"><a href="#d16-cb14-13" aria-hidden="true" tabindex="-1"></a><span class="ex">scutil</span> <span class="at">--dns</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-B1</span> <span class="at">-A4</span> <span class="st">&#39;domain&#39;</span></span></code></pre></div>
+<p>On Linux, the same checks are <code>ping -M do -s 1392 &lt;host&gt;</code>, <code>ip route get &lt;endpoint&gt;</code> (it shows a cached PMTU), <code>tracepath &lt;host&gt;</code> (it reports the PMTU hop by hop), <code>ss -tin</code> (per-socket <code>pmtu</code> and <code>mss</code>), and <code>ip rule</code> plus <code>ip route show table 51820</code> for wg-quick's policy routing. With wg-quick and <code>AllowedIPs = 0.0.0.0/0</code>, <code>ip rule</code> looks like this:</p>
+<pre class="text"><code>0:  from all lookup local
+32764:  from all lookup main suppress_prefixlength 0
+32765:  not from all fwmark 0xca6c lookup 51820
+32766:  from all lookup main
+32767:  from all lookup default</code></pre>
+<p>Rule 32764 lets every specific route in <code>main</code> win (your LAN, for instance) but ignores <code>main</code>'s default route. Rule 32765 sends all unmarked traffic to table 51820, whose only route is a default via <code>wg0</code>. WireGuard's own UDP packets carry the mark, skip that rule, and fall through to <code>main</code>'s real default route. That is route lookup #2 being kept out of the tunnel.</p>
+<h2 id="d16-numbers">Deep dive: by the numbers</h2>
+<h3 id="d16-exact-overhead-computed">Exact overhead, computed</h3>
+<p><code>tunnel_mtu.py</code> computes the outer packet size for each encapsulation byte by byte, including ESP's block padding and WireGuard's 16-byte padding. Its VXLAN figure matches the lab's 1450.</p>
+<div class="sourceCode" id="d16-cb16"><pre class="sourceCode python"><code class="sourceCode python"><span id="d16-cb16-1"><a href="#d16-cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Exact per-packet overhead of common tunnels, and the largest inner packet that fits.&quot;&quot;&quot;</span></span>
+<span id="d16-cb16-2"><a href="#d16-cb16-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d16-cb16-3"><a href="#d16-cb16-3" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> esp(inner, iv, block, icv, outer<span class="op">=</span><span class="dv">20</span>, natt<span class="op">=</span><span class="va">False</span>):</span>
+<span id="d16-cb16-4"><a href="#d16-cb16-4" aria-hidden="true" tabindex="-1"></a>    <span class="co"># ESP (RFC 4303): SPI 4 + seq 4 + IV, then payload + padding + pad-len 1 + next-header 1,</span></span>
+<span id="d16-cb16-5"><a href="#d16-cb16-5" aria-hidden="true" tabindex="-1"></a>    <span class="co"># padded so that (payload + 2) is a multiple of the cipher block (min 4), then the ICV.</span></span>
+<span id="d16-cb16-6"><a href="#d16-cb16-6" aria-hidden="true" tabindex="-1"></a>    body <span class="op">=</span> inner <span class="op">+</span> <span class="dv">2</span></span>
+<span id="d16-cb16-7"><a href="#d16-cb16-7" aria-hidden="true" tabindex="-1"></a>    body <span class="op">+=</span> <span class="op">-</span>body <span class="op">%</span> block</span>
+<span id="d16-cb16-8"><a href="#d16-cb16-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> outer <span class="op">+</span> (<span class="dv">8</span> <span class="cf">if</span> natt <span class="cf">else</span> <span class="dv">0</span>) <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> iv <span class="op">+</span> body <span class="op">+</span> icv</span>
+<span id="d16-cb16-9"><a href="#d16-cb16-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d16-cb16-10"><a href="#d16-cb16-10" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> wg(inner, outer, if_mtu):</span>
+<span id="d16-cb16-11"><a href="#d16-cb16-11" aria-hidden="true" tabindex="-1"></a>    <span class="co"># WireGuard data message: type/reserved 4 + receiver index 4 + counter 8, then the</span></span>
+<span id="d16-cb16-12"><a href="#d16-cb16-12" aria-hidden="true" tabindex="-1"></a>    <span class="co"># plaintext padded to a multiple of 16 (never beyond the wg interface MTU), then a 16-byte tag.</span></span>
+<span id="d16-cb16-13"><a href="#d16-cb16-13" aria-hidden="true" tabindex="-1"></a>    padded <span class="op">=</span> <span class="bu">min</span>(inner <span class="op">+</span> (<span class="op">-</span>inner <span class="op">%</span> <span class="dv">16</span>), <span class="bu">max</span>(inner, if_mtu))</span>
+<span id="d16-cb16-14"><a href="#d16-cb16-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> outer <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">16</span> <span class="op">+</span> padded <span class="op">+</span> <span class="dv">16</span></span>
+<span id="d16-cb16-15"><a href="#d16-cb16-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d16-cb16-16"><a href="#d16-cb16-16" aria-hidden="true" tabindex="-1"></a>TUNNELS <span class="op">=</span> {</span>
+<span id="d16-cb16-17"><a href="#d16-cb16-17" aria-hidden="true" tabindex="-1"></a>    <span class="co"># name: function(inner_ip_packet_len) -&gt; outer_ip_packet_len</span></span>
+<span id="d16-cb16-18"><a href="#d16-cb16-18" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;IPIP (IPv4 in IPv4)&quot;</span>:         <span class="kw">lambda</span> n: <span class="dv">20</span> <span class="op">+</span> n,</span>
+<span id="d16-cb16-19"><a href="#d16-cb16-19" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;GRE, no key&quot;</span>:                 <span class="kw">lambda</span> n: <span class="dv">20</span> <span class="op">+</span> <span class="dv">4</span> <span class="op">+</span> n,</span>
+<span id="d16-cb16-20"><a href="#d16-cb16-20" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;GRE + key&quot;</span>:                   <span class="kw">lambda</span> n: <span class="dv">20</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> n,</span>
+<span id="d16-cb16-21"><a href="#d16-cb16-21" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;VXLAN, IPv4 underlay&quot;</span>:        <span class="kw">lambda</span> n: <span class="dv">20</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">14</span> <span class="op">+</span> n,   <span class="co"># inner Ethernet header rides inside</span></span>
+<span id="d16-cb16-22"><a href="#d16-cb16-22" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;VXLAN, IPv6 underlay&quot;</span>:        <span class="kw">lambda</span> n: <span class="dv">40</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> <span class="dv">14</span> <span class="op">+</span> n,</span>
+<span id="d16-cb16-23"><a href="#d16-cb16-23" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;WireGuard, IPv4 underlay&quot;</span>:    <span class="kw">lambda</span> n: wg(n, <span class="dv">20</span>, if_mtu<span class="op">=</span><span class="dv">1440</span>),</span>
+<span id="d16-cb16-24"><a href="#d16-cb16-24" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;WireGuard, IPv6 underlay&quot;</span>:    <span class="kw">lambda</span> n: wg(n, <span class="dv">40</span>, if_mtu<span class="op">=</span><span class="dv">1420</span>),</span>
+<span id="d16-cb16-25"><a href="#d16-cb16-25" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;ESP tunnel, AES-GCM-128&quot;</span>:     <span class="kw">lambda</span> n: esp(n, iv<span class="op">=</span><span class="dv">8</span>, block<span class="op">=</span><span class="dv">4</span>, icv<span class="op">=</span><span class="dv">16</span>),</span>
+<span id="d16-cb16-26"><a href="#d16-cb16-26" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;ESP tunnel, AES-GCM + NAT-T&quot;</span>: <span class="kw">lambda</span> n: esp(n, iv<span class="op">=</span><span class="dv">8</span>, block<span class="op">=</span><span class="dv">4</span>, icv<span class="op">=</span><span class="dv">16</span>, natt<span class="op">=</span><span class="va">True</span>),</span>
+<span id="d16-cb16-27"><a href="#d16-cb16-27" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;ESP tunnel, AES-CBC+SHA256&quot;</span>:  <span class="kw">lambda</span> n: esp(n, iv<span class="op">=</span><span class="dv">16</span>, block<span class="op">=</span><span class="dv">16</span>, icv<span class="op">=</span><span class="dv">16</span>),</span>
+<span id="d16-cb16-28"><a href="#d16-cb16-28" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;ESP tunnel, AES-CBC+SHA1-96&quot;</span>: <span class="kw">lambda</span> n: esp(n, iv<span class="op">=</span><span class="dv">16</span>, block<span class="op">=</span><span class="dv">16</span>, icv<span class="op">=</span><span class="dv">12</span>),</span>
+<span id="d16-cb16-29"><a href="#d16-cb16-29" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="d16-cb16-30"><a href="#d16-cb16-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d16-cb16-31"><a href="#d16-cb16-31" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> max_inner(f, underlay):</span>
+<span id="d16-cb16-32"><a href="#d16-cb16-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">max</span>(n <span class="cf">for</span> n <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">576</span>, underlay <span class="op">+</span> <span class="dv">1</span>) <span class="cf">if</span> f(n) <span class="op">&lt;=</span> underlay)</span>
+<span id="d16-cb16-33"><a href="#d16-cb16-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d16-cb16-34"><a href="#d16-cb16-34" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;tunnel&#39;</span><span class="sc">:30}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;outer for 1400&#39;</span><span class="sc">:&gt;14}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;max inner @1500&#39;</span><span class="sc">:&gt;16}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;TCP MSS&#39;</span><span class="sc">:&gt;8}</span><span class="ss">&quot;</span>)</span>
+<span id="d16-cb16-35"><a href="#d16-cb16-35" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> name, f <span class="kw">in</span> TUNNELS.items():</span>
+<span id="d16-cb16-36"><a href="#d16-cb16-36" aria-hidden="true" tabindex="-1"></a>    m <span class="op">=</span> max_inner(f, <span class="dv">1500</span>)</span>
+<span id="d16-cb16-37"><a href="#d16-cb16-37" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">:30}</span><span class="ss"> </span><span class="sc">{</span>f(<span class="dv">1400</span>)<span class="sc">:&gt;14}</span><span class="ss"> </span><span class="sc">{</span>m<span class="sc">:&gt;16}</span><span class="ss"> </span><span class="sc">{</span>m <span class="op">-</span> <span class="dv">40</span><span class="sc">:&gt;8}</span><span class="ss">&quot;</span>)</span>
+<span id="d16-cb16-38"><a href="#d16-cb16-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d16-cb16-39"><a href="#d16-cb16-39" aria-hidden="true" tabindex="-1"></a><span class="co"># ESP&#39;s padding makes overhead depend on the inner size: watch it step.</span></span>
+<span id="d16-cb16-40"><a href="#d16-cb16-40" aria-hidden="true" tabindex="-1"></a>f <span class="op">=</span> TUNNELS[<span class="st">&quot;ESP tunnel, AES-CBC+SHA256&quot;</span>]</span>
+<span id="d16-cb16-41"><a href="#d16-cb16-41" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">AES-CBC ESP overhead by inner size:&quot;</span>, {n: f(n) <span class="op">-</span> n <span class="cf">for</span> n <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1400</span>, <span class="dv">1407</span>)})</span></code></pre></div>
+<pre class="text"><code>tunnel                         outer for 1400  max inner @1500  TCP MSS
+IPIP (IPv4 in IPv4)                      1420             1480     1440
+GRE, no key                              1424             1476     1436
+GRE + key                                1428             1472     1432
+VXLAN, IPv4 underlay                     1450             1450     1410
+VXLAN, IPv6 underlay                     1470             1430     1390
+WireGuard, IPv4 underlay                 1468             1440     1400
+WireGuard, IPv6 underlay                 1488             1420     1380
+ESP tunnel, AES-GCM-128                  1456             1446     1406
+ESP tunnel, AES-GCM + NAT-T              1464             1438     1398
+ESP tunnel, AES-CBC+SHA256               1468             1438     1398
+ESP tunnel, AES-CBC+SHA1-96              1464             1438     1398
+
+AES-CBC ESP overhead by inner size: {1400: 68, 1401: 67, 1402: 66, 1403: 65, 1404: 64, 1405: 63, 1406: 62}</code></pre>
+<p>A few of these numbers are worth knowing by heart.</p>
+<ul>
+<li><strong>WireGuard 1420.</strong> 1500 − 40 (IPv6) − 8 (UDP) − 16 (header) − 16 (tag). WireGuard's default assumes an IPv6 underlay, so the same config works over either IP version. Over IPv4 only, 1440 would fit.</li>
+<li><strong>ESP 1446 / MSS 1406.</strong> That is the AES-GCM tunnel-mode figure with no NAT-T. AWS documents exactly this pair (MTU 1446, MSS 1406) for its Site-to-Site VPN. Add NAT-T's 8-byte UDP header, or switch to CBC with 16-byte blocks, and it drops to 1438.</li>
+<li><strong>ESP overhead is not a constant.</strong> With a block cipher, the padding brings <code>payload + 2</code> up to a multiple of 16. The overhead steps between roughly 54 and 69 bytes depending on the inner size, as the last line shows. Quote a range, or the worst case.</li>
+<li><strong>VXLAN 50.</strong> Measured against the underlay's IP MTU, the 50 bytes include the inner Ethernet header. On an IPv6 underlay it is 70.</li>
+<li><strong>Nested tunnels add.</strong> WireGuard (IPv4 underlay) inside an AES-GCM ESP tunnel on a 1500 path leaves 1446 − 60 = 1386 for the innermost packet. TLS VPNs over TCP add a variable overhead on top of TCP's own, and their effective MTU is whatever the client configures.</li>
+</ul>
+<h3 id="d16-wireguards-fixed-sizes-and-timers">WireGuard's fixed sizes and timers</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Item</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Handshake initiation / response / cookie reply</td>
+<td>148 / 92 / 64 bytes of UDP payload</td>
+</tr>
+<tr class="even">
+<td>Data message overhead</td>
+<td>16-byte header (type, reserved, receiver index, 64-bit counter) + 16-byte Poly1305 tag</td>
+</tr>
+<tr class="odd">
+<td>Keepalive</td>
+<td>an empty data message: 32 bytes of UDP payload</td>
+</tr>
+<tr class="even">
+<td>Rekey-After-Time / Reject-After-Time</td>
+<td>120 s / 180 s</td>
+</tr>
+<tr class="odd">
+<td>Rekey-After-Messages</td>
+<td>2^60</td>
+</tr>
+<tr class="even">
+<td>Rekey-Timeout (handshake retry)</td>
+<td>5 s</td>
+</tr>
+<tr class="odd">
+<td>Keepalive-Timeout (passive keepalive)</td>
+<td>10 s</td>
+</tr>
+<tr class="even">
+<td>Common PersistentKeepalive behind NAT</td>
+<td>25 s (an operator setting, off by default)</td>
+</tr>
+</tbody>
+</table>
+<p>PersistentKeepalive exists because of the previous module. A peer behind NAT that only <em>receives</em> traffic will lose its NAT mapping after the router's UDP timeout, 30 seconds on a plain Linux router. After that, the server can't reach it until the client speaks first. A 25-second keepalive keeps the mapping warm.</p>
+<h3 id="d16-ipsecs-fixed-sizes">IPsec's fixed sizes</h3>
+<p>ESP's header is a 32-bit SPI and a 32-bit sequence number. With Extended Sequence Numbers, the high 32 bits are tracked but not sent. IKE runs on UDP 500 and moves to UDP 4500 when NAT-T is detected. On port 4500, IKE packets start with a 4-byte zero "non-ESP marker" so the receiver can tell them from ESP-in-UDP. NAT-T keepalives (RFC 3948) are single <code>0xFF</code> bytes. Implementations commonly send one every 20 seconds, but that is a configurable default.</p>
+<h3 id="d16-underlay-mtus-you-will-meet">Underlay MTUs you will meet</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Underlay</th>
+<th>Typical IP MTU</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Ethernet, home or office</td>
+<td>1500</td>
+<td></td>
+</tr>
+<tr class="even">
+<td>PPPoE DSL / fibre</td>
+<td>1492</td>
+<td>8 bytes of PPPoE. WireGuard's 1420 plus an IPv6 outer header no longer fits.</td>
+</tr>
+<tr class="odd">
+<td>AWS, inside a VPC</td>
+<td>9001</td>
+<td>Traffic leaving through an internet gateway, a VPN or inter-region peering is limited to 1500</td>
+</tr>
+<tr class="even">
+<td>Google Cloud VPC</td>
+<td>1460 by default</td>
+<td>Configurable per VPC, up to 8896</td>
+</tr>
+<tr class="odd">
+<td>IPv6 minimum link MTU</td>
+<td>1280</td>
+<td>RFC 8200; any tunnel carrying IPv6 must deliver at least this, fragmenting below if it has to</td>
+</tr>
+<tr class="even">
+<td>QUIC minimum datagram</td>
+<td>1200 bytes of UDP payload</td>
+<td>RFC 9000; a path that can't carry 1228-byte IPv4 packets can't run QUIC at all</td>
+</tr>
+</tbody>
+</table>
+<p>The cloud rows are published defaults, so check them for your account. The practical point is the GCP row. A VXLAN overlay over GCP's default 1460 gets 1410, not the 1450 many CNI defaults assume.</p>
+<h2 id="d16-failure-modes">Deep dive: production failure modes</h2>
+<h3 id="d16-connected-but-large-transfers-hang-the-pmtud-black-hole">Connected, but large transfers hang (the PMTUD black hole)</h3>
+<p><strong>Symptom.</strong> The VPN is up. Ping works, SSH works, small API calls work. <code>git clone</code>, file uploads, some HTTPS sites (large certificate chains) and database bulk loads stall.</p>
+<p><strong>Mechanism.</strong> Exactly the lab's black-hole run. The tunnel MTU or the hosts' MTU is larger than the real path allows. The ICMP that would correct it is filtered somewhere, or arrives at the tunnel endpoint and is never translated for the inner host.</p>
+<p><strong>Prove it.</strong> Bisect with DF pings through the tunnel: <code>ping -D -s N</code> on macOS, <code>ping -M do -s N</code> on Linux. Find the largest size that works and compare it with the interface MTU. <code>ss -tin</code> on Linux shows the socket's <code>pmtu</code>, <code>mss</code>, retransmissions and backoff. A capture on the tunnel endpoint's underlay interface shows ICMP type 3 code 4 (IPv6: type 2) arriving, or not.</p>
+<p><strong>Fix.</strong> Lower the tunnel interface MTU to what the path carries, clamp TCP MSS at the tunnel ingress, and permit ICMP "fragmentation needed" / "packet too big" (RFC 4890 lists what IPv6 must not filter). On Linux hosts, <code>net.ipv4.tcp_mtu_probing=1</code> turns on packetization-layer PMTU discovery (RFC 4821), which probes instead of waiting for ICMP. macOS has a similar black-hole detection switch, <code>net.inet.tcp.pmtud_blackhole_detection</code>.</p>
+<h3 id="d16-full-tunnel-takes-the-tunnel-down">Full tunnel takes the tunnel down</h3>
+<p><strong>Symptom.</strong> The VPN connects, and the moment you switch to "route all traffic", it drops and reconnects in a loop.</p>
+<p><strong>Mechanism.</strong> Route lookup #2 now matches the tunnel: the outer packets to the VPN server follow the new routes into the tunnel itself. With WireGuard this happens when AllowedIPs covers the endpoint's own address and nothing excludes it, as with a hand-rolled config instead of wg-quick, or on a platform without the fwmark rule.</p>
+<p><strong>Prove it.</strong> <code>route -n get &lt;vpn-server-ip&gt;</code> on macOS, or <code>ip route get &lt;vpn-server-ip&gt; mark 0xca6c</code> on Linux. If the answer is the tunnel interface, you have found it.</p>
+<p><strong>Fix.</strong> Add a host route for the server via the physical gateway (macOS clients do this), use the /1 split, or use policy routing with a mark (Linux wg-quick).</p>
+<h3 id="d16-the-roaming-peer-goes-silent">The roaming peer goes silent</h3>
+<p><strong>Symptom.</strong> A WireGuard client behind NAT works whenever it is sending. Pushes from the server (notifications, SSH sessions opened toward it) fail after the client has been idle for a minute.</p>
+<p><strong>Mechanism.</strong> The client's NAT dropped the UDP mapping after its idle timeout. The server still holds the old endpoint, sends to it, and the NAT discards the packets. WireGuard is silent when idle by design.</p>
+<p><strong>Prove it.</strong> <code>wg show</code> on the server: the peer's <code>latest handshake</code> is minutes old, and <code>transfer</code> stops climbing in the receive direction. A capture on the server shows packets leaving toward the stale endpoint with nothing coming back.</p>
+<p><strong>Fix.</strong> <code>PersistentKeepalive = 25</code> on the client side of the NAT.</p>
+<h3 id="d16-overlapping-address-space">Overlapping address space</h3>
+<p><strong>Symptom.</strong> A remote worker can reach every office service except the one on <code>192.168.1.0/24</code>. That happens to be their home LAN.</p>
+<p><strong>Mechanism.</strong> The connected route for the home LAN is as specific as, or more specific than, the VPN's route. Route lookup #1 sends the packets to the local network, never into the tunnel.</p>
+<p><strong>Prove it.</strong> <code>route -n get 192.168.1.20</code> (macOS) or <code>ip route get 192.168.1.20</code> (Linux) names the physical interface, not <code>utun</code>/<code>wg0</code>.</p>
+<p><strong>Fix.</strong> Renumber office services out of the consumer favourites (192.168.0.0/24, 192.168.1.0/24, 10.0.0.0/24), push more specific routes such as /32s for critical services, or NAT the office side into a non-overlapping range.</p>
+<h3 id="d16-ipsec-comes-up-but-one-subnet-doesnt-pass">IPsec comes up but one subnet doesn't pass</h3>
+<p><strong>Symptom.</strong> A site-to-site IPsec tunnel shows established. Traffic between some subnets works and between others it does not, or the second child SA never comes up.</p>
+<p><strong>Mechanism.</strong> Traffic-selector mismatch. One side proposes <code>10.1.0.0/16 ↔︎ 10.2.0.0/16</code>, the other is configured for <code>10.1.0.0/24 ↔︎ 10.2.0.0/16</code>, and the responder narrows or rejects (<code>TS_UNACCEPTABLE</code> in IKEv2). Packets outside the agreed selectors match no policy. They are dropped, or sent unencrypted down the default route.</p>
+<p><strong>Prove it.</strong> The IKE daemon's log shows the proposed and accepted selectors. On Linux, <code>ip xfrm policy</code> and <code>ip xfrm state</code> show what was installed, and <code>swanctl --list-sas</code> (strongSwan) shows each child SA's selectors.</p>
+<p><strong>Fix.</strong> Make selectors identical on both ends, or move to route-based IPsec (<code>0.0.0.0/0 ↔︎ 0.0.0.0/0</code> selectors on a virtual interface) and steer with routes, which is what cloud VPN gateways recommend.</p>
+<h3 id="d16-some-flows-between-two-pods-fail-others-dont">Some flows between two pods fail, others don't</h3>
+<p><strong>Symptom.</strong> In a VXLAN or Geneve overlay, pod A can talk to pod B on one port but not another. Or a retry with a new connection sometimes works.</p>
+<p><strong>Mechanism.</strong> The underlay hashes overlay flows onto ECMP paths by the outer UDP source port, which comes from each inner flow's hash. One underlay path has a problem: a lower MTU, a lossy link, a misprogrammed ACL. Only the inner flows that hash onto it suffer.</p>
+<p><strong>Prove it.</strong> Capture on the node's underlay interface and compare outer source ports for the failing and working flows. Then test the underlay path itself with matching UDP source and destination ports (<code>traceroute -U</code>, or a probe tool that lets you fix the source port).</p>
+<p><strong>Fix.</strong> Repair the underlay member, and alert on per-path health in the underlay rather than on overlay pings.</p>
+<h2 id="d16-context-2026">Deep dive: 2026 context</h2>
+<p><strong>WireGuard is infrastructure.</strong> It has been in the mainline Linux kernel since 5.6 (2020). There is a native Windows kernel driver (WireGuardNT). Apple platforms run it through the NetworkExtension framework, which is why it shows up as a <code>utun</code> device. Mesh products such as Tailscale, NetBird and Headscale build on it: a coordination server distributes public keys and AllowedIPs, peers punch through NAT, and relays carry what can't go direct. Kubernetes CNIs (Cilium, Calico) offer transparent node-to-node WireGuard encryption, and they size pod MTUs by exactly the 60/80-byte arithmetic above.</p>
+<p><strong>IPsec still owns site-to-site.</strong> Cloud VPN gateways (AWS Site-to-Site VPN, Google Cloud HA VPN, Azure VPN Gateway) speak IKEv2/IPsec with BGP over the tunnels, usually two tunnels per connection for redundancy. That is where the ESP numbers above matter most. Post-quantum migration reached IKE through RFC 9370 (multiple key exchanges in IKEv2), which lets ML-KEM be mixed into the handshake. WireGuard's optional pre-shared key is the usual hedge for its handshake in the meantime.</p>
+<p><strong>Tunnels over HTTP/3.</strong> MASQUE defines proxying UDP (RFC 9298, CONNECT-UDP) and IP (RFC 9484, CONNECT-IP) over HTTP, using HTTP Datagrams (RFC 9297) on QUIC. To a firewall it looks like HTTP/3 on UDP 443, with HTTP/2 over TCP as a fallback. Apple's iCloud Private Relay is built this way, and several consumer VPNs have adopted it. The MTU arithmetic gets tight here. The outer QUIC packet needs its own headers and tag, and an inner QUIC connection needs 1200-byte datagrams, so a QUIC-in-MASQUE path needs a clean 1280+ underlay.</p>
+<p><strong>Zero trust shrinks the network VPN.</strong> Identity-aware proxies and ZTNA connectors replace "put the laptop on the corporate network" with per-application access. Where a network-level tunnel remains, it is increasingly split, with DNS-based routing for specific internal domains. That makes the routing-table and scoped-resolver behaviour above the thing you actually debug.</p>
+<p><strong>Overlays everywhere, mostly hidden.</strong> Cloud VPCs are overlays run by the provider. AWS's Gateway Load Balancer uses Geneve (RFC 8926, UDP 6081) to hand traffic to inspection appliances. Kubernetes overlays use VXLAN (Flannel and Cilium default to UDP 8472, the port Linux used before 4789 was assigned) or Geneve, or skip encapsulation by giving pods VPC-native addresses (AWS VPC CNI, GKE VPC-native). NICs offload checksums and segmentation for VXLAN and Geneve, so the CPU cost of encapsulation is small. The MTU cost is not.</p>
+<h2 id="d16-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: Why is WireGuard's default MTU 1420?</strong></p>
+<p>Because 1500 − 40 (an IPv6 outer header) − 8 (UDP) − 16 (WireGuard's data header: type, reserved, receiver index, 64-bit counter) − 16 (Poly1305 tag) = 1420. Picking the IPv6 case means one MTU works whichever IP version the underlay uses. On a PPPoE line (1492) even that is too big over IPv6, so you set 1412.</p>
+<p><strong>Q2: A VPN is connected. SSH works, <code>git push</code> hangs. Walk me through it.</strong></p>
+<p>Small packets work and big ones don't, so suspect a PMTU black hole. Bisect the working packet size with DF pings through the tunnel. Compare it with the tunnel interface MTU. Check <code>ss -tin</code> for retransmissions with an unchanged <code>pmtu</code>. Then find where the ICMP "fragmentation needed" is lost: filtered on the path, or delivered to the tunnel endpoint (the outer source) and never translated to the inner host. Fix with a lower tunnel MTU and MSS clamping, and allow the ICMP.</p>
+<p><strong>Q3: Why does MSS clamping fix TCP but not QUIC?</strong></p>
+<p>MSS is negotiated in TCP's SYN, in clear text, so a middlebox can rewrite it as it passes. QUIC has no such field visible on the path, because its handshake is encrypted and it sizes datagrams itself. QUIC relies on its own path MTU probing (DPLPMTUD, RFC 8899) above a 1200-byte floor. If the tunnel can't carry 1200-byte UDP payloads, no clamp helps, and the client falls back to TCP.</p>
+<p><strong>Q4: How does WireGuard decide which peer a packet goes to, and what stops a peer from spoofing another peer's addresses?</strong></p>
+<p>Outbound, it does a longest-prefix match of the inner destination over all peers' AllowedIPs, which selects the peer, its key and its endpoint. Inbound, the packet must first authenticate under a session belonging to some peer. Then its inner source address must map, through the same AllowedIPs table, back to that same peer, or it is dropped. One table does both routing and source validation.</p>
+<p><strong>Q5: You enable full tunnel. How does the encrypted outer packet avoid being routed into the tunnel?</strong></p>
+<p>It needs a route that the tunnel's own routes don't override. The options: a host route to the VPN server via the original gateway, plus two /1 routes instead of replacing the default (macOS, many clients); or marking the tunnel's own packets and using policy rules so marked traffic consults the main table (Linux wg-quick with fwmark 0xca6c and table 51820). Otherwise the tunnel tries to carry itself and collapses.</p>
+<p><strong>Q6: Why does a router's "fragmentation needed" not reach the host whose packet was too big?</strong></p>
+<p>The router addresses it to the source of the packet it dropped, which is the <em>outer</em> source, the tunnel endpoint. Its quote contains the outer headers, plus, for an encrypted tunnel, only ciphertext. The endpoint can lower its own path MTU. It can tell the inner host only when the next oversized inner packet arrives, and only if the implementation bothers. The first packet is always lost, and if anything filters ICMP, nothing learns at all.</p>
+<p><strong>Q7: Why does ESP's overhead change with packet size, while WireGuard's is constant at full size?</strong></p>
+<p>ESP pads the plaintext plus its 2-byte trailer to the cipher's block size (16 bytes for AES-CBC, 4-byte alignment for GCM), so overhead steps up and down by up to 15 bytes with the inner length. WireGuard pads to 16 too, but never beyond the interface MTU, so a full-size packet gets no padding. Its overhead at the MTU is exactly 60 (IPv4) or 80 (IPv6).</p>
+<p><strong>Q8: In a VXLAN overlay, pod A reaches pod B on port 80 but not 443. The overlay looks fine. What do you check?</strong></p>
+<p>The underlay. VTEPs hash each inner flow into the outer UDP source port, and the underlay spreads flows across ECMP paths by that port. Two inner flows between the same pods can take different physical paths. Compare outer source ports for the working and failing flows, then test those underlay paths directly: MTU, loss, ACLs. Overlay pings, which hash to one path, prove nothing about the others.</p>

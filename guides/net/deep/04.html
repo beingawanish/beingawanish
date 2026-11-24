@@ -1,0 +1,685 @@
+<h2 id="d04-deep-dive">Deep dive: what a router does to every packet</h2>
+<p>The module treated IP addresses as street addresses and the headers as forms with labelled boxes. That is a fine way to learn the fields. It hides what happens to those boxes in transit.</p>
+<p>A router is a loop that runs billions of times a second. It checks a packet, looks up the destination, decrements the TTL, patches the checksum, checks the size against the next link, rewrites the Ethernet header and queues the frame. Most packets take that fast path entirely in hardware. A few fall off it: the ones whose TTL runs out, the ones too big for the next link, the ones carrying options. They land in a slow path run by a CPU that is a thousand times slower and deliberately rate-limited. Almost every confusing IP behaviour you will meet in production lives on that boundary: traceroute hops that show <code>* * *</code>, PMTUD black holes, IPv6 packets with extension headers that vanish, fragments that never reassemble.</p>
+<p>The second half of this deep dive is about the endpoint. A dual-stack host has two Internets to choose from, and the choice is made by a timer race called Happy Eyeballs. When that race hides a broken IPv6 path, you get a 250 ms penalty on some connections and a two-minute hang on others.</p>
+<h2 id="d04-mental-model">Deep dive: the real mental model — the forwarding loop and its exits</h2>
+<div style="overflow-x:auto">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 600" role="img" aria-labelledby="d04-loop-title d04-loop-desc" style="max-width:100%;height:auto;min-width:760px;background:#f5f5f5;border:1px solid #d8d4cc;border-radius:6px;">
+<title id="d04-loop-title">The router forwarding loop: nine fast-path steps and the exits to the slow path</title>
+<desc id="d04-loop-desc">A vertical chain of nine steps a router applies to each packet: accept the frame, check the header, test whether it is addressed to the router, look up the destination, test and decrement TTL, patch the checksum, compare the size with the egress MTU, find the next-hop MAC, rewrite and queue. Side exits lead right into a rate-limited CPU slow path: local delivery, ICMP Destination Unreachable, ICMP Time Exceeded, ICMP fragmentation needed or Packet Too Big, and ARP resolution. Header errors are simply dropped and counted.</desc>
+<text x="24" y="38" font-family="Georgia,serif" font-size="22" fill="#2d3142">The forwarding loop and its exits</text>
+<text x="24" y="60" font-family="system-ui,sans-serif" font-size="13" fill="#6b6f7e">every packet runs the left column in hardware · anything that must create a packet leaves for the CPU</text>
+<rect x="440" y="178" width="356" height="320" rx="6" fill="#fdf0e8" stroke="#d8d4cc" stroke-width="1"/>
+<text x="618" y="168" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="11" fill="#bf4520">SLOW PATH: CONTROL-PLANE CPU, RATE-LIMITED</text>
+<rect x="40" y="84" width="300" height="40" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="52" y="101" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">1  Frame in</text>
+<text x="52" y="117" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">dst MAC is mine · FCS ok</text>
+<line x1="80" y1="124" x2="80" y2="132" stroke="#2d3142" stroke-width="1.5"/><polygon points="80,136 76,128 84,128" fill="#2d3142"/>
+<rect x="40" y="136" width="300" height="40" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="52" y="153" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">2  Header checks</text>
+<text x="52" y="169" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">version · IHL · length · checksum</text>
+<line x1="80" y1="176" x2="80" y2="184" stroke="#2d3142" stroke-width="1.5"/><polygon points="80,188 76,180 84,180" fill="#2d3142"/>
+<line x1="340" y1="156.0" x2="380" y2="156.0" stroke="#6b6f7e" stroke-width="1.5" stroke-dasharray="4,3"/>
+<text x="386" y="154.0" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">DROP + COUNT</text>
+<text x="386" y="167.0" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">InHdrErrors</text>
+<rect x="40" y="188" width="300" height="40" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="52" y="205" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">3  Addressed to me?</text>
+<text x="52" y="221" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">router's own IPs</text>
+<line x1="80" y1="228" x2="80" y2="236" stroke="#2d3142" stroke-width="1.5"/><polygon points="80,240 76,232 84,232" fill="#2d3142"/>
+<line x1="340" y1="208.0" x2="452" y2="208.0" stroke="#6b6f7e" stroke-width="1.5"/><polygon points="456,208.0 448,204.0 448,212.0" fill="#6b6f7e"/>
+<text x="462" y="206.0" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">local stack</text>
+<text x="462" y="221.0" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">BGP, SSH, ping · CoPP-policed</text>
+<rect x="40" y="240" width="300" height="40" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2.5"/>
+<text x="52" y="257" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">4  FIB lookup</text>
+<text x="52" y="273" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">longest-prefix match</text>
+<line x1="80" y1="280" x2="80" y2="288" stroke="#2d3142" stroke-width="1.5"/><polygon points="80,292 76,284 84,284" fill="#2d3142"/>
+<line x1="340" y1="260.0" x2="452" y2="260.0" stroke="#bf4520" stroke-width="1.5"/><polygon points="456,260.0 448,256.0 448,264.0" fill="#bf4520"/>
+<text x="462" y="258.0" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">ICMP Unreachable</text>
+<text x="462" y="273.0" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">type 3 code 0 · no route</text>
+<rect x="40" y="292" width="300" height="40" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2.5"/>
+<text x="52" y="309" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">5  TTL ≤ 1 ?</text>
+<text x="52" y="325" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">else TTL − 1</text>
+<line x1="80" y1="332" x2="80" y2="340" stroke="#2d3142" stroke-width="1.5"/><polygon points="80,344 76,336 84,336" fill="#2d3142"/>
+<line x1="340" y1="312.0" x2="452" y2="312.0" stroke="#bf4520" stroke-width="1.5"/><polygon points="456,312.0 448,308.0 448,316.0" fill="#bf4520"/>
+<text x="462" y="310.0" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">ICMP Time Exceeded</text>
+<text x="462" y="325.0" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">type 11 · v6: type 3</text>
+<rect x="40" y="344" width="300" height="40" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="52" y="361" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">6  Patch checksum</text>
+<text x="52" y="377" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">+0x0100 · IPv6: nothing</text>
+<line x1="80" y1="384" x2="80" y2="392" stroke="#2d3142" stroke-width="1.5"/><polygon points="80,396 76,388 84,388" fill="#2d3142"/>
+<rect x="40" y="396" width="300" height="40" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2.5"/>
+<text x="52" y="413" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">7  Size > egress MTU ?</text>
+<text x="52" y="429" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">IPv4 with DF clear: fragment</text>
+<line x1="80" y1="436" x2="80" y2="444" stroke="#2d3142" stroke-width="1.5"/><polygon points="80,448 76,440 84,440" fill="#2d3142"/>
+<line x1="340" y1="416.0" x2="452" y2="416.0" stroke="#bf4520" stroke-width="1.5"/><polygon points="456,416.0 448,412.0 448,420.0" fill="#bf4520"/>
+<text x="462" y="414.0" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">ICMP frag needed / PTB</text>
+<text x="462" y="429.0" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">v4 DF set: type 3 code 4 · v6: type 2</text>
+<rect x="40" y="448" width="300" height="40" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="52" y="465" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">8  Next-hop MAC</text>
+<text x="52" y="481" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">ARP / ND adjacency</text>
+<line x1="80" y1="488" x2="80" y2="496" stroke="#2d3142" stroke-width="1.5"/><polygon points="80,500 76,492 84,492" fill="#2d3142"/>
+<line x1="340" y1="468.0" x2="452" y2="468.0" stroke="#6b6f7e" stroke-width="1.5"/><polygon points="456,468.0 448,464.0 448,472.0" fill="#6b6f7e"/>
+<text x="462" y="466.0" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">hold + send ARP / NS</text>
+<text x="462" y="481.0" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">no adjacency yet</text>
+<rect x="40" y="500" width="300" height="40" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="52" y="517" font-family="system-ui,sans-serif" font-size="13" font-weight="600" fill="#2d3142">9  Rewrite MACs, queue</text>
+<text x="52" y="533" font-family="ui-monospace,Menlo,monospace" font-size="10" fill="#6b6f7e">egress port</text>
+<text x="24" y="566" font-family="Georgia,serif" font-style="italic" font-size="14" fill="#2d3142">Fast path: hundreds of millions of packets per second. Slow path: thousands, on purpose.</text>
+<text x="24" y="588" font-family="Georgia,serif" font-style="italic" font-size="14" fill="#6b6f7e">Traceroute, PMTUD and Packet Too Big all depend on the slow path answering.</text>
+</svg>
+</div>
+<p>Here is the per-packet sequence for IPv4, in the order a router performs it. RFC 1812 is the requirements document for IPv4 routers; RFC 8200 and RFC 4443 cover IPv6.</p>
+<ol type="1">
+<li><strong>Accept the frame.</strong> The destination MAC must be the router's own interface MAC, or a multicast/broadcast address it listens to. The NIC has already checked the FCS.</li>
+<li><strong>Sanity-check the header.</strong> Version is 4, IHL is at least 5, Total Length fits within the frame, and the header checksum verifies. A packet that fails is dropped and counted (<code>InHdrErrors</code> on Linux). In hardware routers this check happens in the pipeline at no extra cost.</li>
+<li><strong>Is it for me?</strong> If the destination is one of the router's own addresses, the packet goes up to the router's local stack (routing protocols, SSH, ping replies). This path is policed by <em>control-plane policing</em>, so a flood of packets to the router cannot starve BGP. TTL is not checked for packets addressed to the router.</li>
+<li><strong>Look up the destination.</strong> Longest-prefix match in the FIB returns a next hop and an egress interface. No match and no default route: drop, and generate ICMP Destination Unreachable (type 3, code 0, <em>net unreachable</em>).</li>
+<li><strong>Check and decrement TTL.</strong> If TTL is 1 or 0, the packet cannot be forwarded: drop it and generate ICMP <strong>Time Exceeded</strong> (type 11, code 0). Otherwise TTL becomes TTL − 1.</li>
+<li><strong>Patch the checksum.</strong> The TTL changed, so the header checksum must change. Routers do not recompute it over 20 bytes; they apply an incremental update (RFC 1624). Decrementing TTL by one adds exactly <code>0x0100</code> to the checksum, in ones'-complement arithmetic. The code below proves it.</li>
+<li><strong>Check the size.</strong> If the packet is bigger than the egress MTU and DF is set, drop it and send ICMP Destination Unreachable, code 4, <em>fragmentation needed</em>, with the next-hop MTU in the message (RFC 1191). If DF is clear, fragment it. Fragmentation is usually done by the slow path.</li>
+<li><strong>Resolve the next hop.</strong> Look up the next hop's MAC in the ARP table (IPv4) or neighbor cache (IPv6). In hardware this is an <em>adjacency</em> entry, precomputed with the full new Ethernet header. If there is no entry, the packet is held (or dropped) while the CPU sends an ARP request.</li>
+<li><strong>Rewrite and queue.</strong> New source MAC (the router's egress interface), new destination MAC (the next hop), and the packet joins the egress queue.</li>
+</ol>
+<p>IPv6 is the same loop with three differences. There is no header checksum to patch. The field is called Hop Limit, and the error is ICMPv6 Time Exceeded (type 3, code 0). And step 7 has only one branch: an IPv6 router <em>never</em> fragments. It drops the packet and sends ICMPv6 <strong>Packet Too Big</strong> (type 2), carrying the MTU.</p>
+<h3 id="d04-fast-slow">The fast path and the slow path</h3>
+<p>Steps 1–9 for an ordinary packet run in the forwarding ASIC, or in a tight software loop such as Linux's forwarding path or a DPDK forwarder. Anything that requires generating a new packet, or doing unusual work, is <em>punted</em> to the router's CPU:</p>
+<ul>
+<li>generating any ICMP error (Time Exceeded, Unreachable, Packet Too Big);</li>
+<li>fragmenting an IPv4 packet;</li>
+<li>processing IPv4 options and, on many platforms, IPv6 Hop-by-Hop options;</li>
+<li>packets addressed to the router itself;</li>
+<li>packets whose next hop has no ARP/ND entry yet.</li>
+</ul>
+<p>A hardware router may forward hundreds of millions of packets per second. Its control-plane CPU may handle thousands to tens of thousands per second for all the punted work combined, and the punt path is rate-limited on purpose. Linux does the same in software. Its defaults, read from a fresh network namespace on a 6.18 kernel, rate-limit ICMP errors per destination with a token bucket, plus a global cap:</p>
+<pre class="text"><code>net.ipv4.icmp_ratelimit = 1000        &lt;- ms per token, per destination host
+net.ipv4.icmp_ratemask = 6168         &lt;- bits 3,4,11,12: Unreachable, Source Quench, Time Exceeded, Param Problem
+net.ipv4.icmp_msgs_per_sec = 1000     &lt;- global cap for all destinations
+net.ipv4.icmp_msgs_burst = 50</code></pre>
+<p>Two consequences follow, and both matter for troubleshooting.</p>
+<ul>
+<li><strong>Traceroute measures the slow path.</strong> The RTT printed for an intermediate hop is the time that router's CPU took to generate a Time Exceeded message, not the time to forward through it. A middle hop showing 200 ms while the final hop shows 20 ms means that router's CPU was busy or rate-limiting. It does not mean the path is slow.</li>
+<li><strong><code>* * *</code> is often policy, not failure.</strong> A hop that never answers has usually been told not to generate Time Exceeded, or its answers were rate-limited. If later hops answer, the path through it works.</li>
+</ul>
+<h3 id="d04-icmp-errors">What goes into an ICMP error</h3>
+<p>An ICMP error is a new packet, sent from the router to the <em>source</em> of the packet that caused it. It carries a copy of the offending packet's IP header plus at least the first 8 bytes of its payload (RFC 792). That is enough for the source to find the TCP or UDP ports and match the error to a socket. RFC 1812 lets routers include more, up to a 576-byte total, and Linux does exactly that, as the capture below shows. ICMPv6 errors carry as much of the original as fits in 1,280 bytes.</p>
+<p>Hosts and routers must <em>not</em> send an ICMP error in response to another ICMP error, a packet sent to a broadcast or multicast address, a non-first fragment, or a packet whose source address is not a single host. These rules exist to stop error storms and amplification.</p>
+<p>The source address of the error is one of the router's own addresses. Vendors differ on which one; Linux, by default, uses the address of the interface its route back to the sender points at. That is why traceroute shows interface addresses, and why the same router can appear under different addresses on different paths.</p>
+<h3 id="d04-checksum">TTL decrement and the checksum, proved</h3>
+<p>The checksum is the ones'-complement of the ones'-complement sum of the header's 16-bit words. TTL sits in the high byte of the word it shares with Protocol. Decrementing TTL subtracts <code>0x0100</code> from that word. The sum drops by <code>0x0100</code>, so its complement — the checksum — rises by <code>0x0100</code>. RFC 1624 gives the general update formula, which is safe in every corner case (an earlier version in RFC 1141 was not):</p>
+<div class="sourceCode" id="d04-cb2"><pre class="sourceCode python"><code class="sourceCode python"><span id="d04-cb2-1"><a href="#d04-cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;What a router does to an IPv4 header: decrement TTL, patch the checksum.</span></span>
+<span id="d04-cb2-2"><a href="#d04-cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb2-3"><a href="#d04-cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co">Full recompute (RFC 791/1071) versus incremental update (RFC 1624, eqn. 3):</span></span>
+<span id="d04-cb2-4"><a href="#d04-cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co">    HC&#39; = ~(~HC + ~m + m&#39;)      all in 16-bit ones&#39;-complement arithmetic</span></span>
+<span id="d04-cb2-5"><a href="#d04-cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d04-cb2-6"><a href="#d04-cb2-6" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> random</span>
+<span id="d04-cb2-7"><a href="#d04-cb2-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> struct</span>
+<span id="d04-cb2-8"><a href="#d04-cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb2-9"><a href="#d04-cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> csum(data: <span class="bu">bytes</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:</span>
+<span id="d04-cb2-10"><a href="#d04-cb2-10" aria-hidden="true" tabindex="-1"></a>    s <span class="op">=</span> <span class="bu">sum</span>(struct.unpack(<span class="ss">f&quot;!</span><span class="sc">{</span><span class="bu">len</span>(data)<span class="op">//</span><span class="dv">2</span><span class="sc">}</span><span class="ss">H&quot;</span>, data))</span>
+<span id="d04-cb2-11"><a href="#d04-cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> s <span class="op">&gt;&gt;</span> <span class="dv">16</span>:</span>
+<span id="d04-cb2-12"><a href="#d04-cb2-12" aria-hidden="true" tabindex="-1"></a>        s <span class="op">=</span> (s <span class="op">&amp;</span> <span class="bn">0xFFFF</span>) <span class="op">+</span> (s <span class="op">&gt;&gt;</span> <span class="dv">16</span>)</span>
+<span id="d04-cb2-13"><a href="#d04-cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">~</span>s <span class="op">&amp;</span> <span class="bn">0xFFFF</span></span>
+<span id="d04-cb2-14"><a href="#d04-cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb2-15"><a href="#d04-cb2-15" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> add1c(a, b):</span>
+<span id="d04-cb2-16"><a href="#d04-cb2-16" aria-hidden="true" tabindex="-1"></a>    s <span class="op">=</span> a <span class="op">+</span> b</span>
+<span id="d04-cb2-17"><a href="#d04-cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> (s <span class="op">&amp;</span> <span class="bn">0xFFFF</span>) <span class="op">+</span> (s <span class="op">&gt;&gt;</span> <span class="dv">16</span>)</span>
+<span id="d04-cb2-18"><a href="#d04-cb2-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb2-19"><a href="#d04-cb2-19" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> incremental(hc, old_word, new_word):</span>
+<span id="d04-cb2-20"><a href="#d04-cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">~</span>add1c(add1c(<span class="op">~</span>hc <span class="op">&amp;</span> <span class="bn">0xFFFF</span>, <span class="op">~</span>old_word <span class="op">&amp;</span> <span class="bn">0xFFFF</span>), new_word) <span class="op">&amp;</span> <span class="bn">0xFFFF</span></span>
+<span id="d04-cb2-21"><a href="#d04-cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb2-22"><a href="#d04-cb2-22" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> header(ttl, ident<span class="op">=</span><span class="bn">0x97E5</span>, src<span class="op">=</span><span class="st">&quot;10.1.1.10&quot;</span>, dst<span class="op">=</span><span class="st">&quot;10.2.2.20&quot;</span>):</span>
+<span id="d04-cb2-23"><a href="#d04-cb2-23" aria-hidden="true" tabindex="-1"></a>    a <span class="op">=</span> <span class="bu">bytes</span>(<span class="bu">map</span>(<span class="bu">int</span>, src.split(<span class="st">&quot;.&quot;</span>)))</span>
+<span id="d04-cb2-24"><a href="#d04-cb2-24" aria-hidden="true" tabindex="-1"></a>    b <span class="op">=</span> <span class="bu">bytes</span>(<span class="bu">map</span>(<span class="bu">int</span>, dst.split(<span class="st">&quot;.&quot;</span>)))</span>
+<span id="d04-cb2-25"><a href="#d04-cb2-25" aria-hidden="true" tabindex="-1"></a>    h <span class="op">=</span> struct.pack(<span class="st">&quot;!BBHHHBBH4s4s&quot;</span>, <span class="bn">0x45</span>, <span class="dv">0</span>, <span class="dv">84</span>, ident, <span class="bn">0x4000</span>, ttl, <span class="dv">1</span>, <span class="dv">0</span>, a, b)</span>
+<span id="d04-cb2-26"><a href="#d04-cb2-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> h[:<span class="dv">10</span>] <span class="op">+</span> struct.pack(<span class="st">&quot;!H&quot;</span>, csum(h)) <span class="op">+</span> h[<span class="dv">12</span>:]</span>
+<span id="d04-cb2-27"><a href="#d04-cb2-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb2-28"><a href="#d04-cb2-28" aria-hidden="true" tabindex="-1"></a>h <span class="op">=</span> header(<span class="dv">64</span>)</span>
+<span id="d04-cb2-29"><a href="#d04-cb2-29" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;arriving header :&quot;</span>, h.<span class="bu">hex</span>(<span class="st">&quot; &quot;</span>, <span class="dv">2</span>))</span>
+<span id="d04-cb2-30"><a href="#d04-cb2-30" aria-hidden="true" tabindex="-1"></a>hc <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, h[<span class="dv">10</span>:<span class="dv">12</span>])[<span class="dv">0</span>]</span>
+<span id="d04-cb2-31"><a href="#d04-cb2-31" aria-hidden="true" tabindex="-1"></a>old <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, h[<span class="dv">8</span>:<span class="dv">10</span>])[<span class="dv">0</span>]          <span class="co"># word holding TTL and Protocol</span></span>
+<span id="d04-cb2-32"><a href="#d04-cb2-32" aria-hidden="true" tabindex="-1"></a>new <span class="op">=</span> old <span class="op">-</span> <span class="bn">0x0100</span>                              <span class="co"># TTL - 1 lives in the high byte</span></span>
+<span id="d04-cb2-33"><a href="#d04-cb2-33" aria-hidden="true" tabindex="-1"></a>fast <span class="op">=</span> incremental(hc, old, new)</span>
+<span id="d04-cb2-34"><a href="#d04-cb2-34" aria-hidden="true" tabindex="-1"></a>slow <span class="op">=</span> csum(h[:<span class="dv">8</span>] <span class="op">+</span> struct.pack(<span class="st">&quot;!H&quot;</span>, new) <span class="op">+</span> <span class="st">b&quot;</span><span class="ch">\0\0</span><span class="st">&quot;</span> <span class="op">+</span> h[<span class="dv">12</span>:])</span>
+<span id="d04-cb2-35"><a href="#d04-cb2-35" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;TTL/proto word  : </span><span class="sc">{</span>old<span class="sc">:#06x}</span><span class="ss"> -&gt; </span><span class="sc">{</span>new<span class="sc">:#06x}</span><span class="ss">&quot;</span>)</span>
+<span id="d04-cb2-36"><a href="#d04-cb2-36" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;checksum        : </span><span class="sc">{</span>hc<span class="sc">:#06x}</span><span class="ss"> -&gt; </span><span class="sc">{</span>fast<span class="sc">:#06x}</span><span class="ss"> (incremental), </span><span class="sc">{</span>slow<span class="sc">:#06x}</span><span class="ss"> (full)&quot;</span>)</span>
+<span id="d04-cb2-37"><a href="#d04-cb2-37" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;difference      : </span><span class="sc">{</span>fast <span class="op">-</span> hc<span class="sc">:+#x}</span><span class="ss">  &lt;- TTL-1 adds 0x0100 to the checksum&quot;</span>)</span>
+<span id="d04-cb2-38"><a href="#d04-cb2-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb2-39"><a href="#d04-cb2-39" aria-hidden="true" tabindex="-1"></a><span class="co"># Brute check over many random headers and every TTL from 2 to 255.</span></span>
+<span id="d04-cb2-40"><a href="#d04-cb2-40" aria-hidden="true" tabindex="-1"></a>random.seed(<span class="dv">1</span>)</span>
+<span id="d04-cb2-41"><a href="#d04-cb2-41" aria-hidden="true" tabindex="-1"></a>bad <span class="op">=</span> <span class="dv">0</span></span>
+<span id="d04-cb2-42"><a href="#d04-cb2-42" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">2000</span>):</span>
+<span id="d04-cb2-43"><a href="#d04-cb2-43" aria-hidden="true" tabindex="-1"></a>    ident <span class="op">=</span> random.getrandbits(<span class="dv">16</span>)</span>
+<span id="d04-cb2-44"><a href="#d04-cb2-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> ttl <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">2</span>, <span class="dv">256</span>):</span>
+<span id="d04-cb2-45"><a href="#d04-cb2-45" aria-hidden="true" tabindex="-1"></a>        h <span class="op">=</span> header(ttl, ident)</span>
+<span id="d04-cb2-46"><a href="#d04-cb2-46" aria-hidden="true" tabindex="-1"></a>        hc <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, h[<span class="dv">10</span>:<span class="dv">12</span>])[<span class="dv">0</span>]</span>
+<span id="d04-cb2-47"><a href="#d04-cb2-47" aria-hidden="true" tabindex="-1"></a>        w <span class="op">=</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, h[<span class="dv">8</span>:<span class="dv">10</span>])[<span class="dv">0</span>]</span>
+<span id="d04-cb2-48"><a href="#d04-cb2-48" aria-hidden="true" tabindex="-1"></a>        nh <span class="op">=</span> h[:<span class="dv">8</span>] <span class="op">+</span> struct.pack(<span class="st">&quot;!H&quot;</span>, w <span class="op">-</span> <span class="bn">0x100</span>) <span class="op">+</span> <span class="st">b&quot;</span><span class="ch">\0\0</span><span class="st">&quot;</span> <span class="op">+</span> h[<span class="dv">12</span>:]</span>
+<span id="d04-cb2-49"><a href="#d04-cb2-49" aria-hidden="true" tabindex="-1"></a>        bad <span class="op">+=</span> incremental(hc, w, w <span class="op">-</span> <span class="bn">0x100</span>) <span class="op">!=</span> csum(nh)</span>
+<span id="d04-cb2-50"><a href="#d04-cb2-50" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;checked </span><span class="sc">{</span><span class="dv">2000</span><span class="op">*</span><span class="dv">254</span><span class="sc">:,}</span><span class="ss"> decrements, mismatches: </span><span class="sc">{</span>bad<span class="sc">}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+<p>Output from a real run (Python 3.13):</p>
+<pre class="text"><code>arriving header : 4500 0054 97e5 4000 4001 8ba3 0a01 010a 0a02 0214
+TTL/proto word  : 0x4001 -&gt; 0x3f01
+checksum        : 0x8ba3 -&gt; 0x8ca3 (incremental), 0x8ca3 (full)
+difference      : +0x100  &lt;- TTL-1 adds 0x0100 to the checksum
+checked 508,000 decrements, mismatches: 0</code></pre>
+<p>So IPv6 dropping the checksum was less about CPU cycles than it sounds: the incremental update is one add. The bigger win was removing a field that every router had to touch, and that every middlebox rewriting addresses (NAT) had to patch too.</p>
+<h2 id="d04-wire">Deep dive: what the wire actually shows — a three-namespace router lab</h2>
+<p>The captures in this section come from a real lab: two Linux network namespaces as hosts and one as a router, with the router's second link set to MTU 1400.</p>
+<pre class="text"><code>h1 10.1.1.10 ──(MTU 1500)── 10.1.1.1  r  10.2.2.1 ──(MTU 1400)── 10.2.2.20 h2</code></pre>
+<div class="sourceCode" id="d04-cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d04-cb5-1"><a href="#d04-cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Linux only, needs root. Builds h1 -- r -- h2 in network namespaces.</span></span>
+<span id="d04-cb5-2"><a href="#d04-cb5-2" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> n <span class="kw">in</span> d04h1 d04r d04h2<span class="kw">;</span> <span class="cf">do</span> <span class="ex">ip</span> netns add <span class="va">$n</span><span class="kw">;</span> <span class="ex">ip</span> <span class="at">-n</span> <span class="va">$n</span> link set lo up<span class="kw">;</span> <span class="cf">done</span></span>
+<span id="d04-cb5-3"><a href="#d04-cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link add eth0 netns d04h1 type veth peer name eth1 netns d04r</span>
+<span id="d04-cb5-4"><a href="#d04-cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link add eth0 netns d04h2 type veth peer name eth2 netns d04r</span>
+<span id="d04-cb5-5"><a href="#d04-cb5-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-n</span> d04r  link set eth2 mtu 1400</span>
+<span id="d04-cb5-6"><a href="#d04-cb5-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-n</span> d04h2 link set eth0 mtu 1400</span>
+<span id="d04-cb5-7"><a href="#d04-cb5-7" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-n</span> d04h1 addr add 10.1.1.10/24 dev eth0<span class="kw">;</span>  <span class="ex">ip</span> <span class="at">-n</span> d04r addr add 10.1.1.1/24 dev eth1</span>
+<span id="d04-cb5-8"><a href="#d04-cb5-8" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-n</span> d04r  addr add 10.2.2.1/24 dev eth2<span class="kw">;</span>   <span class="ex">ip</span> <span class="at">-n</span> d04h2 addr add 10.2.2.20/24 dev eth0</span>
+<span id="d04-cb5-9"><a href="#d04-cb5-9" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-n</span> d04h1 link set eth0 up<span class="kw">;</span> <span class="ex">ip</span> <span class="at">-n</span> d04h2 link set eth0 up</span>
+<span id="d04-cb5-10"><a href="#d04-cb5-10" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-n</span> d04r link set eth1 up<span class="kw">;</span>  <span class="ex">ip</span> <span class="at">-n</span> d04r link set eth2 up</span>
+<span id="d04-cb5-11"><a href="#d04-cb5-11" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-n</span> d04h1 route add default via 10.1.1.1</span>
+<span id="d04-cb5-12"><a href="#d04-cb5-12" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> <span class="at">-n</span> d04h2 route add default via 10.2.2.1</span>
+<span id="d04-cb5-13"><a href="#d04-cb5-13" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> netns exec d04r sysctl <span class="at">-qw</span> net.ipv4.ip_forward=1</span>
+<span id="d04-cb5-14"><a href="#d04-cb5-14" aria-hidden="true" tabindex="-1"></a><span class="co"># Capture with e.g.: ip netns exec d04r tcpdump -nn -vv -i eth1 icmp</span></span></code></pre></div>
+<p><strong>1. TTL decrement.</strong> One echo request captured on both sides of the router (Linux 6.18, <code>tcpdump -nn -vv</code>; timestamps removed, interface labels added):</p>
+<pre class="text"><code>r:eth1 (in)   IP (tos 0x0, ttl 64, id 38885, offset 0, flags [DF], proto ICMP (1), length 84)
+                  10.1.1.10 &gt; 10.2.2.20: ICMP echo request, id 6611, seq 1, length 64
+r:eth2 (out)  IP (tos 0x0, ttl 63, id 38885, offset 0, flags [DF], proto ICMP (1), length 84)
+                  10.1.1.10 &gt; 10.2.2.20: ICMP echo request, id 6611, seq 1, length 64</code></pre>
+<p>Same ID, same length, same addresses; the TTL went from 64 to 63. Nothing else in the IP packet changed. The Ethernet header was rewritten too, but <code>tcpdump</code> without <code>-e</code> does not show it.</p>
+<p><strong>2. TTL runs out.</strong> <code>ping -t 1</code> from h1, captured on h1:</p>
+<pre class="text"><code>IP (tos 0x0, ttl 1, id 39091, offset 0, flags [DF], proto ICMP (1), length 84)
+    10.1.1.10 &gt; 10.2.2.20: ICMP echo request, id 7337, seq 1, length 64
+IP (tos 0xc0, ttl 64, id 60671, offset 0, flags [none], proto ICMP (1), length 112)
+    10.1.1.1 &gt; 10.1.1.10: ICMP time exceeded in-transit, length 92
+    IP (tos 0x0, ttl 1, id 39091, offset 0, flags [DF], proto ICMP (1), length 84)
+    10.1.1.10 &gt; 10.2.2.20: ICMP echo request, id 7337, seq 1, length 64</code></pre>
+<p>Read the error from the outside in. It is a fresh packet from the router (10.1.1.1) with a fresh TTL of 64. Its <code>tos 0xc0</code> is Linux marking its ICMP errors with IP precedence 6, "internetwork control". Its length is 112: 20 bytes of IP header, 8 bytes of ICMP header, then the whole 84-byte original packet quoted back. The quoted packet shows <code>ttl 1</code>, because the router quotes the packet as it arrived. Traceroute relies on exactly this quoting to match each answer to the probe that caused it.</p>
+<p><strong>3. Too big, DF set.</strong> <code>ping -M do -s 1472</code> sends a 1,500-byte packet with DF set (on macOS the equivalent is <code>ping -D -s 1472</code>):</p>
+<pre class="text"><code>$ ping -c1 -M do -s 1472 10.2.2.20
+PING 10.2.2.20 (10.2.2.20) 1472(1500) bytes of data.
+From 10.1.1.1 icmp_seq=1 Frag needed and DF set (mtu = 1400)
+
+IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto ICMP (1), length 1500)
+    10.1.1.10 &gt; 10.2.2.20: ICMP echo request, id 8075, seq 1, length 1480
+IP (tos 0xc0, ttl 64, id 60836, offset 0, flags [none], proto ICMP (1), length 576)
+    10.1.1.1 &gt; 10.1.1.10: ICMP 10.2.2.20 unreachable - need to frag (mtu 1400), length 556
+    IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto ICMP (1), length 1500)
+    10.1.1.10 &gt; 10.2.2.20: ICMP echo request, id 8075, seq 1, length 1480</code></pre>
+<p>The error is exactly 576 bytes long. Linux quoted as much of the original as RFC 1812's 576-byte ceiling allows, not just the minimum 28 bytes. The sending host's kernel stores the learned MTU in its route cache, where you can watch it expire:</p>
+<pre class="text"><code>$ ip route get 10.2.2.20
+10.2.2.20 via 10.1.1.1 dev eth0 src 10.1.1.10 uid 0
+    cache expires 599sec mtu 1400        &lt;- PMTU learned from ICMP; forgotten after 600 s</code></pre>
+<p><strong>4. Too big, DF clear.</strong> <code>ping -M dont -s 1472</code>: now the router fragments. Captured on h2:</p>
+<pre class="text"><code>IP (tos 0x0, ttl 63, id 39214, offset 0, flags [+], proto ICMP (1), length 1396)
+    10.1.1.10 &gt; 10.2.2.20: ICMP echo request, id 8837, seq 1, length 1376
+IP (tos 0x0, ttl 63, id 39214, offset 1376, flags [none], proto ICMP (1), length 124)
+    10.1.1.10 &gt; 10.2.2.20: ip-proto-1</code></pre>
+<p>Two fragments share ID 39214. The first carries 1,376 bytes of payload, not 1,380. The arithmetic: 1,400 − 20 = 1,380, which is not a multiple of 8, and fragment offsets count in 8-byte units, so the router rounds down. The <code>[+]</code> flag is MF. The second fragment starts at byte 1,376 (offset field 172) and carries the remaining 104 bytes. <code>tcpdump</code> can decode ICMP only from the first fragment; the second is shown as <code>ip-proto-1</code>, raw payload with no header. That one line is the whole firewall problem with fragments: a non-first fragment has no port numbers and no ICMP type to filter on.</p>
+<p><strong>5. Rate limiting.</strong> Twenty TTL-1 probes in 200 ms, then the router's counters (<code>nstat -az</code> in the router namespace, trimmed to the relevant lines):</p>
+<pre class="text"><code>$ ping -c20 -i 0.01 -t 1 10.2.2.20 | grep -c &#39;Time to live exceeded&#39;
+6
+IpForwDatagrams                 8
+IpFragOKs                       1                  &lt;- one datagram fragmented...
+IpFragCreates                   2                  &lt;- ...into two fragments
+IcmpOutRateLimitHost            14                 &lt;- errors suppressed by the per-host bucket
+IcmpOutDestUnreachs             1                  &lt;- the &quot;need to frag&quot; from step 3
+IcmpOutTimeExcds                7                  &lt;- 1 from step 2 + 6 from the burst</code></pre>
+<p>Six answers, fourteen suppressed. The per-destination token bucket allowed a burst of six and then roughly one per second. A fast traceroute tool that fires many probes at the same hop at once sees exactly this, as missing hops.</p>
+<p><strong>6. IPv6 Packet Too Big.</strong> The lab kernel had IPv6 disabled, so this capture is constructed for the same topology (h1 <code>2001:db8:1::10</code>, router <code>2001:db8:1::1</code>, h2 <code>2001:db8:2::20</code>). Its field values follow RFC 8200 and RFC 4443 and Linux <code>tcpdump</code>'s format:</p>
+<pre class="text"><code>IP6 (hlim 64, next-header ICMPv6 (58) payload length: 1460) 2001:db8:1::10 &gt; 2001:db8:2::20: ICMP6, echo request, id 9, seq 1
+IP6 (hlim 64, next-header ICMPv6 (58) payload length: 1240) 2001:db8:1::1 &gt; 2001:db8:1::10: ICMP6, packet too big, mtu 1400, length 1240
+IP6 (hlim 64, next-header Fragment (44) payload length: 1360) 2001:db8:1::10 &gt; 2001:db8:2::20: frag (0x5e8a7c11:0|1352) ICMP6, echo request, id 9, seq 2
+IP6 (hlim 64, next-header Fragment (44) payload length: 116) 2001:db8:1::10 &gt; 2001:db8:2::20: frag (0x5e8a7c11:1352|108)</code></pre>
+<p>The router drops the first 1,500-byte packet and answers with Packet Too Big. The error's payload is 1,240 bytes, so the whole error packet is 1,280 bytes, the IPv6 minimum MTU. The <em>source</em> then fragments its next packet itself, adding an 8-byte Fragment header: 40 + 8 + 1,352 = 1,400 bytes on the wire, where 1,352 is the largest multiple of 8 that fits. Compare the IPv4 case. There, a router in the middle did this work. Here, only the host may.</p>
+<p>The arithmetic for all of these comes from a small calculator:</p>
+<div class="sourceCode" id="d04-cb13"><pre class="sourceCode python"><code class="sourceCode python"><span id="d04-cb13-1"><a href="#d04-cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Fragment sizes a router (IPv4) or a source host (IPv6) must produce.&quot;&quot;&quot;</span></span>
+<span id="d04-cb13-2"><a href="#d04-cb13-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb13-3"><a href="#d04-cb13-3" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> ipv4_fragments(total_len, mtu, ihl<span class="op">=</span><span class="dv">20</span>):</span>
+<span id="d04-cb13-4"><a href="#d04-cb13-4" aria-hidden="true" tabindex="-1"></a>    payload <span class="op">=</span> total_len <span class="op">-</span> ihl</span>
+<span id="d04-cb13-5"><a href="#d04-cb13-5" aria-hidden="true" tabindex="-1"></a>    per_frag <span class="op">=</span> (mtu <span class="op">-</span> ihl) <span class="op">//</span> <span class="dv">8</span> <span class="op">*</span> <span class="dv">8</span>          <span class="co"># offsets count 8-byte units</span></span>
+<span id="d04-cb13-6"><a href="#d04-cb13-6" aria-hidden="true" tabindex="-1"></a>    out, off <span class="op">=</span> [], <span class="dv">0</span></span>
+<span id="d04-cb13-7"><a href="#d04-cb13-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> off <span class="op">&lt;</span> payload:</span>
+<span id="d04-cb13-8"><a href="#d04-cb13-8" aria-hidden="true" tabindex="-1"></a>        size <span class="op">=</span> <span class="bu">min</span>(per_frag, payload <span class="op">-</span> off)</span>
+<span id="d04-cb13-9"><a href="#d04-cb13-9" aria-hidden="true" tabindex="-1"></a>        mf <span class="op">=</span> off <span class="op">+</span> size <span class="op">&lt;</span> payload</span>
+<span id="d04-cb13-10"><a href="#d04-cb13-10" aria-hidden="true" tabindex="-1"></a>        out.append((off <span class="op">//</span> <span class="dv">8</span>, off, size, ihl <span class="op">+</span> size, mf))</span>
+<span id="d04-cb13-11"><a href="#d04-cb13-11" aria-hidden="true" tabindex="-1"></a>        off <span class="op">+=</span> size</span>
+<span id="d04-cb13-12"><a href="#d04-cb13-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out</span>
+<span id="d04-cb13-13"><a href="#d04-cb13-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb13-14"><a href="#d04-cb13-14" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> ipv6_fragments(payload_len, mtu, unfrag<span class="op">=</span><span class="dv">40</span>):</span>
+<span id="d04-cb13-15"><a href="#d04-cb13-15" aria-hidden="true" tabindex="-1"></a>    per_frag <span class="op">=</span> (mtu <span class="op">-</span> unfrag <span class="op">-</span> <span class="dv">8</span>) <span class="op">//</span> <span class="dv">8</span> <span class="op">*</span> <span class="dv">8</span>   <span class="co"># 8-byte Fragment header</span></span>
+<span id="d04-cb13-16"><a href="#d04-cb13-16" aria-hidden="true" tabindex="-1"></a>    out, off <span class="op">=</span> [], <span class="dv">0</span></span>
+<span id="d04-cb13-17"><a href="#d04-cb13-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> off <span class="op">&lt;</span> payload_len:</span>
+<span id="d04-cb13-18"><a href="#d04-cb13-18" aria-hidden="true" tabindex="-1"></a>        size <span class="op">=</span> <span class="bu">min</span>(per_frag, payload_len <span class="op">-</span> off)</span>
+<span id="d04-cb13-19"><a href="#d04-cb13-19" aria-hidden="true" tabindex="-1"></a>        out.append((off <span class="op">//</span> <span class="dv">8</span>, off, size, unfrag <span class="op">+</span> <span class="dv">8</span> <span class="op">+</span> size, off <span class="op">+</span> size <span class="op">&lt;</span> payload_len))</span>
+<span id="d04-cb13-20"><a href="#d04-cb13-20" aria-hidden="true" tabindex="-1"></a>        off <span class="op">+=</span> size</span>
+<span id="d04-cb13-21"><a href="#d04-cb13-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out</span>
+<span id="d04-cb13-22"><a href="#d04-cb13-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb13-23"><a href="#d04-cb13-23" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> show(title, frags):</span>
+<span id="d04-cb13-24"><a href="#d04-cb13-24" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(title)</span>
+<span id="d04-cb13-25"><a href="#d04-cb13-25" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;  offset-field  byte-offset  data  on-wire-len  MF&quot;</span>)</span>
+<span id="d04-cb13-26"><a href="#d04-cb13-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> f <span class="kw">in</span> frags:</span>
+<span id="d04-cb13-27"><a href="#d04-cb13-27" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  </span><span class="sc">{</span>f[<span class="dv">0</span>]<span class="sc">:&gt;12}</span><span class="ss">  </span><span class="sc">{</span>f[<span class="dv">1</span>]<span class="sc">:&gt;11}</span><span class="ss">  </span><span class="sc">{</span>f[<span class="dv">2</span>]<span class="sc">:&gt;4}</span><span class="ss">  </span><span class="sc">{</span>f[<span class="dv">3</span>]<span class="sc">:&gt;11}</span><span class="ss">  </span><span class="sc">{</span><span class="bu">int</span>(f[<span class="dv">4</span>])<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d04-cb13-28"><a href="#d04-cb13-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb13-29"><a href="#d04-cb13-29" aria-hidden="true" tabindex="-1"></a>show(<span class="st">&quot;IPv4: 1500-byte datagram, next-hop MTU 1400 (the lab capture)&quot;</span>, ipv4_fragments(<span class="dv">1500</span>, <span class="dv">1400</span>))</span>
+<span id="d04-cb13-30"><a href="#d04-cb13-30" aria-hidden="true" tabindex="-1"></a>show(<span class="st">&quot;IPv4: 4000-byte datagram, next-hop MTU 1500&quot;</span>, ipv4_fragments(<span class="dv">4000</span>, <span class="dv">1500</span>))</span>
+<span id="d04-cb13-31"><a href="#d04-cb13-31" aria-hidden="true" tabindex="-1"></a>show(<span class="st">&quot;IPv6: 1500-byte echo request (payload 1460) sent by the host, path MTU 1400&quot;</span>,</span>
+<span id="d04-cb13-32"><a href="#d04-cb13-32" aria-hidden="true" tabindex="-1"></a>     ipv6_fragments(<span class="dv">1460</span>, <span class="dv">1400</span>))</span>
+<span id="d04-cb13-33"><a href="#d04-cb13-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb13-34"><a href="#d04-cb13-34" aria-hidden="true" tabindex="-1"></a><span class="co"># IPv4 Identification wrap: how fast does a 16-bit ID repeat?</span></span>
+<span id="d04-cb13-35"><a href="#d04-cb13-35" aria-hidden="true" tabindex="-1"></a>rate_bps <span class="op">=</span> <span class="fl">1e9</span></span>
+<span id="d04-cb13-36"><a href="#d04-cb13-36" aria-hidden="true" tabindex="-1"></a>frag_pps <span class="op">=</span> rate_bps <span class="op">/</span> (<span class="dv">1500</span> <span class="op">*</span> <span class="dv">8</span>)</span>
+<span id="d04-cb13-37"><a href="#d04-cb13-37" aria-hidden="true" tabindex="-1"></a>datagrams_ps <span class="op">=</span> frag_pps <span class="op">/</span> <span class="dv">2</span>                  <span class="co"># 2 fragments per datagram</span></span>
+<span id="d04-cb13-38"><a href="#d04-cb13-38" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="ss">IPv4 ID wrap at 1 Gb/s of 2-fragment datagrams: &quot;</span></span>
+<span id="d04-cb13-39"><a href="#d04-cb13-39" aria-hidden="true" tabindex="-1"></a>      <span class="ss">f&quot;</span><span class="sc">{</span><span class="dv">65536</span> <span class="op">/</span> datagrams_ps<span class="sc">:.2f}</span><span class="ss"> s (reassembly timeout on Linux: 30 s)&quot;</span>)</span></code></pre></div>
+<p>Output from a real run:</p>
+<pre class="text"><code>IPv4: 1500-byte datagram, next-hop MTU 1400 (the lab capture)
+  offset-field  byte-offset  data  on-wire-len  MF
+             0            0  1376         1396  1
+           172         1376   104          124  0
+IPv4: 4000-byte datagram, next-hop MTU 1500
+  offset-field  byte-offset  data  on-wire-len  MF
+             0            0  1480         1500  1
+           185         1480  1480         1500  1
+           370         2960  1020         1040  0
+IPv6: 1500-byte echo request (payload 1460) sent by the host, path MTU 1400
+  offset-field  byte-offset  data  on-wire-len  MF
+             0            0  1352         1400  1
+           169         1352   108          156  0
+
+IPv4 ID wrap at 1 Gb/s of 2-fragment datagrams: 1.57 s (reassembly timeout on Linux: 30 s)</code></pre>
+<p>The last line is a real hazard, described in RFC 4963. The 16-bit Identification field repeats every 65,536 datagrams. At 1 Gb/s of fragmented traffic between one pair of hosts, it wraps in 1.6 seconds, while a reassembly buffer holds fragments for 30 seconds. If a fragment is lost and a later datagram reuses its ID, the receiver can stitch together pieces of two different datagrams. The UDP checksum catches most of these, but a 16-bit checksum lets roughly one in 65,536 through. High-rate fragmented UDP can silently corrupt data. IPv6's Fragment header uses a 32-bit identification for this reason.</p>
+<h2 id="d04-ext-headers">Deep dive: IPv6 extension headers, and why the Internet drops them</h2>
+<p>The module described extension headers as a tidy linked list: each header's Next Header field names the one after it, and routers skip what they do not need. On paper that is true. In practice, packets carrying extension headers are dropped on a significant fraction of Internet paths. RFC 7872 measured this in 2016 and found loss rates from around a tenth to over half of destinations, depending on the header type and the data set. Later operational documents (RFC 9098, RFC 9288) explain why, and when, transit networks filter them.</p>
+<p>RFC 8200 recommends this order when several are present:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Next Header value</th>
+<th>Header</th>
+<th>Who processes it</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0</td>
+<td>Hop-by-Hop Options</td>
+<td>Every router on the path (in principle; see below)</td>
+</tr>
+<tr class="even">
+<td>60</td>
+<td>Destination Options (before Routing)</td>
+<td>Each destination listed in the Routing header</td>
+</tr>
+<tr class="odd">
+<td>43</td>
+<td>Routing</td>
+<td>Nodes named in it (e.g. SRv6 segment endpoints)</td>
+</tr>
+<tr class="even">
+<td>44</td>
+<td>Fragment</td>
+<td>Final destination only</td>
+</tr>
+<tr class="odd">
+<td>51</td>
+<td>Authentication Header</td>
+<td>Final destination</td>
+</tr>
+<tr class="even">
+<td>50</td>
+<td>ESP</td>
+<td>Final destination</td>
+</tr>
+<tr class="odd">
+<td>60</td>
+<td>Destination Options</td>
+<td>Final destination</td>
+</tr>
+<tr class="even">
+<td>6 / 17 / 58</td>
+<td>TCP / UDP / ICMPv6</td>
+<td>Final destination</td>
+</tr>
+<tr class="odd">
+<td>59</td>
+<td>No Next Header</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>Four mechanisms explain the drops.</p>
+<p><strong>1. Hop-by-Hop means slow path.</strong> Hop-by-Hop options were meant to be examined by every router. Forwarding ASICs did not want to parse variable TLVs, so routers punted these packets to the CPU. That made them a cheap way to attack a router's control plane, and operators responded by dropping or rate-limiting them. RFC 8200 relaxed the rule: routers may ignore Hop-by-Hop options unless explicitly configured to process them. Old habits remain in filters.</p>
+<p><strong>2. The parser window.</strong> As Module 03's deep dive showed, a switch or router parser reads a fixed number of bytes. ACLs that match TCP or UDP ports need those ports inside the window, and every extension header pushes them further out. When a device cannot find the L4 header, it can let the packet through unchecked (unsafe) or drop it (safe). Most choose drop. The script below walks a chain and reports where the ports land:</p>
+<div class="sourceCode" id="d04-cb15"><pre class="sourceCode python"><code class="sourceCode python"><span id="d04-cb15-1"><a href="#d04-cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Walk an IPv6 extension-header chain and find where the TCP ports sit.</span></span>
+<span id="d04-cb15-2"><a href="#d04-cb15-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb15-3"><a href="#d04-cb15-3" aria-hidden="true" tabindex="-1"></a><span class="co">Hardware parsers read a fixed window of bytes. If the ports fall outside it,</span></span>
+<span id="d04-cb15-4"><a href="#d04-cb15-4" aria-hidden="true" tabindex="-1"></a><span class="co">an ACL that matches on port cannot be evaluated, and many devices drop.</span></span>
+<span id="d04-cb15-5"><a href="#d04-cb15-5" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d04-cb15-6"><a href="#d04-cb15-6" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> struct</span>
+<span id="d04-cb15-7"><a href="#d04-cb15-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb15-8"><a href="#d04-cb15-8" aria-hidden="true" tabindex="-1"></a>NAMES <span class="op">=</span> {<span class="dv">0</span>: <span class="st">&quot;Hop-by-Hop&quot;</span>, <span class="dv">43</span>: <span class="st">&quot;Routing&quot;</span>, <span class="dv">44</span>: <span class="st">&quot;Fragment&quot;</span>, <span class="dv">60</span>: <span class="st">&quot;Dest Options&quot;</span>,</span>
+<span id="d04-cb15-9"><a href="#d04-cb15-9" aria-hidden="true" tabindex="-1"></a>         <span class="dv">6</span>: <span class="st">&quot;TCP&quot;</span>, <span class="dv">17</span>: <span class="st">&quot;UDP&quot;</span>, <span class="dv">58</span>: <span class="st">&quot;ICMPv6&quot;</span>, <span class="dv">59</span>: <span class="st">&quot;No Next Header&quot;</span>}</span>
+<span id="d04-cb15-10"><a href="#d04-cb15-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb15-11"><a href="#d04-cb15-11" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> opts_header(next_hdr, total_len):</span>
+<span id="d04-cb15-12"><a href="#d04-cb15-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;Generic TLV header (HBH / DestOpts): len field = 8-octet units minus 1.&quot;&quot;&quot;</span></span>
+<span id="d04-cb15-13"><a href="#d04-cb15-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">assert</span> total_len <span class="op">%</span> <span class="dv">8</span> <span class="op">==</span> <span class="dv">0</span></span>
+<span id="d04-cb15-14"><a href="#d04-cb15-14" aria-hidden="true" tabindex="-1"></a>    pad <span class="op">=</span> total_len <span class="op">-</span> <span class="dv">2</span></span>
+<span id="d04-cb15-15"><a href="#d04-cb15-15" aria-hidden="true" tabindex="-1"></a>    body <span class="op">=</span> <span class="bu">bytes</span>([<span class="dv">1</span>, pad <span class="op">-</span> <span class="dv">2</span>]) <span class="op">+</span> <span class="bu">bytes</span>(pad <span class="op">-</span> <span class="dv">2</span>)       <span class="co"># one PadN option fills it</span></span>
+<span id="d04-cb15-16"><a href="#d04-cb15-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">bytes</span>([next_hdr, total_len <span class="op">//</span> <span class="dv">8</span> <span class="op">-</span> <span class="dv">1</span>]) <span class="op">+</span> body</span>
+<span id="d04-cb15-17"><a href="#d04-cb15-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb15-18"><a href="#d04-cb15-18" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> frag_header(next_hdr, offset_units, more, ident):</span>
+<span id="d04-cb15-19"><a href="#d04-cb15-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> struct.pack(<span class="st">&quot;!BBHI&quot;</span>, next_hdr, <span class="dv">0</span>, (offset_units <span class="op">&lt;&lt;</span> <span class="dv">3</span>) <span class="op">|</span> more, ident)</span>
+<span id="d04-cb15-20"><a href="#d04-cb15-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb15-21"><a href="#d04-cb15-21" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> build(chain):</span>
+<span id="d04-cb15-22"><a href="#d04-cb15-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;chain: list of (kind, size) for extension headers, then TCP.&quot;&quot;&quot;</span></span>
+<span id="d04-cb15-23"><a href="#d04-cb15-23" aria-hidden="true" tabindex="-1"></a>    kinds <span class="op">=</span> [k <span class="cf">for</span> k, _ <span class="kw">in</span> chain] <span class="op">+</span> [<span class="dv">6</span>]</span>
+<span id="d04-cb15-24"><a href="#d04-cb15-24" aria-hidden="true" tabindex="-1"></a>    body <span class="op">=</span> <span class="st">b&quot;&quot;</span></span>
+<span id="d04-cb15-25"><a href="#d04-cb15-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i, (kind, size) <span class="kw">in</span> <span class="bu">enumerate</span>(chain):</span>
+<span id="d04-cb15-26"><a href="#d04-cb15-26" aria-hidden="true" tabindex="-1"></a>        nxt <span class="op">=</span> kinds[i <span class="op">+</span> <span class="dv">1</span>]</span>
+<span id="d04-cb15-27"><a href="#d04-cb15-27" aria-hidden="true" tabindex="-1"></a>        body <span class="op">+=</span> frag_header(nxt, <span class="dv">0</span>, <span class="dv">1</span>, <span class="bn">0x1234</span>) <span class="cf">if</span> kind <span class="op">==</span> <span class="dv">44</span> <span class="cf">else</span> opts_header(nxt, size)</span>
+<span id="d04-cb15-28"><a href="#d04-cb15-28" aria-hidden="true" tabindex="-1"></a>    tcp <span class="op">=</span> struct.pack(<span class="st">&quot;!HHIIBBHHH&quot;</span>, <span class="dv">51000</span>, <span class="dv">443</span>, <span class="dv">1</span>, <span class="dv">0</span>, <span class="bn">0x50</span>, <span class="bn">0x02</span>, <span class="dv">65535</span>, <span class="dv">0</span>, <span class="dv">0</span>)</span>
+<span id="d04-cb15-29"><a href="#d04-cb15-29" aria-hidden="true" tabindex="-1"></a>    payload <span class="op">=</span> body <span class="op">+</span> tcp</span>
+<span id="d04-cb15-30"><a href="#d04-cb15-30" aria-hidden="true" tabindex="-1"></a>    fixed <span class="op">=</span> struct.pack(<span class="st">&quot;!IHBB16s16s&quot;</span>, <span class="dv">6</span> <span class="op">&lt;&lt;</span> <span class="dv">28</span>, <span class="bu">len</span>(payload), kinds[<span class="dv">0</span>], <span class="dv">64</span>,</span>
+<span id="d04-cb15-31"><a href="#d04-cb15-31" aria-hidden="true" tabindex="-1"></a>                        <span class="bu">bytes</span>(<span class="dv">16</span>), <span class="bu">bytes</span>(<span class="dv">16</span>))</span>
+<span id="d04-cb15-32"><a href="#d04-cb15-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> fixed <span class="op">+</span> payload</span>
+<span id="d04-cb15-33"><a href="#d04-cb15-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb15-34"><a href="#d04-cb15-34" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> walk(pkt):</span>
+<span id="d04-cb15-35"><a href="#d04-cb15-35" aria-hidden="true" tabindex="-1"></a>    nxt, off, hops <span class="op">=</span> pkt[<span class="dv">6</span>], <span class="dv">40</span>, []</span>
+<span id="d04-cb15-36"><a href="#d04-cb15-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> nxt <span class="kw">in</span> (<span class="dv">0</span>, <span class="dv">43</span>, <span class="dv">60</span>, <span class="dv">44</span>):</span>
+<span id="d04-cb15-37"><a href="#d04-cb15-37" aria-hidden="true" tabindex="-1"></a>        size <span class="op">=</span> <span class="dv">8</span> <span class="cf">if</span> nxt <span class="op">==</span> <span class="dv">44</span> <span class="cf">else</span> (pkt[off <span class="op">+</span> <span class="dv">1</span>] <span class="op">+</span> <span class="dv">1</span>) <span class="op">*</span> <span class="dv">8</span></span>
+<span id="d04-cb15-38"><a href="#d04-cb15-38" aria-hidden="true" tabindex="-1"></a>        hops.append(<span class="ss">f&quot;</span><span class="sc">{</span>NAMES[nxt]<span class="sc">}</span><span class="ss">(</span><span class="sc">{</span>size<span class="sc">}</span><span class="ss">)&quot;</span>)</span>
+<span id="d04-cb15-39"><a href="#d04-cb15-39" aria-hidden="true" tabindex="-1"></a>        nxt, off <span class="op">=</span> pkt[off], off <span class="op">+</span> size</span>
+<span id="d04-cb15-40"><a href="#d04-cb15-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> hops, NAMES.get(nxt, nxt), off</span>
+<span id="d04-cb15-41"><a href="#d04-cb15-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb15-42"><a href="#d04-cb15-42" aria-hidden="true" tabindex="-1"></a>cases <span class="op">=</span> {</span>
+<span id="d04-cb15-43"><a href="#d04-cb15-43" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;plain TCP&quot;</span>: [],</span>
+<span id="d04-cb15-44"><a href="#d04-cb15-44" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;HBH 8 + Fragment&quot;</span>: [(<span class="dv">0</span>, <span class="dv">8</span>), (<span class="dv">44</span>, <span class="dv">8</span>)],</span>
+<span id="d04-cb15-45"><a href="#d04-cb15-45" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;HBH 8 + DestOpts 64 + Fragment&quot;</span>: [(<span class="dv">0</span>, <span class="dv">8</span>), (<span class="dv">60</span>, <span class="dv">64</span>), (<span class="dv">44</span>, <span class="dv">8</span>)],</span>
+<span id="d04-cb15-46"><a href="#d04-cb15-46" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;DestOpts 256 (padding abuse)&quot;</span>: [(<span class="dv">60</span>, <span class="dv">256</span>)],</span>
+<span id="d04-cb15-47"><a href="#d04-cb15-47" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="d04-cb15-48"><a href="#d04-cb15-48" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;chain&#39;</span><span class="sc">:34}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;L4 at&#39;</span><span class="sc">:&gt;5}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;ports end&#39;</span><span class="sc">:&gt;9}</span><span class="ss">  fits 64B? fits 128B?&quot;</span>)</span>
+<span id="d04-cb15-49"><a href="#d04-cb15-49" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> name, chain <span class="kw">in</span> cases.items():</span>
+<span id="d04-cb15-50"><a href="#d04-cb15-50" aria-hidden="true" tabindex="-1"></a>    pkt <span class="op">=</span> build(chain)</span>
+<span id="d04-cb15-51"><a href="#d04-cb15-51" aria-hidden="true" tabindex="-1"></a>    hops, l4, off <span class="op">=</span> walk(pkt)</span>
+<span id="d04-cb15-52"><a href="#d04-cb15-52" aria-hidden="true" tabindex="-1"></a>    end <span class="op">=</span> off <span class="op">+</span> <span class="dv">4</span>                            <span class="co"># source + destination port</span></span>
+<span id="d04-cb15-53"><a href="#d04-cb15-53" aria-hidden="true" tabindex="-1"></a>    sport, dport <span class="op">=</span> struct.unpack(<span class="st">&quot;!HH&quot;</span>, pkt[off:off <span class="op">+</span> <span class="dv">4</span>])</span>
+<span id="d04-cb15-54"><a href="#d04-cb15-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">assert</span> (sport, dport) <span class="op">==</span> (<span class="dv">51000</span>, <span class="dv">443</span>)</span>
+<span id="d04-cb15-55"><a href="#d04-cb15-55" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">:34}</span><span class="ss"> </span><span class="sc">{</span>off<span class="sc">:&gt;5}</span><span class="ss"> </span><span class="sc">{</span>end<span class="sc">:&gt;9}</span><span class="ss">  </span><span class="sc">{</span><span class="bu">str</span>(end <span class="op">&lt;=</span> <span class="dv">64</span>)<span class="sc">:&gt;9}</span><span class="ss"> </span><span class="sc">{</span><span class="bu">str</span>(end <span class="op">&lt;=</span> <span class="dv">128</span>)<span class="sc">:&gt;9}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+<p>Output from a real run. Offsets count from the start of the IPv6 header; a real parser window also has to hold the 14-byte Ethernet header (18 with a VLAN tag):</p>
+<pre class="text"><code>chain                              L4 at ports end  fits 64B? fits 128B?
+plain TCP                             40        44       True      True
+HBH 8 + Fragment                      56        60       True      True
+HBH 8 + DestOpts 64 + Fragment       120       124      False      True
+DestOpts 256 (padding abuse)         296       300      False     False</code></pre>
+<p>A Destination Options header can legally be up to 2,048 bytes long. An attacker can push the TCP header past any fixed parser window with padding alone. That is a real filter-evasion technique, not a theoretical one, and it is why "drop if the L4 header is not found" is the safe default.</p>
+<p><strong>3. Fragments hide the ports.</strong> A non-first fragment has no L4 header at all, as the IPv4 capture showed, so stateless ACLs cannot classify it. RFC 7112 at least requires the <em>first</em> fragment to carry the entire header chain through the L4 header, so a filter can decide on the first fragment. Many networks still drop all IPv6 fragments at the edge. IPv6 also forbids overlapping fragments outright (RFC 5722), closing an evasion trick that IPv4 still permits.</p>
+<p><strong>4. History.</strong> The Type 0 Routing header let a sender list many intermediate addresses, so a single packet could bounce between two routers dozens of times — a traffic amplifier. RFC 5095 deprecated it in 2007. Filters written then often drop every Routing header, including the legitimate Type 4 Segment Routing Header (RFC 8754) used by SRv6.</p>
+<p>The practical result: <strong>do not design an Internet-facing protocol that depends on IPv6 extension headers arriving.</strong> Inside a single operator's network, where you control every device, SRv6 and other extension-header uses work fine. Across the Internet, the robust choices are plain TCP, UDP, or QUIC over UDP, with no fragmentation.</p>
+<h2 id="d04-happy-eyeballs">Deep dive: dual stack and Happy Eyeballs</h2>
+<p>A dual-stack host has two complete network stacks: two sets of addresses, two default routes and two sets of firewall rules. Either one can be broken while the other works. The classic failure: the host gets an IPv6 address and a default route from a router advertisement, but IPv6 is broken somewhere upstream. A client that tries IPv6 first, and waits for that connection to time out before trying IPv4, hangs. On Linux that is 127 seconds with the default <code>tcp_syn_retries = 6</code> (six SYN retransmissions after waits of 1, 2, 4, 8, 16 and 32 s, then a final 64 s wait). On macOS it is about 75 s.</p>
+<p><strong>Happy Eyeballs</strong> (RFC 8305, "version 2") replaces "try one, then the other" with a race:</p>
+<ol type="1">
+<li>Send the AAAA and A DNS queries in parallel, AAAA first. If A answers first, wait up to 50 ms (the <em>Resolution Delay</em>) for AAAA before starting.</li>
+<li>Sort the addresses (RFC 6724 rules, plus any history the client keeps) and interleave the families: v6, v4, v6, v4.</li>
+<li>Start a connection to the first address. If it has not completed within the <em>Connection Attempt Delay</em> — 250 ms recommended, with RFC-recommended bounds of 100 ms to 2 s — start the next one <em>without cancelling the first</em>. If an attempt fails outright, start the next one immediately.</li>
+<li>The first connection to complete wins. Cancel the rest.</li>
+</ol>
+<p>The simulation below runs that race with real asyncio timers against three scripted network conditions:</p>
+<div class="sourceCode" id="d04-cb17"><pre class="sourceCode python"><code class="sourceCode python"><span id="d04-cb17-1"><a href="#d04-cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Happy Eyeballs v2 (RFC 8305) connection racing, with simulated paths.</span></span>
+<span id="d04-cb17-2"><a href="#d04-cb17-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb17-3"><a href="#d04-cb17-3" aria-hidden="true" tabindex="-1"></a><span class="co">Each address has a scripted outcome: (&quot;ok&quot;, rtt) completes after rtt seconds,</span></span>
+<span id="d04-cb17-4"><a href="#d04-cb17-4" aria-hidden="true" tabindex="-1"></a><span class="co">(&quot;refused&quot;, t) fails after t, (&quot;blackhole&quot;, None) never answers.</span></span>
+<span id="d04-cb17-5"><a href="#d04-cb17-5" aria-hidden="true" tabindex="-1"></a><span class="co">Real asyncio timers run the race; only the network is simulated.</span></span>
+<span id="d04-cb17-6"><a href="#d04-cb17-6" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d04-cb17-7"><a href="#d04-cb17-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> asyncio</span>
+<span id="d04-cb17-8"><a href="#d04-cb17-8" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="d04-cb17-9"><a href="#d04-cb17-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb17-10"><a href="#d04-cb17-10" aria-hidden="true" tabindex="-1"></a>ATTEMPT_DELAY <span class="op">=</span> <span class="fl">0.250</span>        <span class="co"># RFC 8305 recommended Connection Attempt Delay</span></span>
+<span id="d04-cb17-11"><a href="#d04-cb17-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb17-12"><a href="#d04-cb17-12" aria-hidden="true" tabindex="-1"></a><span class="cf">async</span> <span class="kw">def</span> <span class="ex">connect</span>(addr, outcome, log, t0):</span>
+<span id="d04-cb17-13"><a href="#d04-cb17-13" aria-hidden="true" tabindex="-1"></a>    kind, t <span class="op">=</span> outcome</span>
+<span id="d04-cb17-14"><a href="#d04-cb17-14" aria-hidden="true" tabindex="-1"></a>    log.append(<span class="ss">f&quot;</span><span class="sc">{</span>(time.monotonic()<span class="op">-</span>t0)<span class="op">*</span><span class="dv">1000</span><span class="sc">:6.0f}</span><span class="ss"> ms  try </span><span class="sc">{</span>addr<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d04-cb17-15"><a href="#d04-cb17-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> kind <span class="op">==</span> <span class="st">&quot;blackhole&quot;</span>:</span>
+<span id="d04-cb17-16"><a href="#d04-cb17-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">await</span> asyncio.sleep(<span class="dv">3600</span>)</span>
+<span id="d04-cb17-17"><a href="#d04-cb17-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">await</span> asyncio.sleep(t)</span>
+<span id="d04-cb17-18"><a href="#d04-cb17-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> kind <span class="op">==</span> <span class="st">&quot;refused&quot;</span>:</span>
+<span id="d04-cb17-19"><a href="#d04-cb17-19" aria-hidden="true" tabindex="-1"></a>        log.append(<span class="ss">f&quot;</span><span class="sc">{</span>(time.monotonic()<span class="op">-</span>t0)<span class="op">*</span><span class="dv">1000</span><span class="sc">:6.0f}</span><span class="ss"> ms  </span><span class="sc">{</span>addr<span class="sc">}</span><span class="ss"> refused&quot;</span>)</span>
+<span id="d04-cb17-20"><a href="#d04-cb17-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">raise</span> <span class="pp">ConnectionRefusedError</span>(addr)</span>
+<span id="d04-cb17-21"><a href="#d04-cb17-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> addr</span>
+<span id="d04-cb17-22"><a href="#d04-cb17-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb17-23"><a href="#d04-cb17-23" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> interleave(v6, v4):</span>
+<span id="d04-cb17-24"><a href="#d04-cb17-24" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> []</span>
+<span id="d04-cb17-25"><a href="#d04-cb17-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="bu">max</span>(<span class="bu">len</span>(v6), <span class="bu">len</span>(v4))):</span>
+<span id="d04-cb17-26"><a href="#d04-cb17-26" aria-hidden="true" tabindex="-1"></a>        out <span class="op">+=</span> v6[i:i<span class="op">+</span><span class="dv">1</span>] <span class="op">+</span> v4[i:i<span class="op">+</span><span class="dv">1</span>]</span>
+<span id="d04-cb17-27"><a href="#d04-cb17-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out</span>
+<span id="d04-cb17-28"><a href="#d04-cb17-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb17-29"><a href="#d04-cb17-29" aria-hidden="true" tabindex="-1"></a><span class="cf">async</span> <span class="kw">def</span> happy_eyeballs(addrs, paths):</span>
+<span id="d04-cb17-30"><a href="#d04-cb17-30" aria-hidden="true" tabindex="-1"></a>    t0, log, tasks <span class="op">=</span> time.monotonic(), [], []</span>
+<span id="d04-cb17-31"><a href="#d04-cb17-31" aria-hidden="true" tabindex="-1"></a>    failed <span class="op">=</span> asyncio.Event()</span>
+<span id="d04-cb17-32"><a href="#d04-cb17-32" aria-hidden="true" tabindex="-1"></a>    winner <span class="op">=</span> <span class="va">None</span></span>
+<span id="d04-cb17-33"><a href="#d04-cb17-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> addr <span class="kw">in</span> addrs:</span>
+<span id="d04-cb17-34"><a href="#d04-cb17-34" aria-hidden="true" tabindex="-1"></a>        task <span class="op">=</span> asyncio.create_task(<span class="ex">connect</span>(addr, paths[addr], log, t0))</span>
+<span id="d04-cb17-35"><a href="#d04-cb17-35" aria-hidden="true" tabindex="-1"></a>        task.add_done_callback(<span class="kw">lambda</span> _t: failed.<span class="bu">set</span>())</span>
+<span id="d04-cb17-36"><a href="#d04-cb17-36" aria-hidden="true" tabindex="-1"></a>        tasks.append(task)</span>
+<span id="d04-cb17-37"><a href="#d04-cb17-37" aria-hidden="true" tabindex="-1"></a>        failed.clear()</span>
+<span id="d04-cb17-38"><a href="#d04-cb17-38" aria-hidden="true" tabindex="-1"></a>        <span class="cf">try</span>:</span>
+<span id="d04-cb17-39"><a href="#d04-cb17-39" aria-hidden="true" tabindex="-1"></a>            <span class="cf">await</span> asyncio.wait_for(failed.wait(), ATTEMPT_DELAY)</span>
+<span id="d04-cb17-40"><a href="#d04-cb17-40" aria-hidden="true" tabindex="-1"></a>        <span class="cf">except</span> <span class="pp">TimeoutError</span>:</span>
+<span id="d04-cb17-41"><a href="#d04-cb17-41" aria-hidden="true" tabindex="-1"></a>            <span class="cf">pass</span></span>
+<span id="d04-cb17-42"><a href="#d04-cb17-42" aria-hidden="true" tabindex="-1"></a>        done <span class="op">=</span> [t <span class="cf">for</span> t <span class="kw">in</span> tasks <span class="cf">if</span> t.done() <span class="kw">and</span> <span class="kw">not</span> t.exception()]</span>
+<span id="d04-cb17-43"><a href="#d04-cb17-43" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> done:</span>
+<span id="d04-cb17-44"><a href="#d04-cb17-44" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span></span>
+<span id="d04-cb17-45"><a href="#d04-cb17-45" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> winner <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="d04-cb17-46"><a href="#d04-cb17-46" aria-hidden="true" tabindex="-1"></a>        pending <span class="op">=</span> [t <span class="cf">for</span> t <span class="kw">in</span> tasks <span class="cf">if</span> <span class="kw">not</span> t.done()]</span>
+<span id="d04-cb17-47"><a href="#d04-cb17-47" aria-hidden="true" tabindex="-1"></a>        ok <span class="op">=</span> [t <span class="cf">for</span> t <span class="kw">in</span> tasks <span class="cf">if</span> t.done() <span class="kw">and</span> <span class="kw">not</span> t.exception()]</span>
+<span id="d04-cb17-48"><a href="#d04-cb17-48" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> ok:</span>
+<span id="d04-cb17-49"><a href="#d04-cb17-49" aria-hidden="true" tabindex="-1"></a>            winner <span class="op">=</span> ok[<span class="dv">0</span>].result()</span>
+<span id="d04-cb17-50"><a href="#d04-cb17-50" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span></span>
+<span id="d04-cb17-51"><a href="#d04-cb17-51" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">not</span> pending:</span>
+<span id="d04-cb17-52"><a href="#d04-cb17-52" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span></span>
+<span id="d04-cb17-53"><a href="#d04-cb17-53" aria-hidden="true" tabindex="-1"></a>        <span class="cf">await</span> asyncio.wait(pending, return_when<span class="op">=</span>asyncio.FIRST_COMPLETED)</span>
+<span id="d04-cb17-54"><a href="#d04-cb17-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> t <span class="kw">in</span> tasks:</span>
+<span id="d04-cb17-55"><a href="#d04-cb17-55" aria-hidden="true" tabindex="-1"></a>        t.cancel()</span>
+<span id="d04-cb17-56"><a href="#d04-cb17-56" aria-hidden="true" tabindex="-1"></a>    log.append(<span class="ss">f&quot;</span><span class="sc">{</span>(time.monotonic()<span class="op">-</span>t0)<span class="op">*</span><span class="dv">1000</span><span class="sc">:6.0f}</span><span class="ss"> ms  connected via </span><span class="sc">{</span>winner<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d04-cb17-57"><a href="#d04-cb17-57" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> log</span>
+<span id="d04-cb17-58"><a href="#d04-cb17-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d04-cb17-59"><a href="#d04-cb17-59" aria-hidden="true" tabindex="-1"></a>V6 <span class="op">=</span> [<span class="st">&quot;[2001:db8::10]&quot;</span>, <span class="st">&quot;[2001:db8::11]&quot;</span>]</span>
+<span id="d04-cb17-60"><a href="#d04-cb17-60" aria-hidden="true" tabindex="-1"></a>V4 <span class="op">=</span> [<span class="st">&quot;192.0.2.10&quot;</span>, <span class="st">&quot;192.0.2.11&quot;</span>]</span>
+<span id="d04-cb17-61"><a href="#d04-cb17-61" aria-hidden="true" tabindex="-1"></a>scenarios <span class="op">=</span> {</span>
+<span id="d04-cb17-62"><a href="#d04-cb17-62" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;healthy IPv6 (20 ms)&quot;</span>: {V6[<span class="dv">0</span>]: (<span class="st">&quot;ok&quot;</span>, <span class="fl">.020</span>), V6[<span class="dv">1</span>]: (<span class="st">&quot;ok&quot;</span>, <span class="fl">.020</span>),</span>
+<span id="d04-cb17-63"><a href="#d04-cb17-63" aria-hidden="true" tabindex="-1"></a>                             V4[<span class="dv">0</span>]: (<span class="st">&quot;ok&quot;</span>, <span class="fl">.018</span>), V4[<span class="dv">1</span>]: (<span class="st">&quot;ok&quot;</span>, <span class="fl">.018</span>)},</span>
+<span id="d04-cb17-64"><a href="#d04-cb17-64" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;IPv6 black-holed&quot;</span>:     {V6[<span class="dv">0</span>]: (<span class="st">&quot;blackhole&quot;</span>, <span class="va">None</span>), V6[<span class="dv">1</span>]: (<span class="st">&quot;blackhole&quot;</span>, <span class="va">None</span>),</span>
+<span id="d04-cb17-65"><a href="#d04-cb17-65" aria-hidden="true" tabindex="-1"></a>                             V4[<span class="dv">0</span>]: (<span class="st">&quot;ok&quot;</span>, <span class="fl">.018</span>), V4[<span class="dv">1</span>]: (<span class="st">&quot;ok&quot;</span>, <span class="fl">.018</span>)},</span>
+<span id="d04-cb17-66"><a href="#d04-cb17-66" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;IPv6 refused fast&quot;</span>:    {V6[<span class="dv">0</span>]: (<span class="st">&quot;refused&quot;</span>, <span class="fl">.005</span>), V6[<span class="dv">1</span>]: (<span class="st">&quot;refused&quot;</span>, <span class="fl">.005</span>),</span>
+<span id="d04-cb17-67"><a href="#d04-cb17-67" aria-hidden="true" tabindex="-1"></a>                             V4[<span class="dv">0</span>]: (<span class="st">&quot;ok&quot;</span>, <span class="fl">.018</span>), V4[<span class="dv">1</span>]: (<span class="st">&quot;ok&quot;</span>, <span class="fl">.018</span>)},</span>
+<span id="d04-cb17-68"><a href="#d04-cb17-68" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="d04-cb17-69"><a href="#d04-cb17-69" aria-hidden="true" tabindex="-1"></a>order <span class="op">=</span> interleave(V6, V4)</span>
+<span id="d04-cb17-70"><a href="#d04-cb17-70" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;attempt order:&quot;</span>, <span class="st">&quot;, &quot;</span>.join(order))</span>
+<span id="d04-cb17-71"><a href="#d04-cb17-71" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> name, paths <span class="kw">in</span> scenarios.items():</span>
+<span id="d04-cb17-72"><a href="#d04-cb17-72" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="ss">== </span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d04-cb17-73"><a href="#d04-cb17-73" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> line <span class="kw">in</span> asyncio.run(happy_eyeballs(order, paths)):</span>
+<span id="d04-cb17-74"><a href="#d04-cb17-74" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(line)</span></code></pre></div>
+<p>Output from a real run (timer values can differ by a millisecond between runs):</p>
+<pre class="text"><code>attempt order: [2001:db8::10], 192.0.2.10, [2001:db8::11], 192.0.2.11
+
+== healthy IPv6 (20 ms)
+     0 ms  try [2001:db8::10]
+    20 ms  connected via [2001:db8::10]
+
+== IPv6 black-holed
+     0 ms  try [2001:db8::10]
+   252 ms  try 192.0.2.10
+   271 ms  connected via 192.0.2.10
+
+== IPv6 refused fast
+     0 ms  try [2001:db8::10]
+     5 ms  [2001:db8::10] refused
+     5 ms  try 192.0.2.10
+    25 ms  connected via 192.0.2.10</code></pre>
+<p>The middle case is the important one. A black-holed IPv6 path costs 250 ms on every new connection, not two minutes. That is a huge improvement. It is also a trap, because the breakage becomes invisible. Nobody files a ticket for "every page load is a quarter-second slower". Some clients also remember which family worked recently and skip the losing one for a while, which hides the problem further.</p>
+<p>You can watch the race with <code>curl</code>, which implements Happy Eyeballs with a 200 ms default delay (<code>--happy-eyeballs-timeout-ms</code>). The output below is an annotated illustration of curl 8.x against a host whose IPv6 path is black-holed:</p>
+<pre class="text"><code># run on your Mac — your output will differ
+$ curl -sv -o /dev/null https://www.example.net/ 2&gt;&amp;1 | head -6
+* Host www.example.net:443 was resolved.
+* IPv6: 2001:db8::10
+* IPv4: 192.0.2.10
+*   Trying [2001:db8::10]:443...        &lt;- t = 0
+*   Trying 192.0.2.10:443...            &lt;- t ≈ 200 ms: v6 has not answered, start v4 too
+* Connected to www.example.net (192.0.2.10) port 443</code></pre>
+<p>To test each family on its own, force it: <code>curl -6 -sv -o /dev/null https://…</code> and <code>curl -4 …</code>. A dual-stack host where <code>curl -6</code> hangs and <code>curl -4</code> works has a broken IPv6 path that Happy Eyeballs is hiding.</p>
+<p>Not everything races. In Python, <code>socket.create_connection()</code> tries addresses one at a time in <code>getaddrinfo</code> order, waiting for each to fail. <code>asyncio</code>'s <code>open_connection()</code> races only when you pass <code>happy_eyeballs_delay</code> (0.25 is the recommended value). Plain <code>connect()</code> loops in C, old Java, and many health-check scripts do not race either. They are the ones that hang.</p>
+<p>On Linux, <code>getaddrinfo</code> sorts addresses with the RFC 6724 rules, adjustable in <code>/etc/gai.conf</code>. On macOS, the system's Network framework (used by <code>URLSession</code> and Safari) does its own Happy Eyeballs, while programs that use BSD sockets directly get the raw <code>getaddrinfo</code> order.</p>
+<h2 id="d04-numbers">Deep dive: by the numbers</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Value</th>
+<th>Note</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Default initial TTL / Hop Limit</td>
+<td>64 on Linux and macOS; 128 on Windows; 255 on many routers</td>
+<td>OS defaults; a received TTL of 57 probably started at 64, seven hops away</td>
+</tr>
+<tr class="even">
+<td>TTL decrement → checksum change</td>
+<td>+0x0100 (ones'-complement)</td>
+<td>RFC 1624 incremental update</td>
+</tr>
+<tr class="odd">
+<td>IPv4 header</td>
+<td>20–60 bytes</td>
+<td>Options are rare and often dropped (RFC 7126)</td>
+</tr>
+<tr class="even">
+<td>IPv6 header</td>
+<td>40 bytes fixed</td>
+<td>Extension headers follow</td>
+</tr>
+<tr class="odd">
+<td>IPv6 minimum link MTU</td>
+<td>1,280 bytes</td>
+<td>Every IPv6 link must carry this unfragmented</td>
+</tr>
+<tr class="even">
+<td>IPv4 minimum reassembly buffer</td>
+<td>576 bytes</td>
+<td>Every IPv4 host must accept this</td>
+</tr>
+<tr class="odd">
+<td>Fragment offset unit</td>
+<td>8 bytes</td>
+<td>13-bit field × 8 = 65,528-byte maximum offset</td>
+</tr>
+<tr class="even">
+<td>ICMPv4 error size (Linux)</td>
+<td>up to 576 bytes total</td>
+<td>RFC 792 minimum: IP header + 8 bytes</td>
+</tr>
+<tr class="odd">
+<td>ICMPv6 error size</td>
+<td>up to 1,280 bytes total</td>
+<td>RFC 4443</td>
+</tr>
+<tr class="even">
+<td>Linux PMTU cache lifetime</td>
+<td>600 s (<code>net.ipv4.route.mtu_expires</code>)</td>
+<td>Then the host tries the full MTU again</td>
+</tr>
+<tr class="odd">
+<td>Linux minimum PMTU</td>
+<td>552 (<code>net.ipv4.route.min_pmtu</code>)</td>
+<td>A smaller MTU claimed by ICMP is clamped up to this</td>
+</tr>
+<tr class="even">
+<td>IPv4 reassembly timeout</td>
+<td>30 s on Linux (<code>ipfrag_time</code>)</td>
+<td>IPv6: 60 s (RFC 8200)</td>
+</tr>
+<tr class="odd">
+<td>Reassembly memory</td>
+<td>4 MB high / 3 MB low threshold on Linux</td>
+<td>Per network namespace; a fragment flood evicts real traffic</td>
+</tr>
+<tr class="even">
+<td>ICMP error rate limit (Linux)</td>
+<td>per host ~1 token/s after a burst (6 observed); 1,000/s global</td>
+<td>Lab: 6 of 20 rapid probes answered</td>
+</tr>
+<tr class="odd">
+<td>Happy Eyeballs delays</td>
+<td>50 ms resolution delay; 250 ms attempt delay</td>
+<td>RFC 8305; curl uses 200 ms</td>
+</tr>
+<tr class="even">
+<td>Non-racing connect to a black hole</td>
+<td>~127 s Linux, ~75 s macOS</td>
+<td>The cost when Happy Eyeballs is absent</td>
+</tr>
+<tr class="odd">
+<td>Common tunnel/cloud MTUs</td>
+<td>1,420 WireGuard default; 1,460 GCP VPC default; 9,001 AWS within a VPC</td>
+<td>MTU mismatches are where PMTUD failures live</td>
+</tr>
+</tbody>
+</table>
+<p>A worked MTU budget, because it comes up constantly. A VXLAN overlay on a 1,500-byte underlay adds an outer IPv4 header (20), UDP (8), VXLAN (8) and the inner Ethernet header (14): 50 bytes. The inner MTU must be 1,450. Inner TCP over IPv4 then has an MSS of 1,450 − 20 − 20 = 1,410 bytes. Put that overlay inside a WireGuard tunnel with a 1,420-byte MTU and the inner MTU drops to 1,370. If any layer advertises 1,500 to the layer above, packets will be too big somewhere. The only thing that saves you then is an ICMP message getting back to the sender.</p>
+<h2 id="d04-failures">Deep dive: production failure modes</h2>
+<h3 id="d04-fail-pmtud">The PMTUD black hole</h3>
+<p><strong>Symptom.</strong> SSH logs in, then hangs on <code>ls</code> of a big directory. A web page loads its HTML and stalls on images. TLS handshakes fail on some sites, because the server's certificate chain is the first large packet. Small requests always work.</p>
+<p><strong>Mechanism.</strong> Some link on the path has a smaller MTU: a tunnel, a PPPoE line, a cloud interconnect. The sender sets DF. The router at the small link drops the full-size packets and sends ICMP <em>frag needed</em> (or ICMPv6 Packet Too Big). Something on the way back — a firewall, a security group, a load balancer — drops that ICMP. The sender never learns, and keeps retransmitting the same full-size segment.</p>
+<p><strong>Prove it.</strong> Find the largest packet that gets through with DF set. On macOS, <code>ping -D -s 1472 host</code> (1,472 + 8 ICMP + 20 IP = 1,500), then shrink until replies arrive. On Linux, <code>ping -M do -s 1472 host</code>, or <code>tracepath host</code>, which reports the PMTU hop by hop. Capture on the sender with <code>sudo tcpdump -nn -i en0 'icmp[icmptype]=3 and icmp[icmpcode]=4 or icmp6[0]=2'</code>. In the black-hole case you see big segments being retransmitted and no ICMP coming back. On Linux, <code>ip route get &lt;dst&gt;</code> shows whether a PMTU was ever learned.</p>
+<p><strong>Fix.</strong> Let ICMP type 3 code 4 and ICMPv6 type 2 through every firewall (RFC 4890 is the guide for ICMPv6 filtering). Where you cannot, clamp the TCP MSS at the tunnel edge (<code>iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu</code> on Linux). On end hosts, enable packetization-layer PMTU discovery (RFC 4821), which finds the size by probing with TCP itself and needs no ICMP: <code>sysctl -w net.ipv4.tcp_mtu_probing=1</code> on Linux (the default is 0).</p>
+<h3 id="d04-fail-traceroute">Traceroute shows loss or latency at a middle hop</h3>
+<p><strong>Symptom.</strong> Someone pastes a traceroute where hop 6 shows 40 % loss and 300 ms, and asks you to escalate to that ISP.</p>
+<p><strong>Mechanism.</strong> Traceroute's answers come from each router's slow path, which is rate-limited and low priority. If hops 7 to 12 show no loss and normal latency, traffic is being forwarded through hop 6 fine. Only the ICMP generation there is slow.</p>
+<p><strong>Prove it.</strong> Look at the final hop. Loss or latency that is real <em>persists to the destination</em>. Use <code>mtr</code> to see per-hop statistics over many probes. With ECMP in the path, classic traceroute varies the probe's ports, so different probes take different paths and the hop list mixes routers. Paris-traceroute-style probing keeps the flow fields constant (for example <code>traceroute -U</code> on Linux, which uses a fixed destination port).</p>
+<p><strong>Fix.</strong> Nothing on hop 6. Escalate only loss that appears at a hop and continues through every hop after it.</p>
+<h3 id="d04-fail-frag">Fragments dropped, or reassembled wrong</h3>
+<p><strong>Symptom.</strong> DNS works for most names but fails for some, usually DNSSEC-signed names or large TXT records. UDP-based VPNs or game traffic fail on some networks. Rarely, silent data corruption in high-rate UDP.</p>
+<p><strong>Mechanism.</strong> A response larger than the path MTU is fragmented, and a firewall drops non-first fragments (they carry no ports) or the reassembly buffer evicts them. For DNS, the client then waits for a timeout before retrying over TCP. Corruption is the ID wrap described above.</p>
+<p><strong>Prove it.</strong> Compare <code>dig +bufsize=4096 +dnssec &lt;name&gt;</code> with <code>dig +bufsize=1232 …</code> and <code>dig +tcp …</code>; the large-buffer query fails and the others work. On the receiver, Linux counts reassembly failures in <code>nstat -az IpReasmFails IpReasmTimeout</code>; macOS reports them in <code>netstat -s -p ip</code>.</p>
+<p><strong>Fix.</strong> Avoid fragmentation. DNS resolvers now default to an EDNS buffer size of 1,232 bytes (the "DNS flag day 2020" value) so responses fit in one IPv6 packet, and fall back to TCP for larger ones. UDP applications should size their datagrams to the path MTU, as QUIC does.</p>
+<h3 id="d04-fail-dualstack">Broken IPv6 hidden by Happy Eyeballs</h3>
+<p><strong>Symptom.</strong> Browsers are fine. A cron job, a health check or a Python script hangs for two minutes against the same hostname. Or: p50 connect time to a service rose by exactly 200–300 ms after a network change.</p>
+<p><strong>Mechanism.</strong> IPv6 is configured but does not work end to end: a missing route, a security group with IPv4 rules only, a load balancer with an AAAA record but no IPv6 listener. Racing clients lose a quarter of a second; non-racing clients time out.</p>
+<p><strong>Prove it.</strong> Compare <code>curl -6</code> and <code>curl -4</code> against the same URL, adding <code>-w '%{time_connect}\n'</code>. Check the AAAA record (<code>dig AAAA name</code>) and whether the service actually listens on IPv6. In Kubernetes, <code>kubectl get svc &lt;name&gt; -o jsonpath='{.spec.ipFamilies}'</code> shows which families a Service has.</p>
+<p><strong>Fix.</strong> Fix the IPv6 path, or stop publishing the AAAA record until it works. Do not "fix" it by disabling IPv6 on clients; that just moves the problem to the next person.</p>
+<h2 id="d04-2026">Deep dive: 2026 context</h2>
+<p><strong>IPv6 is now the majority path for many networks.</strong> Google's public statistics have shown close to half of its users reaching it over IPv6 in recent years, and mobile networks are often IPv6-only underneath. Many phones on those networks run 464XLAT (RFC 6877): the phone has an IPv6-only connection, a local translator (CLAT) presents IPv4 to apps, and the carrier's NAT64 (RFC 6146) translates to IPv4 at the edge. DNS64 (RFC 6147) synthesises AAAA records inside the well-known prefix <code>64:ff9b::/96</code> (RFC 6052) for names that only have A records. Apple has required iOS apps to work on IPv6-only networks since 2016, for exactly this reason.</p>
+<p><strong>Public IPv4 has a price tag.</strong> AWS has charged for every public IPv4 address since February 2024 ($0.005 per hour). That turned "should we go IPv6?" from an architecture debate into a cost line. IPv6-only subnets, IPv6 EKS clusters and dual-stack load balancers are now ordinary choices, which makes the dual-stack failure modes above ordinary too.</p>
+<p><strong>Kubernetes has two address families to get right.</strong> Dual-stack networking has been stable since Kubernetes 1.23. Pods get one address per family, Services declare <code>ipFamilies</code> and <code>ipFamilyPolicy</code>, and NetworkPolicies need rules for both. A <code>SingleStack</code> IPv4 Service behind an ingress that publishes AAAA records is a black hole waiting to happen.</p>
+<p><strong>Overlays and tunnels make MTU everyone's problem.</strong> VXLAN and Geneve CNIs, WireGuard (and the meshes built on it), IPsec and cloud interconnects each take tens of bytes per packet. Inside AWS a VPC carries 9,001-byte frames, but traffic leaving through an Internet gateway is limited to 1,500. Google Cloud's VPC default is 1,460. Path MTU problems that were rare on a flat LAN now turn up all the time in clusters.</p>
+<p><strong>QUIC does PMTU discovery itself.</strong> QUIC (RFC 9000) runs over UDP, sets DF, and requires every path to carry UDP payloads of at least 1,200 bytes. It then probes for larger sizes with its own packets (datagram PLPMTUD, RFC 8899), so it does not depend on ICMP arriving. It never relies on IP fragmentation. HTTP/3's growth is one reason fragmentation is becoming rarer on the Internet.</p>
+<p><strong>Happy Eyeballs keeps evolving.</strong> A version 3 is being worked on as an IETF draft. It adds the DNS HTTPS/SVCB records (which can advertise HTTP/3 support and address hints), and racing QUIC against TCP, to the version 2 algorithm. Browsers already do much of this in practice.</p>
+<p><strong>Extension headers live inside operator domains.</strong> SRv6, which carries a list of segments in a Routing header, is deployed by some large carriers and in some data-centre fabrics — inside networks that control every router. Across the open Internet, the advice from the extension-header section stands.</p>
+<h2 id="d04-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: A router decrements TTL. What else must it change in the packet, and how expensive is that?</strong></p>
+<p>For IPv4, the header checksum. It does not recompute it over the whole header. The RFC 1624 incremental update adjusts the old checksum by the difference in the changed word, and a TTL decrement of one adds <code>0x0100</code> in ones'-complement arithmetic: a single add with end-around carry. The router also rewrites the Ethernet header (new source and destination MACs), and the NIC computes a new FCS. For IPv6, only the Hop Limit changes; there is no header checksum.</p>
+<p><strong>Q2: Traceroute shows 300 ms at hop 5 and 25 ms at hops 6 to 10. Is hop 5 congested?</strong></p>
+<p>Almost certainly not. The hop-5 RTT measures how quickly that router's CPU generated an ICMP Time Exceeded message, which happens on a rate-limited, low-priority slow path. Packets <em>forwarded</em> through hop 5 take the fast path, and hops 6–10 show they arrive promptly. Real congestion or loss at hop 5 would show up at every hop after it.</p>
+<p><strong>Q3: Why can't a firewall filter a non-first IPv4 fragment by port, and what do firewalls do about it?</strong></p>
+<p>Only the first fragment carries the TCP or UDP header; non-first fragments contain raw payload with no ports. A stateless filter can either pass them (risky: overlapping-fragment tricks have been used to sneak data past filters) or drop them (which breaks large UDP). Stateful firewalls reassemble, or virtually reassemble by tracking fragments per (source, destination, protocol, ID), and apply the first fragment's decision to the rest. That costs memory per datagram, which is why fragment floods are a DoS attack against firewalls.</p>
+<p><strong>Q4: An IPv6 packet with a 72-byte Destination Options header and a Fragment header is dropped by a transit network. Give three reasons it might be.</strong></p>
+<p>One: the network's routers or ACLs parse a fixed number of bytes and cannot find the TCP/UDP header past the extension headers, so they drop rather than pass unclassified traffic. Two: policy drops IPv6 fragments at the border, because non-first fragments cannot be classified and fragments are a common attack tool. Three: the device filters packets with any extension headers at all, a common blanket rule (RFC 7872 measured how common). A Hop-by-Hop header would add a fourth: it is often punted to the CPU, so it is rate-limited or dropped to protect the control plane.</p>
+<p><strong>Q5: Why does IPv6 forbid router fragmentation but still require a minimum MTU of 1,280 bytes?</strong></p>
+<p>Removing router fragmentation pushes the job to the source, which then needs Path MTU Discovery to work. The 1,280-byte floor gives the source a size it may always send without waiting for discovery. It also bounds how much of a packet an ICMPv6 error can quote, so the error itself never needs fragmenting. Links that cannot carry 1,280 bytes must fragment and reassemble below IPv6, at the link layer.</p>
+<p><strong>Q6: A Python service calling an internal API sometimes takes exactly 127 seconds to fail. Browsers hitting the same hostname are fine. What is going on?</strong></p>
+<p>127 seconds is Linux's default TCP connect timeout: six SYN retransmissions after waits of 1, 2, 4, 8, 16 and 32 seconds, then a final 64-second wait. The hostname has an AAAA record, but IPv6 to it is black-holed. Browsers use Happy Eyeballs, start an IPv4 attempt after about 250 ms, and win on IPv4. The Python code uses <code>socket.create_connection</code>, which tries addresses in order and waits for each to time out before trying the next. Fix the IPv6 path or the AAAA record. As a mitigation, set a short connect timeout, or use asyncio with <code>happy_eyeballs_delay</code>.</p>
+<p><strong>Q7: Your SSH session works, but <code>cat</code> of a large file freezes the terminal — only on the VPN. Walk through the diagnosis.</strong></p>
+<p>Small packets work and large ones vanish, so suspect MTU. The VPN reduces the path MTU, and the ICMP that would tell the sender is being dropped somewhere. Confirm with DF-set pings of decreasing size (<code>ping -D -s</code> on macOS, <code>ping -M do -s</code> on Linux) to find the largest size that works, and capture to check that no ICMP <em>frag needed</em> comes back. Fixes: let that ICMP through, clamp the MSS on the VPN gateway, lower the tunnel interface MTU, or enable TCP MTU probing on the hosts.</p>
+<p><strong>Q8: Fragments of two different datagrams get reassembled together. How is that possible, and why is IPv6 less exposed?</strong></p>
+<p>IPv4's Identification field is 16 bits. A busy sender of fragmented traffic to one destination can cycle through all 65,536 values in a second or two, while the receiver keeps incomplete datagrams for up to 30 seconds (Linux). So an old fragment can match a new datagram with the same ID. The 16-bit transport checksum catches most such mixes, but not all (RFC 4963). IPv6's Fragment header carries a 32-bit identification, which pushes wraparound out by a factor of 65,536.</p>
