@@ -106,7 +106,7 @@
 <h3 id="d16-the-lab">The lab</h3>
 <p>Two VTEPs, <code>x</code> (<code>192.0.2.1</code>) and <code>y</code> (<code>192.0.2.6</code>), are routed through a middle router <code>m</code>. Each VTEP bridges a host onto VNI 42. Host <code>h1</code> is <code>10.10.0.1</code> and host <code>h2</code> is <code>10.10.0.2</code>, on one overlay subnet. The underlay links are 1500 bytes, except in the runs where the <code>m</code>–<code>y</code> hop is set to 1400. This is Linux-only (<code>ip netns</code>, <code>ip link add ... type vxlan</code>).</p>
 <p>When a VXLAN device is created on top of a 1500-byte underlay device, Linux sets its MTU for you:</p>
-<pre class="text"><code>$ ip -d link show vxlan42
+<pre class="text"><code>$ ip -d link show vxlan42        # excerpt: offload fields trimmed
 2: vxlan42: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1450 qdisc noqueue master br0 state UNKNOWN mode DEFAULT group default qlen 1000
     vxlan id 42 remote 192.0.2.6 local 192.0.2.1 dev wan srcport 0 0 dstport 4789 ttl auto ageing 300 udpcsum noudp6zerocsumtx noudp6zerocsumrx</code></pre>
 <p>That 1450 is 1500 minus 50: outer IPv4 20, UDP 8, VXLAN 8, and the inner Ethernet header 14 that rides inside. Ask for more and the kernel refuses. Setting the VXLAN MTU to 1500 on that device returned <code>RTNETLINK answers: Invalid argument</code>. The local VTEP protects itself; it knows nothing about the rest of the path.</p>
@@ -198,7 +198,7 @@ h1 upload done in 0.01s
 <span id="d16-cb14-11"><a href="#d16-cb14-11" aria-hidden="true" tabindex="-1"></a></span>
 <span id="d16-cb14-12"><a href="#d16-cb14-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Scoped resolvers a VPN installed (look for &quot;domain&quot; entries pointing at office DNS)</span></span>
 <span id="d16-cb14-13"><a href="#d16-cb14-13" aria-hidden="true" tabindex="-1"></a><span class="ex">scutil</span> <span class="at">--dns</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-B1</span> <span class="at">-A4</span> <span class="st">&#39;domain&#39;</span></span></code></pre></div>
-<p>On Linux, the same checks are <code>ping -M do -s 1392 &lt;host&gt;</code>, <code>ip route get &lt;endpoint&gt;</code> (it shows a cached PMTU), <code>tracepath &lt;host&gt;</code> (it reports the PMTU hop by hop), <code>ss -tin</code> (per-socket <code>pmtu</code> and <code>mss</code>), and <code>ip rule</code> plus <code>ip route show table 51820</code> for wg-quick's policy routing. With wg-quick and <code>AllowedIPs = 0.0.0.0/0</code>, <code>ip rule</code> looks like this:</p>
+<p>On Linux, the same checks are <code>ping -M do -s 1392 &lt;host&gt;</code>, <code>ip route get &lt;endpoint&gt;</code> (it shows a cached PMTU), <code>tracepath &lt;host&gt;</code> (it reports the PMTU hop by hop), <code>ss -tin</code> (per-socket <code>pmtu</code> and <code>mss</code>), and <code>ip rule</code> plus <code>ip route show table 51820</code> for wg-quick's policy routing. With wg-quick and <code>AllowedIPs = 0.0.0.0/0</code>, <code>ip rule</code> looks like this (illustrative; the lab kernel had no WireGuard module):</p>
 <pre class="text"><code>0:  from all lookup local
 32764:  from all lookup main suppress_prefixlength 0
 32765:  not from all fwmark 0xca6c lookup 51820

@@ -1,0 +1,569 @@
+<h2 id="d10-deep-dive">Deep dive: what registered mail leaves out</h2>
+<p>Registered mail is a good picture of TCP's <em>promise</em>: everything arrives, in order, or you hear about it. It says nothing about the <em>machine</em> that keeps the promise. Behind every connected socket the kernel keeps a small state machine with real fields: sequence pointers, two windows, a smoothed RTT estimate, a retransmission queue, an out-of-order queue, two buffers and half a dozen timers. Almost every TCP performance problem you will debug is one of those fields holding a number you did not expect.</p>
+<p>The analogy also hides the fact that TCP has to <em>guess</em>. It cannot see the network. It infers capacity from ACK timing and infers loss from silence or from gaps. Those guesses have defaults, and the defaults have consequences: a 40 ms stall on small requests, a 15-minute wait to notice a dead peer, a 200 ms queue that only one congestion controller fills.</p>
+<p>UDP gets the opposite treatment. "A postcard" sounds harmless. In practice UDP means that nothing pushes back on a fast sender, so the receiver's socket buffer overflows and the kernel quietly counts the losses.</p>
+<p>Most output below is real. It comes from a three-namespace Linux lab (client <code>c</code> 10.10.0.2, router <code>r</code>, server <code>s</code> 10.20.0.2) on the guide's sandbox, kernel 6.18, plus stdlib Python scripts. The lab has no artificial propagation delay; where RTTs are large, a queue made them large, and the text says so.</p>
+<h2 id="d10-mental-model">Deep dive: the real mental model</h2>
+<h3 id="d10-a-connection-is-a-struct-with-pointers-into-a-byte-stream">A connection is a struct with pointers into a byte stream</h3>
+<p>Each direction of a TCP connection is a numbered byte stream. The sender tracks three positions in it (RFC 9293 names):</p>
+<ul>
+<li><strong>SND.UNA</strong>: the oldest byte sent but not yet acknowledged.</li>
+<li><strong>SND.NXT</strong>: the next byte it will send.</li>
+<li><strong>The send limit</strong>: SND.UNA plus the effective window.</li>
+</ul>
+<p>Bytes between SND.UNA and SND.NXT are <strong>in flight</strong>. The sender may keep sending until in-flight bytes reach the effective window, which is the smaller of two numbers that come from opposite ends of the path:</p>
+<ul>
+<li><strong>rwnd</strong>, the receive window, comes from the <em>receiver</em>. It is the free space in the receiver's socket buffer, advertised in every ACK. It protects the receiving application.</li>
+<li><strong>cwnd</strong>, the congestion window, lives only in the <em>sender</em>. It is the sender's running guess at how much the network can hold without loss. It protects the path.</li>
+</ul>
+<svg viewBox="0 0 760 500" role="img" aria-labelledby="d10-win-title d10-win-desc" style="min-width:760px;max-width:100%;height:auto;">
+<title id="d10-win-title">What a TCP sender may send: sequence pointers, cwnd and rwnd</title>
+<desc id="d10-win-desc">The sender's byte stream is split into acknowledged bytes, bytes in flight between SND.UNA and SND.NXT, bytes it may send now, and bytes that must wait. The limit is SND.UNA plus the smaller of the congestion window, kept privately by the sender, and the receive window, advertised by the receiver in every ACK. Below, data flows from the send buffer across a path with a bottleneck queue into the receive buffer, and ACKs flow back.</desc>
+<defs>
+<marker id="d10-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2d3142"/></marker>
+<marker id="d10-arr2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#bf4520"/></marker>
+</defs>
+<rect x="0" y="0" width="760" height="500" fill="#f5f5f5"/>
+<text x="24" y="34" font-family="monospace" font-size="11" fill="#8a8f98" letter-spacing="2">D10 · TCP SENDER STATE</text>
+<text x="24" y="62" font-family="sans-serif" font-size="21" font-weight="600" fill="#2d3142">In flight ≤ min(cwnd, rwnd)</text>
+<g font-family="monospace" font-size="11" fill="#2d3142" text-anchor="middle">
+<line x1="190" y1="98" x2="190" y2="122" stroke="#2d3142" stroke-width="1.5"/><text x="190" y="92">SND.UNA</text>
+<line x1="430" y1="98" x2="430" y2="122" stroke="#2d3142" stroke-width="1.5"/><text x="430" y="92">SND.NXT</text>
+<line x1="560" y1="98" x2="560" y2="122" stroke="#bf4520" stroke-width="1.5"/><text x="580" y="92" fill="#bf4520">SND.UNA + min(cwnd, rwnd)</text>
+</g>
+<rect x="40" y="122" width="150" height="38" fill="#2d3142" opacity="0.18"/>
+<rect x="190" y="122" width="240" height="38" fill="#bf4520" opacity="0.22"/>
+<rect x="430" y="122" width="130" height="38" fill="#2d3142" opacity="0.07"/>
+<rect x="560" y="122" width="160" height="38" fill="#f5f5f5" stroke="#8a8f98" stroke-width="1" stroke-dasharray="4,3"/>
+<rect x="40" y="122" width="680" height="38" fill="none" stroke="#2d3142" stroke-width="1.2"/>
+<g font-family="sans-serif" font-size="12" fill="#2d3142" text-anchor="middle">
+<text x="115" y="146">acked</text>
+<text x="310" y="146" font-weight="600">sent, not acked: in flight</text>
+<text x="495" y="146">may send now</text>
+<text x="640" y="146" fill="#8a8f98">must wait</text>
+</g>
+<text x="728" y="146" font-family="sans-serif" font-size="11" fill="#8a8f98">→ seq</text>
+<path d="M190,170 L190,178 L560,178 L560,170" fill="none" stroke="#bf4520" stroke-width="1.3"/>
+<text x="375" y="196" font-family="sans-serif" font-size="12" fill="#bf4520" text-anchor="middle">effective window = min(cwnd, rwnd), from SND.UNA</text>
+<rect x="24" y="230" width="170" height="120" rx="6" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5"/>
+<text x="38" y="252" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">sender kernel</text>
+<g font-family="sans-serif" font-size="11" fill="#2d3142">
+<text x="38" y="274">send buffer (tcp_wmem)</text>
+<text x="38" y="294" fill="#bf4520" font-weight="600">cwnd: private guess</text>
+<text x="38" y="310" fill="#8a8f98">of what the path holds</text>
+<text x="38" y="330" fill="#8a8f98">srtt, rto, retransmit queue</text>
+</g>
+<rect x="566" y="230" width="170" height="120" rx="6" fill="#f5f5f5" stroke="#2d3142" stroke-width="1.5"/>
+<text x="580" y="252" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">receiver kernel</text>
+<g font-family="sans-serif" font-size="11" fill="#2d3142">
+<text x="580" y="274">receive buffer (tcp_rmem)</text>
+<text x="580" y="294" fill="#bf4520" font-weight="600">rwnd = free space here</text>
+<text x="580" y="310" fill="#8a8f98">app read() drains it</text>
+<text x="580" y="330" fill="#8a8f98">out-of-order queue, SACK</text>
+</g>
+<line x1="194" y1="270" x2="562" y2="270" stroke="#2d3142" stroke-width="1.5" marker-end="url(#d10-arr)"/>
+<text x="214" y="262" font-family="sans-serif" font-size="11" fill="#2d3142">data segments</text>
+<rect x="410" y="252" width="92" height="36" rx="4" fill="#f5f5f5" stroke="#bf4520" stroke-width="1.5"/>
+<g fill="#bf4520" opacity="0.5"><rect x="416" y="258" width="10" height="24"/><rect x="430" y="258" width="10" height="24"/><rect x="444" y="258" width="10" height="24"/><rect x="458" y="258" width="10" height="24"/></g>
+<text x="404" y="306" font-family="sans-serif" font-size="11" fill="#bf4520">bottleneck queue</text>
+<text x="404" y="320" font-family="sans-serif" font-size="11" fill="#8a8f98">(bufferbloat lives here)</text>
+<text x="214" y="306" font-family="sans-serif" font-size="11" fill="#8a8f98">path: rate C, delay RTT</text>
+<text x="214" y="320" font-family="sans-serif" font-size="11" fill="#8a8f98">BDP = C × RTT bytes</text>
+<line x1="566" y1="336" x2="198" y2="336" stroke="#bf4520" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#d10-arr2)"/>
+<text x="232" y="354" font-family="monospace" font-size="11" fill="#bf4520">ACK: ack=SND.UNA', win=rwnd, sack {…}</text>
+<rect x="24" y="384" width="712" height="92" rx="6" fill="#f5f5f5" stroke="#2d3142" stroke-width="1"/>
+<g font-family="sans-serif" font-size="12" fill="#2d3142">
+<text x="40" y="408">• rwnd is on the wire in every ACK; cwnd never appears in a packet (read it with ss -ti).</text>
+<text x="40" y="430">• To keep the pipe full, both windows must reach the BDP: 1 Gbit/s × 100 ms = 12.5 MB.</text>
+<text x="40" y="452">• Slow start, CUBIC and BBR move cwnd; an app that stops reading drives rwnd to zero.</text>
+</g>
+</svg>
+
+<p>Everything else in this deep dive hangs off this picture. Slow start, CUBIC and BBR are rules for moving cwnd. Flow-control stalls are rwnd hitting zero. A retransmission is SND.UNA refusing to move. And the bandwidth-delay product tells you how big the window must be for the pipe to stay full.</p>
+<h3 id="d10-the-state-you-can-actually-read">The state you can actually read</h3>
+<p>On Linux, <code>ss -ti</code> prints most of a socket's internal state. Here is one real line from the lab, taken from a CUBIC sender pushing data through a 20 Mbit/s bottleneck, with the fields that matter:</p>
+<pre class="text"><code>cubic wscale:10,10 rto:412 rtt:210.532/0.483 mss:1448 pmtu:1500 cwnd:351 ssthresh:258
+bytes_sent:17294912 bytes_retrans:47784 bytes_acked:16738880 send 19312903bps
+pacing_rate 23175448bps delivery_rate 19120768bps unacked:351 retrans:0/33 notsent:632776
+minrtt:0.062 snd_wnd:4167680</code></pre>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>cubic</code></td>
+<td>congestion control algorithm for this socket</td>
+</tr>
+<tr class="even">
+<td><code>wscale:10,10</code></td>
+<td>window scale shifts (send, receive): the 16-bit window field is multiplied by 2^10</td>
+</tr>
+<tr class="odd">
+<td><code>rto:412</code></td>
+<td>current retransmission timeout, ms</td>
+</tr>
+<tr class="even">
+<td><code>rtt:210.532/0.483</code></td>
+<td>smoothed RTT / RTT variance, ms</td>
+</tr>
+<tr class="odd">
+<td><code>mss:1448</code></td>
+<td>payload bytes per segment (1500 − 20 − 20 − 12 timestamp option)</td>
+</tr>
+<tr class="even">
+<td><code>cwnd:351</code> / <code>ssthresh:258</code></td>
+<td>congestion window in segments; slow-start threshold</td>
+</tr>
+<tr class="odd">
+<td><code>send 19312903bps</code></td>
+<td>cwnd × mss × 8 ÷ srtt: 351 × 1448 × 8 ÷ 0.2105 s ≈ 19.3 Mbit/s</td>
+</tr>
+<tr class="even">
+<td><code>delivery_rate</code></td>
+<td>measured rate at which ACKs confirm data, bits/s</td>
+</tr>
+<tr class="odd">
+<td><code>unacked:351</code></td>
+<td>segments in flight, which equals cwnd here: the sender is cwnd-limited</td>
+</tr>
+<tr class="even">
+<td><code>retrans:0/33</code></td>
+<td>segments currently retransmitted / total retransmissions over the connection's life</td>
+</tr>
+<tr class="odd">
+<td><code>notsent:632776</code></td>
+<td>bytes the application wrote that TCP has not sent yet</td>
+</tr>
+<tr class="even">
+<td><code>minrtt:0.062</code></td>
+<td>lowest RTT ever seen: 62 µs, the empty path</td>
+</tr>
+<tr class="odd">
+<td><code>snd_wnd:4167680</code></td>
+<td>the peer's advertised receive window (rwnd), about 4 MB</td>
+</tr>
+</tbody>
+</table>
+<p>That last pair tells the story. The empty path has an RTT of 62 microseconds, yet the smoothed RTT is 210 ms. All of the difference is queueing in the router. We come back to that under CUBIC and BBR.</p>
+<p>On macOS there is no <code>ss</code>. <code>netstat -anv -p tcp</code> shows per-socket windows and state, and <code>netstat -s -p tcp</code> prints the global counters (retransmits, duplicate ACKs, out-of-order bytes).</p>
+<h3 id="d10-timers-the-kernels-to-do-list-per-socket">Timers: the kernel's to-do list per socket</h3>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Timer</th>
+<th>What fires it</th>
+<th>Linux default</th>
+<th>macOS default</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Retransmission (RTO)</td>
+<td>no ACK for the oldest unacknowledged byte</td>
+<td>starts at 1 s; floor 200 ms; ceiling 120 s; doubles on each repeat</td>
+<td>starts at 1 s (RFC 6298); floor differs</td>
+</tr>
+<tr class="even">
+<td>Delayed ACK</td>
+<td>data arrived, nothing to send back yet</td>
+<td>40 ms minimum, up to 200 ms</td>
+<td>separate algorithm (<code>net.inet.tcp.delayed_ack</code>)</td>
+</tr>
+<tr class="odd">
+<td>Persist</td>
+<td>peer advertised a zero window</td>
+<td>probes with backoff until the window reopens</td>
+<td>same idea</td>
+</tr>
+<tr class="even">
+<td>Keepalive</td>
+<td>connection idle</td>
+<td>7200 s idle, then 9 probes 75 s apart</td>
+<td><code>net.inet.tcp.keepidle</code> 7200 s</td>
+</tr>
+<tr class="odd">
+<td>TIME_WAIT</td>
+<td>active close finished</td>
+<td>60 s (fixed in the kernel)</td>
+<td>2 × MSL = 30 s (<code>net.inet.tcp.msl</code> 15000 ms)</td>
+</tr>
+<tr class="even">
+<td>SYN retransmit</td>
+<td>no SYN-ACK</td>
+<td><code>tcp_syn_retries</code> 6; see the capture below</td>
+<td>differs</td>
+</tr>
+</tbody>
+</table>
+<p>Check your own machine with <code>sysctl net.ipv4.tcp_keepalive_time net.ipv4.tcp_syn_retries</code> on Linux, or <code>sysctl net.inet.tcp | grep -E 'keep|msl|delayed'</code> on macOS.</p>
+<h2 id="d10-on-the-wire">Deep dive: what the wire and the kernel actually do</h2>
+<h3 id="d10-one-whole-connection-annotated">One whole connection, annotated</h3>
+<p>A client in namespace <code>c</code> fetches a tiny response from a server in <code>s</code>. This is a real capture on the client, taken with <code>tcpdump -nn -v -S</code> (<code>-S</code> prints absolute sequence numbers). The <code>cksum ... incorrect</code> noise caused by checksum offload has been removed.</p>
+<pre class="text"><code>IP (ttl 64, id 34079, flags [DF], proto TCP (6), length 60)
+  10.10.0.2.36228 &gt; 10.20.0.2.8080: Flags [S], seq 2585217731, win 64240,
+  options [mss 1460,sackOK,TS val 1488672089 ecr 0,nop,wscale 10], length 0
+      &lt;- SYN: random ISN; window 64240 (not yet scaled); MSS 1460; SACK allowed;
+         timestamps on; &quot;multiply my future windows by 2^10&quot;
+IP (ttl 63, id 0, flags [DF], proto TCP (6), length 60)
+  10.20.0.2.8080 &gt; 10.10.0.2.36228: Flags [S.], seq 1112794493, ack 2585217732, win 65160,
+  options [mss 1460,sackOK,TS val 2102460955 ecr 1488672089,nop,wscale 10], length 0
+      &lt;- SYN-ACK: server&#39;s own ISN; ack = client ISN + 1 (the SYN uses one number);
+         ttl 63 because it crossed router r
+IP (ttl 64, id 34080, flags [DF], proto TCP (6), length 52)
+  10.10.0.2.36228 &gt; 10.20.0.2.8080: Flags [.], ack 1112794494, win 63, ...
+      &lt;- ACK: win 63 is scaled now: 63 x 1024 = 64,512 bytes
+IP (ttl 64, id 34081, flags [DF], proto TCP (6), length 79)
+  10.10.0.2.36228 &gt; 10.20.0.2.8080: Flags [P.], seq 2585217732:2585217759, ack 1112794494, win 63, length 27
+      &lt;- request: 27 bytes, so the next byte is ...759
+IP (ttl 63, id 63620, flags [DF], proto TCP (6), length 52)
+  10.20.0.2.8080 &gt; 10.10.0.2.36228: Flags [.], ack 2585217759, win 64, length 0
+IP (ttl 63, id 63621, flags [DF], proto TCP (6), length 95)
+  10.20.0.2.8080 &gt; 10.10.0.2.36228: Flags [P.], seq 1112794494:1112794537, ack 2585217759, win 64, length 43
+      &lt;- response: 43 bytes
+IP (ttl 64, id 34082, flags [DF], proto TCP (6), length 52)
+  10.10.0.2.36228 &gt; 10.20.0.2.8080: Flags [.], ack 1112794537, win 63, length 0
+IP (ttl 63, id 63622, flags [DF], proto TCP (6), length 52)
+  10.20.0.2.8080 &gt; 10.10.0.2.36228: Flags [F.], seq 1112794537, ack 2585217759, win 64, length 0
+      &lt;- the SERVER closes first, so the server is the active closer
+IP (ttl 64, id 34083, flags [DF], proto TCP (6), length 52)
+  10.10.0.2.36228 &gt; 10.20.0.2.8080: Flags [F.], seq 2585217759, ack 1112794538, win 63, length 0
+      &lt;- client ACKs the FIN (ack = FIN + 1) and sends its own FIN in the same segment
+IP (ttl 63, id 63623, flags [DF], proto TCP (6), length 52)
+  10.20.0.2.8080 &gt; 10.10.0.2.36228: Flags [.], ack 2585217760, win 64, length 0
+      &lt;- final ACK; the server now sits in TIME_WAIT</code></pre>
+<p>Right after the capture, <code>ss -tano state time-wait</code> showed the TIME_WAIT entry on the <em>server</em>, not the client:</p>
+<pre class="text"><code>TIME-WAIT 0 0 10.20.0.2:8080 10.10.0.2:36228 timer:(timewait,59sec,0)</code></pre>
+<p>Two things in this capture surprise people. First, the IP header length is 52 on bare ACKs: 20 bytes of IP, 20 of TCP, and 12 of timestamp option on <em>every</em> segment. Second, whoever closes first gets TIME_WAIT. An HTTP server that closes connections itself collects thousands of TIME_WAIT entries. A client that closes first, which is the common case with connection pools, collects them instead.</p>
+<h3 id="d10-one-lost-segment-repaired-with-sack">One lost segment, repaired with SACK</h3>
+<p>The router drops exactly one data segment (an <code>iptables ... -m statistic --mode nth</code> rule). Segmentation offload was turned down on the sender so the capture shows real 1448-byte segments. Real capture on the client, with relative sequence numbers, trimmed around the loss; <code>[TS]</code> replaces the timestamp option:</p>
+<pre class="text"><code>.311175 IP s.9000 &gt; c.38090: Flags [.], seq 26065:27513, length 1448
+.311189 IP c.38090 &gt; s.9000: Flags [.], ack 27513, win 80, [TS], length 0
+                                    &lt;- segment 27513:28961 is dropped by the router here
+.311225 IP s.9000 &gt; c.38090: Flags [.], seq 28961:30409, length 1448      &lt;- arrives out of order
+.311228 IP c.38090 &gt; s.9000: Flags [.], ack 27513, win 80, [TS,nop,nop,sack 1 {28961:30409}], length 0
+                                    &lt;- duplicate ACK #1: &quot;still need 27513, but I hold 28961-30409&quot;
+.311255 IP s.9000 &gt; c.38090: Flags [.], seq 30409:31857, length 1448
+.311256 IP c.38090 &gt; s.9000: Flags [.], ack 27513, win 80, [TS,nop,nop,sack 1 {28961:31857}], length 0
+                                    &lt;- duplicate ACK #2: the SACK block grows
+.311285 IP s.9000 &gt; c.38090: Flags [.], seq 27513:28961, length 1448      &lt;- retransmission, 57 µs later
+.311296 IP c.38090 &gt; s.9000: Flags [.], ack 31857, win 78, [TS], length 0 &lt;- cumulative ACK jumps past the hole</code></pre>
+<p>The textbook says "fast retransmit after three duplicate ACKs" (RFC 5681). This sender retransmitted after <em>two</em>. Modern Linux decides loss with RACK-TLP (RFC 8985): a segment counts as lost when a segment sent <em>after</em> it has been acknowledged and a short reordering window has passed. The rule is based on time, not on a fixed count. SACK blocks (RFC 2018) tell the sender exactly which bytes are missing, so it resends one segment instead of everything after the hole. The whole repair took one round trip and no timeout.</p>
+<h3 id="d10-syn-retransmissions-and-where-21-seconds-comes-from">SYN retransmissions, and where "21 seconds" comes from</h3>
+<p>Now the server silently drops SYNs to port 7000, and the client has <code>tcp_syn_retries=3</code>. Real capture with <code>tcpdump -ttttt</code> (time since the first packet):</p>
+<pre class="text"><code> 00:00:00.000000 IP 10.10.0.2.38458 &gt; 10.20.0.2.7000: Flags [S], seq 2742203075, win 64240
+ 00:00:01.024826 IP 10.10.0.2.38458 &gt; 10.20.0.2.7000: Flags [S], seq 2742203075, win 64240
+ 00:00:02.048888 IP 10.10.0.2.38458 &gt; 10.20.0.2.7000: Flags [S], seq 2742203075, win 64240
+ 00:00:03.072827 IP 10.10.0.2.38458 &gt; 10.20.0.2.7000: Flags [S], seq 2742203075, win 64240
+ 00:00:04.096824 IP 10.10.0.2.38458 &gt; 10.20.0.2.7000: Flags [S], seq 2742203075, win 64240
+ 00:00:05.120799 IP 10.10.0.2.38458 &gt; 10.20.0.2.7000: Flags [S], seq 2742203075, win 64240
+ 00:00:07.136832 IP 10.10.0.2.38458 &gt; 10.20.0.2.7000: Flags [S], seq 2742203075, win 64240
+ 00:00:11.200835 IP 10.10.0.2.38458 &gt; 10.20.0.2.7000: Flags [S], seq 2742203075, win 64240
+connect() failed after 19.4s: [Errno 110] Connection timed out</code></pre>
+<p>The spacing is 1, 1, 1, 1, 1, then 2, 4, then a final 8-second wait. Recent kernels add <code>net.ipv4.tcp_syn_linear_timeouts</code> (default 4), which keeps the first retries one second apart before exponential backoff begins. Those linear retries are added on top of <code>tcp_syn_retries</code>, which is why three "retries" put eight SYNs on the wire. With the default <code>tcp_syn_retries=6</code>, the same schedule works out to about 131 seconds before <code>connect()</code> fails. Older kernels used pure doubling (1 + 2 + 4 + ... + 64 = 127 s). Always set your own connect timeout instead of inheriting either number.</p>
+<p>The "21 seconds" in the module comes from Windows: an initial 3 s timeout and two retries, 3 + 6 + 12 = 21 s. When you see a round number like that in a latency histogram, work out the retransmission schedule before blaming the application.</p>
+<h2 id="d10-by-the-numbers">Deep dive: by the numbers</h2>
+<p>All the arithmetic in this section comes from one stdlib script:</p>
+<div class="sourceCode" id="d10-cb6"><pre class="sourceCode python"><code class="sourceCode python"><span id="d10-cb6-1"><a href="#d10-cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;tcp_numbers.py - the arithmetic behind TCP tuning, checked.&quot;&quot;&quot;</span></span>
+<span id="d10-cb6-2"><a href="#d10-cb6-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> math</span>
+<span id="d10-cb6-3"><a href="#d10-cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb6-4"><a href="#d10-cb6-4" aria-hidden="true" tabindex="-1"></a>MSS <span class="op">=</span> <span class="dv">1448</span>                       <span class="co"># 1500 MTU - 20 IP - 20 TCP - 12 timestamp option</span></span>
+<span id="d10-cb6-5"><a href="#d10-cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb6-6"><a href="#d10-cb6-6" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;1. Bandwidth-delay product (bytes that must be in flight to fill the pipe)&quot;</span>)</span>
+<span id="d10-cb6-7"><a href="#d10-cb6-7" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> gbps, rtt_ms <span class="kw">in</span> [(<span class="fl">0.1</span>, <span class="dv">20</span>), (<span class="dv">1</span>, <span class="dv">20</span>), (<span class="dv">1</span>, <span class="dv">100</span>), (<span class="dv">10</span>, <span class="dv">100</span>)]:</span>
+<span id="d10-cb6-8"><a href="#d10-cb6-8" aria-hidden="true" tabindex="-1"></a>    bdp <span class="op">=</span> gbps <span class="op">*</span> <span class="fl">1e9</span> <span class="op">/</span> <span class="dv">8</span> <span class="op">*</span> rtt_ms <span class="op">/</span> <span class="dv">1000</span></span>
+<span id="d10-cb6-9"><a href="#d10-cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;   </span><span class="sc">{</span>gbps<span class="sc">:&gt;5}</span><span class="ss"> Gbit/s x </span><span class="sc">{</span>rtt_ms<span class="sc">:&gt;3}</span><span class="ss"> ms = </span><span class="sc">{</span>bdp <span class="op">/</span> <span class="fl">1e6</span><span class="sc">:7.2f}</span><span class="ss"> MB  (</span><span class="sc">{</span>bdp <span class="op">/</span> MSS<span class="sc">:9,.0f}</span><span class="ss"> segments)&quot;</span>)</span>
+<span id="d10-cb6-10"><a href="#d10-cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb6-11"><a href="#d10-cb6-11" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;2. Throughput ceiling = window / RTT&quot;</span>)</span>
+<span id="d10-cb6-12"><a href="#d10-cb6-12" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> window, label <span class="kw">in</span> [(<span class="dv">65_535</span>, <span class="st">&quot;64 KiB (no window scaling)&quot;</span>), (<span class="dv">6</span> <span class="op">*</span> <span class="dv">2</span><span class="op">**</span><span class="dv">20</span>, <span class="st">&quot;6 MiB (common tcp_rmem max)&quot;</span>)]:</span>
+<span id="d10-cb6-13"><a href="#d10-cb6-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> rtt_ms <span class="kw">in</span> (<span class="dv">20</span>, <span class="dv">100</span>):</span>
+<span id="d10-cb6-14"><a href="#d10-cb6-14" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;   </span><span class="sc">{</span>label<span class="sc">:28s}</span><span class="ss"> @ </span><span class="sc">{</span>rtt_ms<span class="sc">:&gt;3}</span><span class="ss"> ms -&gt; </span><span class="sc">{</span>window <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> (rtt_ms <span class="op">/</span> <span class="dv">1000</span>) <span class="op">/</span> <span class="fl">1e6</span><span class="sc">:8.1f}</span><span class="ss"> Mbit/s&quot;</span>)</span>
+<span id="d10-cb6-15"><a href="#d10-cb6-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb6-16"><a href="#d10-cb6-16" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;3. Loss ceiling for Reno-style AIMD (Mathis: rate &lt;= MSS/RTT * 1.22/sqrt(p))&quot;</span>)</span>
+<span id="d10-cb6-17"><a href="#d10-cb6-17" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> p <span class="kw">in</span> (<span class="fl">1e-4</span>, <span class="fl">1e-3</span>, <span class="fl">1e-2</span>):</span>
+<span id="d10-cb6-18"><a href="#d10-cb6-18" aria-hidden="true" tabindex="-1"></a>    rate <span class="op">=</span> MSS <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> <span class="fl">0.1</span> <span class="op">*</span> <span class="fl">1.22</span> <span class="op">/</span> math.sqrt(p)</span>
+<span id="d10-cb6-19"><a href="#d10-cb6-19" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;   RTT 100 ms, loss </span><span class="sc">{</span>p<span class="sc">:.2%}</span><span class="ss">: </span><span class="sc">{</span>rate <span class="op">/</span> <span class="fl">1e6</span><span class="sc">:7.1f}</span><span class="ss"> Mbit/s, whatever the link speed&quot;</span>)</span>
+<span id="d10-cb6-20"><a href="#d10-cb6-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb6-21"><a href="#d10-cb6-21" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;4. Slow start from IW10: round trips to deliver a response (no loss)&quot;</span>)</span>
+<span id="d10-cb6-22"><a href="#d10-cb6-22" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> size <span class="kw">in</span> (<span class="dv">14_480</span>, <span class="dv">100_000</span>, <span class="dv">1_000_000</span>, <span class="dv">10_000_000</span>):</span>
+<span id="d10-cb6-23"><a href="#d10-cb6-23" aria-hidden="true" tabindex="-1"></a>    cwnd, sent, rtts <span class="op">=</span> <span class="dv">10</span>, <span class="dv">0</span>, <span class="dv">0</span></span>
+<span id="d10-cb6-24"><a href="#d10-cb6-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> sent <span class="op">&lt;</span> size:</span>
+<span id="d10-cb6-25"><a href="#d10-cb6-25" aria-hidden="true" tabindex="-1"></a>        sent <span class="op">+=</span> cwnd <span class="op">*</span> MSS</span>
+<span id="d10-cb6-26"><a href="#d10-cb6-26" aria-hidden="true" tabindex="-1"></a>        cwnd <span class="op">*=</span> <span class="dv">2</span></span>
+<span id="d10-cb6-27"><a href="#d10-cb6-27" aria-hidden="true" tabindex="-1"></a>        rtts <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d10-cb6-28"><a href="#d10-cb6-28" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;   </span><span class="sc">{</span>size<span class="sc">:&gt;10,}</span><span class="ss"> bytes -&gt; </span><span class="sc">{</span>rtts<span class="sc">:2d}</span><span class="ss"> RTTs&quot;</span>)</span>
+<span id="d10-cb6-29"><a href="#d10-cb6-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb6-30"><a href="#d10-cb6-30" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;5. RTO from RTT samples (RFC 6298: alpha 1/8, beta 1/4, K 4)&quot;</span>)</span>
+<span id="d10-cb6-31"><a href="#d10-cb6-31" aria-hidden="true" tabindex="-1"></a>srtt <span class="op">=</span> rttvar <span class="op">=</span> <span class="va">None</span></span>
+<span id="d10-cb6-32"><a href="#d10-cb6-32" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> r <span class="kw">in</span> (<span class="dv">100</span>, <span class="dv">102</span>, <span class="dv">98</span>, <span class="dv">250</span>, <span class="dv">101</span>, <span class="dv">99</span>):</span>
+<span id="d10-cb6-33"><a href="#d10-cb6-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> srtt <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="d10-cb6-34"><a href="#d10-cb6-34" aria-hidden="true" tabindex="-1"></a>        srtt, rttvar <span class="op">=</span> r, r <span class="op">/</span> <span class="dv">2</span></span>
+<span id="d10-cb6-35"><a href="#d10-cb6-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span>:</span>
+<span id="d10-cb6-36"><a href="#d10-cb6-36" aria-hidden="true" tabindex="-1"></a>        rttvar <span class="op">=</span> <span class="fl">0.75</span> <span class="op">*</span> rttvar <span class="op">+</span> <span class="fl">0.25</span> <span class="op">*</span> <span class="bu">abs</span>(srtt <span class="op">-</span> r)</span>
+<span id="d10-cb6-37"><a href="#d10-cb6-37" aria-hidden="true" tabindex="-1"></a>        srtt <span class="op">=</span> <span class="fl">0.875</span> <span class="op">*</span> srtt <span class="op">+</span> <span class="fl">0.125</span> <span class="op">*</span> r</span>
+<span id="d10-cb6-38"><a href="#d10-cb6-38" aria-hidden="true" tabindex="-1"></a>    rto <span class="op">=</span> srtt <span class="op">+</span> <span class="dv">4</span> <span class="op">*</span> rttvar</span>
+<span id="d10-cb6-39"><a href="#d10-cb6-39" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;   sample </span><span class="sc">{</span>r<span class="sc">:3d}</span><span class="ss"> ms -&gt; srtt </span><span class="sc">{</span>srtt<span class="sc">:6.1f}</span><span class="ss">  rttvar </span><span class="sc">{</span>rttvar<span class="sc">:5.1f}</span><span class="ss">  rto </span><span class="sc">{</span>rto<span class="sc">:6.1f}</span><span class="ss"> ms&quot;</span>)</span>
+<span id="d10-cb6-40"><a href="#d10-cb6-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb6-41"><a href="#d10-cb6-41" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;6. Give-up time for an established connection, tcp_retries2 = 15&quot;</span>)</span>
+<span id="d10-cb6-42"><a href="#d10-cb6-42" aria-hidden="true" tabindex="-1"></a>total, rto <span class="op">=</span> <span class="fl">0.0</span>, <span class="fl">0.2</span></span>
+<span id="d10-cb6-43"><a href="#d10-cb6-43" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">16</span>):</span>
+<span id="d10-cb6-44"><a href="#d10-cb6-44" aria-hidden="true" tabindex="-1"></a>    total <span class="op">+=</span> <span class="bu">min</span>(rto, <span class="dv">120</span>)</span>
+<span id="d10-cb6-45"><a href="#d10-cb6-45" aria-hidden="true" tabindex="-1"></a>    rto <span class="op">*=</span> <span class="dv">2</span></span>
+<span id="d10-cb6-46"><a href="#d10-cb6-46" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;   200 ms doubling, capped at 120 s, 16 timeouts: </span><span class="sc">{</span>total<span class="sc">:.1f}</span><span class="ss"> s (~</span><span class="sc">{</span>total <span class="op">/</span> <span class="dv">60</span><span class="sc">:.1f}</span><span class="ss"> min)&quot;</span>)</span>
+<span id="d10-cb6-47"><a href="#d10-cb6-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb6-48"><a href="#d10-cb6-48" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;7. 32-bit sequence space: time to wrap (why PAWS/timestamps exist)&quot;</span>)</span>
+<span id="d10-cb6-49"><a href="#d10-cb6-49" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> gbps <span class="kw">in</span> (<span class="dv">1</span>, <span class="dv">10</span>, <span class="dv">100</span>):</span>
+<span id="d10-cb6-50"><a href="#d10-cb6-50" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;   </span><span class="sc">{</span>gbps<span class="sc">:&gt;3}</span><span class="ss"> Gbit/s: </span><span class="sc">{</span><span class="dv">2</span><span class="op">**</span><span class="dv">32</span> <span class="op">*</span> <span class="dv">8</span> <span class="op">/</span> (gbps <span class="op">*</span> <span class="fl">1e9</span>)<span class="sc">:6.2f}</span><span class="ss"> s&quot;</span>)</span>
+<span id="d10-cb6-51"><a href="#d10-cb6-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb6-52"><a href="#d10-cb6-52" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;8. TIME_WAIT budget: one client IP -&gt; one server ip:port&quot;</span>)</span>
+<span id="d10-cb6-53"><a href="#d10-cb6-53" aria-hidden="true" tabindex="-1"></a>ports <span class="op">=</span> <span class="dv">60999</span> <span class="op">-</span> <span class="dv">32768</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span id="d10-cb6-54"><a href="#d10-cb6-54" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;   </span><span class="sc">{</span>ports<span class="sc">:,}</span><span class="ss"> ephemeral ports / 60 s TIME_WAIT = </span><span class="sc">{</span>ports <span class="op">/</span> <span class="dv">60</span><span class="sc">:.0f}</span><span class="ss"> new connections/s sustained&quot;</span>)</span></code></pre></div>
+<p>Real output (Python 3.13):</p>
+<pre class="text"><code>1. Bandwidth-delay product (bytes that must be in flight to fill the pipe)
+     0.1 Gbit/s x  20 ms =    0.25 MB  (      173 segments)
+       1 Gbit/s x  20 ms =    2.50 MB  (    1,727 segments)
+       1 Gbit/s x 100 ms =   12.50 MB  (    8,633 segments)
+      10 Gbit/s x 100 ms =  125.00 MB  (   86,326 segments)
+2. Throughput ceiling = window / RTT
+   64 KiB (no window scaling)   @  20 ms -&gt;     26.2 Mbit/s
+   64 KiB (no window scaling)   @ 100 ms -&gt;      5.2 Mbit/s
+   6 MiB (common tcp_rmem max)  @  20 ms -&gt;   2516.6 Mbit/s
+   6 MiB (common tcp_rmem max)  @ 100 ms -&gt;    503.3 Mbit/s
+3. Loss ceiling for Reno-style AIMD (Mathis: rate &lt;= MSS/RTT * 1.22/sqrt(p))
+   RTT 100 ms, loss 0.01%:    14.1 Mbit/s, whatever the link speed
+   RTT 100 ms, loss 0.10%:     4.5 Mbit/s, whatever the link speed
+   RTT 100 ms, loss 1.00%:     1.4 Mbit/s, whatever the link speed
+4. Slow start from IW10: round trips to deliver a response (no loss)
+       14,480 bytes -&gt;  1 RTTs
+      100,000 bytes -&gt;  3 RTTs
+    1,000,000 bytes -&gt;  7 RTTs
+   10,000,000 bytes -&gt; 10 RTTs
+5. RTO from RTT samples (RFC 6298: alpha 1/8, beta 1/4, K 4)
+   sample 100 ms -&gt; srtt  100.0  rttvar  50.0  rto  300.0 ms
+   sample 102 ms -&gt; srtt  100.2  rttvar  38.0  rto  252.2 ms
+   sample  98 ms -&gt; srtt  100.0  rttvar  29.1  rto  216.2 ms
+   sample 250 ms -&gt; srtt  118.7  rttvar  59.3  rto  355.9 ms
+   sample 101 ms -&gt; srtt  116.5  rttvar  48.9  rto  312.1 ms
+   sample  99 ms -&gt; srtt  114.3  rttvar  41.1  rto  278.6 ms
+6. Give-up time for an established connection, tcp_retries2 = 15
+   200 ms doubling, capped at 120 s, 16 timeouts: 924.6 s (~15.4 min)
+7. 32-bit sequence space: time to wrap (why PAWS/timestamps exist)
+     1 Gbit/s:  34.36 s
+    10 Gbit/s:   3.44 s
+   100 Gbit/s:   0.34 s
+8. TIME_WAIT budget: one client IP -&gt; one server ip:port
+   28,232 ephemeral ports / 60 s TIME_WAIT = 471 new connections/s sustained</code></pre>
+<h3 id="d10-sequence-space">Sequence space</h3>
+<p>Sequence numbers are 32 bits and count bytes. The initial sequence number is randomised per connection (RFC 6528), so the numbers in two captures never line up. At 10 Gbit/s the whole space wraps in 3.4 seconds, which is shorter than the time an old duplicate segment can survive in the network. The timestamp option (RFC 7323) fixes this: PAWS (Protection Against Wrapped Sequences) rejects segments whose timestamp is older than the last one seen. That is one reason Linux sends 12 bytes of timestamps on every segment.</p>
+<p>The 16-bit window field can describe at most 65,535 bytes. Window scaling, agreed once in the SYN and SYN-ACK, shifts it left by up to 14 bits, for a maximum window of about 1 GiB. If either side's SYN lacks the option, the connection is stuck at 64 KiB for its whole life. Row 2 shows what that costs: 5.2 Mbit/s at 100 ms, however fast the link. Middleboxes that strip TCP options used to cause exactly this.</p>
+<h3 id="d10-rwnd-versus-cwnd-and-buffer-sizing">rwnd versus cwnd, and buffer sizing</h3>
+<p>The bandwidth-delay product (row 1) is the number of bytes that must be in flight to keep a path busy. Both windows must reach it. On a 1 Gbit/s, 100 ms path that is 12.5 MB.</p>
+<p>rwnd is bounded by the receiver's socket buffer. Linux sizes it automatically (<code>tcp_moderate_rcvbuf=1</code>) within <code>net.ipv4.tcp_rmem</code>. That is three numbers: min, default and max. A common distro maximum is 6 MiB; this sandbox uses 32 MiB. With 6 MiB, a single connection on a 100 ms path tops out near 500 Mbit/s (row 2). The send side has <code>tcp_wmem</code> in the same way.</p>
+<p>Two traps live here. First, setting <code>SO_RCVBUF</code> yourself <em>switches off</em> autotuning for that socket, and the kernel doubles the value you ask for to cover its bookkeeping. A hard-coded 64 KiB buffer in an old library will quietly cap a long-distance transfer. Second, <code>net.core.rmem_max</code> caps what <code>setsockopt</code> may request, but it does not cap autotuning, which follows <code>tcp_rmem[2]</code>.</p>
+<p>Loss sets a ceiling of its own. For Reno-style AIMD, the Mathis formula (row 3) says a 100 ms path with 0.1% random loss cannot exceed about 4.5 Mbit/s per connection, whatever the link speed. CUBIC does better than Reno on long fat paths, and BBR does not treat loss as its main signal at all. That difference is why lossy long-haul links were where BBR first paid off.</p>
+<h3 id="d10-slow-start">Slow start</h3>
+<p>A new connection starts with an initial window of 10 segments (IW10, RFC 6928): 14,480 bytes with timestamps. Each ACK grows cwnd by the amount acknowledged, so cwnd doubles every round trip. Row 4 shows the consequence. A 100 KB response needs 3 round trips and a 1 MB response needs 7, even on an infinitely fast link. On a 100 ms path that is 300 ms and 700 ms of pure ramp-up. This is the strongest argument for reusing connections: a warm connection keeps its cwnd.</p>
+<p>Slow start ends at <code>ssthresh</code>, at the first loss, or when HyStart notices RTT rising (Linux CUBIC uses HyStart; RFC 9406 standardises HyStart++). Watch one more Linux default: <code>net.ipv4.tcp_slow_start_after_idle=1</code> collapses cwnd after the connection has been idle for longer than one RTO. A long-lived HTTP/2 or gRPC connection with bursty traffic therefore pays slow start again after every pause. Many operators set it to 0 on servers.</p>
+<h3 id="d10-cubic-and-bbr-measured">CUBIC and BBR, measured</h3>
+<p>The lab router shapes the server-to-client direction to 20 Mbit/s with a deep queue (<code>tc qdisc add dev eth0 root tbf rate 20mbit burst 32kb latency 200ms</code>). The server sends for nine seconds, once with CUBIC and once with BBR, chosen per socket with <code>setsockopt(IPPROTO_TCP, TCP_CONGESTION, b"cubic")</code>. A <code>ping</code> runs alongside. Real results, with <code>ss -ti</code> sampled about five seconds in:</p>
+<pre class="text"><code>########## cubic
+ cubic rto:412 rtt:210.532/0.483 mss:1448 cwnd:351 ssthresh:258 ... send 19312903bps
+       delivery_rate 19120768bps unacked:351 retrans:0/33 minrtt:0.062
+ping during transfer: rtt min/avg/max/mdev = 87.626/169.372/211.304/32.528 ms
+client: 19.1 Mbit/s goodput
+
+########## bbr
+ bbr rto:208 rtt:6.923/0.253 mss:1448 cwnd:18
+       bbr:(bw:19223792bps,mrtt:0.026,pacing_gain:1,cwnd_gain:2) pacing_rate 19031552bps
+       delivery_rate 19112184bps unacked:8 minrtt:0.026
+ping during transfer: rtt min/avg/max/mdev = 1.849/7.000/11.878/2.311 ms
+client: 19.2 Mbit/s goodput</code></pre>
+<p>Both algorithms deliver the full 19 Mbit/s. The difference is what they do to everyone else. CUBIC is loss-based: it keeps growing cwnd until a packet drops, so it fills the router's 200 ms queue. Its cwnd of 351 segments is about 508 KB, which is roughly the bottleneck rate times the <em>queue</em> delay. Every other flow sharing that link now waits 210 ms. This is <strong>bufferbloat</strong>, and the ping column shows it.</p>
+<p>BBR builds a model instead. It tracks the bottleneck bandwidth (<code>bw:19.2 Mbit/s</code>, the maximum delivery rate over recent round trips) and the minimum RTT (<code>mrtt</code>). It then paces packets at that bandwidth (<code>pacing_rate</code>) and caps cwnd near <code>cwnd_gain × bandwidth × min RTT</code>, so the queue stays almost empty. Here 18 segments were enough. Every ten seconds or so BBR briefly drops to a tiny window (ProbeRTT) to re-measure the minimum RTT. The <code>pacing_gain:1</code> shown is its steady cruise phase.</p>
+<p>The mechanics of CUBIC (RFC 9438) are worth knowing too. After a loss it cuts cwnd to 70% (β = 0.7), not 50% as Reno does. It then grows along a cubic curve, W(t) = C(t − K)³ + W_max with C = 0.4: fast at first, flattening as it nears the window where the last loss happened, then probing beyond it. The curve depends on time since the last loss, not on RTT, which makes it fairer between short- and long-RTT flows than Reno.</p>
+<p>BBR has honest caveats. Version 1, which mainline Linux ships as <code>tcp_bbr</code>, can be unfair to CUBIC flows and can cause heavy retransmission on shallow buffers. Later versions add responses to loss and ECN; check which one your kernel or QUIC library actually runs. The real fix for bufferbloat is in the router: an AQM such as fq_codel (CoDel target 5 ms, interval 100 ms) keeps queues short whatever the senders do.</p>
+<h3 id="d10-rto-and-the-15-minute-timeout">RTO and the 15-minute timeout</h3>
+<p>Row 5 is RFC 6298 in action. The timeout is the smoothed RTT plus four times its variance, so one 250 ms outlier pushes the RTO from 216 ms to 356 ms. RFC 6298 asks for a 1-second floor. Linux uses a 200 ms floor instead and in practice comes out near SRTT + 200 ms on a stable path. The lab shows exactly that: <code>rtt:210.5</code> gave <code>rto:412</code>, and <code>rtt:6.9</code> gave <code>rto:208</code>.</p>
+<p>Each consecutive timeout doubles the RTO, which the PMTUD black-hole capture in the Module 09 deep dive shows on the wire: +0.22 s, +0.41 s, +0.84 s, +1.66 s, +3.29 s. With <code>tcp_retries2=15</code>, an established connection whose peer has vanished keeps retrying for about 924.6 seconds (row 6) before the application sees <code>ETIMEDOUT</code>. That is over fifteen minutes. <code>TCP_USER_TIMEOUT</code> (RFC 5482) caps it per socket, and application-level deadlines cap it from above.</p>
+<h3 id="d10-time_wait-and-port-exhaustion">TIME_WAIT and port exhaustion</h3>
+<p>A connection is identified by its 4-tuple. A client talking to <em>one</em> server address and port can only vary its own port, and every port it closed first is held for 60 seconds. Row 8 gives the budget: 28,232 ephemeral ports divided by 60 s is about 471 new connections per second, sustained, per destination. macOS has 16,384 ephemeral ports (49152–65535) but a 30-second TIME_WAIT.</p>
+<p>To show the wall without generating thousands of connections, the lab narrows the client's port range to four ports. Real output:</p>
+<pre class="text"><code>net.ipv4.tcp_tw_reuse = 0
+connection 1: local port 50002 ok
+connection 2: local port 50000 ok
+connection 3: local port 50003 ok
+connection 4: local port 50001 ok
+connection 5: [Errno 99] Cannot assign requested address
+connection 6: [Errno 99] Cannot assign requested address
+
+net.ipv4.tcp_tw_reuse = 1
+connection 1: local port 50002 ok
+connection 2: local port 50000 ok
+connection 3: local port 50001 ok
+connection 4: local port 50003 ok
+connection 5: local port 50002 ok      &lt;- reused a TIME_WAIT port older than 1 s
+connection 6: local port 50000 ok</code></pre>
+<p><code>EADDRNOTAVAIL</code> ("Cannot assign requested address") on <code>connect()</code> is the signature. <code>tcp_tw_reuse=1</code> lets <em>outgoing</em> connections take over a TIME_WAIT entry that is more than one second old. It is safe because timestamps let the kernel tell old segments from new ones. The default on current kernels is <code>2</code>, which means loopback only. The old <code>tcp_tw_recycle</code> broke clients behind NAT and was removed in Linux 4.12. Do not go looking for it.</p>
+<h3 id="d10-nagle-and-delayed-ack">Nagle and delayed ACK</h3>
+<p>Nagle's algorithm (RFC 896) holds back a small segment while any earlier data is unacknowledged. Delayed ACK (RFC 1122) lets a receiver wait up to 500 ms (Linux: 40 ms minimum) before acknowledging, hoping to piggyback the ACK on a reply. Each is sensible alone. Together they deadlock briefly whenever an application does <em>write, write, read</em>:</p>
+<div class="sourceCode" id="d10-cb10"><pre class="sourceCode python"><code class="sourceCode python"><span id="d10-cb10-1"><a href="#d10-cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;nagle_delack.py - the write-write-read stall, measured.</span></span>
+<span id="d10-cb10-2"><a href="#d10-cb10-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb10-3"><a href="#d10-cb10-3" aria-hidden="true" tabindex="-1"></a><span class="co">The client sends each request as two small writes (header, then body) and waits</span></span>
+<span id="d10-cb10-4"><a href="#d10-cb10-4" aria-hidden="true" tabindex="-1"></a><span class="co">for a reply. With Nagle on, the body waits for the ACK of the header; the server</span></span>
+<span id="d10-cb10-5"><a href="#d10-cb10-5" aria-hidden="true" tabindex="-1"></a><span class="co">delays that ACK because it has nothing to send yet. Run on loopback:</span></span>
+<span id="d10-cb10-6"><a href="#d10-cb10-6" aria-hidden="true" tabindex="-1"></a><span class="co">    python3 nagle_delack.py</span></span>
+<span id="d10-cb10-7"><a href="#d10-cb10-7" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d10-cb10-8"><a href="#d10-cb10-8" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> socket</span>
+<span id="d10-cb10-9"><a href="#d10-cb10-9" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> statistics</span>
+<span id="d10-cb10-10"><a href="#d10-cb10-10" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> threading</span>
+<span id="d10-cb10-11"><a href="#d10-cb10-11" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="d10-cb10-12"><a href="#d10-cb10-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb10-13"><a href="#d10-cb10-13" aria-hidden="true" tabindex="-1"></a>HEADER, BODY, ROUNDS <span class="op">=</span> <span class="st">b&quot;LEN 5</span><span class="ch">\n</span><span class="st">&quot;</span>, <span class="st">b&quot;hello&quot;</span>, <span class="dv">40</span></span>
+<span id="d10-cb10-14"><a href="#d10-cb10-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb10-15"><a href="#d10-cb10-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb10-16"><a href="#d10-cb10-16" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> server(listener):</span>
+<span id="d10-cb10-17"><a href="#d10-cb10-17" aria-hidden="true" tabindex="-1"></a>    conn, _ <span class="op">=</span> listener.accept()</span>
+<span id="d10-cb10-18"><a href="#d10-cb10-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> conn:</span>
+<span id="d10-cb10-19"><a href="#d10-cb10-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="va">True</span>:</span>
+<span id="d10-cb10-20"><a href="#d10-cb10-20" aria-hidden="true" tabindex="-1"></a>            data <span class="op">=</span> <span class="st">b&quot;&quot;</span></span>
+<span id="d10-cb10-21"><a href="#d10-cb10-21" aria-hidden="true" tabindex="-1"></a>            <span class="cf">while</span> <span class="bu">len</span>(data) <span class="op">&lt;</span> <span class="bu">len</span>(HEADER) <span class="op">+</span> <span class="bu">len</span>(BODY):   <span class="co"># wait for a whole request</span></span>
+<span id="d10-cb10-22"><a href="#d10-cb10-22" aria-hidden="true" tabindex="-1"></a>                chunk <span class="op">=</span> conn.recv(<span class="dv">64</span>)</span>
+<span id="d10-cb10-23"><a href="#d10-cb10-23" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="kw">not</span> chunk:</span>
+<span id="d10-cb10-24"><a href="#d10-cb10-24" aria-hidden="true" tabindex="-1"></a>                    <span class="cf">return</span></span>
+<span id="d10-cb10-25"><a href="#d10-cb10-25" aria-hidden="true" tabindex="-1"></a>                data <span class="op">+=</span> chunk</span>
+<span id="d10-cb10-26"><a href="#d10-cb10-26" aria-hidden="true" tabindex="-1"></a>            conn.sendall(<span class="st">b&quot;ok&quot;</span>)</span>
+<span id="d10-cb10-27"><a href="#d10-cb10-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb10-28"><a href="#d10-cb10-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb10-29"><a href="#d10-cb10-29" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> run(nodelay):</span>
+<span id="d10-cb10-30"><a href="#d10-cb10-30" aria-hidden="true" tabindex="-1"></a>    listener <span class="op">=</span> socket.create_server((<span class="st">&quot;127.0.0.1&quot;</span>, <span class="dv">0</span>))</span>
+<span id="d10-cb10-31"><a href="#d10-cb10-31" aria-hidden="true" tabindex="-1"></a>    threading.Thread(target<span class="op">=</span>server, args<span class="op">=</span>(listener,), daemon<span class="op">=</span><span class="va">True</span>).start()</span>
+<span id="d10-cb10-32"><a href="#d10-cb10-32" aria-hidden="true" tabindex="-1"></a>    client <span class="op">=</span> socket.create_connection(listener.getsockname())</span>
+<span id="d10-cb10-33"><a href="#d10-cb10-33" aria-hidden="true" tabindex="-1"></a>    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, nodelay)</span>
+<span id="d10-cb10-34"><a href="#d10-cb10-34" aria-hidden="true" tabindex="-1"></a>    samples <span class="op">=</span> []</span>
+<span id="d10-cb10-35"><a href="#d10-cb10-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(ROUNDS):</span>
+<span id="d10-cb10-36"><a href="#d10-cb10-36" aria-hidden="true" tabindex="-1"></a>        t0 <span class="op">=</span> time.perf_counter()</span>
+<span id="d10-cb10-37"><a href="#d10-cb10-37" aria-hidden="true" tabindex="-1"></a>        client.sendall(HEADER)          <span class="co"># write 1</span></span>
+<span id="d10-cb10-38"><a href="#d10-cb10-38" aria-hidden="true" tabindex="-1"></a>        client.sendall(BODY)            <span class="co"># write 2 - Nagle holds this back</span></span>
+<span id="d10-cb10-39"><a href="#d10-cb10-39" aria-hidden="true" tabindex="-1"></a>        client.recv(<span class="dv">2</span>)                  <span class="co"># read</span></span>
+<span id="d10-cb10-40"><a href="#d10-cb10-40" aria-hidden="true" tabindex="-1"></a>        samples.append((time.perf_counter() <span class="op">-</span> t0) <span class="op">*</span> <span class="dv">1000</span>)</span>
+<span id="d10-cb10-41"><a href="#d10-cb10-41" aria-hidden="true" tabindex="-1"></a>    client.close()</span>
+<span id="d10-cb10-42"><a href="#d10-cb10-42" aria-hidden="true" tabindex="-1"></a>    listener.close()</span>
+<span id="d10-cb10-43"><a href="#d10-cb10-43" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> samples</span>
+<span id="d10-cb10-44"><a href="#d10-cb10-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb10-45"><a href="#d10-cb10-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb10-46"><a href="#d10-cb10-46" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> nodelay <span class="kw">in</span> (<span class="dv">0</span>, <span class="dv">1</span>):</span>
+<span id="d10-cb10-47"><a href="#d10-cb10-47" aria-hidden="true" tabindex="-1"></a>    s <span class="op">=</span> run(nodelay)</span>
+<span id="d10-cb10-48"><a href="#d10-cb10-48" aria-hidden="true" tabindex="-1"></a>    label <span class="op">=</span> <span class="st">&quot;TCP_NODELAY=1 (Nagle off)&quot;</span> <span class="cf">if</span> nodelay <span class="cf">else</span> <span class="st">&quot;TCP_NODELAY=0 (Nagle on) &quot;</span></span>
+<span id="d10-cb10-49"><a href="#d10-cb10-49" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>label<span class="sc">}</span><span class="ss">  median </span><span class="sc">{</span>statistics<span class="sc">.</span>median(s)<span class="sc">:7.3f}</span><span class="ss"> ms   &quot;</span></span>
+<span id="d10-cb10-50"><a href="#d10-cb10-50" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;max </span><span class="sc">{</span><span class="bu">max</span>(s)<span class="sc">:7.3f}</span><span class="ss"> ms   total for </span><span class="sc">{</span>ROUNDS<span class="sc">}</span><span class="ss"> requests </span><span class="sc">{</span><span class="bu">sum</span>(s)<span class="sc">:7.1f}</span><span class="ss"> ms&quot;</span>)</span></code></pre></div>
+<p>Real output on Linux loopback:</p>
+<pre class="text"><code>TCP_NODELAY=0 (Nagle on)   median  43.980 ms   max  44.195 ms   total for 40 requests  1712.4 ms
+TCP_NODELAY=1 (Nagle off)  median   0.041 ms   max   0.138 ms   total for 40 requests     2.0 ms</code></pre>
+<p>A thousandfold difference on a path with no latency at all. The header goes out at once. The body waits for the header's ACK (Nagle). The server will not ACK yet, because it is waiting for the whole request before replying (delayed ACK). After about 40 ms the delayed-ACK timer fires and everything moves. The first few requests are fast because Linux starts each connection in "quick ACK" mode; that is why the total is less than 40 × 44 ms.</p>
+<p>The best fix is to write each message in one call, by buffering or with <code>writev</code>/<code>sendmsg</code>. The common fix is <code>TCP_NODELAY</code>, which many frameworks set by default (Go's <code>net</code> package does). <code>TCP_CORK</code> (Linux) and <code>MSG_MORE</code> go the other way: they tell the kernel to hold data until you say the message is complete. On macOS the delayed-ACK behaviour differs in detail, but the write-write-read pattern stalls there too.</p>
+<h3 id="d10-keepalive">Keepalive</h3>
+<p>An idle TCP connection sends nothing at all. If the peer's machine loses power, or a NAT box forgets the mapping, neither side notices until it next sends. Keepalive probes fix that, but the Linux defaults (7200 s idle, then 9 probes 75 s apart) mean a dead peer is noticed after 7,875 seconds: more than two hours. Set the timers per socket:</p>
+<div class="sourceCode" id="d10-cb12"><pre class="sourceCode python"><code class="sourceCode python"><span id="d10-cb12-1"><a href="#d10-cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;keepalive.py - turn on TCP keepalive with timers short enough to matter.&quot;&quot;&quot;</span></span>
+<span id="d10-cb12-2"><a href="#d10-cb12-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> socket</span>
+<span id="d10-cb12-3"><a href="#d10-cb12-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> subprocess</span>
+<span id="d10-cb12-4"><a href="#d10-cb12-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> sys</span>
+<span id="d10-cb12-5"><a href="#d10-cb12-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb12-6"><a href="#d10-cb12-6" aria-hidden="true" tabindex="-1"></a>listener <span class="op">=</span> socket.create_server((<span class="st">&quot;127.0.0.1&quot;</span>, <span class="dv">0</span>))</span>
+<span id="d10-cb12-7"><a href="#d10-cb12-7" aria-hidden="true" tabindex="-1"></a>s <span class="op">=</span> socket.create_connection(listener.getsockname())</span>
+<span id="d10-cb12-8"><a href="#d10-cb12-8" aria-hidden="true" tabindex="-1"></a>peer, _ <span class="op">=</span> listener.accept()</span>
+<span id="d10-cb12-9"><a href="#d10-cb12-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb12-10"><a href="#d10-cb12-10" aria-hidden="true" tabindex="-1"></a>s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, <span class="dv">1</span>)</span>
+<span id="d10-cb12-11"><a href="#d10-cb12-11" aria-hidden="true" tabindex="-1"></a>idle_opt <span class="op">=</span> socket.TCP_KEEPALIVE <span class="cf">if</span> sys.platform <span class="op">==</span> <span class="st">&quot;darwin&quot;</span> <span class="cf">else</span> socket.TCP_KEEPIDLE</span>
+<span id="d10-cb12-12"><a href="#d10-cb12-12" aria-hidden="true" tabindex="-1"></a>s.setsockopt(socket.IPPROTO_TCP, idle_opt, <span class="dv">60</span>)               <span class="co"># first probe after 60 s idle</span></span>
+<span id="d10-cb12-13"><a href="#d10-cb12-13" aria-hidden="true" tabindex="-1"></a>s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, <span class="dv">10</span>)   <span class="co"># then every 10 s</span></span>
+<span id="d10-cb12-14"><a href="#d10-cb12-14" aria-hidden="true" tabindex="-1"></a>s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, <span class="dv">3</span>)      <span class="co"># give up after 3 misses</span></span>
+<span id="d10-cb12-15"><a href="#d10-cb12-15" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;dead peer detected after at most&quot;</span>, <span class="dv">60</span> <span class="op">+</span> <span class="dv">10</span> <span class="op">*</span> <span class="dv">3</span>, <span class="st">&quot;s of silence&quot;</span>)</span>
+<span id="d10-cb12-16"><a href="#d10-cb12-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb12-17"><a href="#d10-cb12-17" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> sys.platform.startswith(<span class="st">&quot;linux&quot;</span>):</span>
+<span id="d10-cb12-18"><a href="#d10-cb12-18" aria-hidden="true" tabindex="-1"></a>    port <span class="op">=</span> s.getsockname()[<span class="dv">1</span>]</span>
+<span id="d10-cb12-19"><a href="#d10-cb12-19" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> subprocess.run([<span class="st">&quot;ss&quot;</span>, <span class="st">&quot;-tno&quot;</span>, <span class="ss">f&quot;sport = :</span><span class="sc">{</span>port<span class="sc">}</span><span class="ss">&quot;</span>], capture_output<span class="op">=</span><span class="va">True</span>, text<span class="op">=</span><span class="va">True</span>)</span>
+<span id="d10-cb12-20"><a href="#d10-cb12-20" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(out.stdout.strip())</span></code></pre></div>
+<p>Real output on Linux; <code>ss -o</code> shows the armed timer:</p>
+<pre class="text"><code>dead peer detected after at most 90 s of silence
+State Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+ESTAB 0      0          127.0.0.1:58832    127.0.0.1:40437 timer:(keepalive,59sec,0)</code></pre>
+<p>TCP keepalive is not HTTP keep-alive. HTTP keep-alive means "reuse this connection for another request". TCP keepalive means "send an empty probe so the path stays known to be alive".</p>
+<h3 id="d10-udp-nothing-pushes-back">UDP: nothing pushes back</h3>
+<p>UDP has no window, no ACKs and no congestion control. A sender can always send faster than a receiver reads, and the excess is dropped at the receiver's socket buffer. Nobody tells the sender.</p>
+<div class="sourceCode" id="d10-cb14"><pre class="sourceCode python"><code class="sourceCode python"><span id="d10-cb14-1"><a href="#d10-cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;udp_drops.py - UDP has no flow control: a slow reader loses datagrams silently.</span></span>
+<span id="d10-cb14-2"><a href="#d10-cb14-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb14-3"><a href="#d10-cb14-3" aria-hidden="true" tabindex="-1"></a><span class="co">The sender fires 10,000 x 1,200-byte datagrams at a receiver that is busy.</span></span>
+<span id="d10-cb14-4"><a href="#d10-cb14-4" aria-hidden="true" tabindex="-1"></a><span class="co">Nothing tells the sender; the kernel drops what does not fit in the socket buffer.</span></span>
+<span id="d10-cb14-5"><a href="#d10-cb14-5" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d10-cb14-6"><a href="#d10-cb14-6" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> socket</span>
+<span id="d10-cb14-7"><a href="#d10-cb14-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="d10-cb14-8"><a href="#d10-cb14-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb14-9"><a href="#d10-cb14-9" aria-hidden="true" tabindex="-1"></a>N, SIZE <span class="op">=</span> <span class="dv">10_000</span>, <span class="dv">1200</span></span>
+<span id="d10-cb14-10"><a href="#d10-cb14-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb14-11"><a href="#d10-cb14-11" aria-hidden="true" tabindex="-1"></a>rx <span class="op">=</span> socket.socket(socket.AF_INET, socket.SOCK_DGRAM)</span>
+<span id="d10-cb14-12"><a href="#d10-cb14-12" aria-hidden="true" tabindex="-1"></a>rx.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, <span class="dv">256</span> <span class="op">*</span> <span class="dv">1024</span>)</span>
+<span id="d10-cb14-13"><a href="#d10-cb14-13" aria-hidden="true" tabindex="-1"></a>rx.bind((<span class="st">&quot;127.0.0.1&quot;</span>, <span class="dv">0</span>))</span>
+<span id="d10-cb14-14"><a href="#d10-cb14-14" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;receive buffer: asked 262144, kernel granted &quot;</span></span>
+<span id="d10-cb14-15"><a href="#d10-cb14-15" aria-hidden="true" tabindex="-1"></a>      <span class="ss">f&quot;</span><span class="sc">{</span>rx<span class="sc">.</span>getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)<span class="sc">}</span><span class="ss"> bytes&quot;</span>)</span>
+<span id="d10-cb14-16"><a href="#d10-cb14-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb14-17"><a href="#d10-cb14-17" aria-hidden="true" tabindex="-1"></a>tx <span class="op">=</span> socket.socket(socket.AF_INET, socket.SOCK_DGRAM)</span>
+<span id="d10-cb14-18"><a href="#d10-cb14-18" aria-hidden="true" tabindex="-1"></a>payload <span class="op">=</span> <span class="st">b&quot;x&quot;</span> <span class="op">*</span> SIZE</span>
+<span id="d10-cb14-19"><a href="#d10-cb14-19" aria-hidden="true" tabindex="-1"></a>sent_ok <span class="op">=</span> <span class="dv">0</span></span>
+<span id="d10-cb14-20"><a href="#d10-cb14-20" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(N):                 <span class="co"># receiver is &quot;busy&quot;: it reads nothing meanwhile</span></span>
+<span id="d10-cb14-21"><a href="#d10-cb14-21" aria-hidden="true" tabindex="-1"></a>    sent_ok <span class="op">+=</span> tx.sendto(payload, rx.getsockname()) <span class="op">==</span> SIZE</span>
+<span id="d10-cb14-22"><a href="#d10-cb14-22" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;sender: </span><span class="sc">{</span>sent_ok<span class="sc">}</span><span class="ss"> sendto() calls succeeded, no errors reported&quot;</span>)</span>
+<span id="d10-cb14-23"><a href="#d10-cb14-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d10-cb14-24"><a href="#d10-cb14-24" aria-hidden="true" tabindex="-1"></a>time.sleep(<span class="fl">0.2</span>)</span>
+<span id="d10-cb14-25"><a href="#d10-cb14-25" aria-hidden="true" tabindex="-1"></a>rx.setblocking(<span class="va">False</span>)</span>
+<span id="d10-cb14-26"><a href="#d10-cb14-26" aria-hidden="true" tabindex="-1"></a>got <span class="op">=</span> <span class="dv">0</span></span>
+<span id="d10-cb14-27"><a href="#d10-cb14-27" aria-hidden="true" tabindex="-1"></a><span class="cf">try</span>:</span>
+<span id="d10-cb14-28"><a href="#d10-cb14-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="va">True</span>:</span>
+<span id="d10-cb14-29"><a href="#d10-cb14-29" aria-hidden="true" tabindex="-1"></a>        rx.recv(<span class="dv">2048</span>)</span>
+<span id="d10-cb14-30"><a href="#d10-cb14-30" aria-hidden="true" tabindex="-1"></a>        got <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="d10-cb14-31"><a href="#d10-cb14-31" aria-hidden="true" tabindex="-1"></a><span class="cf">except</span> <span class="pp">BlockingIOError</span>:</span>
+<span id="d10-cb14-32"><a href="#d10-cb14-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">pass</span></span>
+<span id="d10-cb14-33"><a href="#d10-cb14-33" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;receiver: </span><span class="sc">{</span>got<span class="sc">}</span><span class="ss"> datagrams delivered, </span><span class="sc">{</span>N <span class="op">-</span> got<span class="sc">}</span><span class="ss"> silently dropped &quot;</span></span>
+<span id="d10-cb14-34"><a href="#d10-cb14-34" aria-hidden="true" tabindex="-1"></a>      <span class="ss">f&quot;(</span><span class="sc">{</span>(N <span class="op">-</span> got) <span class="op">/</span> N<span class="sc">:.1%}</span><span class="ss">)&quot;</span>)</span></code></pre></div>
+<p>Real output on Linux, followed by the kernel's UDP counters (<code>grep Udp: /proc/net/snmp</code>):</p>
+<pre class="text"><code>receive buffer: asked 262144, kernel granted 524288 bytes
+sender: 10000 sendto() calls succeeded, no errors reported
+receiver: 227 datagrams delivered, 9773 silently dropped (97.7%)
+
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors
+Udp: 263 0 9773 10036 9773 0 0 0 0</code></pre>
+<p>Three lessons are packed in here. First, every one of the 10,000 <code>sendto()</code> calls succeeded, because success only means "handed to the kernel". Second, <code>RcvbufErrors</code> counted all 9,773 drops; on Linux, <code>nstat -az UdpRcvbufErrors</code> reads the same counter, and <code>ss -uamn</code> shows per-socket drops in the <code>d</code> field of <code>skmem</code>. On macOS, <code>netstat -s -p udp</code> reports them as "dropped due to full socket buffers". Third, a 512 KiB buffer held only 227 datagrams of 1,200 bytes. That is about 2.3 KB each, because the kernel charges each datagram's full in-memory size (its <code>truesize</code>), not just its payload. Size UDP buffers in packets times overhead, not in payload bytes.</p>
+<h2 id="d10-failure-modes">Deep dive: production failure modes</h2>
+<p><strong>1. Small RPCs take 40 ms (or 200 ms) no matter what.</strong> <em>Mechanism:</em> Nagle plus delayed ACK on a write-write-read pattern, as measured above. <em>Prove it:</em> in a capture, the second small segment leaves exactly when the peer's ACK arrives, about 40 ms after the first. In <code>strace -e trace=write,sendto</code>, one logical message goes out in two syscalls. <em>Fix:</em> coalesce writes, or set <code>TCP_NODELAY</code>.</p>
+<p><strong>2. <code>connect: Cannot assign requested address</code> under load.</strong> <em>Mechanism:</em> ephemeral ports to one destination are all in TIME_WAIT or in use. <em>Prove it:</em> <code>ss -tan state time-wait dst &lt;ip&gt; | wc -l</code> approaches the size of <code>ip_local_port_range</code>. <code>ss -s</code> shows the totals. <em>Fix:</em> connection pooling and keep-alive, first and foremost. Then <code>tcp_tw_reuse=1</code>, a wider port range, or more destination IPs or ports. Do not use <code>SO_LINGER</code> with a zero timeout to dodge TIME_WAIT: it turns every close into a RST.</p>
+<p><strong>3. CLOSE_WAIT climbs forever.</strong> <em>Mechanism:</em> the peer closed and the kernel ACKed its FIN, but your application never called <code>close()</code>. This is a file descriptor leak, not a network problem. <em>Prove it:</em> <code>ss -tanp state close-wait</code> names the process. <code>ls /proc/&lt;pid&gt;/fd | wc -l</code> keeps rising. <em>Fix:</em> close sockets on every error path. Use context managers in Python, and <code>defer conn.Close()</code> in Go.</p>
+<p><strong>4. Throughput is far below the link speed on a long path.</strong> <em>Mechanism:</em> a window smaller than the BDP. Either rwnd is capped (a fixed <code>SO_RCVBUF</code>, a low <code>tcp_rmem</code> max, window scaling missing) or cwnd keeps collapsing because of loss. <em>Prove it:</em> <code>ss -ti</code> on the sender. If <code>snd_wnd</code> is small, or the <code>rwnd_limited</code> / <code>sndbuf_limited</code> time fields are large, a buffer is the cap. If <code>cwnd</code> is small with rising <code>retrans</code>, loss is the cap. Look at <code>wscale</code> in the SYN. <em>Fix:</em> raise <code>tcp_rmem</code>/<code>tcp_wmem</code> maxima, stop hard-coding socket buffers, find and fix the loss, or try BBR on the sender.</p>
+<p><strong>5. Latency spikes under load, while throughput stays fine.</strong> <em>Mechanism:</em> bufferbloat. Loss-based senders fill a deep queue at the bottleneck, as in the CUBIC run above. <em>Prove it:</em> ping (or <code>ss -ti</code> <code>rtt</code> against <code>minrtt</code>) while a bulk transfer runs. RTT jumps from its idle value to hundreds of milliseconds. <em>Fix:</em> AQM at the bottleneck (<code>fq_codel</code>, <code>cake</code>), or rate-limit just below the bottleneck so the queue forms where you control it. BBR on the senders helps their own traffic.</p>
+<p><strong>6. A pooled database connection hangs for 15 minutes after a quiet night.</strong> <em>Mechanism:</em> a NAT gateway or load balancer dropped the idle mapping. Common idle timeouts are 350 s for AWS NAT Gateway and NLB, and 4 minutes for an Azure load balancer by default; check current docs. The next query's segments vanish into nothing, and TCP retransmits for about 924 s before giving up. <em>Prove it:</em> <code>ss -ti</code> shows <code>retrans</code> and <code>backoff</code> rising on that socket, and the capture shows retransmissions with no reply. <em>Fix:</em> keepalive idle time below the middlebox timeout (for example 60 s); a pool max-idle-time below it too; <code>TCP_USER_TIMEOUT</code> to bound the hang.</p>
+<p><strong>7. A UDP service loses data and nobody logs an error.</strong> <em>Mechanism:</em> receive-buffer overflow, as shown above. <em>Prove it:</em> <code>nstat -az UdpRcvbufErrors</code> rises; per socket, look at the <code>d</code> field in <code>ss -uamn</code>. <em>Fix:</em> drain faster (more reader threads with <code>SO_REUSEPORT</code>, batching with <code>recvmmsg</code>), a bigger <code>SO_RCVBUF</code> (raise <code>net.core.rmem_max</code> first), or backpressure in the protocol itself.</p>
+<h2 id="d10-context-2026">Deep dive: 2026 context</h2>
+<p><strong>QUIC moved congestion control into user space.</strong> HTTP/3 runs CUBIC or BBR inside the QUIC library, not in the kernel, so <code>ss -ti</code> cannot see it. Use the library's qlog output instead. The UDP-buffer lesson above applies in full. QUIC stacks routinely warn at startup when they cannot get a receive buffer of several megabytes, and the fix is to raise <code>net.core.rmem_max</code> on the host. Kernel UDP segmentation offload (GSO/GRO) is what makes QUIC's CPU cost competitive with TCP.</p>
+<p><strong>Kubernetes multiplies connection state.</strong> A sidecar proxy turns one logical connection into two or three TCP connections, each with its own TIME_WAIT. Node-level SNAT funnels many pods through one source IP, so the per-destination port budget from row 8 is shared by every pod on the node. A full conntrack table shows up as <code>nf_conntrack: table full, dropping packet</code> in <code>dmesg</code>. One famous UDP case: parallel A and AAAA DNS lookups sent from the same socket could race in conntrack, so one was dropped and glibc retried only after a 5-second timeout. Workarounds include <code>options single-request-reopen</code> in <code>resolv.conf</code> and a node-local DNS cache.</p>
+<p><strong>Cloud middleboxes have idle timers and port budgets.</strong> An AWS NAT gateway supports up to 55,000 simultaneous connections to each unique destination (IP, port, protocol) per NAT IP, and both it and the NLB drop idle flows after 350 s by default. GCP Cloud NAT allocates a fixed number of ports per VM (64 by default). These are TIME_WAIT and keepalive problems wearing a cloud badge.</p>
+<p><strong>Congestion control keeps evolving.</strong> Large content providers run BBR on their edges. Low-latency signalling (L4S, RFC 9330–9332) is in early deployment on some access networks: routers mark packets with ECN instead of building a queue, and senders back off gently. Kernel TCP remains the default for service-to-service traffic, so the <code>ss -ti</code> skills in this deep dive still pay off every week.</p>
+<h2 id="d10-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1. A 1 Gbit/s link with 100 ms RTT gives one TCP connection only 5 Mbit/s. What is your first hypothesis, and how do you check it?</strong> A 64 KiB window: 65,535 bytes ÷ 0.1 s ≈ 5.2 Mbit/s. Window scaling is missing (an option stripped from the SYN by a middlebox, or disabled), or the application pinned a small <code>SO_RCVBUF</code>. Check <code>wscale</code> in the SYN and SYN-ACK, and <code>snd_wnd</code> in <code>ss -ti</code> on the sender. The BDP is 12.5 MB, so both windows need to reach that size.</p>
+<p><strong>Q2. What is the difference between rwnd and cwnd, and which one shows in a packet capture?</strong> rwnd is the receiver's free buffer space, advertised in every ACK's window field, so it is on the wire. cwnd is the sender's private estimate of what the network can hold, and it never appears in a packet. You infer it from bytes in flight, or read it from <code>ss -ti</code> on the sender. The sender may have min(rwnd, cwnd) bytes in flight. A zero rwnd points at the receiving application; a small cwnd points at the path.</p>
+<p><strong>Q3. CUBIC and BBR both reach full throughput through the same bottleneck. Why might users prefer one?</strong> CUBIC is loss-driven, so it keeps filling the bottleneck queue until a drop occurs. Every flow sharing that queue then sees the added delay; in the lab it was about 210 ms instead of under 1 ms. BBR estimates bottleneck bandwidth and minimum RTT and paces at that rate, keeping the queue nearly empty (7 ms in the same lab). The caveats: BBRv1 can be unfair to CUBIC and can retransmit heavily on shallow buffers. The router-side fix is AQM.</p>
+<p><strong>Q4. Fast retransmit is "three duplicate ACKs". Is that what Linux does?</strong> Not any more. Linux uses SACK with RACK-TLP (RFC 8985). A segment is declared lost when a later-sent segment has been acknowledged and a reordering window has passed, so recovery can start after one or two duplicate ACKs. The lab capture retransmitted after two. Tail loss probes send a probe segment after about two RTTs of silence, so that a loss at the end of a burst produces SACK information instead of waiting for a full RTO.</p>
+<p><strong>Q5. A client gets <code>EADDRNOTAVAIL</code> on <code>connect()</code> at about 500 new connections per second to one backend. Explain and fix.</strong> Each connection to the same destination IP and port needs a unique local port. The client closes first, so each used port sits in TIME_WAIT for 60 s. 28,232 ports ÷ 60 s ≈ 470 per second. Fix it with connection pooling and keep-alive, then <code>tcp_tw_reuse=1</code> (safe for outgoing connections because of timestamps), a wider port range, or more backend addresses. Not with <code>tcp_tw_recycle</code>, which broke NAT and was removed in Linux 4.12.</p>
+<p><strong>Q6. The peer's machine loses power mid-connection. How long until your application finds out?</strong> It depends on whether you have data in flight. With unacknowledged data, the RTO backs off exponentially, and with <code>tcp_retries2=15</code> the connection fails after about 924.6 s. With an idle connection and default keepalive, it takes 7200 s plus 9 × 75 s, over two hours. With no keepalive it is never. Bound it with <code>TCP_USER_TIMEOUT</code>, sensible keepalive timers and application-level deadlines.</p>
+<p><strong>Q7. Small request/response calls on a fast LAN take a steady 40 ms. What is happening?</strong> Nagle plus delayed ACK. The application writes a request in two pieces. Nagle holds the second piece until the first is acknowledged, and the receiver delays that ACK (40 ms minimum on Linux) because it has nothing to send until it has the whole request. Fix it by writing each message in one call, or by setting <code>TCP_NODELAY</code>.</p>
+<p><strong>Q8. A UDP metrics collector is missing data, but the senders report no errors. How do you diagnose it?</strong> UDP has no flow control or feedback, so <code>sendto()</code> succeeding proves nothing about delivery. On the receiver, check <code>UdpRcvbufErrors</code> (<code>nstat</code>) and the per-socket drop field in <code>ss -uamn</code>; on macOS, <code>netstat -s -p udp</code>. If they rise, the reader is too slow for its buffer. Remember the buffer is charged per datagram's in-memory size, not its payload. Raise <code>rmem_max</code> and <code>SO_RCVBUF</code>, add readers with <code>SO_REUSEPORT</code>, batch with <code>recvmmsg</code>, or add application-level acknowledgement and rate control.</p>

@@ -1,0 +1,437 @@
+<h2 id="d02-deep-dive">Deep dive: one HTTPS request, byte by byte</h2>
+<p>The postal analogy is right about the nesting. It hides three things you meet the moment you open a real capture.</p>
+<p>First, a "request" is not one envelope. Fetching a 1,257-byte page over HTTPS took <strong>17 frames and 4,630 bytes</strong> in the lab below, and a quarter of those bytes were headers. Second, the 1500-byte budget from section 4 is not a single rule. It is enforced by three separate mechanisms, MSS, fragmentation and path MTU discovery, and each one fails in its own recognisable way. Third, the packets in your capture are often not the packets on the wire. Modern hosts build 16 KB or 64 KB "packets" in software and let the NIC cut them up, so <code>tcpdump</code> happily shows you a 16,458-byte IP packet on a 1500-byte link.</p>
+<p>This deep dive walks one real HTTPS request frame by frame with exact byte counts, then breaks the MTU on purpose, then explains the giant packets.</p>
+<h2 id="d02-real-mental-model">Deep dive: the real mental model — big units inside, small units on the wire</h2>
+<p>Hold three size limits apart, because people blur them all the time.</p>
+<ul>
+<li><strong>MTU</strong> is a property of <em>one link</em>: the largest IP packet a frame on that link can carry. Standard Ethernet is 1500.</li>
+<li><strong>Path MTU</strong> is the smallest MTU of every link between two hosts. No single device knows it. It has to be discovered or assumed.</li>
+<li><strong>MSS</strong> is a TCP number each side announces in its SYN: "don't send me segments with more than this much payload." It is derived from the announcing host's <em>own</em> interface MTU, so it says nothing about the links in between.</li>
+</ul>
+<p>The sender's real segment size is the smallest of three things: the peer's MSS, the path MTU minus IP and TCP headers, and the TCP options it carries on every segment. With timestamps on, which is the default on Linux and macOS, every segment carries 12 bytes of options. So a full segment on a 1500-byte path holds <strong>1448</strong> bytes of data, not the 1460 from section 4.</p>
+<p>Now the part that explains your captures. The software stack does <em>not</em> work in 1500-byte units. TLS writes records of up to 16,384 bytes of plaintext. TCP builds buffers (skbs) of up to 64 KB. Segmentation into wire-sized pieces is pushed as late as possible: ideally into the NIC itself (TCP Segmentation Offload, TSO). Reassembly on the receiving side is pulled as early as possible: the driver merges consecutive segments before the stack sees them (Generic Receive Offload, GRO). Both exist for one reason: per-packet work is what costs CPU, so the stack handles one big unit instead of a dozen small ones.</p>
+<p>Packet capture taps the stack <em>between</em> those two points.</p>
+<div style="overflow-x:auto">
+<svg width="100%" viewBox="0 0 760 560" role="img" aria-labelledby="d02-tso-title d02-tso-desc" style="min-width:760px; background:#f5f5f5; border:1px solid #d8d4cc; border-radius:6px;">
+<title id="d02-tso-title">Why captures show giant packets: segmentation offload and the tap</title>
+<desc id="d02-tso-desc">On the sender, TCP hands one 16,406-byte buffer down the stack; tcpdump taps it before the NIC cuts it into twelve segments with TCP segmentation offload. Twelve frames of at most 1514 bytes cross the wire. On the receiver, GRO merges them back into one buffer before the tcpdump tap, so both captures show a 16,458-byte IP packet that never existed on the wire.</desc>
+<text x="380" y="32" text-anchor="middle" font-family="Georgia, serif" font-size="21" fill="#2d3142">Why captures show “giant” packets: segmentation offload and the tap</text>
+<text x="175" y="70" text-anchor="middle" font-family="monospace" font-size="12" fill="#6b6f7e">SENDER (TSO ON)</text>
+<text x="585" y="70" text-anchor="middle" font-family="monospace" font-size="12" fill="#6b6f7e">RECEIVER (GRO ON)</text>
+<rect x="30" y="84" width="290" height="54" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="44" y="106" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">TCP builds one large skb</text>
+<text x="44" y="125" font-family="monospace" font-size="11" fill="#6b6f7e">16,406 B payload · gso_size 1448</text>
+<rect x="30" y="160" width="290" height="54" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="44" y="182" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">Qdisc and driver queue</text>
+<text x="44" y="201" font-family="monospace" font-size="11" fill="#6b6f7e">one entry, not twelve</text>
+<rect x="30" y="236" width="290" height="54" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2.5"/>
+<circle cx="52" cy="263" r="9" fill="none" stroke="#bf4520" stroke-width="2"/>
+<circle cx="52" cy="263" r="3.5" fill="#bf4520"/>
+<text x="72" y="258" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">tcpdump tap sees it here</text>
+<text x="72" y="277" font-family="monospace" font-size="11" fill="#6b6f7e">IP length 16,458 · bigger than MTU</text>
+<rect x="30" y="312" width="290" height="54" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="44" y="334" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">NIC: TCP segmentation offload</text>
+<text x="44" y="353" font-family="monospace" font-size="11" fill="#6b6f7e">cuts 12 segments, fixes headers</text>
+<rect x="440" y="84" width="290" height="54" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="454" y="106" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">TCP receives one skb</text>
+<text x="454" y="125" font-family="monospace" font-size="11" fill="#6b6f7e">one ACK decision, one wake-up</text>
+<rect x="440" y="160" width="290" height="54" rx="6" fill="#fff7f0" stroke="#bf4520" stroke-width="2.5"/>
+<circle cx="462" cy="187" r="9" fill="none" stroke="#bf4520" stroke-width="2"/>
+<circle cx="462" cy="187" r="3.5" fill="#bf4520"/>
+<text x="482" y="182" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">tcpdump tap sees it here</text>
+<text x="482" y="201" font-family="monospace" font-size="11" fill="#6b6f7e">one 16,458 B packet again</text>
+<rect x="440" y="236" width="290" height="54" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="454" y="258" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">GRO in the NAPI poll</text>
+<text x="454" y="277" font-family="monospace" font-size="11" fill="#6b6f7e">merges in-order segs of one flow</text>
+<rect x="440" y="312" width="290" height="54" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.5"/>
+<text x="454" y="334" font-family="sans-serif" font-size="14" font-weight="600" fill="#2d3142">NIC RX ring</text>
+<text x="454" y="353" font-family="monospace" font-size="11" fill="#6b6f7e">12 frames arrive, ≤ 1514 B each</text>
+<line x1="175" y1="138" x2="175" y2="154" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="175,160 170,152 180,152" fill="#6b6f7e"/>
+<line x1="585" y1="160" x2="585" y2="144" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="585,138 580,146 590,146" fill="#6b6f7e"/>
+<line x1="175" y1="214" x2="175" y2="230" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="175,236 170,228 180,228" fill="#6b6f7e"/>
+<line x1="585" y1="236" x2="585" y2="220" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="585,214 580,222 590,222" fill="#6b6f7e"/>
+<line x1="175" y1="290" x2="175" y2="306" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="175,312 170,304 180,304" fill="#6b6f7e"/>
+<line x1="585" y1="312" x2="585" y2="296" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="585,290 580,298 590,298" fill="#6b6f7e"/>
+<line x1="40" y1="452" x2="720" y2="452" stroke="#2d3142" stroke-width="3"/>
+<line x1="175" y1="366" x2="175" y2="430" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="175,436 170,428 180,428" fill="#6b6f7e"/>
+<line x1="585" y1="436" x2="585" y2="374" stroke="#6b6f7e" stroke-width="1.5"/>
+<polygon points="585,368 580,376 590,376" fill="#6b6f7e"/>
+<rect x="128" y="412" width="34" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<rect x="170" y="412" width="34" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<rect x="212" y="412" width="34" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<rect x="254" y="412" width="34" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<rect x="296" y="412" width="34" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<rect x="338" y="412" width="34" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<rect x="380" y="412" width="34" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<rect x="422" y="412" width="34" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<rect x="464" y="412" width="34" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<rect x="506" y="412" width="34" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<rect x="548" y="412" width="34" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<rect x="590" y="412" width="12" height="24" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1.2"/>
+<text x="380" y="478" text-anchor="middle" font-family="monospace" font-size="12" fill="#6b6f7e">ON THE WIRE: 11 × 1514 B + 1 × 544 B FRAMES (EACH ≤ MTU 1500 AT THE IP LAYER)</text>
+<text x="380" y="514" text-anchor="middle" font-family="Georgia, serif" font-style="italic" font-size="14" fill="#bf4520">The capture is taken inside the host, before TSO on send and after GRO on receive.</text>
+<text x="380" y="536" text-anchor="middle" font-family="Georgia, serif" font-style="italic" font-size="14" fill="#bf4520">Software GSO cuts segments before the tap, so it shows normal-sized frames.</text>
+</svg>
+</div>
+<p>On the sender, the tap sits after the qdisc but before the NIC. With hardware TSO, it sees the big buffer. On the receiver, the tap sits after GRO, so it sees the merged buffer. The frames that actually crossed the cable never appear in either capture. Keep that picture in mind; the offload section below shows it in real captures.</p>
+<h2 id="d02-wire">Deep dive: what the wire actually carries</h2>
+<p>The lab is three Linux network namespaces joined by veth pairs: a client at 192.168.1.50, a router at 192.168.1.1/203.0.113.1, and a server at 203.0.113.10 running a Python 3.13 <code>http.server</code> wrapped in TLS 1.3. The client runs <code>curl</code> 8.5.0 with OpenSSL 3.0.13, fetching a 1,257-byte <code>index.html</code> over HTTP/1.1. <code>--resolve</code> skips DNS, which would add two UDP frames of roughly 80–100 bytes each at the front. Every byte below was captured, not constructed.</p>
+<h3 id="d02-the-capture">The capture</h3>
+<p><code>tcpdump -nn -e -v</code> on the client's interface:</p>
+<pre class="text"><code>18:34:43.671899 02:00:00:00:01:02 &gt; 02:00:00:00:01:01, ethertype IPv4 (0x0800), length 74: (tos 0x0, ttl 64, id 34736, offset 0, flags [DF], proto TCP (6), length 60)
+    192.168.1.50.40666 &gt; 203.0.113.10.443: Flags [S], cksum 0xfe13 (incorrect -&gt; 0x119b), seq 416868075, win 64240, options [mss 1460,sackOK,TS val 1696151577 ecr 0,nop,wscale 10], length 0
+18:34:43.671980 02:00:00:00:01:01 &gt; 02:00:00:00:01:02, ethertype IPv4 (0x0800), length 74: (tos 0x0, ttl 63, id 0, offset 0, flags [DF], proto TCP (6), length 60)
+    203.0.113.10.443 &gt; 192.168.1.50.40666: Flags [S.], cksum 0xfe13 (incorrect -&gt; 0x7f48), seq 2406442651, ack 416868076, win 65160, options [mss 1460,sackOK,TS val 4146372985 ecr 1696151577,nop,wscale 10], length 0
+18:34:43.671993 02:00:00:00:01:02 &gt; 02:00:00:00:01:01, ethertype IPv4 (0x0800), length 66: (tos 0x0, ttl 64, id 34737, offset 0, flags [DF], proto TCP (6), length 52)
+    192.168.1.50.40666 &gt; 203.0.113.10.443: Flags [.], cksum 0xfe0b (incorrect -&gt; 0xac60), ack 1, win 63, options [nop,nop,TS val 1696151578 ecr 4146372985], length 0
+18:34:43.681417 02:00:00:00:01:02 &gt; 02:00:00:00:01:01, ethertype IPv4 (0x0800), length 583: (tos 0x0, ttl 64, id 34738, offset 0, flags [DF], proto TCP (6), length 569)
+    192.168.1.50.40666 &gt; 203.0.113.10.443: Flags [P.], cksum 0x0011 (incorrect -&gt; 0x7220), seq 1:518, ack 1, win 63, options [nop,nop,TS val 1696151587 ecr 4146372985], length 517
+18:34:43.681454 02:00:00:00:01:01 &gt; 02:00:00:00:01:02, ethertype IPv4 (0x0800), length 66: (tos 0x0, ttl 63, id 39600, offset 0, flags [DF], proto TCP (6), length 52)
+    203.0.113.10.443 &gt; 192.168.1.50.40666: Flags [.], cksum 0xfe0b (incorrect -&gt; 0xaa47), ack 518, win 64, options [nop,nop,TS val 4146372995 ecr 1696151587], length 0
+18:34:43.682183 02:00:00:00:01:01 &gt; 02:00:00:00:01:02, ethertype IPv4 (0x0800), length 849: (tos 0x0, ttl 63, id 39601, offset 0, flags [DF], proto TCP (6), length 835)
+    203.0.113.10.443 &gt; 192.168.1.50.40666: Flags [P.], cksum 0x011b (incorrect -&gt; 0x828b), seq 1:784, ack 518, win 64, options [nop,nop,TS val 4146372996 ecr 1696151587], length 783
+18:34:43.682201 02:00:00:00:01:02 &gt; 02:00:00:00:01:01, ethertype IPv4 (0x0800), length 66: (tos 0x0, ttl 64, id 34739, offset 0, flags [DF], proto TCP (6), length 52)
+    192.168.1.50.40666 &gt; 203.0.113.10.443: Flags [.], cksum 0xfe0b (incorrect -&gt; 0xa737), ack 784, win 63, options [nop,nop,TS val 1696151588 ecr 4146372996], length 0
+18:34:43.685677 02:00:00:00:01:02 &gt; 02:00:00:00:01:01, ethertype IPv4 (0x0800), length 146: (tos 0x0, ttl 64, id 34740, offset 0, flags [DF], proto TCP (6), length 132)
+    192.168.1.50.40666 &gt; 203.0.113.10.443: Flags [P.], cksum 0xfe5b (incorrect -&gt; 0x4fb0), seq 518:598, ack 784, win 63, options [nop,nop,TS val 1696151591 ecr 4146372996], length 80
+18:34:43.685880 02:00:00:00:01:01 &gt; 02:00:00:00:01:02, ethertype IPv4 (0x0800), length 321: (tos 0x0, ttl 63, id 39602, offset 0, flags [DF], proto TCP (6), length 307)
+    203.0.113.10.443 &gt; 192.168.1.50.40666: Flags [P.], cksum 0xff0a (incorrect -&gt; 0x6464), seq 784:1039, ack 598, win 64, options [nop,nop,TS val 4146372999 ecr 1696151591], length 255
+18:34:43.685892 02:00:00:00:01:02 &gt; 02:00:00:00:01:01, ethertype IPv4 (0x0800), length 173: (tos 0x0, ttl 64, id 34741, offset 0, flags [DF], proto TCP (6), length 159)
+    192.168.1.50.40666 &gt; 203.0.113.10.443: Flags [P.], cksum 0xfe76 (incorrect -&gt; 0xf9f8), seq 598:705, ack 1039, win 63, options [nop,nop,TS val 1696151591 ecr 4146372999], length 107
+18:34:43.685928 02:00:00:00:01:01 &gt; 02:00:00:00:01:02, ethertype IPv4 (0x0800), length 321: (tos 0x0, ttl 63, id 39603, offset 0, flags [DF], proto TCP (6), length 307)
+    203.0.113.10.443 &gt; 192.168.1.50.40666: Flags [P.], cksum 0xff0a (incorrect -&gt; 0x105f), seq 1039:1294, ack 705, win 64, options [nop,nop,TS val 4146372999 ecr 1696151591], length 255
+18:34:43.689427 02:00:00:00:01:01 &gt; 02:00:00:00:01:02, ethertype IPv4 (0x0800), length 1514: (tos 0x0, ttl 63, id 39604, offset 0, flags [DF], proto TCP (6), length 1500)
+    203.0.113.10.443 &gt; 192.168.1.50.40666: Flags [.], cksum 0x03b4 (incorrect -&gt; 0xc959), seq 1294:2742, ack 705, win 64, options [nop,nop,TS val 4146373003 ecr 1696151591], length 1448
+18:34:43.689462 02:00:00:00:01:02 &gt; 02:00:00:00:01:01, ethertype IPv4 (0x0800), length 66: (tos 0x0, ttl 64, id 34742, offset 0, flags [DF], proto TCP (6), length 52)
+    192.168.1.50.40666 &gt; 203.0.113.10.443: Flags [.], cksum 0xfe0b (incorrect -&gt; 0x9ec9), ack 2742, win 66, options [nop,nop,TS val 1696151595 ecr 4146372999], length 0
+18:34:43.689472 02:00:00:00:01:01 &gt; 02:00:00:00:01:02, ethertype IPv4 (0x0800), length 101: (tos 0x0, ttl 63, id 39605, offset 0, flags [DF], proto TCP (6), length 87)
+    203.0.113.10.443 &gt; 192.168.1.50.40666: Flags [P.], cksum 0xfe2e (incorrect -&gt; 0xa7a9), seq 2742:2777, ack 705, win 64, options [nop,nop,TS val 4146373003 ecr 1696151595], length 35
+18:34:43.689529 02:00:00:00:01:01 &gt; 02:00:00:00:01:02, ethertype IPv4 (0x0800), length 66: (tos 0x0, ttl 63, id 39606, offset 0, flags [DF], proto TCP (6), length 52)
+    203.0.113.10.443 &gt; 192.168.1.50.40666: Flags [F.], cksum 0xfe0b (incorrect -&gt; 0x9ea3), seq 2777, ack 705, win 64, options [nop,nop,TS val 4146373003 ecr 1696151595], length 0
+18:34:43.689621 02:00:00:00:01:02 &gt; 02:00:00:00:01:01, ethertype IPv4 (0x0800), length 90: (tos 0x0, ttl 64, id 34743, offset 0, flags [DF], proto TCP (6), length 76)
+    192.168.1.50.40666 &gt; 203.0.113.10.443: Flags [P.], cksum 0xfe23 (incorrect -&gt; 0xd3d2), seq 705:729, ack 2778, win 66, options [nop,nop,TS val 1696151595 ecr 4146373003], length 24
+18:34:43.689657 02:00:00:00:01:01 &gt; 02:00:00:00:01:02, ethertype IPv4 (0x0800), length 54: (tos 0x0, ttl 63, id 0, offset 0, flags [DF], proto TCP (6), length 40)
+    203.0.113.10.443 &gt; 192.168.1.50.40666: Flags [R], cksum 0x1081 (correct), seq 2406445429, win 0, length 0</code></pre>
+<h3 id="d02-the-byte-budget">The byte budget</h3>
+<p>This stdlib script reads the pcap, splits every frame into Ethernet, IP and TCP headers and payload, and tracks TLS record boundaries across segments. TLS record headers (type, version, length) travel in clear even in TLS 1.3, so it can find them without any keys.</p>
+<p><code>code/d02/wire_budget.py</code>:</p>
+<div class="sourceCode" id="d02-cb2"><pre class="sourceCode python"><code class="sourceCode python"><span id="d02-cb2-1"><a href="#d02-cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;Walk a pcap with the stdlib only: per-frame byte budget and TLS record boundaries.</span></span>
+<span id="d02-cb2-2"><a href="#d02-cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d02-cb2-3"><a href="#d02-cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co">    python3.13 wire_budget.py capture.pcap</span></span>
+<span id="d02-cb2-4"><a href="#d02-cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co">Expects a classic pcap of one TCP connection to port 443 over Ethernet (tcpdump -w).</span></span>
+<span id="d02-cb2-5"><a href="#d02-cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co">&quot;&quot;&quot;</span></span>
+<span id="d02-cb2-6"><a href="#d02-cb2-6" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> struct</span>
+<span id="d02-cb2-7"><a href="#d02-cb2-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> sys</span>
+<span id="d02-cb2-8"><a href="#d02-cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d02-cb2-9"><a href="#d02-cb2-9" aria-hidden="true" tabindex="-1"></a>TLS_TYPES <span class="op">=</span> {<span class="dv">20</span>: <span class="st">&quot;ChangeCipherSpec&quot;</span>, <span class="dv">21</span>: <span class="st">&quot;Alert&quot;</span>, <span class="dv">22</span>: <span class="st">&quot;Handshake&quot;</span>, <span class="dv">23</span>: <span class="st">&quot;AppData&quot;</span>}</span>
+<span id="d02-cb2-10"><a href="#d02-cb2-10" aria-hidden="true" tabindex="-1"></a>HS_TYPES <span class="op">=</span> {<span class="dv">1</span>: <span class="st">&quot;ClientHello&quot;</span>, <span class="dv">2</span>: <span class="st">&quot;ServerHello&quot;</span>}</span>
+<span id="d02-cb2-11"><a href="#d02-cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d02-cb2-12"><a href="#d02-cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d02-cb2-13"><a href="#d02-cb2-13" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> frames(path):</span>
+<span id="d02-cb2-14"><a href="#d02-cb2-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> <span class="bu">open</span>(path, <span class="st">&quot;rb&quot;</span>) <span class="im">as</span> f:</span>
+<span id="d02-cb2-15"><a href="#d02-cb2-15" aria-hidden="true" tabindex="-1"></a>        magic <span class="op">=</span> f.read(<span class="dv">24</span>)[:<span class="dv">4</span>]</span>
+<span id="d02-cb2-16"><a href="#d02-cb2-16" aria-hidden="true" tabindex="-1"></a>        endian <span class="op">=</span> <span class="st">&quot;&lt;&quot;</span> <span class="cf">if</span> magic <span class="kw">in</span> (<span class="st">b&quot;</span><span class="ch">\xd4\xc3\xb2\xa1</span><span class="st">&quot;</span>, <span class="st">b&quot;</span><span class="ch">\x4d\x3c\xb2\xa1</span><span class="st">&quot;</span>) <span class="cf">else</span> <span class="st">&quot;&gt;&quot;</span></span>
+<span id="d02-cb2-17"><a href="#d02-cb2-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> hdr <span class="op">:=</span> f.read(<span class="dv">16</span>):</span>
+<span id="d02-cb2-18"><a href="#d02-cb2-18" aria-hidden="true" tabindex="-1"></a>            _, _, caplen, wirelen <span class="op">=</span> struct.unpack(endian <span class="op">+</span> <span class="st">&quot;IIII&quot;</span>, hdr)</span>
+<span id="d02-cb2-19"><a href="#d02-cb2-19" aria-hidden="true" tabindex="-1"></a>            <span class="cf">yield</span> f.read(caplen), wirelen</span>
+<span id="d02-cb2-20"><a href="#d02-cb2-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d02-cb2-21"><a href="#d02-cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d02-cb2-22"><a href="#d02-cb2-22" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> main(path):</span>
+<span id="d02-cb2-23"><a href="#d02-cb2-23" aria-hidden="true" tabindex="-1"></a>    isn, pending <span class="op">=</span> {}, {}   <span class="co"># per direction: initial sequence number, unparsed TLS bytes</span></span>
+<span id="d02-cb2-24"><a href="#d02-cb2-24" aria-hidden="true" tabindex="-1"></a>    n_frames <span class="op">=</span> wire <span class="op">=</span> payload <span class="op">=</span> <span class="dv">0</span></span>
+<span id="d02-cb2-25"><a href="#d02-cb2-25" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span><span class="st">&#39;#&#39;</span><span class="sc">:&gt;2}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;dir&#39;</span><span class="sc">:&lt;3}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;frame&#39;</span><span class="sc">:&gt;5}</span><span class="ss"> = eth + ip + tcp + data   flags  rel seq  TLS records completed&quot;</span>)</span>
+<span id="d02-cb2-26"><a href="#d02-cb2-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> n, (buf, wirelen) <span class="kw">in</span> <span class="bu">enumerate</span>(frames(path), <span class="dv">1</span>):</span>
+<span id="d02-cb2-27"><a href="#d02-cb2-27" aria-hidden="true" tabindex="-1"></a>        ihl <span class="op">=</span> (buf[<span class="dv">14</span>] <span class="op">&amp;</span> <span class="bn">0x0F</span>) <span class="op">*</span> <span class="dv">4</span></span>
+<span id="d02-cb2-28"><a href="#d02-cb2-28" aria-hidden="true" tabindex="-1"></a>        tcp <span class="op">=</span> buf[<span class="dv">14</span> <span class="op">+</span> ihl:]</span>
+<span id="d02-cb2-29"><a href="#d02-cb2-29" aria-hidden="true" tabindex="-1"></a>        sport, dport, seq <span class="op">=</span> struct.unpack(<span class="st">&quot;!HHI&quot;</span>, tcp[:<span class="dv">8</span>])</span>
+<span id="d02-cb2-30"><a href="#d02-cb2-30" aria-hidden="true" tabindex="-1"></a>        thl <span class="op">=</span> (tcp[<span class="dv">12</span>] <span class="op">&gt;&gt;</span> <span class="dv">4</span>) <span class="op">*</span> <span class="dv">4</span></span>
+<span id="d02-cb2-31"><a href="#d02-cb2-31" aria-hidden="true" tabindex="-1"></a>        flags <span class="op">=</span> tcp[<span class="dv">13</span>]</span>
+<span id="d02-cb2-32"><a href="#d02-cb2-32" aria-hidden="true" tabindex="-1"></a>        data <span class="op">=</span> tcp[thl:]</span>
+<span id="d02-cb2-33"><a href="#d02-cb2-33" aria-hidden="true" tabindex="-1"></a>        key <span class="op">=</span> (sport, dport)</span>
+<span id="d02-cb2-34"><a href="#d02-cb2-34" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> flags <span class="op">&amp;</span> <span class="bn">0x02</span>:                 <span class="co"># SYN: remember the initial sequence number</span></span>
+<span id="d02-cb2-35"><a href="#d02-cb2-35" aria-hidden="true" tabindex="-1"></a>            isn[key] <span class="op">=</span> seq</span>
+<span id="d02-cb2-36"><a href="#d02-cb2-36" aria-hidden="true" tabindex="-1"></a>        rel <span class="op">=</span> (seq <span class="op">-</span> isn.get(key, seq)) <span class="op">%</span> <span class="dv">2</span><span class="op">**</span><span class="dv">32</span></span>
+<span id="d02-cb2-37"><a href="#d02-cb2-37" aria-hidden="true" tabindex="-1"></a>        stream <span class="op">=</span> pending.get(key, <span class="st">b&quot;&quot;</span>) <span class="op">+</span> data</span>
+<span id="d02-cb2-38"><a href="#d02-cb2-38" aria-hidden="true" tabindex="-1"></a>        recs <span class="op">=</span> []</span>
+<span id="d02-cb2-39"><a href="#d02-cb2-39" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="bu">len</span>(stream) <span class="op">&gt;=</span> <span class="dv">5</span> <span class="kw">and</span> <span class="bu">len</span>(stream) <span class="op">&gt;=</span> <span class="dv">5</span> <span class="op">+</span> struct.unpack(<span class="st">&quot;!H&quot;</span>, stream[<span class="dv">3</span>:<span class="dv">5</span>])[<span class="dv">0</span>]:</span>
+<span id="d02-cb2-40"><a href="#d02-cb2-40" aria-hidden="true" tabindex="-1"></a>            ctype, rlen <span class="op">=</span> stream[<span class="dv">0</span>], struct.unpack(<span class="st">&quot;!H&quot;</span>, stream[<span class="dv">3</span>:<span class="dv">5</span>])[<span class="dv">0</span>]</span>
+<span id="d02-cb2-41"><a href="#d02-cb2-41" aria-hidden="true" tabindex="-1"></a>            name <span class="op">=</span> TLS_TYPES.get(ctype, <span class="bu">hex</span>(ctype))</span>
+<span id="d02-cb2-42"><a href="#d02-cb2-42" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> ctype <span class="op">==</span> <span class="dv">22</span>:</span>
+<span id="d02-cb2-43"><a href="#d02-cb2-43" aria-hidden="true" tabindex="-1"></a>                name <span class="op">=</span> HS_TYPES.get(stream[<span class="dv">5</span>], name)</span>
+<span id="d02-cb2-44"><a href="#d02-cb2-44" aria-hidden="true" tabindex="-1"></a>            recs.append(<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">(</span><span class="sc">{</span><span class="dv">5</span> <span class="op">+</span> rlen<span class="sc">}</span><span class="ss">)&quot;</span>)</span>
+<span id="d02-cb2-45"><a href="#d02-cb2-45" aria-hidden="true" tabindex="-1"></a>            stream <span class="op">=</span> stream[<span class="dv">5</span> <span class="op">+</span> rlen:]</span>
+<span id="d02-cb2-46"><a href="#d02-cb2-46" aria-hidden="true" tabindex="-1"></a>        pending[key] <span class="op">=</span> stream</span>
+<span id="d02-cb2-47"><a href="#d02-cb2-47" aria-hidden="true" tabindex="-1"></a>        n_frames, wire, payload <span class="op">=</span> n_frames <span class="op">+</span> <span class="dv">1</span>, wire <span class="op">+</span> wirelen, payload <span class="op">+</span> <span class="bu">len</span>(data)</span>
+<span id="d02-cb2-48"><a href="#d02-cb2-48" aria-hidden="true" tabindex="-1"></a>        d <span class="op">=</span> <span class="st">&quot;C&gt;S&quot;</span> <span class="cf">if</span> dport <span class="op">==</span> <span class="dv">443</span> <span class="cf">else</span> <span class="st">&quot;S&gt;C&quot;</span></span>
+<span id="d02-cb2-49"><a href="#d02-cb2-49" aria-hidden="true" tabindex="-1"></a>        flag_s <span class="op">=</span> <span class="st">&quot;&quot;</span>.join(c <span class="cf">for</span> c, bit <span class="kw">in</span> <span class="bu">zip</span>(<span class="st">&quot;SFRPA&quot;</span>, (<span class="dv">2</span>, <span class="dv">1</span>, <span class="dv">4</span>, <span class="dv">8</span>, <span class="dv">16</span>)) <span class="cf">if</span> flags <span class="op">&amp;</span> bit)</span>
+<span id="d02-cb2-50"><a href="#d02-cb2-50" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>n<span class="sc">:&gt;2}</span><span class="ss"> </span><span class="sc">{</span>d<span class="sc">:&lt;3}</span><span class="ss"> </span><span class="sc">{</span>wirelen<span class="sc">:&gt;5}</span><span class="ss"> = </span><span class="sc">{</span><span class="dv">14</span><span class="sc">:&gt;3}</span><span class="ss"> + </span><span class="sc">{</span>ihl<span class="sc">:&gt;2}</span><span class="ss"> + </span><span class="sc">{</span>thl<span class="sc">:&gt;3}</span><span class="ss"> + </span><span class="sc">{</span><span class="bu">len</span>(data)<span class="sc">:&gt;4}</span><span class="ss">   &quot;</span></span>
+<span id="d02-cb2-51"><a href="#d02-cb2-51" aria-hidden="true" tabindex="-1"></a>              <span class="ss">f&quot;</span><span class="sc">{</span>flag_s<span class="sc">:&lt;5}</span><span class="ss"> </span><span class="sc">{</span>rel<span class="sc">:&gt;7}</span><span class="ss">  </span><span class="sc">{</span><span class="st">&#39; &#39;</span><span class="sc">.</span>join(recs) <span class="kw">or</span> <span class="st">&#39;-&#39;</span><span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="d02-cb2-52"><a href="#d02-cb2-52" aria-hidden="true" tabindex="-1"></a>    over <span class="op">=</span> wire <span class="op">-</span> payload</span>
+<span id="d02-cb2-53"><a href="#d02-cb2-53" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="sc">{</span>n_frames<span class="sc">}</span><span class="ss"> frames, </span><span class="sc">{</span>wire<span class="sc">}</span><span class="ss"> bytes captured, </span><span class="sc">{</span>payload<span class="sc">}</span><span class="ss"> bytes of TCP payload, &quot;</span></span>
+<span id="d02-cb2-54"><a href="#d02-cb2-54" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;</span><span class="sc">{</span>over<span class="sc">}</span><span class="ss"> bytes of headers (</span><span class="sc">{</span>over <span class="op">/</span> wire<span class="sc">:.0%}</span><span class="ss">)&quot;</span>)</span>
+<span id="d02-cb2-55"><a href="#d02-cb2-55" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Each frame also costs 4 B FCS + 8 B preamble/SFD + 12 B inter-frame gap on the cable.</span></span>
+<span id="d02-cb2-56"><a href="#d02-cb2-56" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Line cost adds </span><span class="sc">{</span><span class="dv">24</span> <span class="op">*</span> n_frames<span class="sc">}</span><span class="ss"> bytes (FCS + preamble + gap): &quot;</span></span>
+<span id="d02-cb2-57"><a href="#d02-cb2-57" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;</span><span class="sc">{</span>wire <span class="op">+</span> <span class="dv">24</span> <span class="op">*</span> n_frames<span class="sc">}</span><span class="ss"> byte-times on the cable&quot;</span>)</span>
+<span id="d02-cb2-58"><a href="#d02-cb2-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d02-cb2-59"><a href="#d02-cb2-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="d02-cb2-60"><a href="#d02-cb2-60" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="d02-cb2-61"><a href="#d02-cb2-61" aria-hidden="true" tabindex="-1"></a>    main(sys.argv[<span class="dv">1</span>])</span></code></pre></div>
+<p>Real output on the capture above:</p>
+<pre class="text"><code> # dir frame = eth + ip + tcp + data   flags  rel seq  TLS records completed
+ 1 C&gt;S    74 =  14 + 20 +  40 +    0   S           0  -
+ 2 S&gt;C    74 =  14 + 20 +  40 +    0   SA          0  -
+ 3 C&gt;S    66 =  14 + 20 +  32 +    0   A           1  -
+ 4 C&gt;S   583 =  14 + 20 +  32 +  517   PA          1  ClientHello(517)
+ 5 S&gt;C    66 =  14 + 20 +  32 +    0   A           1  -
+ 6 S&gt;C   849 =  14 + 20 +  32 +  783   PA          1  ServerHello(127) ChangeCipherSpec(6) AppData(50) AppData(426) AppData(100) AppData(74)
+ 7 C&gt;S    66 =  14 + 20 +  32 +    0   A         518  -
+ 8 C&gt;S   146 =  14 + 20 +  32 +   80   PA        518  ChangeCipherSpec(6) AppData(74)
+ 9 S&gt;C   321 =  14 + 20 +  32 +  255   PA        784  AppData(255)
+10 C&gt;S   173 =  14 + 20 +  32 +  107   PA        598  AppData(107)
+11 S&gt;C   321 =  14 + 20 +  32 +  255   PA       1039  AppData(255)
+12 S&gt;C  1514 =  14 + 20 +  32 + 1448   A        1294  AppData(204)
+13 C&gt;S    66 =  14 + 20 +  32 +    0   A         705  -
+14 S&gt;C   101 =  14 + 20 +  32 +   35   PA       2742  AppData(1279)
+15 S&gt;C    66 =  14 + 20 +  32 +    0   FA       2777  -
+16 C&gt;S    90 =  14 + 20 +  32 +   24   PA        705  AppData(24)
+17 S&gt;C    54 =  14 + 20 +  20 +    0   R        2778  -
+
+17 frames, 4630 bytes captured, 3504 bytes of TCP payload, 1126 bytes of headers (24%)
+Line cost adds 408 bytes (FCS + preamble + gap): 5038 byte-times on the cable</code></pre>
+<h3 id="d02-reading-it-frame-by-frame">Reading it frame by frame</h3>
+<p><strong>Frames 1–3: the TCP handshake, 214 bytes.</strong> The SYN is 74 bytes: 14 Ethernet + 20 IPv4 + 20 TCP + <strong>20 bytes of options</strong>. Those options are MSS (4 bytes), SACK-permitted (2), timestamps (10), one NOP for alignment (1) and window scale (3). Both sides announce <code>mss 1460</code>, because both have 1500-byte interfaces. Both announce <code>wscale 10</code>, so the "win 63" you see later means 63 × 1024 = 64,512 bytes. The third packet, the ACK, is 66 bytes: it carries only the 12-byte timestamp option (two NOPs plus 10 bytes). Every later packet in this connection carries those 12 bytes too. macOS orders and pads its SYN options differently, so a Mac's SYN is usually a few bytes longer.</p>
+<p><strong>Frame 4: ClientHello, 517 bytes in one segment.</strong> That fits easily today. With a post-quantum key share it would not, as the 2026 section explains.</p>
+<p><strong>Frame 6: the server's whole first flight, 783 bytes in one segment.</strong> The records are ServerHello (127), a 6-byte ChangeCipherSpec, and four encrypted records of 50, 426, 100 and 74 bytes. TLS 1.3 labels every encrypted record "application data" on the outside and hides the real type inside. RFC 8446 fixes the order, though, so they are EncryptedExtensions, Certificate, CertificateVerify and Finished. The ChangeCipherSpec does nothing in TLS 1.3. It is sent only so that middleboxes that expect TLS 1.2 don't drop the connection ("middlebox compatibility mode"). The certificate is small here because the lab uses one self-signed P-256 certificate. A real site sends a chain of two or three certificates, typically 2.5–5 KB, which spans several segments, and that matters for the MTU failures below.</p>
+<p><strong>Frame 8: client Finished, 80 bytes.</strong> A 6-byte ChangeCipherSpec plus a 74-byte record. The 74 adds up exactly: 4-byte handshake header + 48-byte verify_data (the suite is TLS_AES_256_GCM_SHA384, so SHA-384) + 1 byte of inner content type + 16-byte AEAD tag + 5-byte record header.</p>
+<p><strong>Frames 9 and 11: two NewSessionTicket records, 255 bytes each.</strong> OpenSSL servers send two tickets by default. The client can use them to resume later without a full handshake.</p>
+<p><strong>Frame 10: the HTTP request, 107 bytes.</strong> The plaintext is 85 bytes: <code>GET /index.html HTTP/1.1</code>, <code>Host</code>, <code>User-Agent</code> and <code>Accept</code> headers, and the CRLFs. Every TLS 1.3 record over AES-GCM costs exactly <strong>22 bytes</strong>: 5 header + 1 inner type + 16 tag. So 85 + 22 = 107.</p>
+<p><strong>Frames 12 and 14: the response.</strong> The headers are one record of 204 bytes (182 plaintext). The body is one record of 1,279 bytes (1,257 + 22). Frame 12 is a <em>full</em> segment: 1,448 bytes of payload, 1,514 bytes on the frame. It holds the header record and the first 1,244 bytes of the body record. Frame 14 carries the remaining 35. A record split across segments is normal. TCP is a byte stream and knows nothing about TLS records.</p>
+<p><strong>Frames 15–17: the close.</strong> The server sends FIN. The client answers with a 24-byte TLS <code>close_notify</code> alert (2 bytes of alert + 22 of overhead). By then the server has fully closed its socket, so the kernel answers the alert with a RST. That RST is harmless here, and very common with simple servers. In general, though, a RST throws away any data still unread at the receiving side. That is why careful servers do a "lingering close" instead of slamming the socket shut.</p>
+<p><strong>Two things that look wrong and aren't.</strong> Every packet the client <em>sent</em> shows <code>cksum ... (incorrect -&gt; ...)</code>. The kernel left the TCP checksum for the NIC to fill in (checksum offload), and the capture tap sits before the NIC. In this lab the "received" packets show it too, because veth passes the unfinished checksum along. On a physical NIC, received packets show correct checksums. And every packet <em>from</em> the server arrives with TTL 63: it left the server at 64 and crossed one router. The server's own capture of the same SYN shows TTL 63 there too, and different MAC addresses (02:00:00:00:02:01 → 02:00:00:00:02:02), while the ports, sequence numbers and options match byte for byte. That is section 3's hop-by-hop rule, seen in real bytes.</p>
+<p><strong>The bottom line.</strong> 1,257 bytes of page cost 4,630 bytes of capture: 27% useful. Headers alone are 1,126 bytes (24%). Handshakes, tickets and TLS framing account for most of the rest. On the cable, the 17 frames also pay 24 bytes each for FCS, preamble and inter-frame gap, for 5,038 byte-times in total. This is why connection reuse (HTTP keep-alive, HTTP/2 multiplexing) and TLS resumption matter far more for small requests than any header shaving.</p>
+<h2 id="d02-pmtud">Deep dive: MTU, fragmentation and path MTU discovery, live</h2>
+<h3 id="d02-what-ipv4-fragmentation-looks-like">What IPv4 fragmentation looks like</h3>
+<p>A Python socket sends one 4,000-byte UDP datagram from the client to the server. The IP packet is 4,028 bytes (4,000 + 8 UDP + 20 IP), and the path MTU is 1500, so the sending host fragments it. Captured at the server:</p>
+<pre class="text"><code>01:14:29.478819 IP (tos 0x0, ttl 63, id 17314, offset 0, flags [+], proto UDP (17), length 1500)
+    192.168.1.50.56217 &gt; 203.0.113.10.9999: UDP, length 4000
+01:14:29.478834 IP (tos 0x0, ttl 63, id 17314, offset 1480, flags [+], proto UDP (17), length 1500)
+    192.168.1.50 &gt; 203.0.113.10: ip-proto-17
+01:14:29.478836 IP (tos 0x0, ttl 63, id 17314, offset 2960, flags [none], proto UDP (17), length 1068)
+    192.168.1.50 &gt; 203.0.113.10: ip-proto-17
+01:14:29.479036 IP (tos 0xc0, ttl 64, id 22584, offset 0, flags [none], proto ICMP (1), length 576)
+    203.0.113.10 &gt; 192.168.1.50: ICMP 203.0.113.10 udp port 9999 unreachable, length 556
+    IP (tos 0x0, ttl 63, id 17314, offset 0, flags [none], proto UDP (17), length 4028)
+    192.168.1.50.56217 &gt; 203.0.113.10.9999: UDP, length 4000 [|icmp]</code></pre>
+<p>All three fragments share <strong>IP ID 17314</strong>. That ID is the only thing that ties them together. The first two have the More Fragments flag (<code>[+]</code>) and carry 1,480 bytes of payload each. The last carries 1,048. 1,480 + 1,480 + 1,048 = 4,008 = UDP header plus data. <code>tcpdump</code> prints offsets in bytes. The header field itself counts in 8-byte units, so it holds 0, 185 and 370, and that is why every fragment except the last must carry a multiple of 8 bytes. Only the first fragment has the UDP header, so only it shows ports. The ICMP "port unreachable" at the end quotes a 4,028-byte datagram: the server reassembled all three fragments <em>before</em> looking for a socket on port 9999.</p>
+<p>Fragmentation is a misery for four concrete reasons:</p>
+<ul>
+<li><strong>Loss multiplies.</strong> Lose any fragment and the whole datagram is lost. With 1% fragment loss, a three-fragment datagram is lost about 3% of the time.</li>
+<li><strong>The receiver holds state.</strong> Partial datagrams wait in a reassembly queue, up to 30 s by default on Linux (<code>net.ipv4.ipfrag_time</code>) and within a memory cap (<code>ipfrag_high_thresh</code>). That queue is a classic denial-of-service target.</li>
+<li><strong>Middleboxes are blind.</strong> Non-first fragments carry no ports, so firewalls, load balancers and NAT either reassemble (expensive) or drop them.</li>
+<li><strong>The ID field is only 16 bits.</strong> At 1 Gbit/s of 1500-byte packets, 65,536 IDs are used up in about 0.79 s. The reassembly timeout is 30 s, so a fragment from an old datagram can be stitched into a new one with the same ID. RFC 4963 describes this misassembly problem.</li>
+</ul>
+<p>IPv6 took the obvious lesson. Routers never fragment IPv6. Only the sending host may, using a Fragment extension header. Every IPv6 link must carry at least <strong>1280</strong> bytes (RFC 8200), which gives everyone a safe floor.</p>
+<p>TCP avoids all of this. It sets Don't Fragment (<code>flags [DF]</code> on every packet in the capture above) and sizes its segments to fit. Which raises the question: fit <em>what</em>? The sender only knows its own MTU.</p>
+<h3 id="d02-path-mtu-discovery-working">Path MTU discovery working</h3>
+<p>To find out, the lab's router link toward the client is set to MTU 1400. Both hosts still have 1500-byte interfaces, so both announce MSS 1460, and the server starts sending 1,448-byte segments. Captured at the server (offloads off, so each line is one real packet):</p>
+<pre class="text"><code>21:34:10.679857 IP (tos 0x0, ttl 64, id 44846, offset 0, flags [DF], proto TCP (6), length 1500)
+    203.0.113.10.443 &gt; 192.168.1.50.50978: Flags [P.], seq 6810:8258, ack 702, win 64, options [nop,nop,TS val 1929340177 ecr 3906723785], length 1448
+21:34:10.680130 IP (tos 0xc0, ttl 64, id 12308, offset 0, flags [none], proto ICMP (1), length 576)
+    203.0.113.1 &gt; 203.0.113.10: ICMP 192.168.1.50 unreachable - need to frag (mtu 1400), length 556
+    IP (tos 0x0, ttl 64, id 44842, offset 0, flags [DF], proto TCP (6), length 1500)
+    203.0.113.10.443 &gt; 192.168.1.50.50978: Flags [.], seq 1018:2466, ack 702, win 64, options [nop,nop,TS val 1929340177 ecr 3906723785], length 1448 [|icmp]
+...                                   (one ICMP per dropped packet, 10 in total)
+21:34:10.680206 IP (tos 0x0, ttl 64, id 44852, offset 0, flags [DF], proto TCP (6), length 1400)
+    203.0.113.10.443 &gt; 192.168.1.50.50978: Flags [.], seq 1018:2366, ack 702, win 64, options [nop,nop,TS val 1929340177 ecr 3906723785], length 1348
+21:34:10.680206 IP (tos 0x0, ttl 64, id 44853, offset 0, flags [DF], proto TCP (6), length 1400)
+    203.0.113.10.443 &gt; 192.168.1.50.50978: Flags [.], seq 2366:3714, ack 702, win 64, options [nop,nop,TS val 1929340177 ecr 3906723785], length 1348</code></pre>
+<p>The router can't forward a 1,500-byte packet with DF set onto a 1,400-byte link. So it drops the packet and sends back ICMP type 3, code 4, "fragmentation needed," with the next-hop MTU (1400) in the message (RFC 1191). It quotes the dropped packet's headers, so the server knows which connection to fix. The server's kernel records the MTU against the destination and retransmits at once with 1,348-byte segments: 1400 − 20 IP − 20 TCP − 12 options. The learned value is visible in the route cache, and it expires after 10 minutes (<code>net.ipv4.route.mtu_expires</code> = 600 s):</p>
+<pre class="text"><code>$ ip route get 192.168.1.50          # on the server
+192.168.1.50 via 203.0.113.1 dev d02s0 src 203.0.113.10 uid 0
+    cache expires 596sec mtu 1400</code></pre>
+<p>The whole correction took 0.35 ms in the lab, roughly one round trip. On a real path it costs one RTT plus the retransmission.</p>
+<h3 id="d02-path-mtu-discovery-broken-the-black-hole">Path MTU discovery broken: the black hole</h3>
+<p>Now the server drops incoming ICMP "fragmentation needed", the way an over-eager firewall does:</p>
+<div class="sourceCode" id="d02-cb7"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d02-cb7-1"><a href="#d02-cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> netns exec d02s iptables <span class="at">-A</span> INPUT <span class="at">-p</span> icmp <span class="at">--icmp-type</span> fragmentation-needed <span class="at">-j</span> DROP</span></code></pre></div>
+<pre class="text"><code>curl: (28) Operation timed out after 20002 milliseconds with 0 bytes received
+curl: http=000 connect=0.000340s tls=0.003820s total=20.002612s</code></pre>
+<p>Look at those timings. The TCP connect took 0.34 ms and the TLS handshake finished in 3.8 ms, because every handshake packet in this lab is smaller than 1400 bytes. Then the first full-size response segment vanished, and so did every retransmission of it, because each one was 1,500 bytes again. The server never learned why. That is the signature of a <strong>PMTUD black hole</strong>: small things work, big things hang forever, and nothing logs an error. With a real certificate chain, the server's <em>handshake</em> flight is already bigger than one segment. So the symptom you usually see is "the TLS handshake hangs after ClientHello."</p>
+<p>There are three ways out, and the lab tried each one.</p>
+<p><strong>Packetization-layer probing (RFC 4821).</strong> With <code>net.ipv4.tcp_mtu_probing=1</code>, Linux notices repeated timeouts on full-size segments and falls back to <code>tcp_base_mss</code> (1024 by default):</p>
+<pre class="text"><code>curl: http=200 connect=0.000264s tls=0.003634s total=3.159643s
+...
+21:35:29.804673 IP 203.0.113.10.443 &gt; 192.168.1.50.34496: Flags [.], seq 1019:2043, ack 705, win 64, options [nop,nop,TS val 2286491710 ecr 2303093507], length 1024
+21:35:29.804730 IP 203.0.113.10.443 &gt; 192.168.1.50.34496: Flags [.], seq 2043:2467, ack 705, win 64, options [nop,nop,TS val 2286491710 ecr 2303093507], length 424</code></pre>
+<p>It works, but only after about 3.15 s of retransmission timeouts (<code>TcpExtTCPTimeouts</code> went up by 4). That is a terrible user experience. It is also off by default.</p>
+<p><strong>MSS clamping on the router.</strong> The router rewrites the MSS option in SYN packets it forwards, so neither end ever offers a segment size the path can't carry:</p>
+<div class="sourceCode" id="d02-cb10"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d02-cb10-1"><a href="#d02-cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> netns exec d02r iptables <span class="at">-t</span> mangle <span class="at">-A</span> FORWARD <span class="at">-p</span> tcp <span class="at">--tcp-flags</span> SYN,RST SYN <span class="dt">\</span></span>
+<span id="d02-cb10-2"><a href="#d02-cb10-2" aria-hidden="true" tabindex="-1"></a>    <span class="at">-j</span> TCPMSS <span class="at">--clamp-mss-to-pmtu</span></span></code></pre></div>
+<pre class="text"><code>01:12:22.258544 IP 203.0.113.10.443 &gt; 192.168.1.50.46620: Flags [S.], seq 539327135, ack 3307917238, win 65160, options [mss 1360,sackOK,TS val 718839559 ecr 226474446,nop,wscale 10], length 0
+curl: http=200 connect=0.000917s tls=0.009552s total=0.018884s</code></pre>
+<p>The server <em>sent</em> <code>mss 1460</code>. The client <em>received</em> <code>mss 1360</code>, because the router rewrote it in flight (and fixed the TCP checksum). The server's data segments were 1,348 bytes, which proves the client's SYN was clamped the same way on its way out. Linux's <code>--clamp-mss-to-pmtu</code> uses the smaller of the two route MTUs it sees. Zero retransmissions, 19 ms total. Every VPN concentrator, PPPoE router and many cloud gateways do exactly this. It is a layering violation, a router editing a TCP option, and it only helps TCP. UDP and QUIC get nothing from it.</p>
+<p><strong>Not breaking ICMP in the first place.</strong> This is the actual fix. ICMP type 3 code 4 (and ICMPv6 type 2, "Packet Too Big") are control traffic that PMTUD depends on. RFC 4890 says plainly that ICMPv6 Packet Too Big must not be filtered. Blocking "all ICMP" for security is how black holes are made.</p>
+<h2 id="d02-offload">Deep dive: segmentation offload and the giant packets in your capture</h2>
+<p>These four captures come from the same 1 MiB download over the same 1500-MTU path. Only the offload settings changed.</p>
+<p><strong>Sender, TSO on (the default).</strong> Captured on the server's own interface:</p>
+<pre class="text"><code>21:33:34.335221 IP (tos 0x0, ttl 64, id 3002, offset 0, flags [DF], proto TCP (6), length 16458)
+    203.0.113.10.443 &gt; 192.168.1.50.53392: Flags [P.], seq 497569118:497585524, ack 1882282286, win 64, options [nop,nop,TS val 950299288 ecr 2162843027], length 16406</code></pre>
+<p>A 16,458-byte IP packet on a 1500-byte link. Its TCP payload is 16,406 bytes, which is exactly one full TLS record: 16,384 bytes of plaintext + 22. TCP handed the whole record down as one buffer, the tap recorded it, and the NIC (here, veth) was trusted to cut it into 11 × 1,448 + 1 × 478 bytes. Across the whole download the capture showed 77 such packets instead of 773 wire-sized ones. The device advertises how big these may get:</p>
+<pre class="text"><code>$ ip -d link show d02s0 | grep -o &#39;gso_max_size [0-9]* gso_max_segs [0-9]*&#39;
+gso_max_size 65536 gso_max_segs 65535</code></pre>
+<p><strong>Sender, TSO and GSO off.</strong> <code>ethtool -K d02s0 tso off gso off</code>, same download:</p>
+<pre class="text"><code>21:33:38.386282 IP (tos 0x0, ttl 64, id 39074, offset 0, flags [DF], proto TCP (6), length 1500)
+    203.0.113.10.443 &gt; 192.168.1.50.53406: Flags [.], seq 3323386110:3323387558, ack 1628058525, win 64, options [nop,nop,TS val 4203593786 ecr 2462780421], length 1448</code></pre>
+<p>Now TCP itself builds MSS-sized segments. The capture matches the wire: 704 segments of 1,448 bytes, 63 of 478 and a few odd sizes.</p>
+<p><strong>Sender, TSO off but GSO on.</strong> The capture <em>still</em> shows 1,448-byte segments. Generic Segmentation Offload is TSO done in software, just before the driver. That point is upstream of the capture tap, so the tap already sees the cut-up segments. GSO saves most of the per-packet cost (one trip through the stack per 64 KB) without hiding anything from <code>tcpdump</code>. So "giant" packets in an outgoing capture mean hardware TSO, specifically.</p>
+<p><strong>Receiver, GRO on.</strong> With TSO still off on the server, so that 1,448-byte segments genuinely arrive, GRO is turned on at the receiving interface:</p>
+<pre class="text"><code>21:33:42.459005 IP (tos 0x0, ttl 64, id 43617, offset 0, flags [DF], proto TCP (6), length 16458)
+    203.0.113.10.443 &gt; 192.168.1.50.32962: Flags [P.], seq 1044885956:1044902362, ack 1586781324, win 64, options [nop,nop,TS val 2585550317 ecr 3863586525], length 16406</code></pre>
+<p>Twelve real 1,448/478-byte segments went in. GRO merged them into one 16,406-byte buffer before the tap. It stopped at the PSH flag at the end of the TLS record, which is one of GRO's flush conditions. The receiving TCP then processes one buffer and makes one ACK decision instead of twelve.</p>
+<p>What this means for everyday work:</p>
+<ul>
+<li><strong>A capture is a view of the host, not the wire.</strong> To see true wire packets, capture on a switch SPAN port or a network tap. Or, on a test box only, turn the offloads off (<code>ethtool -K eth0 tso off gso off gro off</code>), at a real CPU cost.</li>
+<li><strong>"Bad checksum" on outgoing packets is checksum offload.</strong> Use <code>tcpdump -K</code> (<code>--dont-verify-checksums</code>), or turn off checksum validation in Wireshark.</li>
+<li><strong>Wireshark's "packet size limited during capture" and odd-looking giant segments are not network errors.</strong> Before you file a ticket about "jumbo frames on our 1500 network," check <code>ethtool -k</code>.</li>
+<li><strong>macOS does TSO too</strong> (<code>sysctl net.inet.tcp.tso</code>), so an outgoing capture on a Mac can show oversized segments as well.</li>
+</ul>
+<h2 id="d02-numbers">Deep dive: by the numbers</h2>
+<p><strong>MTU and MSS budgets you should know cold.</strong> The MSS figures assume IPv4 with a 20-byte TCP header. Subtract 12 more when timestamps are on, which is almost always.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Link or encapsulation</th>
+<th>MTU seen by the inner IP packet</th>
+<th>IPv4 TCP MSS</th>
+<th>Overhead and notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Ethernet</td>
+<td>1500</td>
+<td>1460 (1448 with timestamps)</td>
+<td>baseline</td>
+</tr>
+<tr class="even">
+<td>IPv6 over Ethernet</td>
+<td>1500</td>
+<td>1440 (1428 with timestamps)</td>
+<td>40-byte IPv6 header</td>
+</tr>
+<tr class="odd">
+<td>PPPoE (DSL, some fibre)</td>
+<td>1492</td>
+<td>1452</td>
+<td>8-byte PPPoE header</td>
+</tr>
+<tr class="even">
+<td>VXLAN on a 1500 underlay</td>
+<td>1450</td>
+<td>1410</td>
+<td>50 bytes: outer Ethernet 14 + IPv4 20 + UDP 8 + VXLAN 8</td>
+</tr>
+<tr class="odd">
+<td>WireGuard default</td>
+<td>1420</td>
+<td>1380</td>
+<td>sized for the worst case: IPv6 outer 40 + UDP 8 + WireGuard 32</td>
+</tr>
+<tr class="even">
+<td>IPsec ESP tunnel</td>
+<td>about 1400–1440</td>
+<td>varies</td>
+<td>depends on cipher, padding and NAT traversal</td>
+</tr>
+<tr class="odd">
+<td>Jumbo frames</td>
+<td>9000</td>
+<td>8960</td>
+<td>data centre only; AWS uses 9001 inside a VPC</td>
+</tr>
+<tr class="even">
+<td>IPv6 minimum</td>
+<td>1280</td>
+<td>—</td>
+<td>every IPv6 link must carry it (RFC 8200)</td>
+</tr>
+<tr class="odd">
+<td>QUIC</td>
+<td>≥ 1200 UDP payload</td>
+<td>—</td>
+<td>QUIC requires paths to carry 1200-byte datagrams (RFC 9000)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Line-rate goodput.</strong> A full-size frame costs 1,538 byte-times on the cable: 1,514 + 4 FCS + 8 preamble + 12 inter-frame gap. With 1,448 bytes of TCP data per frame, the best possible goodput is 1448 / 1538 = <strong>94.1%</strong>. On gigabit Ethernet that is <strong>941 Mbit/s</strong>, which is exactly the number <code>iperf3</code> reports on a healthy 1 GbE link. If you see 941, the link is perfect. Don't chase the missing 59.</p>
+<p><strong>Small packets cost the same fixed overhead.</strong> A minimum Ethernet frame is 64 bytes, or 84 byte-times with preamble and gap. That gives the famous <strong>14.88 million packets per second</strong> at 10 Gbit/s. A bare ACK in the capture above is 66 bytes on the frame; padding, FCS, preamble and gap still bring it to 84 byte-times on the cable.</p>
+<p><strong>TLS framing is cheap only in big records.</strong> 22 bytes of overhead on a 16,406-byte record is 0.13%. The same 22 bytes on the 107-byte request record is 21%.</p>
+<p><strong>Offload saves trips through the stack, not bytes.</strong> In the lab download, TSO turned 773 trips through the stack into 77. At 100 Gbit/s with 1,500-byte frames you have about <strong>123 ns per packet</strong>. That budget is the reason Linux added BIG TCP, which lets these super-packets exceed 64 KB (up to 512 KB) on fast NICs, for IPv6 from kernel 5.19 and IPv4 from 6.3.</p>
+<p><strong>Fragment ID wraparound.</strong> IPv4's ID field is 16 bits. At 1 Gbit/s of full-size packets, 65,536 IDs last about <strong>0.79 s</strong>. Reassembly waits up to 30 s. That mismatch is why high-rate fragmented UDP can silently corrupt data unless the application checks integrity itself.</p>
+<h2 id="d02-failures">Deep dive: production failure modes</h2>
+<h3 id="d02-1-small-requests-work-large-responses-hang-pmtud-black-hole">1. Small requests work; large responses hang (PMTUD black hole)</h3>
+<p><strong>Symptom.</strong> <code>curl</code> connects, maybe completes TLS, then hangs. SSH logs in but freezes when you <code>cat</code> a big file. Often it is only for users on a VPN, PPPoE or a tunnel.</p>
+<p><strong>Mechanism.</strong> Something on the path has a smaller MTU, and the ICMP "fragmentation needed" (or ICMPv6 "packet too big") never reaches the sender. That is the black hole demonstrated above.</p>
+<p><strong>Prove it.</strong> Find the largest DF packet that gets through.</p>
+<div class="sourceCode" id="d02-cb16"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="d02-cb16-1"><a href="#d02-cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># macOS: -D sets Don&#39;t Fragment; 1472 + 8 ICMP + 20 IP = 1500</span></span>
+<span id="d02-cb16-2"><a href="#d02-cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ping</span> <span class="at">-D</span> <span class="at">-s</span> 1472 example.com</span>
+<span id="d02-cb16-3"><a href="#d02-cb16-3" aria-hidden="true" tabindex="-1"></a><span class="fu">ping</span> <span class="at">-D</span> <span class="at">-s</span> 1372 example.com</span>
+<span id="d02-cb16-4"><a href="#d02-cb16-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Linux</span></span>
+<span id="d02-cb16-5"><a href="#d02-cb16-5" aria-hidden="true" tabindex="-1"></a><span class="fu">ping</span> <span class="at">-M</span> do <span class="at">-s</span> 1472 example.com</span>
+<span id="d02-cb16-6"><a href="#d02-cb16-6" aria-hidden="true" tabindex="-1"></a><span class="ex">tracepath</span> example.com                  <span class="co"># reports &quot;pmtu&quot; hop by hop</span></span>
+<span id="d02-cb16-7"><a href="#d02-cb16-7" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-ti</span> dst example.com <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-o</span> <span class="st">&#39;pmtu:[0-9]*&#39;</span></span></code></pre></div>
+<p>If 1472 fails silently while 1372 works, and <code>tcpdump -n icmp</code> shows no "need to frag", you have a black hole.</p>
+<p><strong>Fix.</strong> Allow ICMP type 3 code 4 and ICMPv6 type 2 through every firewall. Clamp MSS on the tunnel or edge router. Set the tunnel interface MTU correctly. Enable <code>tcp_mtu_probing=1</code> on servers as a safety net.</p>
+<h3 id="d02-2-cross-node-pod-traffic-hangs-on-large-payloads">2. Cross-node pod traffic hangs on large payloads</h3>
+<p><strong>Symptom.</strong> In Kubernetes, pod-to-pod calls on the same node work. Across nodes, small requests work and large POSTs or responses hang.</p>
+<p><strong>Mechanism.</strong> The overlay (VXLAN, GENEVE, IPIP or WireGuard) adds 20–80 bytes per packet. If the pod interface MTU equals the node's MTU, full-size pod packets no longer fit once encapsulated. The node tries to fragment or drop them, and the ICMP often goes nowhere useful.</p>
+<p><strong>Prove it.</strong> From inside a pod, run <code>ping -M do -s &lt;MTU-28&gt;</code> to a pod on another node and step the size down. Compare the pod's MTU (<code>ip link</code> inside the pod) with the node's.</p>
+<p><strong>Fix.</strong> Set the CNI's MTU to the underlay MTU minus the encapsulation overhead (1450 for VXLAN on 1500), or let a CNI that detects it do so. On cloud networks with 9001-byte MTU, the overlay can keep a comfortable 8951.</p>
+<h3 id="d02-3-dns-times-out-for-some-names-fragmented-udp">3. DNS times out for some names (fragmented UDP)</h3>
+<p><strong>Symptom.</strong> Lookups for DNSSEC-signed or record-heavy names time out or are slow. Other names are fine.</p>
+<p><strong>Mechanism.</strong> The response is larger than the path MTU, so it arrives as IP fragments, and a firewall or NAT drops non-first fragments. The resolver retries, eventually over TCP.</p>
+<p><strong>Prove it.</strong> <code>dig +dnssec +bufsize=4096 example.com</code> against <code>dig +dnssec +bufsize=1232 example.com</code> and <code>dig +tcp</code>. If only the large buffer size fails, it is fragmentation.</p>
+<p><strong>Fix.</strong> Use an EDNS buffer size of 1232 bytes. That was the 2020 DNS Flag Day recommendation, chosen to fit the IPv6 minimum MTU with headroom. Responses that don't fit come back truncated and are retried over TCP.</p>
+<h3 id="d02-4-a-jumbostandard-mismatch-on-one-segment">4. A jumbo/standard mismatch on one segment</h3>
+<p><strong>Symptom.</strong> Interactive sessions work, bulk copies stall, but only between certain hosts. Switch counters show "giants" or <code>rx_length_errors</code>.</p>
+<p><strong>Mechanism.</strong> One side has MTU 9000, the other 1500, on the same L2 segment. No router sits between them, so nobody sends ICMP. Oversized frames are simply discarded by the receiver's NIC or the switch.</p>
+<p><strong>Prove it.</strong> <code>ping -M do -s 8972</code> (9000 − 28) between the two hosts, plus interface error counters (<code>ip -s link</code>, <code>ethtool -S</code>).</p>
+<p><strong>Fix.</strong> One MTU per L2 domain. No exceptions.</p>
+<h3 id="d02-5-chasing-ghosts-in-captures">5. Chasing ghosts in captures</h3>
+<p><strong>Symptom.</strong> An engineer reports "our servers send 60 KB packets" or "every outgoing checksum is wrong" from a <code>tcpdump</code> on the server.</p>
+<p><strong>Mechanism.</strong> TSO and checksum offload, as shown above. Nothing is wrong.</p>
+<p><strong>Prove it.</strong> <code>ethtool -k eth0 | grep -E 'tcp-segmentation|tx-checksumming|generic-receive'</code>. Then capture again with offloads off on a test host, or on a SPAN port, and the giants disappear.</p>
+<p><strong>Fix.</strong> Teach the team where the tap sits. Real offload bugs do exist, usually in virtual NICs or tunnel devices that mishandle segmentation of encapsulated traffic. The test for one is the same: turn that offload off (<code>ethtool -K</code>) and see if the corruption stops.</p>
+<h2 id="d02-context-2026">Deep dive: 2026 context</h2>
+<p><strong>Post-quantum key exchange made the ClientHello bigger than a packet.</strong> Browsers and major CDNs now negotiate the hybrid <code>X25519MLKEM768</code> key exchange by default. Its client key share is 1,216 bytes (an ML-KEM-768 public key of 1,184 bytes plus 32 bytes of X25519). That pushes a browser's ClientHello to roughly 1.8 KB, which needs <strong>two TCP segments</strong>. Frame 4 above becomes frames 4 and 5. Some middleboxes assumed a ClientHello always fits in one packet, and they broke when this rolled out. If a TLS-inspecting firewall drops "only modern browsers," look here first. The server's reply share is 1,120 bytes (an 1,088-byte ML-KEM ciphertext plus 32), so the server's first flight grows too.</p>
+<p><strong>QUIC owns its own MTU logic.</strong> HTTP/3 runs over UDP, so there is no MSS and no router clamping. QUIC sets DF, requires the path to carry 1,200-byte datagrams, and pads every client Initial packet to at least that size. Then it probes upward with its own packetization-layer PMTUD (DPLPMTUD, RFC 8899). A post-quantum ClientHello simply spans two Initial packets. Because QUIC lives in user space, Linux added <strong>UDP GSO and GRO</strong> (<code>UDP_SEGMENT</code>, and the <code>tx-udp-segmentation</code> feature you can see in <code>ethtool -k</code>). So QUIC captures show "giant" UDP datagrams for the same reason TCP captures show giant segments.</p>
+<p><strong>Cloud MTUs differ by path, not by host.</strong> AWS supports 9001 within a VPC, but traffic through an internet gateway, and most VPN paths, is limited to 1500. GCP VPCs default to 1460, configurable up to 8896. Overlays, service meshes and zero-trust tunnels each take another slice. One request can cross four different MTUs, and an MTU black hole at any one of them looks exactly like an application hang.</p>
+<p><strong>Encrypted Client Hello (ECH)</strong> hides the real server name inside an encrypted extension, and clients pad it so its size doesn't leak the name. That is one more reason a ClientHello no longer fits into an old firewall's idea of "one small packet."</p>
+<h2 id="d02-interview">Deep dive: senior interview questions</h2>
+<p><strong>Q1: Every textbook says the MSS on Ethernet is 1460. Your capture shows 1448-byte segments. Why?</strong></p>
+<p>1460 is the MSS: the MTU minus 20 bytes of IP and 20 of TCP <em>fixed</em> header. But TCP timestamps (RFC 7323) add 12 bytes of options to every segment after the handshake, and they are on by default on Linux and macOS. So the data per segment is 1460 − 12 = 1448. The SYN announces 1460 because the announced MSS doesn't count options. A senior answer also notes that the path MTU, not the announced MSS, sets the real ceiling.</p>
+<p><strong>Q2: <code>tcpdump</code> on a server shows a 16,458-byte IP packet leaving an interface with MTU 1500. Is something broken?</strong></p>
+<p>No. That is TCP Segmentation Offload. The kernel hands the NIC one large buffer with a <code>gso_size</code>, and the NIC cuts it into MSS-sized segments with correct headers. The capture tap sits before the NIC, so it sees the big buffer. On the receive side, GRO does the reverse before the tap. Software GSO, by contrast, segments <em>before</em> the tap, so its captures look normal. To see the true wire, capture off-host or disable offloads on a test machine.</p>
+<p><strong>Q3: Explain path MTU discovery, how it fails, and how TCP survives the failure.</strong></p>
+<p>TCP sends with DF set. A router that can't forward a packet onto a smaller link drops it and returns ICMP "fragmentation needed" (IPv4) or "packet too big" (IPv6), carrying the next-hop MTU. The sender caches the lower MTU per destination and resends smaller segments. It fails when that ICMP is filtered, which creates a black hole: small packets pass, full-size ones vanish, and connections hang after the handshake. TCP survives in three ways. Routers can clamp MSS in SYNs. Hosts can use packetization-layer probing (RFC 4821; Linux <code>tcp_mtu_probing</code>), which falls back to a smaller MSS after timeouts. And operators can stop filtering ICMP, which is the real fix.</p>
+<p><strong>Q4: Why can't IPv6 routers fragment, and what did that cost?</strong></p>
+<p>Router fragmentation costs router CPU, multiplies loss, forces receivers to hold reassembly state, and blinds middleboxes to ports. IPv6 moved fragmentation to the source host only (a Fragment extension header) and guaranteed a 1280-byte minimum MTU. The cost is that IPv6 depends completely on ICMPv6 Packet Too Big reaching the sender. That is why RFC 4890 says never to filter it, and why IPv6 black holes are worse than IPv4 ones.</p>
+<p><strong>Q5: What does MSS clamping do, where does it run, and why is it a hack?</strong></p>
+<p>A router or firewall rewrites the MSS option in TCP SYNs passing through it, down to what the path can carry, and fixes the checksum. Both ends then never send segments that need PMTUD. It runs on VPN gateways, PPPoE routers and tunnel endpoints. It's a hack because a network device edits a transport-layer header, which breaks the layering, and it does nothing for UDP or QUIC. It also only works if the clamp point actually knows the path's bottleneck MTU.</p>
+<p><strong>Q6: Why did a GET for a 1.2 KB page take 17 frames and about 4.6 KB?</strong></p>
+<p>Count them: three frames of TCP handshake, then the ClientHello, the server's TLS flight and the client Finished. Then two session tickets, the request, and the response split across two segments. ACKs fill the gaps, and three frames close the connection. Each frame pays 66 bytes of Ethernet, IP and TCP headers (with timestamps), and each TLS record pays 22. Header bytes alone were 24% of the capture. Connection reuse, TLS resumption or 0-RTT, and HTTP/2 or HTTP/3 multiplexing exist to amortise exactly this fixed cost.</p>
+<p><strong>Q7: Why must QUIC client Initial packets be at least 1200 bytes?</strong></p>
+<p>Two reasons. First, it proves the path can carry 1,200-byte UDP datagrams before the connection depends on that size. Second, it limits amplification. A server may send at most three times the bytes it has received from an unvalidated client address (RFC 9000). A large first packet from the client lets the server send its handshake without becoming a useful tool for reflection attacks.</p>
