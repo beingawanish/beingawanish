@@ -75,6 +75,11 @@ def apply(text: str) -> str:
     for old, new_text, count in TEXT_EDITS(len(new)):
         assert text.count(old) == count, f"expected {count} of: {old[:70]}"
         text = text.replace(old, new_text)
+
+    # Some diagrams sit directly in the article with a fixed min-width and no scrolling wrapper,
+    # so phones clip them. Give each one the same overflow wrapper the other diagrams use.
+    wrap = '<div style="overflow-x:auto">'
+    text = re.sub(r"(?<!" + re.escape(wrap) + r")\n(<svg\b.*?</svg>)", "\n" + wrap + "\n\\1\n</div>", text, flags=re.S)
     return text
 
 

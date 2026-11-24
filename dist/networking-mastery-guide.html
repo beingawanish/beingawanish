@@ -4169,6 +4169,7 @@ $ curl -sv -o /dev/null https://www.example.net/ 2&gt;&amp;1 | head -6
 <li><strong>Last usable</strong> — broadcast address − 1.</li>
 </ol>
 <p>Convention, not law: the gateway takes the first usable address (.1), and DHCP pools start just above it. Nothing in the protocol requires this. It is a habit the whole industry shares, which makes it nearly as binding.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 300" role="img" aria-labelledby="m05-cidr-title m05-cidr-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="m05-cidr-title">Reading 192.168.1.0/24: the CIDR divider</title>
 <desc id="m05-cidr-desc">The 32 bits of 192.168.1.0 split into 24 network bits and 8 host bits, with the subnet mask 255.255.255.0 shown beneath.</desc>
@@ -4200,6 +4201,7 @@ $ curl -sv -o /dev/null https://www.example.net/ 2&gt;&amp;1 | head -6
 <text x="24" y="288" font-family="system-ui,sans-serif" font-size="12" fill="#6b6f7e">network = host bits → 0 → <tspan font-family="ui-monospace,Menlo,monospace">192.168.1.0</tspan> · broadcast = host bits → 1 → <tspan font-family="ui-monospace,Menlo,monospace">192.168.1.255</tspan></text>
 </g>
 </svg>
+</div>
 
 <h3 id="the-binary-and-how-a-host-finds-its-own-network">The binary AND: how a host finds its own network</h3>
 <p>A host learns its subnet by AND-ing its address with its mask, bit by bit. Take <code>192.168.10.77</code> with a <code>/26</code> mask. Only the last octet is interesting:</p>
@@ -4321,6 +4323,7 @@ AND =   0100 0000 = 64</code></pre>
 <li><strong>WAN B: 10.10.3.164/30.</strong> Network .164, broadcast .167, usable .165, .166.</li>
 </ol>
 <p>Total consumed: 512 + 256 + 128 + 32 + 4 + 4 = <strong>936 addresses</strong> out of 65,536. The verifier confirms all six slices are disjoint, all sit inside 10.10.0.0/16, and 64,600 addresses remain — 10.10.3.168 through 10.10.255.255 — for growth. A growth plan matters: the next likely request is "engineering needs 600 hosts," and you can point at the free space instead of renumbering.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 330" role="img" aria-labelledby="m05-vlsm-title m05-vlsm-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="m05-vlsm-title">VLSM carve of 10.10.0.0/16</title>
 <desc id="m05-vlsm-desc">The used head of the /16, from 10.10.0.0 to 10.10.3.167, divided into six labeled slices, with the remaining 64,600 addresses shown as reserved space.</desc>
@@ -4356,6 +4359,7 @@ AND =   0100 0000 = 64</code></pre>
 <text x="40" y="292" fill="#6b6f7e">/31 (RFC 3021) exists for point-to-point links — 2 usable, no network/broadcast reserved — but /30 is the conservative default.</text>
 </g>
 </svg>
+</div>
 
 <p>A note on the /31 versus /30 choice. RFC 3021 lets a /31 carry two usable addresses with no network or broadcast reservation, which is exactly what a point-to-point link needs. It works on modern gear. But not all gear — older or quirky implementations still assume a broadcast address exists. In an interview, "I'd use /30 unless the platform guarantees /31 support" shows you know both the standard and the real world.</p>
 <p><strong>Worked 7 — the membership test.</strong> Given an address, which slice owns it? This is what routers do on every packet (longest-prefix match), and it's a sharp interview question because the /23 spans two third-octet values:</p>
@@ -4502,6 +4506,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href=
 <li><strong>Equal prefixes are the same node.</strong> Two routes for exactly 10.10.0.0/16 land on one node. Something else must break the tie: a metric, an administrative distance, a policy. Longest-prefix match itself has nothing to say.</li>
 </ul>
 <p>A naive trie spends one node per bit, which is wasteful. The six-prefix table below needs 33 nodes, most of them single-child links. Real implementations compress those chains. A <strong>PATRICIA trie</strong> (path-compressed, also called a radix tree) stores a whole run of bits on one edge and only branches where two prefixes actually diverge. BSD and macOS route lookup uses a radix tree of this kind. Linux goes further for IPv4. Since the 2.6 era its tables have been an <strong>LC-trie</strong> (level-compressed, <code>fib_trie</code>). A dense node can index several bits at once and have 2^k children, so a typical lookup touches only a handful of nodes. Linux IPv6 routes live in a separate radix tree (<code>fib6</code>).</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 470" role="img" aria-labelledby="d05-trie-title d05-trie-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="d05-trie-title">Longest-prefix match as a walk down a path-compressed binary trie</title>
 <desc id="d05-trie-desc">Six routes stored as a path-compressed trie. Edges carry runs of address bits. Looking up 10.10.1.200 follows the highlighted path from the default route through 10.0.0.0/8 and 10.10.0.0/16 to 10.10.0.0/23, remembering each prefix node it passes; the last one remembered is the answer. A second lookup, 10.20.0.1, leaves the path after the /8 and answers with the /8.</desc>
@@ -4568,6 +4573,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href=
 <text x="24" y="454" fill="#6b6f7e">Filled dots end a route; the hollow dot is a branch point that path compression keeps. Edges carry runs of bits.</text>
 </g>
 </svg>
+</div>
 
 <p>Hardware does the same job a different way. A switch or router ASIC holds routes in <strong>TCAM</strong> (ternary content-addressable memory). Each TCAM entry is a value plus a mask, and the chip compares the destination against every entry in parallel in one clock. Several entries can match. The chip returns the first match by physical position, so software keeps the entries sorted longest-prefix-first. That sort is where the work hides: inserting a /23 into a TCAM full of /24s and /16s may mean shuffling entries to open a slot. TCAM is fast, power-hungry and small, so modern ASICs mix it with algorithmic LPM in ordinary SRAM. Capacity varies widely by chip, and "how many routes fit" is a real purchasing question.</p>
 <p>Here is the walk in Python. It is the one-node-per-bit version, which is slow but makes every step visible, and it is checked against a brute-force "test every prefix, keep the longest" lookup.</p>
@@ -4957,6 +4963,7 @@ one /80 per node (EKS IPv6 style) inside a /64: 65,536 nodes</code></pre>
 <p>From the verifier script, the actual bytes:</p>
 <pre><code>ARP REQUEST   eth_dst=ff:ff:ff:ff:ff:ff &lt;- oper=request &lt;- sender_mac=00:11:22:33:44:55 &lt;- sender_ip=192.168.1.10 &lt;- target_ip=192.168.1.20
 ARP REPLY     eth_dst=00:11:22:33:44:55 &lt;- oper=reply   &lt;- sender_mac=aa:bb:cc:dd:ee:ff &lt;- sender_ip=192.168.1.20 &lt;- target_ip=192.168.1.10</code></pre>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 360" role="img" aria-labelledby="m06-arp-title m06-arp-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="m06-arp-title">The ARP exchange: broadcast request, unicast reply</title>
 <desc id="m06-arp-desc">Alice broadcasts an ARP request to the whole LAN; only Bob answers, with a unicast reply. Both hosts then cache the mapping.</desc>
@@ -5001,6 +5008,7 @@ ARP REPLY     eth_dst=00:11:22:33:44:55 &lt;- oper=reply   &lt;- sender_mac=aa:b
 <text x="24" y="344" font-size="12" fill="#6b6f7e">Entries age out in minutes — a stale entry after a NIC swap is a classic outage cause.</text>
 </g>
 </svg>
+</div>
 
 <h3 id="the-arp-table">The ARP table</h3>
 <p>The ARP table is a cache, not a configuration. Each entry maps an IP to a MAC with a timer. When the timer expires, the next packet to that IP triggers a fresh request. This is why the first ping to a new host sometimes drops: the ICMP echo request is waiting while ARP resolves. The second ping sails through on the cached entry.</p>
@@ -5024,6 +5032,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href=
 <p>This is why every routed hop needs its own ARP exchange. When Alice sends to an off-network address, she ARPs for her <em>gateway's</em> IP, not the final destination's. The gateway ARPs for the next hop on the far side. Each broadcast domain resolves its own next hop. Traceroute works because each router decrements TTL and answers locally — no router ever needs the MAC of a host two networks away.</p>
 <h2 id="4-the-exact-structure-the-arp-packet-rfc-826">4. The exact structure: the ARP packet (RFC 826)</h2>
 <p>ARP was defined in RFC 826 (Plummer, November 1982) — one of the oldest RFCs still in daily use, and essentially unchanged. It rides directly on Ethernet (EtherType 0x0806), not inside IP. The 28-byte payload for Ethernet/IPv4:</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 300" role="img" aria-labelledby="m06-hdr-title m06-hdr-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="m06-hdr-title">ARP packet layout, 28 bytes (RFC 826)</title>
 <desc id="m06-hdr-desc">The nine fields of an Ethernet/IPv4 ARP message with their bit sizes, from hardware type through target protocol address.</desc>
@@ -5063,6 +5072,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href=
 <text x="24" y="290" fill="#6b6f7e">Total: 14-byte Ethernet II header + 28-byte ARP = 42-byte frame on the wire (verified by the script).</text>
 </g>
 </svg>
+</div>
 
 <p>Field by field:</p>
 <table>
@@ -5270,6 +5280,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href=
 <li><strong>PROBE.</strong> No proof arrived. The kernel sends <em>unicast</em> requests to the cached MAC, <code>ucast_solicit</code> (3) of them, one second apart. Packets keep flowing to the cached MAC meanwhile.</li>
 <li><strong>FAILED</strong> (Linux). Probing got no answer. Queued packets are dropped. Local senders get <code>EHOSTUNREACH</code> ("No route to host"), and <code>ping</code> prints <code>Destination Host Unreachable</code> from your own address. The next packet starts a new INCOMPLETE round.</li>
 </ul>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 500" role="img" aria-labelledby="d06-nud-title d06-nud-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="d06-nud-title">The neighbour cache state machine (RFC 4861, Linux defaults)</title>
 <desc id="d06-nud-desc">Six states: INCOMPLETE, REACHABLE, STALE on the top row and FAILED, PROBE, DELAY on the bottom row. A first packet creates INCOMPLETE and broadcasts; a reply moves to REACHABLE. After 15 to 45 seconds without confirmation the entry becomes STALE. A packet sent on a STALE entry moves it to DELAY; confirmation within 5 seconds returns it to REACHABLE, otherwise PROBE sends three unicast requests. A reply returns to REACHABLE; silence leads to FAILED, which drops queued packets. An unsolicited ARP or gratuitous ARP with a new MAC sets the entry to STALE.</desc>
@@ -5337,6 +5348,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href=
 <text x="40" y="472" fill="#6b6f7e">Worst-case silent failover on Linux: 45 + 5 + 3 ≈ 53 s. One gratuitous ARP cuts it to milliseconds.</text>
 </g>
 </svg>
+</div>
 
 <p>The subtle part is <strong>confirmation</strong>. A neighbour is confirmed by a reply to a solicitation. It is also confirmed by <em>upper-layer hints</em>. When TCP sees new data acknowledged, it tells the neighbour layer that the next hop must be alive, because packets are getting through. That is why a busy TCP connection never generates ARP traffic after the first resolution: every ACK resets <code>confirmed</code>. UDP has no such signal unless the application passes <code>MSG_CONFIRM</code> to <code>sendmsg</code>. So a UDP-only flow on Linux walks REACHABLE → STALE → DELAY → PROBE about once per <code>reachable_time</code>, which costs one unicast ARP exchange each time.</p>
 <p>Two other inputs move entries, and both matter for failover. An ARP <em>request</em> from a neighbour updates its existing entry with the sender's MAC; if the MAC changed, the entry goes to STALE with the new address. A gratuitous ARP is exactly such a request. So on Linux a GARP <em>updates</em> an existing entry, and the next packet goes to the new MAC at once. It does not <em>create</em> an entry unless <code>arp_accept</code> is set (default 0). And <code>locktime</code> (1 s by default) blocks a second change within one second of the last one, so when two hosts answer, the first answer holds.</p>
@@ -5762,6 +5774,7 @@ IP6 (hlim 255, next-header ICMPv6 (58) payload length: 32) 2001:db8:7::1 &gt; 20
 <pre><code>DISCOVER  xid=0x12345678  msg_type=1 (1=DISCOVER)  options=[12, 53, 55, 61]
 OFFER     xid=0x12345678  msg_type=2 (2=OFFER)  yiaddr=192.168.1.77
           mask=255.255.255.0  router=192.168.1.1  dns=8.8.8.8  lease=86400s</code></pre>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 400" role="img" aria-labelledby="m07-dora-title m07-dora-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="m07-dora-title">The DHCP DORA exchange as a sequence</title>
 <desc id="m07-dora-desc">Four messages between client and server: broadcast Discover, broadcast Offer, broadcast Request, and the final ACK, with ports and addresses labeled.</desc>
@@ -5804,6 +5817,7 @@ OFFER     xid=0x12345678  msg_type=2 (2=OFFER)  yiaddr=192.168.1.77
 <text x="24" y="322" font-size="12" fill="#2d3142">Why broadcast the REQUEST? Every server that offered must hear the client choose — otherwise two servers believe they leased to you.</text>
 </g>
 </svg>
+</div>
 
 <h3 id="the-lease-lifecycle-t1-and-t2-in-plain-language">The lease lifecycle: T1 and T2 in plain language</h3>
 <p>A lease is a timer, not a permanent grant. For a lease of length L:</p>
@@ -5812,6 +5826,7 @@ OFFER     xid=0x12345678  msg_type=2 (2=OFFER)  yiaddr=192.168.1.77
 <li><strong>T2 = 0.875 × L (rebind).</strong> If T1 got no answer, the client escalates. The server may be down, or the network moved. The client broadcasts a REQUEST to <em>any</em> server: "whoever you are, extend this lease." Any server with authority over the subnet can ACK.</li>
 <li><strong>Expiry = L.</strong> If T2 also fails, the client must stop using the address. It unconfigures the interface and restarts at DISCOVER.</li>
 </ul>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 260" role="img" aria-labelledby="m07-lease-title m07-lease-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="m07-lease-title">DHCP lease lifecycle: T1 renew, T2 rebind, expiry</title>
 <desc id="m07-lease-desc">A timeline of one 24-hour lease showing the renew attempt at 12 hours, the rebind broadcast at 21 hours, and expiry at 24 hours.</desc>
@@ -5854,6 +5869,7 @@ OFFER     xid=0x12345678  msg_type=2 (2=OFFER)  yiaddr=192.168.1.77
 <text x="40" y="248" font-size="12" fill="#6b6f7e">A client that renews at T1 keeps its address indefinitely — this is why servers and printers hold stable IPs without reservations.</text>
 </g>
 </svg>
+</div>
 
 <p>The practical consequence: lease length is a tradeoff. Short leases (hours) recycle addresses fast — good for guest Wi-Fi with high churn. Long leases (days) keep addresses stable and cut broadcast traffic — good for offices. But a long lease also means a misconfigured scope poisons clients for days. When someone asks "how long should the lease be," the answer is "it depends on churn," and now you know what churn means here.</p>
 <h3 id="key-options">Key options</h3>
@@ -6169,6 +6185,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb30-1"><a href=
 <p>DHCP has no authentication. RFC 3118 defined authentication in 2001, and practically nobody deployed it. So the network imposes trust from outside, at the access switch, with <strong>DHCP snooping</strong> (a vendor feature, implemented by every enterprise switch vendor under roughly the same name).</p>
 <p>The switch keeps two pieces of state. One is a list of <strong>trusted ports</strong>, normally just the uplinks toward the relay. Server messages (OFFER, ACK, NAK) arriving on any other port are dropped. The other is a <strong>binding table</strong>: (VLAN, MAC) → (IP, port, lease expiry), filled by watching ACKs go past and emptied by RELEASE, by lease expiry, or by the port going down.</p>
 <p>That binding table then feeds two more features. <strong>Dynamic ARP Inspection</strong> drops ARP packets whose sender IP/MAC pair doesn't match a binding on that port. <strong>IP Source Guard</strong> drops IP packets whose source address doesn't match. Together they turn "whoever shouts first wins" into "only addresses the real server handed out, only from the port they were handed out on."</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 440" role="img" aria-labelledby="d07-state-title d07-state-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="d07-state-title">Where DHCP state lives: client, snooping switch, relay, server</title>
 <desc id="d07-state-desc">Four boxes from left to right: the host with its client state machine and lease file, the access switch with trusted ports and a snooping binding table, the gateway relay which keeps no lease state but rewrites giaddr, hops and option 82, and the server with its lease database. A broadcast DISCOVER travels through the switch and relay and becomes a unicast to the server; the OFFER returns via giaddr. A dashed line shows the T1 renewal going straight from host to server as a routed unicast, bypassing the relay and option 82.</desc>
@@ -6235,6 +6252,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb30-1"><a href=
 <text x="24" y="428" font-size="12" fill="#6b6f7e">Only the switch sees every port; only the server is authoritative; the relay remembers nothing between packets.</text>
 </g>
 </svg>
+</div>
 <h3 id="d07-v6-state">IPv6: the host keeps the lists, and the RA writes most of them</h3>
 <p>An IPv6 host has no single lease. RFC 4861 gives it a set of lists, each with its own timers:</p>
 <ul>
@@ -6669,6 +6687,7 @@ frame: 74 bytes untagged -&gt; 78 bytes tagged -&gt; 74 bytes after strip (ident
 reserved VIDs 0 (priority-tagged) and 4095 parse back intact
 usable VLAN IDs per trunk: 4094 (2^12 - 0 - 4095)</code></pre>
 <p>The tag costs exactly 4 bytes and stripping restores the frame bit-for-bit — the script asserts both.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 340" role="img" aria-labelledby="m08-tag-title m08-tag-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="m08-tag-title">The 802.1Q tag: TPID, PCP, DEI, VID</title>
 <desc id="m08-tag-desc">An Ethernet frame with the 4-byte 802.1Q tag inserted after the source MAC, showing each sub-field with its bit size.</desc>
@@ -6713,6 +6732,7 @@ usable VLAN IDs per trunk: 4094 (2^12 - 0 - 4095)</code></pre>
 <text x="24" y="316" fill="#6b6f7e">handle this ("baby giants"); ancient NICs doing strict 1518-byte checks do not — a real, if rare, interop footnote.</text>
 </g>
 </svg>
+</div>
 
 <h3 id="access-vs-trunk-ports">Access vs trunk ports</h3>
 <p>Every switch port is one of two kinds:</p>
@@ -6774,6 +6794,7 @@ after setting dist-1 priority 4096: root = dist-1 (by design, not by MAC luck)</
 </ul>
 <p>What RSTP did <em>not</em> change: one tree per network. Every VLAN shares the same blocked links, so redundancy is wasted for load-sharing and a blocked 10G uplink sits idle. <strong>MSTP</strong> (IEEE 802.1s) fixes that with multiple spanning-tree instances mapped to VLAN groups — one tree can block the left uplink while another blocks the right, using both. Mention MSTP when an interviewer asks "what's wrong with RSTP."</p>
 <p>Everything here is standard behavior — no vendor commands needed, and deliberately so. The concepts (root election, roles, handshake vs timers) transfer across every vendor's CLI.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 380" role="img" aria-labelledby="m08-stp-title m08-stp-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="m08-stp-title">STP in a switch triangle: root, designated, alternate</title>
 <desc id="m08-stp-desc">Three switches in a triangle. The elected root bridge has all-designated ports; one non-root switch blocks its redundant port as an alternate, breaking the loop.</desc>
@@ -6814,6 +6835,7 @@ after setting dist-1 priority 4096: root = dist-1 (by design, not by MAC luck)</
 <text x="24" y="370" font-size="12" fill="#6b6f7e">Cut the SW1–SW3 link and the alternate unblocks in ~1s (RSTP) — redundancy without a loop, at any moment only one logical path.</text>
 </g>
 </svg>
+</div>
 
 <h2 id="5-a-realistic-example-three-departments-two-switches">5. A realistic example: three departments, two switches</h2>
 <p>A small office: two 24-port switches (SW1, SW2), one trunk between them, three VLANs — 10 Engineering, 20 Sales, 30 Guest. The router (a Layer-3 switch, or a firewall) connects via a trunk carrying all three.</p>
@@ -6931,6 +6953,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb37-1"><a href=
 <li><strong>Egress.</strong> For each output port, look up whether this VID is tagged or untagged on that port. Add or keep the tag, or strip it, and recompute the FCS.</li>
 </ol>
 <p>The VID is half the key in steps 3 and 4. The same MAC address in VLAN 20 and VLAN 310 is two independent entries. Most switches work this way, which 802.1Q calls independent VLAN learning. That is what isolation means mechanically: a frame classified into VLAN 20 can only ever match VLAN 20's entries and flood to VLAN 20's member ports. Nothing reads the color sticker again until egress.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 450" role="img" aria-labelledby="d08-pipe-title d08-pipe-desc" style="max-width:100%;height:auto;background:#f5f5f5;border:1px solid #d8d4c8;border-radius:6px;">
 <title id="d08-pipe-title">Inside a VLAN-aware switch: the five-stage forwarding pipeline</title>
 <desc id="d08-pipe-desc">Five stages left to right: ingress classification assigns a VLAN ID from the tag or the port's PVID; the spanning-tree gate checks the port's state for that VLAN's instance; learning writes the VLAN and source MAC into the forwarding table; lookup reads the VLAN and destination MAC, flooding to the VLAN's member ports on a miss; egress strips or keeps the tag per port. Below, a table of three ports with their PVID, tagged and untagged sets and STP state, and three forwarding-table entries keyed by VLAN and MAC.</desc>
@@ -7000,6 +7023,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb37-1"><a href=
 <text x="24" y="438" font-size="12" fill="#bf4520">Native VLAN = PVID + untagged egress. A mismatch: the far end files your untagged frames under its own PVID.</text>
 </g>
 </svg>
+</div>
 <h3 id="d08-priority-vector">Spanning tree is a comparison of priority vectors</h3>
 <p>Every BPDU carries a <em>priority vector</em>: root bridge ID, root path cost, sender's bridge ID, sender's port ID. (The receiving port's own ID is the final tiebreaker.) Each switch keeps the best vector it has heard on each port. "Best" means lowest, compared field by field from left to right, like a tuple compare in Python.</p>
 <p>From those stored vectors, everything follows:</p>
@@ -7395,6 +7419,7 @@ below).</td>
 <p>Four matches. Longest prefix is the <code>/24</code>. The packet goes to next hop <code>10.0.0.3</code> out <code>eth0</code>.</p>
 <p>A packet for <code>10.1.9.4</code> matches the <code>/16</code>, the <code>/8</code>, and the default — the <code>/16</code> wins, next hop <code>10.0.0.2</code>. A packet for <code>203.0.113.5</code> matches only <code>0.0.0.0/0</code> — the default route catches it, next hop <code>10.0.0.1</code>.</p>
 <p>This is worth verifying mechanically, not just by hand. The companion script does exactly these lookups with Python's <code>ipaddress</code> module:</p>
+<div style="overflow-x:auto">
 <svg viewBox="0 0 720 470" role="img" aria-labelledby="m09-lpm-title m09-lpm-desc" style="min-width:720px;max-width:100%;height:auto;">
 <title id="m09-lpm-title">Longest-prefix match for destination 10.1.2.77</title>
 <desc id="m09-lpm-desc">A routing table with four matching rows; the most specific /24 row is highlighted as the winner.</desc>
@@ -7428,6 +7453,7 @@ below).</td>
 <text x="40" y="402" font-family="sans-serif" font-size="13" fill="#2d3142">verdict: forward via <tspan font-family="monospace" font-weight="600">10.0.0.3</tspan>, dev <tspan font-family="monospace" font-weight="600">eth0</tspan></text>
 <text x="40" y="424" font-family="sans-serif" font-size="12" fill="#8a8f98">metric never entered the picture — specificity decides first</text>
 </svg>
+</div>
 
 <p>The script (<code>code/m09/longest_prefix_match.py</code>) runs the same five lookups and asserts each result. Real output from the sandbox run:</p>
 <pre><code>destination       10.1.2.77  -&gt;  10.1.2.0/24       via 10.0.0.3  dev eth0 metric 1
@@ -7535,6 +7561,7 @@ All 5 lookups verified: longest prefix wins every time.</code></pre>
 <li>Send another probe with <strong>TTL = 2</strong>. It survives router #1, dies at router #2, which sends Time Exceeded. Router #2 identified.</li>
 <li>Repeat, incrementing TTL, until the probe reaches the destination. On classic Unix <code>traceroute</code>, probes are UDP datagrams to unlikely high ports (33434+); the destination replies <strong>ICMP Port Unreachable</strong>, which is how the tool knows it arrived. (Windows <code>tracert</code> uses ICMP Echo Request instead — same TTL trick, different probe.)</li>
 </ol>
+<div style="overflow-x:auto">
 <svg viewBox="0 0 760 400" role="img" aria-labelledby="m09-tr-title m09-tr-desc" style="min-width:760px;max-width:100%;height:auto;">
 <title id="m09-tr-title">How traceroute maps each hop with TTL</title>
 <desc id="m09-tr-desc">Three probes with increasing TTL; each router returns ICMP time exceeded, the destination returns port unreachable.</desc>
@@ -7567,6 +7594,7 @@ All 5 lookups verified: longest prefix wins every time.</code></pre>
 </defs>
 <text x="24" y="372" font-family="sans-serif" font-size="12" fill="#8a8f98">each reply's source address names one hop — that is the whole trick</text>
 </svg>
+</div>
 
 <p>Three honest limitations to carry into interviews:</p>
 <ul>
@@ -7689,6 +7717,7 @@ S   203.0.113.0/24 [1/0] via 10.0.99.1 inactive, weight 1, 00:03:40   &lt;- stat
 <li><strong>Rewrite and queue.</strong> Decrement TTL, patch the header checksum, write the new Ethernet header, enqueue on the egress qdisc.</li>
 </ol>
 <p>Steps 1 and 6 are the interesting ones for this module. Both branch off the fast path into code that builds a brand-new ICMP packet. On a hardware router that means punting the packet through a policer to a general-purpose CPU. That one fact explains most of traceroute's quirks.</p>
+<div style="overflow-x:auto">
 <svg viewBox="0 0 760 560" role="img" aria-labelledby="d09-planes-title d09-planes-desc" style="min-width:760px;max-width:100%;height:auto;">
 <title id="d09-planes-title">Inside a router: control plane, RIB, FIB and the per-packet forwarding path</title>
 <desc id="d09-planes-desc">Routing sources feed candidate routes into the RIB, which selects one winner per prefix and installs it into the FIB. Each forwarded packet passes policy rules, longest-prefix match in the FIB, an ECMP hash, neighbour resolution and rewrite. Packets with expiring TTL or that are too big with DF set are punted to the CPU, which generates rate-limited ICMP errors.</desc>
@@ -7756,6 +7785,7 @@ S   203.0.113.0/24 [1/0] via 10.0.99.1 inactive, weight 1, 00:03:40   &lt;- stat
 <text x="40" y="498" font-family="sans-serif" font-size="13" font-weight="600" fill="#2d3142">slow path: punt to CPU through a policer → build ICMP 11/0 or 3/4 (IPv6: PTB) → rate-limited</text>
 <text x="40" y="520" font-family="sans-serif" font-size="12" fill="#8a8f98">traceroute times and stars come from here, not from the fast path your traffic takes</text>
 </svg>
+</div>
 
 <h3 id="d09-policy-routing-choosing-the-table-before-the-route">Policy routing: choosing the table before the route</h3>
 <p>Linux ships with three rules. Real output from the lab router before any changes:</p>
@@ -8181,6 +8211,7 @@ VXLAN inside WireGuard (IPv4)         1390      1350     1338      1330</code></
 <h2 id="3-how-it-works-5">3. How it works</h2>
 <h3 id="31-the-three-way-handshake">3.1 The three-way handshake</h3>
 <p>Before any data flows, TCP's two ends must agree on starting sequence numbers — one for each direction, because TCP is full-duplex and each side numbers its own bytes independently. The handshake is three messages:</p>
+<div style="overflow-x:auto">
 <svg viewBox="0 0 720 440" role="img" aria-labelledby="m10-hs-title m10-hs-desc" style="min-width:720px;max-width:100%;height:auto;">
 <title id="m10-hs-title">TCP three-way handshake with sequence numbers</title>
 <desc id="m10-hs-desc">SYN, SYN-ACK, and ACK messages between client and server, showing how each side's sequence number is agreed.</desc>
@@ -8212,6 +8243,7 @@ VXLAN inside WireGuard (IPv4)         1390      1350     1338      1330</code></
 <text x="126" y="372" font-family="sans-serif" font-size="13" fill="#2d3142">ESTABLISHED — each side's next byte is agreed: client sends 1001…, server sends 5001…</text>
 <text x="126" y="392" font-family="sans-serif" font-size="12" fill="#8a8f98">real ISNs are random 32-bit values; 1000/5000 keep the arithmetic readable</text>
 </svg>
+</div>
 
 <p>Step by step:</p>
 <ol type="1">
@@ -8289,6 +8321,7 @@ VXLAN inside WireGuard (IPv4)         1390      1350     1338      1330</code></
 <hr />
 <h2 id="4-the-exact-structure-1">4. The exact structure</h2>
 <p>The TCP header is a minimum of 20 bytes (it grows if options are present — timestamps and window scaling usually are). Every field's width is fixed by the standard (RFC 9293, §3.1):</p>
+<div style="overflow-x:auto">
 <svg viewBox="0 0 720 400" role="img" aria-labelledby="m10-hdr-title m10-hdr-desc" style="min-width:720px;max-width:100%;height:auto;">
 <title id="m10-hdr-title">TCP header layout with field widths</title>
 <desc id="m10-hdr-desc">Five 32-bit rows showing each TCP header field and its bit width, plus the 8-byte UDP header for contrast.</desc>
@@ -8326,6 +8359,7 @@ VXLAN inside WireGuard (IPv4)         1390      1350     1338      1330</code></
 </g>
 <text x="24" y="368" font-family="sans-serif" font-size="12" fill="#8a8f98">8 bytes total — that is all there is</text>
 </svg>
+</div>
 
 <p>Field notes worth carrying:</p>
 <ul>
@@ -8416,6 +8450,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb51-1"><a href=
 <li><strong>rwnd</strong>, the receive window, comes from the <em>receiver</em>. It is the free space in the receiver's socket buffer, advertised in every ACK. It protects the receiving application.</li>
 <li><strong>cwnd</strong>, the congestion window, lives only in the <em>sender</em>. It is the sender's running guess at how much the network can hold without loss. It protects the path.</li>
 </ul>
+<div style="overflow-x:auto">
 <svg viewBox="0 0 760 500" role="img" aria-labelledby="d10-win-title d10-win-desc" style="min-width:760px;max-width:100%;height:auto;">
 <title id="d10-win-title">What a TCP sender may send: sequence pointers, cwnd and rwnd</title>
 <desc id="d10-win-desc">The sender's byte stream is split into acknowledged bytes, bytes in flight between SND.UNA and SND.NXT, bytes it may send now, and bytes that must wait. The limit is SND.UNA plus the smaller of the congestion window, kept privately by the sender, and the receive window, advertised by the receiver in every ACK. Below, data flows from the send buffer across a path with a bottleneck queue into the receive buffer, and ACKs flow back.</desc>
@@ -8478,6 +8513,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb51-1"><a href=
 <text x="40" y="452">• Slow start, CUBIC and BBR move cwnd; an app that stops reading drives rwnd to zero.</text>
 </g>
 </svg>
+</div>
 
 <p>Everything else in this deep dive hangs off this picture. Slow start, CUBIC and BBR are rules for moving cwnd. Flow-control stalls are rwnd hitting zero. A retransmission is SND.UNA refusing to move. And the bandwidth-delay product tells you how big the window must be for the pipe to stay full.</p>
 <h3 id="d10-the-state-you-can-actually-read">The state you can actually read</h3>
@@ -8987,6 +9023,7 @@ Udp: 263 0 9773 10036 9773 0 0 0 0</code></pre>
 <h2 id="3-how-it-works-6">3. How it works</h2>
 <h3 id="31-the-resolution-flow">3.1 The resolution flow</h3>
 <p>Resolving <code>www.example.com</code> for the first time — nothing cached anywhere:</p>
+<div style="overflow-x:auto">
 <svg viewBox="0 0 800 430" role="img" aria-labelledby="m11-flow-title m11-flow-desc" style="min-width:800px;max-width:100%;height:auto;">
 <title id="m11-flow-title">DNS resolution from stub to authoritative server</title>
 <desc id="m11-flow-desc">A stub resolver asks a recursive resolver, which queries root, TLD, and authoritative servers in turn, then returns the answer.</desc>
@@ -9032,6 +9069,7 @@ Udp: 263 0 9773 10036 9773 0 0 0 0</code></pre>
 </g>
 <text x="32" y="408" font-family="sans-serif" font-size="12" fill="#8a8f98">second lookup for the same name: step 1 only — the resolver answers from cache</text>
 </svg>
+</div>
 
 <p>The key subtlety: steps 2–4 are <strong>iterative</strong> queries — the resolver asks each server directly and follows referrals itself. Step 1 is a <strong>recursive</strong> query — the stub asks once and waits for the complete answer. (In practice, resolvers also cache the referrals, so a warm resolver often skips straight from step 1 to step 4.)</p>
 <p>Two details worth knowing exist, without going deep:</p>
@@ -9151,6 +9189,7 @@ t= 360s  EXPIRED example.com: TTL lapsed, re-query upstream</code></pre>
 <li><strong>Failover pairs:</strong> a low TTL plus a health-checked authoritative server that stops advertising the dead IP. This is DNS failover, and its speed limit is the TTL — which is why the TTL playbook from §3.3 matters here too.</li>
 </ul>
 <p>The honest limits, because interviews probe them: DNS has no feedback loop. The server doesn't know if the client actually connected, or if the IP it handed out is now overloaded. Sticky sessions don't exist. And any "instant" failover claim dies on cached TTLs. DNS steering is a good <em>first</em> layer — coarse, cheap, global — with real load balancers behind it doing the fine work.</p>
+<div style="overflow-x:auto">
 <svg viewBox="0 0 720 400" role="img" aria-labelledby="m11-ttl-title m11-ttl-desc" style="min-width:720px;max-width:100%;height:auto;">
 <title id="m11-ttl-title">DNS cache layers and TTL expiry</title>
 <desc id="m11-ttl-desc">An answer cached at three layers with a 300-second TTL; after expiry the next lookup goes upstream again.</desc>
@@ -9177,6 +9216,7 @@ t= 360s  EXPIRED example.com: TTL lapsed, re-query upstream</code></pre>
 <text x="40" y="362" font-family="sans-serif" font-size="12" fill="#8a8f98">each layer caches independently — the resolver's copy serves every client behind it</text>
 <text x="40" y="382" font-family="sans-serif" font-size="12" fill="#8a8f98">wrong answer + TTL 86400 = wrong for a day, everywhere, with no recall button</text>
 </svg>
+</div>
 
 <hr />
 <h2 id="4-the-exact-structure-2">4. The exact structure</h2>
@@ -12604,6 +12644,7 @@ $ iw dev wlan0 survey dump | grep -A5 &#39;in use&#39;
 <p>The port matters because the full identity of a connection is not the IP address. It is the 5-tuple: source IP, source port, destination IP, destination port, protocol. Change any one element and you have a different conversation. PAT exploits that. Two laptops can both talk to the same web server on port 443 from the same private source port, and the router gives each conversation a different public source port. The server sees two distinct clients. The router's table remembers which is which.</p>
 <h3 id="the-translation-table-up-close">The translation table, up close</h3>
 <p>Here is the whole trick, drawn out. Two laptops, one public address, one web server:</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 430" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="m15-pat-title m15-pat-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="m15-pat-title">PAT: two private hosts sharing one public address</title>
 <desc id="m15-pat-desc">Laptop A and laptop B both use source port 51234 toward the same web server. The NAT router rewrites them to public ports 50000 and 50001 on 203.0.113.7, records the mappings in its translation table, and reverses the rewrite on the way back.</desc>
@@ -12653,6 +12694,7 @@ $ iw dev wlan0 survey dump | grep -A5 &#39;in use&#39;
 <text x="24" y="372" font-size="13" fill="#6b7280">Both laptops picked source port 51234. The router gave them different public ports, so the server sees two distinct clients.</text>
 <text x="24" y="394" font-size="13" fill="#6b7280">The dashed line is the reply: matched against the table, translated back, delivered to Laptop A.</text>
 </svg>
+</div>
 
 <p>Notice the detail that makes PAT work. Laptop A and Laptop B both chose source port 51234. That is not a problem. The router assigned public port 50000 to A's conversation and 50001 to B's. From the server's side, the two connections are <code>(203.0.113.7, 50000)</code> and <code>(203.0.113.7, 50001)</code> — different 5-tuples, no ambiguity.</p>
 <p>The entry is created when the first outbound packet leaves. Most NATs are triggered by outbound traffic. The table entry also records which protocol it is (TCP and UDP have separate port spaces — TCP port 50000 and UDP port 50000 can map to different hosts). Entries expire. A UDP mapping might time out after a couple of minutes of silence; a TCP mapping after hours. The exact timers are implementation choices; RFC 4787 and RFC 5382 set behavioral expectations for UDP and TCP NATs respectively, including how quickly mappings should time out. When an entry expires, its public port goes back in the pool.</p>
@@ -12676,6 +12718,7 @@ $ iw dev wlan0 survey dump | grep -A5 &#39;in use&#39;
 <p>A firewall's job is allow/deny per packet. There are two philosophies.</p>
 <p><strong>Stateless filtering</strong> judges every packet in isolation, against a fixed rule list. It looks at the header — the 5-tuple plus flags — and decides. It remembers nothing. This is simple and fast, which is why core routers and cloud network ACLs still use it. The cost: return traffic must be explicitly permitted. If you allow outbound TCP to port 443, you must also allow the inbound replies, usually with a broad rule like "allow established TCP from 443" — except a truly stateless filter cannot verify "established". It can only check that the ACK flag is set and trust it.</p>
 <p><strong>Stateful filtering</strong> keeps a connection table — notice the family resemblance to NAT's translation table. When it sees the start of a legitimate connection (a TCP SYN going out, or the first UDP packet of an exchange), it records the 5-tuple and the state. Return packets that match an entry are allowed automatically. Anything else falls through to the rule list. This is what "stateful inspection" means — a term Check Point coined in the 1990s, now generic. Consumer routers call it SPI. <code>iptables</code> implements it with the conntrack module and the <code>-m state</code> / <code>-m conntrack</code> match.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 520" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="m15-fw-title m15-fw-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="m15-fw-title">Stateless vs stateful packet filtering</title>
 <desc id="m15-fw-desc">A stateless filter judges each packet alone against a fixed rule list, so return traffic needs its own explicit rule. A stateful filter records each new connection in a state table and lets matching return traffic through automatically.</desc>
@@ -12732,6 +12775,7 @@ $ iw dev wlan0 survey dump | grep -A5 &#39;in use&#39;
 <text x="24" y="470" font-size="13" fill="#6b7280">One rule covers both directions: the reply matches the table entry, so no return rule is needed.</text>
 <text x="24" y="492" font-size="13" fill="#6b7280">The state table is the same idea as NAT's translation table — and most NAT routers are stateful filters too.</text>
 </svg>
+</div>
 
 <p>Two observations worth keeping. First, most real NAT devices are stateful firewalls wearing a trench coat. Your home router does PAT <em>and</em> stateful filtering in one box: the translation table and the connection table are often the same data structure. Second, statelessness is not stupidity. It is a performance choice. A stateless filter holds no per-connection state, so it cannot be exhausted by a flood of fake connections — but that is also why cloud providers pair stateless network ACLs with stateful security groups. Each covers the other's weakness.</p>
 <hr />
@@ -12867,6 +12911,7 @@ Stale TCP mappings time out and their ports are recycled:
 <h3 id="d15-one-table-two-tuples-per-flow">One table, two tuples per flow</h3>
 <p>A conntrack entry stores a flow once, as two tuples. The ORIGINAL tuple is the flow as its first packet saw it. The REPLY tuple is what a reply packet will look like on the wire. With no NAT, the reply tuple is just the original turned around. With NAT, the reply tuple is the <em>translated</em> one, and that difference is the translation. There is no separate NAT table. NAT is a conntrack entry whose two tuples do not mirror each other.</p>
 <p>The entry is hashed under both tuples. A packet in either direction does one hash lookup and lands on the same entry. The lookup tells the kernel three things at once: which flow this is, which direction it is travelling, and how to rewrite it.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="d15-ct-title d15-ct-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="d15-ct-title">Linux netfilter: where conntrack and NAT act on a forwarded packet</title>
 <desc id="d15-ct-desc">A packet enters from the LAN and passes the prerouting hook (raw, conntrack lookup, destination NAT), the routing decision, the forward hook (filter), and the postrouting hook (source NAT, then confirm). The conntrack table stores each flow once with an original tuple and a reply tuple. Only the first packet of a flow consults the NAT chains; later packets are rewritten from the stored tuples.</desc>
@@ -12919,6 +12964,7 @@ Stale TCP mappings time out and their ports are recycled:
 <text x="24" y="448" font-size="13" fill="#6b7280">A reply is recognised because its tuple equals the REPLY tuple, which is how it gets un-NATed.</text>
 <text x="24" y="470" font-size="13" fill="#6b7280">A packet dropped before confirm (by a filter rule) leaves no entry behind.</text>
 </svg>
+</div>
 
 <h3 id="d15-nat-is-decided-once-per-flow">NAT is decided once per flow</h3>
 <p>This is the single most useful fact in the module. The nat chains (iptables <code>-t nat</code>, or nftables chains of <code>type nat</code>) are consulted only for the first packet of a flow. That packet is NEW and its entry is still <em>unconfirmed</em>. Source NAT at the postrouting hook picks a public address and port, writes them into the REPLY tuple, and the entry is confirmed at the very end of the path. Every later packet hits the entry in prerouting and is rewritten from the stored tuples. The nat chains never see it.</p>
@@ -13373,6 +13419,7 @@ a=candidate:2 1 udp 1694498815 203.0.113.7 40000 typ srflx raddr 192.168.1.10 rp
 <h2 id="3-how-it-works-11">3. How it works</h2>
 <h3 id="the-anatomy-of-a-tunneled-packet">The anatomy of a tunneled packet</h3>
 <p>Here is what actually goes on the wire when your laptop talks to the office server through a tunnel:</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 400" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="m16-tun-title m16-tun-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="m16-tun-title">A tunneled packet: the inner packet is opaque on the wire</title>
 <desc id="m16-tun-desc">The original IP packet is encrypted, wrapped in an ESP header and trailer, then placed inside a new outer IP packet. An observer on the café Wi-Fi sees only the outer headers; the inner addresses and payload are hidden.</desc>
@@ -13416,12 +13463,14 @@ a=candidate:2 1 udp 1694498815 203.0.113.7 40000 typ srflx raddr 192.168.1.10 rp
 <text x="48" y="372" font-size="13" fill="#6b7280">2. How is each packet wrapped, encrypted, and authenticated?</text>
 <text x="560" y="372" font-size="13" fill="#2d3142" font-weight="600">— the data path.</text>
 </svg>
+</div>
 
 <p>ESP is the Encapsulating Security Payload (RFC 4303). It is the "wax seal": it encrypts the inner packet and adds an authentication tag so tampering is detected. Every serious VPN uses ESP or something equivalent for the data path. The approaches differ mostly in the handshake and in how much machinery surrounds it.</p>
 <h3 id="ipsec-transport-mode-vs-tunnel-mode">IPsec: transport mode vs tunnel mode</h3>
 <p>IPsec (RFC 4301) is the standards-based suite — not one protocol but a framework: ESP for the data path, IKEv2 (RFC 7296) for the handshake. It has two modes, and the difference is exactly what gets encapsulated.</p>
 <p><strong>Transport mode</strong> protects the payload of an IP packet but leaves the original IP header in place. The packet keeps its real source and destination addresses; ESP is inserted between the IP header and the TCP/UDP header. Use it when two endpoints talk directly to each other — host to host — and there is no NAT or private addressing in the way. Two servers in the same data center encrypting their replication traffic: transport mode.</p>
 <p><strong>Tunnel mode</strong> encapsulates the <em>entire</em> original IP packet — header included — inside a new outer IP packet, as the diagram above shows. The inner addresses are hidden. Use it when the endpoints are gateways rather than the final hosts: your laptop to the office VPN concentrator, or office router to office router (site-to-site). The inner packet can carry private addresses the public internet could never route.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 430" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="m16-modes-title m16-modes-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="m16-modes-title">IPsec transport mode versus tunnel mode</title>
 <desc id="m16-modes-desc">In transport mode the original IP header stays visible and only the payload is protected by ESP. In tunnel mode the whole original packet is encrypted and carried inside a new outer IP packet, hiding the inner addresses.</desc>
@@ -13464,6 +13513,7 @@ a=candidate:2 1 udp 1694498815 203.0.113.7 40000 typ srflx raddr 192.168.1.10 rp
 <text x="24" y="368" font-size="13" fill="#6b7280">Rule of thumb: endpoints are the final hosts → transport. Anything crosses private addressing or NAT → tunnel.</text>
 <text x="24" y="392" font-size="13" fill="#6b7280">IPsec through NAT needs NAT-Traversal: ESP wrapped in UDP on port 4500 (RFC 3948), because NAT cannot track bare ESP.</text>
 </svg>
+</div>
 
 <p>A word on that last line, because it connects two modules. ESP is its own IP protocol (protocol number 50) — not TCP, not UDP. NAT's translation table keys on ports, and ESP has no ports. So a NAT device cannot multiplex ESP flows; at best it can pass one through. NAT-Traversal fixes this by wrapping ESP packets in UDP datagrams on port 4500. Now the NAT sees ordinary UDP with ports, and everything works. IKEv2 detects the NAT automatically during the handshake and switches to NAT-T on its own. When someone asks "why is my IPsec VPN slow to establish behind a hotel router," NAT-T negotiation is the machinery involved.</p>
 <h3 id="the-return-trip-routing-is-half-the-vpn">The return trip: routing is half the VPN</h3>
@@ -13636,6 +13686,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb73-1"><a href=
 <li><strong>Route lookup #2, on the outer packet.</strong> The kernel now routes a UDP datagram to <code>203.0.113.50</code>. This lookup must <em>not</em> choose <code>wg0</code>. If it did, the tunnel would be trying to carry itself.</li>
 </ol>
 <p>Every tunnel technology has the same skeleton: an inner route, a selector that picks the remote end, an encapsulation function, and an outer route. IPsec's selector is the Security Policy Database. Each policy matches traffic selectors (source and destination subnets, sometimes ports and protocol) and points at a Security Association: SPI, keys, sequence number. A route-based IPsec setup puts a virtual interface (<code>xfrm</code> or VTI on Linux, a <code>utun</code>/<code>ipsec</code> interface on macOS) in front of that, so ordinary routes can steer traffic. GRE and VXLAN have the simplest selector of all: a configured remote address, or for VXLAN a forwarding table that maps inner MAC addresses to remote endpoints.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 540" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="d16-wg-title d16-wg-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="d16-wg-title">One packet through a WireGuard interface: two route lookups and a cryptokey table</title>
 <desc id="d16-wg-desc">An application's packet to 10.1.7.20 is routed to the wg0 interface. WireGuard looks up the destination in its cryptokey table of allowed IPs, finds the peer office-gw, encrypts the packet with that peer's session key and hands it to its UDP socket. The resulting outer packet to 203.0.113.50 is routed a second time, and a policy rule keeps it out of the tunnel so it leaves through the physical interface. A byte budget shows 40 bytes of outer IPv6 header, 8 of UDP, 16 of WireGuard header, up to 1420 of inner packet and a 16-byte tag, totalling 1500.</desc>
@@ -13704,6 +13755,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb73-1"><a href=
 <text x="24" y="482" font-size="13" fill="#6b7280">If lookup #2 also chose wg0, the tunnel would try to carry itself. wg-quick prevents that with a fwmark</text>
 <text x="24" y="504" font-size="13" fill="#6b7280">rule on Linux and with two /1 routes plus a host route to the endpoint on macOS.</text>
 </svg>
+</div>
 
 <h3 id="d16-wireguards-cryptokey-routing-as-a-data-structure">WireGuard's cryptokey routing, as a data structure</h3>
 <p>Each WireGuard peer is a record: a public key, a list of AllowedIPs, an optional endpoint, and session state (keys, counters, timers). Internally the AllowedIPs of every peer go into one prefix trie. That gives two operations, and they are the whole design.</p>
@@ -14063,6 +14115,7 @@ AES-CBC ESP overhead by inner size: {1400: 68, 1401: 67, 1402: 66, 1403: 65, 140
 <h2 id="3-how-it-works-12">3. How it works</h2>
 <h3 id="layered-defenses">Layered defenses</h3>
 <p>Here is the stack, outside to in. Each layer assumes the one outside it has failed:</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 560" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="m17-lay-title m17-lay-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="m17-lay-title">Layered defenses, outside to in</title>
 <desc id="m17-lay-desc">Six stacked layers from the internet edge to the data: perimeter filtering, segmentation, network detection, host controls, application controls, and data protection. Each layer's note names what it catches that the outer layers miss.</desc>
@@ -14093,6 +14146,7 @@ AES-CBC ESP overhead by inner size: {1400: 68, 1401: 67, 1402: 66, 1403: 65, 140
 <text x="24" y="512" font-size="13" fill="#6b7280">The accent is deliberate: most breaches are won or lost at the host layer, long after the perimeter did its job.</text>
 <text x="24" y="534" font-size="13" fill="#6b7280">Attackers live on compromised hosts. Patching, EDR, and least privilege are unglamorous and decisive.</text>
 </svg>
+</div>
 
 <p>Read it as a story of failure. The perimeter stops the volumetric DDoS and the port scans. Something targeted gets through — a phished credential, a zero-day. Segmentation keeps it in one zone. The IDS notices the odd lateral connection the firewall rules technically allowed. The host's EDR kills the payload. The application's auth refuses the stolen session because the device posture changed. And if all of that fails, the stolen database is encrypted and the backups are offline.</p>
 <p>No layer is optional because no layer is sufficient. That sentence is the whole philosophy.</p>
@@ -14105,6 +14159,7 @@ AES-CBC ESP overhead by inner size: {1400: 68, 1401: 67, 1402: 66, 1403: 65, 140
 <p><strong>VLANs</strong> are the coarsest cut. A VLAN (IEEE 802.1Q) splits one physical switch into multiple logical Layer-2 networks. Engineering is VLAN 10, guests are VLAN 99, and their broadcasts never meet. But — and this is the part people get wrong — a VLAN by itself is not a security boundary. It is a separation of broadcast domains. Traffic <em>between</em> VLANs routes through a Layer-3 device, and unless that device enforces policy (ACLs, a firewall), the VLANs can still talk freely. A VLAN without inter-VLAN filtering is just tidier, not safer.</p>
 <p><strong>Firewall zones</strong> add the policy. You group interfaces into zones — <em>inside</em>, <em>outside</em>, <em>DMZ</em> — and write rules about zone-to-zone traffic: inside can initiate to outside, outside can initiate to DMZ web servers on 443 only, DMZ can initiate to inside on nothing. (Vendors name this differently: Palo Alto calls them zones with security policies, Cisco ASA calls them security levels, Linux does it with interface-based rules. Same idea.) The DMZ — demilitarized zone — is the classic: public-facing servers live there, isolated from both the internet and the internal LAN, so a compromised web server cannot reach the database directly.</p>
 <p><strong>Microsegmentation</strong> takes the zone idea down to the workload. Instead of "the database VLAN can talk to the app VLAN," the policy is "this specific app instance can talk to that specific database instance on port 5432, and nothing else can." Enforcement moves into the hypervisor, the container host, or a host agent — the network fabric itself carries identity. VMware NSX popularized it; Kubernetes NetworkPolicies are the container-native version. The granularity is the point: when every workload has its own perimeter, lateral movement has nowhere to go.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 470" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="m17-seg-title m17-seg-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="m17-seg-title">Segmentation in three steps: VLANs, zones, microsegmentation</title>
 <desc id="m17-seg-desc">Three panels showing increasing segmentation granularity: VLANs separate broadcast domains, firewall zones add policy between groups, microsegmentation enforces per-workload allowlists.</desc>
@@ -14150,6 +14205,7 @@ AES-CBC ESP overhead by inner size: {1400: 68, 1401: 67, 1402: 66, 1403: 65, 140
 <text x="24" y="442" font-size="13" fill="#6b7280">Kubernetes NetworkPolicies, AWS security groups between tiers, and NSX distributed firewall rules</text>
 <text x="24" y="462" font-size="13" fill="#6b7280">are all this idea wearing different uniforms.</text>
 </svg>
+</div>
 
 <h3 id="zero-trust-stop-trusting-the-address">Zero trust: stop trusting the address</h3>
 <p>Zero trust starts from an observation: the network location tells you nothing about trustworthiness. The laptop on the office LAN might be compromised. The phone on the café Wi-Fi might be the CEO's, fully patched, with hardware-backed keys. "Inside = trusted" was never true; it was convenient.</p>
@@ -14274,6 +14330,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb77-1"><a href=
 <p>The <strong>SYN queue</strong> holds <em>request sockets</em>: small records for connections where the server has received a SYN and sent a SYN-ACK, but hasn't yet seen the final ACK. These are the connections <code>ss</code> shows in state <code>SYN-RECV</code>. Each one remembers the client's initial sequence number, its options (MSS, window scale, SACK, timestamps), and a retransmit timer. If the ACK never comes, the kernel resends the SYN-ACK. With <code>net.ipv4.tcp_synack_retries = 5</code> (the Linux default) that is five retransmits with exponential backoff, about a minute of holding the slot.</p>
 <p>The <strong>accept queue</strong> holds fully established connections that the application hasn't yet picked up with <code>accept()</code>. Its limit is the <code>backlog</code> argument to <code>listen()</code>, capped by <code>net.core.somaxconn</code> (4096 by default since Linux 5.4; it used to be 128).</p>
 <p>A SYN flood fills the first queue. A slow application fills the second. The symptoms look similar from the client — new connections hang — but the counters, the causes and the fixes are completely different.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="d17-q-title d17-q-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="d17-q-title">A Linux listening socket: SYN queue, accept queue, and the SYN-cookie bypass</title>
 <desc id="d17-q-desc">Real clients' SYNs create request sockets in the SYN queue; their ACK moves the connection to the accept queue, where the application's accept() takes it. When the SYN queue is full, SYNs take a stateless cookie path: the SYN-ACK sequence number encodes the state, nothing is stored, and a valid ACK creates the socket directly in the accept queue. Spoofed SYNs never return an ACK. Counters at the bottom show which queue is under pressure.</desc>
@@ -14326,6 +14383,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb77-1"><a href=
 <text x="24" y="474" font-size="12" fill="#6b7280">flood → SYN queue full → TcpExtSyncookiesSent, TcpExtTCPReqQFullDoCookies climb</text>
 <text x="24" y="492" font-size="12" fill="#6b7280">slow app → accept queue full → TcpExtListenOverflows, TcpExtListenDrops climb; Recv-Q = Send-Q</text>
 </svg>
+</div>
 
 <h3 id="d17-syn-cookies">SYN cookies: state folded into a sequence number</h3>
 <p>When the SYN queue is full and <code>net.ipv4.tcp_syncookies = 1</code> (the Linux default), the kernel stops allocating request sockets. It still answers every SYN with a SYN-ACK. But the server's initial sequence number in that SYN-ACK is no longer random. It is a <em>cookie</em>: a keyed hash of the connection's 4-tuple, a coarse clock, and an index that encodes the client's MSS. Then the server forgets the connection completely.</p>
@@ -14756,6 +14814,7 @@ spec:
 <p>Bottom-up wins when you have <em>no hypothesis</em>: an unfamiliar system, a vague symptom ("the network is slow"), or any hint of physical trouble. It is slow and thorough. It never skips the layer that turns out to be the problem, which is its virtue and its cost.</p>
 <p><strong>Split the stack: bisect.</strong> Pick a test in the middle of the stack and run it first. The classic: <code>ping</code> the gateway. If it works, everything at L1–L3 locally is fine — the problem is above (DNS, firewall, app). If it fails, the problem is at or below L3 — forget DNS and the app entirely. You just eliminated half the stack with one command. Then bisect the broken half: if the gateway pings but the internet doesn't, the problem is between your gateway and the destination — test DNS next, then the route, then the port.</p>
 <p>Split-the-stack wins when you have <em>a hypothesis</em> or <em>a clock</em>: production is down, the symptom is specific ("this one site fails"), or you already suspect a layer. It is fast because every test eliminates half the remaining possibilities. Its risk is a wrong first test — bisecting at a layer whose test is itself broken (ping blocked by a firewall, for example) sends you down the wrong half.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="m18-meth-title m18-meth-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="m18-meth-title">Choosing a troubleshooting methodology</title>
 <desc id="m18-meth-desc">A decision diamond routes to bottom-up testing when there is no hypothesis and to split-the-stack bisection when there is one. Each path shows its layer order and its risk.</desc>
@@ -14806,6 +14865,7 @@ spec:
 <text x="30" y="470" font-size="13" fill="#6b7280">Bottom-up never skips the broken layer. Split-the-stack finds it faster — if your middle test is trustworthy.</text>
 <text x="30" y="490" font-size="13" fill="#6b7280">Risk of bisecting: a firewall that blocks ping makes L3 look dead. Confirm with a second test before committing.</text>
 </svg>
+</div>
 
 <p>A third move belongs in your pocket: <strong>follow the packet</strong>. When you know the path — client to load balancer to app to database — check each hop in order with <code>traceroute</code> (network path) or logs (application path). It is bottom-up applied to a specific conversation rather than the whole stack. Senior engineers do this instinctively: they pick the failing request and walk it.</p>
 <p>And the meta-rule that governs all three: <strong>one variable at a time.</strong> Form a hypothesis, run the test that would disprove it, observe, update. Never change two things between tests. The number of outages extended by "well, I changed the DNS and rebooted the router and now it's different" is uncountable.</p>
@@ -14814,6 +14874,7 @@ spec:
 <p>The rule of thumb: escalate when you've identified the <em>layer and the owner</em> but can't reach the fix — the break is in the ISP, the cloud provider, the vendor appliance. Your job then is the handoff, not the repair. And loop back afterward: read the vendor's postmortem, learn what their tools showed that yours couldn't. Every escalation you write well makes the next one shorter.</p>
 <h3 id="the-dependency-ladder">The dependency ladder</h3>
 <p>Here is the stack as a checklist. Each rung depends on every rung below it. Next to each rung is the test that proves it — the same tests the worked scenario will use:</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 430" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="m18-lad-title m18-lad-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="m18-lad-title">The dependency ladder: what each layer needs</title>
 <desc id="m18-lad-desc">A vertical ladder from the physical link up to the application. Each rung names the layer, the question it answers, and the command that proves it.</desc>
@@ -14850,6 +14911,7 @@ spec:
 <text x="24" y="414" font-size="13" fill="#6b7280">DNS is accented because it is the most skipped rung: it depends on the network, and the network</text>
 <text x="24" y="434" font-size="13" fill="#6b7280">depends on nothing above it. Test it after L3, never before.</text>
 </svg>
+</div>
 
 <hr />
 <h2 id="4-the-exact-structure-the-decision-procedure">4. The exact structure: the decision procedure</h2>
@@ -15038,6 +15100,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb88-1"><a href=
 <p>The commands are Linux first, because that's where production servers, containers and cloud nodes run. Where macOS differs, the text says so.</p>
 <h2 id="d18-mental-model">Deep dive: the real mental model</h2>
 <p>A packet's trip through a host is a fixed sequence of stages. Each stage keeps its own state and its own counters, and each one can drop a packet for its own reasons. Socket buffers, the routing table and its cache of path MTUs, netfilter rules and the connection-tracking table, the neighbour (ARP/ND) table, the queueing discipline, the NIC's rings. Every troubleshooting tool reads exactly one of these stages. That is the real mental model: <strong>a symptom is a drop or a delay in one stage, and a tool is a window onto one stage.</strong></p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 456" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="d18-path-title d18-path-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="d18-path-title">Where each troubleshooting tool looks on a Linux host's packet path</title>
 <desc id="d18-path-desc">Two rows of boxes. Egress, left to right: socket (ss), routing and PMTU cache (ip route get), netfilter OUTPUT and POSTROUTING with conntrack, neighbour table (ip neigh), qdisc (tc), the AF_PACKET tap (tcpdump), driver and NIC (ethtool -S), wire. Ingress, right to left: wire, driver and NIC, the tap, netfilter PREROUTING and conntrack, routing with the rp_filter check, netfilter INPUT, socket, application. Notes explain that tcpdump sees inbound packets before the firewall and outbound packets after it.</desc>
@@ -15129,6 +15192,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb88-1"><a href=
 <text x="24" y="402" font-size="12" fill="#6b7280">a packet you see leave has been routed, NATed and queued, though the NIC can still drop it (ethtool -S).</text>
 <text x="24" y="436" font-size="13" fill="#2d3142" font-weight="600">Debugging is picking the box your hypothesis lives in, and reading that box's state.</text>
 </svg>
+</div>
 
 <p>The single most useful fact in that diagram is where <code>tcpdump</code> sits. On Linux, packet capture taps the path at the device. Inbound packets are copied to the capture <em>before</em> netfilter and before the reverse-path check. Outbound packets are copied <em>after</em> routing, netfilter and the qdisc, just before the driver. So two common inferences are wrong:</p>
 <ul>
@@ -21421,6 +21485,7 @@ podC saw client 192.168.10.11:4085</code></pre>
 <hr />
 <h2 id="troubleshooting-flowchart">Troubleshooting flowchart</h2>
 <p>Module 18's decision tree as a printable flowchart. Start at the top; each diamond's answer picks the next step.</p>
+<div style="overflow-x:auto">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 800" style="min-width:760px;max-width:100%;height:auto;display:block" role="img" aria-labelledby="m19-flow-title m19-flow-desc" font-family="-apple-system, 'Segoe UI', sans-serif">
 <title id="m19-flow-title">Troubleshooting flowchart: can't reach the website</title>
 <desc id="m19-flow-desc">A top-down flowchart: scope the outage, then test link, gateway, internet, DNS, port, and application in order. Each failed test names the faulty layer and the fix direction.</desc>
@@ -21500,6 +21565,7 @@ podC saw client 192.168.10.11:4085</code></pre>
 <text x="380" y="748" font-size="12" fill="#2d3142" text-anchor="middle" font-weight="600">Read the status code:</text>
 <text x="380" y="766" font-size="11" fill="#6b7280" text-anchor="middle">2xx works · 4xx/5xx = app · TLS = cert/proxy</text>
 </svg>
+</div>
 
 <p>Two reading notes. The DNS diamond is accented because it's the most skipped step — people test DNS before proving the network, then misread a network failure as a DNS failure. And the "port connects" diamond has three exits, not two: <em>refused</em> and <em>timeout</em> are different diagnoses, and the flowchart refuses to let you merge them.</p>
 </article></div>
