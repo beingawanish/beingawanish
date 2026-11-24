@@ -25,12 +25,15 @@ GUIDES = [
 ]
 # "</script" would end the holder block early; it is swapped for a placeholder and restored in JS.
 PLACEHOLDER = "</scr_ipt"
+BOOK_CSS = (pathlib.Path(__file__).with_name("book.css")).read_text()
 
 
 def build() -> str:
     holders, cards, tabs = [], [], []
     for key, title, name, blurb in GUIDES:
         doc = (DIST / name).read_text()
+        # Book theme last, so it overrides the guide's own colours and fonts.
+        doc = doc.replace("</body>", f'<style id="book-theme">{BOOK_CSS}</style></body>', 1)
         assert PLACEHOLDER not in doc
         holders.append(f'<script type="text/html" id="src-{key}">{doc.replace("</script", PLACEHOLDER)}</script>')
         tabs.append(f'<button type="button" data-guide="{key}">{html.escape(title)}</button>')
@@ -44,27 +47,27 @@ def build() -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>System Design &amp; Networking</title>
 <style>
-  html, body {{ margin: 0; height: 100%; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #f6f4ef; color: #1f2933; }}
+  html, body {{ margin: 0; height: 100%; font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif; background: #fff; color: #111; }}
   body {{ display: flex; flex-direction: column; }}
   header {{ display: flex; align-items: center; gap: 8px; padding: 0 12px; height: 46px; flex: none;
-           background: #17202b; color: #fff; overflow-x: auto; white-space: nowrap; }}
-  header a.home {{ color: #fff; font-weight: 700; text-decoration: none; margin-right: 8px; }}
-  header button {{ font: inherit; font-size: 14px; color: #cfd8e3; background: none; border: 0; padding: 8px 12px;
+           background: #fff; color: #111; border-bottom: 1px solid #111; overflow-x: auto; white-space: nowrap; }}
+  header a.home {{ color: #000; font-weight: 700; text-decoration: none; margin-right: 8px; }}
+  header button {{ font: inherit; font-size: 14px; color: #333; background: none; border: 0; padding: 8px 12px;
                    border-radius: 6px; cursor: pointer; }}
-  header button[aria-current="true"] {{ background: #2f6f8f; color: #fff; }}
+  header button[aria-current="true"] {{ color: #000; text-decoration: underline; text-underline-offset: 6px; }}
   @media (max-width: 600px) {{ header a.home {{ font-size: 0; }} header a.home::before {{ content: "Home"; font-size: 14px; }} }}
   main {{ flex: 1; min-height: 0; position: relative; }}
   iframe {{ position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #fff; }}
   #home {{ max-width: 960px; margin: 0 auto; padding: 48px 20px; overflow-y: auto; height: 100%; box-sizing: border-box; }}
   #home h1 {{ font-size: 32px; margin: 0 0 8px; }}
-  #home > p {{ color: #52606d; margin: 0 0 28px; line-height: 1.6; }}
+  #home > p {{ color: #333; margin: 0 0 28px; line-height: 1.6; }}
   .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }}
-  .card {{ display: block; background: #fff; border: 1px solid #e4e0d6; border-radius: 12px; padding: 24px;
-           color: inherit; text-decoration: none; box-shadow: 0 1px 2px rgba(0,0,0,.04); }}
-  .card:hover {{ border-color: #2f6f8f; }}
+  .card {{ display: block; background: #fff; border: 1px solid #111; border-radius: 0; padding: 24px;
+           color: inherit; text-decoration: none;  }}
+  .card:hover {{ background: #f6f6f6; }}
   .card h2 {{ margin: 0 0 10px; font-size: 21px; }}
-  .card p {{ margin: 0 0 16px; line-height: 1.6; color: #3e4c59; }}
-  .card span {{ color: #2f6f8f; font-weight: 600; }}
+  .card p {{ margin: 0 0 16px; line-height: 1.6; color: #222; }}
+  .card span {{ color: #000; font-weight: 600; }}
 </style>
 </head>
 <body>

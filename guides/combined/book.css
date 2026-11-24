@@ -1,0 +1,78 @@
+/* Book theme for the combined guide: white page, black serif text, black headings,
+   diagrams in black and white. Injected last into each guide, so it wins over the guide's own CSS. */
+:root {
+  /* System Design Patterns */
+  --bg: #ffffff; --paper: #ffffff; --ink: #111111; --muted: #444444; --line: #d0d0d0;
+  --accent: #111111; --current-mod: #111111;
+  --read-font: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Times New Roman", serif;
+  /* Networking Mastery Guide */
+  --bg-canvas: #ffffff; --bg-deep: #ffffff; --surface: #ffffff; --surface-2: #f4f4f4;
+  --border: #d0d0d0; --text: #111111; --text-base: #111111;
+  --terracotta: #111111; --green: #111111; --amber: #111111; --red: #111111;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Times New Roman", serif;
+  --sans: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Times New Roman", serif;
+}
+
+html, body { background: #ffffff !important; color: #111111 !important; }
+body, button, input, select, textarea, nav, aside, header {
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Times New Roman", serif !important;
+}
+
+/* Every coloured panel, card and sidebar becomes plain paper. */
+header, aside, nav, section, article, main, .card, [class*="card"], [class*="module"], [class*="mod-"],
+[class*="callout"], [class*="note"], [class*="tip"], [class*="warn"], [class*="sidebar"], [class*="side"],
+[class*="toc"], [class*="outline"], [class*="pager"] a, details, summary, blockquote, .lesson-head, #article {
+  background: #ffffff !important;
+  background-image: none !important;
+  color: #111111 !important;
+  box-shadow: none !important;
+}
+[class*="module"], [class*="mod-"], [class*="card"], [class*="callout"], details, blockquote, .pager a {
+  border-color: #bbbbbb !important;
+}
+blockquote, [class*="callout"] { border-left: 3px solid #111111 !important; font-style: italic; }
+
+/* Headings: black, serif, with a thin rule under chapter-level headings, as in a book. */
+h1, h2, h3, h4, h5, h6, #lesson-title {
+  color: #000000 !important;
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Times New Roman", serif !important;
+  letter-spacing: 0 !important;
+}
+#article h2, article h1, article h2 { border-bottom: 1px solid #111111 !important; padding-bottom: 6px; }
+#article h3, article h3 { font-style: italic; font-weight: 600; }
+
+/* Text and links. */
+p, li, td, th, dd, dt, span, small, strong, em, label, figcaption { color: #111111 !important; }
+a, a:visited { color: #111111 !important; text-decoration-color: #777777 !important; }
+a:hover { text-decoration-color: #111111 !important; }
+
+/* Active states and progress bars: black instead of colour. */
+[aria-current="page"], [aria-current="true"], .active, .is-active, [class*="current"] {
+  background: #eeeeee !important; color: #000000 !important; border-color: #111111 !important;
+}
+#progress-fill, #side-fill, .progress { background: #111111 !important; }
+#progress-track, .reading-track { background: #dddddd !important; }
+.top-progress, .top-progress * { background: transparent !important; }
+.top-progress .icon-btn { border: 1px solid #999999 !important; }
+
+/* Module colours (set inline per module) become black on white. */
+.module, .app, :root { --mod: #ffffff !important; --mod-edge: #111111 !important; --mod-ink: #111111 !important; --current-mod: #111111 !important; }
+.lesson-head { border-top: 2px solid #111111 !important; border-radius: 0 !important; }
+#article { font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Times New Roman", serif !important; }
+
+/* Code: light grey block, black text, no syntax colours. */
+pre, code, .sourceCode, pre * { color: #111111 !important; }
+pre, .sourceCode { background: #f4f4f4 !important; border: 1px solid #d0d0d0 !important; }
+:not(pre) > code { background: #f2f2f2 !important; border: 0 !important; }
+
+/* Tables: ruled like a printed table. */
+table { border-collapse: collapse !important; }
+th, td { background: #ffffff !important; border-color: #bbbbbb !important; }
+th { border-bottom: 1.5px solid #111111 !important; font-weight: 700; }
+
+/* Diagrams: black and white, slightly crisper. */
+svg, img { filter: grayscale(1) contrast(1.08); }
+div[style*="overflow"]:has(> svg), figure { background: #ffffff !important; border: 1px solid #d0d0d0 !important; }
+
+button { background: #ffffff !important; color: #111111 !important; border-color: #999999 !important; }
+::selection { background: #dddddd; }
